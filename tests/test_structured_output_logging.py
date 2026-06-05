@@ -41,6 +41,48 @@ def test_resolve_keeps_explicit_model_and_records_provider() -> None:
     assert provider == "Google AI Studio"
 
 
+def test_resolve_uses_explicit_provider_without_global_lookup() -> None:
+    """An explicit per-call provider is recorded as-is, and the global
+    ``get_provider`` source is never consulted."""
+    override = MagicMock()
+    override.model = "anthropic/claude-sonnet-4-6"
+    override.name = "OpenRouter"
+    with patch(
+        "llmkit.providers.get_provider",
+        side_effect=AssertionError("global get_provider must not be called"),
+    ):
+        resolved, provider = structured_output._resolve_model_and_provider(None, override)
+    assert resolved == "anthropic/claude-sonnet-4-6"
+    assert provider == "OpenRouter"
+
+
+def test_structured_call_forwards_provider_override_to_transport() -> None:
+    """``structured_llm_call`` threads a per-call provider down to the
+    transport so the call routes through the override, not the global."""
+    import asyncio
+
+    from pydantic import BaseModel
+
+    class _Schema(BaseModel):
+        ok: bool
+
+    override = MagicMock()
+    override.model = "some-model"
+    override.name = "OpenRouter"
+
+    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[_Schema, float | None]:
+        assert kwargs["provider"] is override
+        return _Schema(ok=True), None
+
+    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+        result = asyncio.run(
+            structured_output.structured_llm_call(
+                "hi", _Schema, feature="test", provider=override
+            )
+        )
+    assert result.ok is True
+
+
 def test_resolve_degrades_gracefully_when_provider_unavailable() -> None:
     """A provider-resolution failure must not break the log write — it
     degrades to (model, None) rather than raising into the call's finally

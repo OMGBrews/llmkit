@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-06-05
+
+### Added
+
+- Per-call `provider` override on `structured_llm_call`,
+  `structured_llm_call_sync`, `text_llm_call`, and `stream_text_with_log`.
+  Passing an explicit `LLMProviderInterface` (e.g. an `OpenRouterProvider`
+  built from credentials) routes that single call through a different
+  provider family without changing the app-wide `configure_llm_client`
+  registration; `None` (the default) preserves the existing behaviour, so
+  every current caller is unchanged. The invocation log records the
+  provider that actually ran.
+
 ## [0.1.0] — 2026-06-05
 
 Initial public release.

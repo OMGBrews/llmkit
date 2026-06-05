@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import cast
 
 from llmkit.logging import LLMCallRecord, write_llm_log
+from llmkit.providers import LLMProviderInterface
 from llmkit.sync import run_sync
 
 logger = logging.getLogger(__name__)
@@ -40,21 +41,26 @@ _captured_log_paths: contextvars.ContextVar[list[Path] | None] = contextvars.Con
 )
 
 
-def _resolve_model_and_provider(model: str | None) -> tuple[str | None, str | None]:
+def _resolve_model_and_provider(
+    model: str | None, provider: LLMProviderInterface | None = None
+) -> tuple[str | None, str | None]:
     """Resolve the *effective* model + provider name for the log record.
 
     When the caller passes ``model=None`` the provider's configured
     default is what actually ran — record that instead of ``null`` so
     cost attribution is a ``grep | sort | uniq -c`` over the logs, not a
     code trace (the recurrence fix the route-coach-eval-judges task
-    calls for). Best-effort: any failure resolving the provider degrades
-    to ``(model, None)`` rather than breaking the log write — logging
-    must never break the LLM call.
+    calls for). An explicit ``provider`` (the per-call override) is used
+    as-is so the log names the provider that *actually* ran, not the
+    globally-configured one. Best-effort: any failure resolving the
+    provider degrades to ``(model, None)`` rather than breaking the log
+    write — logging must never break the LLM call.
     """
     try:
-        from llmkit.providers import get_provider
+        if provider is None:
+            from llmkit.providers import get_provider
 
-        provider = get_provider()
+            provider = get_provider()
         return (model or provider.model, provider.name)
     except Exception:
         # Logging must never break the LLM call; degrade to (model, None).
@@ -86,6 +92,7 @@ async def structured_llm_call[T](
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    provider: LLMProviderInterface | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
 
@@ -102,6 +109,13 @@ async def structured_llm_call[T](
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
         model: Optional model override (provider default when ``None``).
+        provider: Optional provider override for THIS call only. ``None``
+            (the default) uses the globally-configured provider — so every
+            existing caller is unchanged. Pass an explicit provider (e.g. an
+            :class:`~llmkit.OpenRouterProvider` built from credentials) to
+            route a single call through a different provider family without
+            touching the app-wide :func:`~llmkit.configure_llm_client`
+            registration. The log records the provider that actually ran.
 
     Returns:
         An instance of *output_schema* populated by the LLM.
@@ -129,6 +143,7 @@ async def structured_llm_call[T](
             output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
             temperature=temperature,
             model=model,
+            provider=provider,
         )
         response = cast("T", parsed)
         return response
@@ -137,7 +152,7 @@ async def structured_llm_call[T](
         raise
     finally:
         duration_ms = (time.monotonic() - start_t) * 1000
-        resolved_model, provider = _resolve_model_and_provider(model)
+        resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
         response_dump = (
             response.model_dump()  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — Pydantic result dumped for the log
             if response is not None and hasattr(response, "model_dump")
@@ -149,7 +164,7 @@ async def structured_llm_call[T](
                 feature=feature,
                 label=label,
                 model=resolved_model,
-                provider=provider,
+                provider=resolved_provider,
                 temperature=temperature,
                 duration_ms=duration_ms,
                 schema=output_schema.__name__,
@@ -172,6 +187,7 @@ def structured_llm_call_sync[T](
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    provider: LLMProviderInterface | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
 
@@ -190,6 +206,7 @@ def structured_llm_call_sync[T](
             label=label,
             temperature=temperature,
             model=model,
+            provider=provider,
         )
     )
 
@@ -202,6 +219,7 @@ async def text_llm_call(
     temperature: float = 0.2,
     model: str | None = None,
     max_tokens: int | None = None,
+    provider: LLMProviderInterface | None = None,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
 
@@ -219,6 +237,8 @@ async def text_llm_call(
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set (e.g. the readiness healthcheck uses
             ``max_tokens=1`` to keep its ping cheap).
+        provider: Optional provider override for THIS call only (``None``
+            uses the globally-configured provider).
 
     Returns:
         The model's textual response.
@@ -237,7 +257,7 @@ async def text_llm_call(
     error: str | None = None
     try:
         text, cost = await _litellm.acompletion_text(
-            prompt, temperature=temperature, model=model, max_tokens=max_tokens
+            prompt, temperature=temperature, model=model, max_tokens=max_tokens, provider=provider
         )
         return text
     except Exception as exc:
@@ -253,6 +273,7 @@ async def text_llm_call(
             start_t=start_t,
             temperature=temperature,
             model=model,
+            provider=provider,
             error=error,
             approximate_cost=cost,
         )
@@ -268,6 +289,7 @@ async def stream_text_with_log(
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    provider: LLMProviderInterface | None = None,
 ) -> AsyncIterator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
@@ -290,7 +312,9 @@ async def stream_text_with_log(
     accumulated: list[str] = []
     error: str | None = None
     try:
-        async for chunk in _litellm.astream_text(prompt, temperature=temperature, model=model):
+        async for chunk in _litellm.astream_text(
+            prompt, temperature=temperature, model=model, provider=provider
+        ):
             if chunk:
                 accumulated.append(chunk)
                 yield chunk
@@ -308,6 +332,7 @@ async def stream_text_with_log(
             start_t=start_t,
             temperature=temperature,
             model=model,
+            provider=provider,
             error=error,
             approximate_cost=None,
         )
@@ -326,6 +351,7 @@ def _log_text_call(
     start_t: float,
     temperature: float,
     model: str | None,
+    provider: LLMProviderInterface | None,
     error: str | None,
     approximate_cost: float | None,
 ) -> Path | None:
@@ -335,17 +361,18 @@ def _log_text_call(
     ``schema`` is the literal ``"stream"`` and ``response`` is the
     accumulated text rather than a Pydantic dump. ``model`` is resolved to
     the effective model (provider default substituted when the caller
-    passed ``None``).
+    passed ``None``); ``provider`` is the per-call override (``None`` uses
+    the globally-configured one) and names the provider the log records.
     """
     duration_ms = (time.monotonic() - start_t) * 1000
-    resolved_model, provider = _resolve_model_and_provider(model)
+    resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
     return write_llm_log(
         LLMCallRecord(
             started_at=started_at,
             feature=feature,
             label=label,
             model=resolved_model,
-            provider=provider,
+            provider=resolved_provider,
             temperature=temperature,
             duration_ms=duration_ms,
             schema="stream",

@@ -28,7 +28,7 @@ import instructor
 import litellm
 from pydantic import BaseModel
 
-from llmkit.providers import BaseProvider, get_provider
+from llmkit.providers import LLMProviderInterface, get_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ async def acompletion_structured[T: BaseModel](
     *,
     temperature: float,
     model: str | None,
+    provider: LLMProviderInterface | None = None,
     validation_retries: int = 1,
 ) -> tuple[T, float | None]:
     """Structured completion via instructor pinned to the provider's mode.
@@ -72,9 +73,14 @@ async def acompletion_structured[T: BaseModel](
     separate from the transient-error retry layer (``with_retries`` in
     :mod:`llmkit.retry`), which handles 429/503/5xx.
 
+    ``provider`` overrides the configured provider for this call only
+    (``None`` uses the globally-configured one) — the seam that lets a
+    single call route through a different provider family without changing
+    the app-wide registration.
+
     Returns ``(parsed, approximate_cost)``.
     """
-    provider: BaseProvider = get_provider()
+    provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
     client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
     async with GlobalRateLimiter.acquire_async():
@@ -96,13 +102,17 @@ async def acompletion_text(
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
+    provider: LLMProviderInterface | None = None,
 ) -> tuple[str, float | None]:
     """Plain-text completion via LiteLLM.
+
+    ``provider`` overrides the configured provider for this call only
+    (``None`` uses the globally-configured one).
 
     Returns ``(text, approximate_cost)``. The text is the first choice's
     message content (an empty string when the provider returns none).
     """
-    provider: BaseProvider = get_provider()
+    provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
     async with GlobalRateLimiter.acquire_async():
         resp = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
@@ -122,13 +132,15 @@ async def astream_text(
     *,
     temperature: float,
     model: str | None,
+    provider: LLMProviderInterface | None = None,
 ) -> AsyncIterator[str]:
     """Stream plain-text deltas via LiteLLM.
 
     Yields each chunk's textual delta as it arrives. The rate-limit slot
-    is held for the lifetime of the stream.
+    is held for the lifetime of the stream. ``provider`` overrides the
+    configured provider for this call only (``None`` uses the global one).
     """
-    provider: BaseProvider = get_provider()
+    provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
     async with GlobalRateLimiter.acquire_async():
         stream = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
