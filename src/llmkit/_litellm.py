@@ -1,0 +1,145 @@
+"""Internal LiteLLM call layer.
+
+The single place that talks to LiteLLM (and, for structured output,
+``instructor`` over LiteLLM). The public call functions in
+:mod:`llmkit.structured_output` build/log :class:`LLMCallRecord`s
+around these helpers; this module owns provider routing, the rate-limit
+semaphore, structured-output mode pinning, and best-effort cost extraction.
+
+It is also the **test seam**: unit tests patch these three coroutines
+(``acompletion_structured`` / ``acompletion_text`` / ``astream_text``) so
+the real call-function bodies — logging, retry, content coercion — still
+run over a faked provider response (see ``tests/_support`` ``patch_llm``).
+
+LiteLLM's ``acompletion`` and instructor's ``create_with_completion`` carry
+very strict, heavily-overloaded type stubs that reject this module's generic
+``**credential-kwargs`` and ``list[dict[str, str]]`` message shapes. Those
+call expressions therefore carry a single ``reportArgumentType`` suppression
+each, tagged ``raw-llm`` — the boundary where our thin wrapper meets the
+provider SDK's exhaustive parameter surface.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+
+import instructor
+import litellm
+from pydantic import BaseModel
+
+from llmkit.providers import BaseProvider, get_provider
+from llmkit.rate_limiting import GlobalRateLimiter
+
+logger = logging.getLogger(__name__)
+
+
+def _messages(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:
+    """Normalise a prompt into LiteLLM's message-list shape."""
+    return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+
+
+def _response_cost(
+    raw: object,
+) -> float | None:
+    """Best-effort USD cost for a completion from its ``_hidden_params``.
+
+    LiteLLM stamps ``response_cost`` onto the completion's
+    ``_hidden_params`` (token usage x model pricing). Best-effort: any
+    missing/odd shape degrades to ``None`` rather than breaking the call.
+    """
+    hidden = getattr(raw, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        cost = hidden.get("response_cost")  # pyright: ignore[reportUnknownMemberType]  # raw-llm — litellm hidden-params dict
+        if isinstance(cost, (int, float)):
+            return float(cost)
+    return None
+
+
+async def acompletion_structured[T: BaseModel](
+    prompt: str | list[dict[str, str]],
+    output_schema: type[T],
+    *,
+    temperature: float,
+    model: str | None,
+    validation_retries: int = 1,
+) -> tuple[T, float | None]:
+    """Structured completion via instructor pinned to the provider's mode.
+
+    Uses ``create_with_completion`` so the parsed model *and* the raw
+    completion (for cost) are both in hand. ``validation_retries`` is
+    instructor's in-call schema-repair budget — deliberately low and kept
+    separate from the transient-error retry layer (``with_retries`` in
+    :mod:`llmkit.retry`), which handles 429/503/5xx.
+
+    Returns ``(parsed, approximate_cost)``.
+    """
+    provider: BaseProvider = get_provider()
+    creds = provider.completion_kwargs()
+    client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
+    async with GlobalRateLimiter.acquire_async():
+        parsed, completion = await client.chat.completions.create_with_completion(
+            model=provider.litellm_model(model),
+            messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
+            response_model=output_schema,
+            temperature=temperature,
+            max_retries=validation_retries,
+            api_key=creds.get("api_key"),
+            api_base=creds.get("api_base"),
+        )
+    return parsed, _response_cost(completion)
+
+
+async def acompletion_text(
+    prompt: str | list[dict[str, str]],
+    *,
+    temperature: float,
+    model: str | None,
+    max_tokens: int | None = None,
+) -> tuple[str, float | None]:
+    """Plain-text completion via LiteLLM.
+
+    Returns ``(text, approximate_cost)``. The text is the first choice's
+    message content (an empty string when the provider returns none).
+    """
+    provider: BaseProvider = get_provider()
+    creds = provider.completion_kwargs()
+    async with GlobalRateLimiter.acquire_async():
+        resp = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
+            model=provider.litellm_model(model),
+            messages=_messages(prompt),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=creds.get("api_key"),
+            api_base=creds.get("api_base"),
+        )
+    content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
+    return (content or ""), _response_cost(resp)
+
+
+async def astream_text(
+    prompt: str | list[dict[str, str]],
+    *,
+    temperature: float,
+    model: str | None,
+) -> AsyncIterator[str]:
+    """Stream plain-text deltas via LiteLLM.
+
+    Yields each chunk's textual delta as it arrives. The rate-limit slot
+    is held for the lifetime of the stream.
+    """
+    provider: BaseProvider = get_provider()
+    creds = provider.completion_kwargs()
+    async with GlobalRateLimiter.acquire_async():
+        stream = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
+            model=provider.litellm_model(model),
+            messages=_messages(prompt),
+            temperature=temperature,
+            stream=True,
+            api_key=creds.get("api_key"),
+            api_base=creds.get("api_base"),
+        )
+        async for chunk in stream:  # pyright: ignore[reportGeneralTypeIssues]  # raw-llm — litellm stream wrapper is async-iterable
+            delta = chunk.choices[0].delta.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm stream chunk
+            if delta:
+                yield delta

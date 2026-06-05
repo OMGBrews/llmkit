@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual env / uv
+.venv/
+uv.lock
+
+# Local LLM call logs (default LocalYamlLogSink output)
+data/llm-logs/
+
+# Editor / OS
+.DS_Store
