@@ -12,6 +12,9 @@ license = { file = "LICENSE" }
 authors = [{ name = "OMGBrews" }]
 keywords = ["llm", "litellm", "instructor", "structured-output", "openai", "anthropic", "gemini"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -35,7 +38,10 @@ dev = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/OMGBrews/llmkit"
 Repository = "https://github.com/OMGBrews/llmkit"
+Issues = "https://github.com/OMGBrews/llmkit/issues"
+Changelog = "https://github.com/OMGBrews/llmkit/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/llmkit"]

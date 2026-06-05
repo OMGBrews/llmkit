@@ -153,6 +153,14 @@ uv run basedpyright          # 0 errors, 0 warnings — no baseline
 uv run pytest
 ```
 
+## Status & support
+
+`llmkit` is a small, opinionated, **best-effort** project, extracted from a real
+application and maintained in the open. It is used in production by its author
+but carries no support SLA. Bug reports and focused pull requests are welcome —
+see [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see
+[SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

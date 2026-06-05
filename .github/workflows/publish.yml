@@ -1,0 +1,48 @@
+name: Publish to PyPI
+
+# Publishes to PyPI when a GitHub Release is published. Uses PyPI Trusted
+# Publishing (OIDC) — there is NO API token stored in the repo. Configure the
+# matching "pending publisher" on PyPI first (see CONTRIBUTING / release notes):
+#   project: llmkit | owner: OMGBrews | repo: llmkit
+#   workflow: publish.yml | environment: pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/llmkit
+    permissions:
+      id-token: write    # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
