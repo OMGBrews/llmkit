@@ -76,9 +76,7 @@ def test_structured_call_forwards_provider_override_to_transport() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
-            structured_output.structured_llm_call(
-                "hi", _Schema, feature="test", provider=override
-            )
+            structured_output.structured_llm_call("hi", _Schema, feature="test", provider=override)
         )
     assert result.ok is True
 
