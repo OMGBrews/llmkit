@@ -14,7 +14,14 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Install
 
 ```bash
-uv add llmkit          # or: pip install llmkit
+uv add omg-llmkit          # or: pip install omg-llmkit
+```
+
+The distribution is published as **`omg-llmkit`** (the bare `llmkit` name was already
+taken on PyPI), but the import name is just `llmkit`:
+
+```python
+import llmkit
 ```
 
 Requires Python ≥ 3.13.

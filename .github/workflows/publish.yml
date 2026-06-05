@@ -3,8 +3,9 @@ name: Publish to PyPI
 # Publishes to PyPI when a GitHub Release is published. Uses PyPI Trusted
 # Publishing (OIDC) — there is NO API token stored in the repo. Configure the
 # matching "pending publisher" on PyPI first (see CONTRIBUTING / release notes):
-#   project: llmkit | owner: OMGBrews | repo: llmkit
+#   project: omg-llmkit | owner: OMGBrews | repo: llmkit
 #   workflow: publish.yml | environment: pypi
+# (PyPI distribution name is "omg-llmkit"; the import name stays "llmkit".)
 
 on:
   release:
@@ -34,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/llmkit
+      url: https://pypi.org/p/omg-llmkit
     permissions:
       id-token: write    # required for PyPI Trusted Publishing (OIDC)
     steps:
