@@ -62,6 +62,7 @@ async def acompletion_structured[T: BaseModel](
     *,
     temperature: float,
     model: str | None,
+    max_tokens: int | None = None,
     provider: LLMProviderInterface | None = None,
     validation_retries: int = 1,
 ) -> tuple[T, float | None]:
@@ -72,6 +73,13 @@ async def acompletion_structured[T: BaseModel](
     instructor's in-call schema-repair budget — deliberately low and kept
     separate from the transient-error retry layer (``with_retries`` in
     :mod:`llmkit.retry`), which handles 429/503/5xx.
+
+    ``max_tokens`` caps the completion length when set; it is only included
+    in the underlying call when not ``None``, so the default produces a
+    request byte-identical to the prior behaviour (no ``max_tokens`` key).
+    LiteLLM accepts ``max_tokens`` as a standard cross-provider kwarg and
+    instructor forwards extra kwargs to the wrapped completion, so no
+    per-provider branching is needed.
 
     ``provider`` overrides the configured provider for this call only
     (``None`` uses the globally-configured one) — the seam that lets a
@@ -92,6 +100,7 @@ async def acompletion_structured[T: BaseModel](
             max_retries=validation_retries,
             api_key=creds.get("api_key"),
             api_base=creds.get("api_base"),
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional max_tokens
         )
     return parsed, _response_cost(completion)
 

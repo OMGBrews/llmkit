@@ -61,6 +61,7 @@ class LLMCallRecord:
     response: Any  # pyright: ignore[reportExplicitAny]  # raw-llm — Pydantic dump or accumulated text
     error: str | None
     approximate_cost: float | None = None
+    max_tokens: int | None = None
 
 
 class LogSink(Protocol):

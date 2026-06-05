@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omg-llmkit"
-version = "0.1.1"
+version = "0.1.2"
 description = "A thin, opinionated, local-first structured-output + logging layer over LiteLLM"
 readme = "README.md"
 requires-python = ">=3.13"

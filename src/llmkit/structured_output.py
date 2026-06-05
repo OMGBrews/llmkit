@@ -92,6 +92,7 @@ async def structured_llm_call[T](
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    max_tokens: int | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
@@ -109,6 +110,9 @@ async def structured_llm_call[T](
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
         model: Optional model override (provider default when ``None``).
+        max_tokens: Optional cap on the completion length, forwarded to the
+            provider when set (no cap when ``None`` — byte-identical to the
+            prior request). Parity with :func:`text_llm_call`.
         provider: Optional provider override for THIS call only. ``None``
             (the default) uses the globally-configured provider — so every
             existing caller is unchanged. Pass an explicit provider (e.g. an
@@ -143,6 +147,7 @@ async def structured_llm_call[T](
             output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
             temperature=temperature,
             model=model,
+            max_tokens=max_tokens,
             provider=provider,
         )
         response = cast("T", parsed)
@@ -172,6 +177,7 @@ async def structured_llm_call[T](
                 response=response_dump,
                 error=error,
                 approximate_cost=cost,
+                max_tokens=max_tokens,
             )
         )
         captured = _captured_log_paths.get()
@@ -187,6 +193,7 @@ def structured_llm_call_sync[T](
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    max_tokens: int | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
@@ -196,7 +203,8 @@ def structured_llm_call_sync[T](
     output as the async version; the coroutine is driven to completion
     via :func:`run_sync`, which handles running-event-loop detection. The
     rate-limit slot is acquired inside the async path, so the sync caller
-    inherits it.
+    inherits it. ``max_tokens`` caps the completion length when set
+    (parity with :func:`text_llm_call`); ``None`` leaves it uncapped.
     """
     return run_sync(
         structured_llm_call(
@@ -206,6 +214,7 @@ def structured_llm_call_sync[T](
             label=label,
             temperature=temperature,
             model=model,
+            max_tokens=max_tokens,
             provider=provider,
         )
     )
