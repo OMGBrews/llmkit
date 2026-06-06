@@ -60,11 +60,25 @@ from llmkit import (
 )
 
 
-class Capital(BaseModel):
-    """Tiny schema: cheap to generate, unambiguous to verify."""
+class CountryProfile(BaseModel):
+    """Multi-field, multi-type smoke schema: cheap to generate, strict to verify.
+
+    Deliberately exercises a string, an integer, a boolean, and a list so a
+    structured-output mode that silently drops or empties fields (the
+    ``Mode.TOOLS_STRICT`` regression on ``gpt-4.1-mini`` that returned empty
+    fields yet flaked green) cannot satisfy the assertion by luck — every
+    field is checked below. The values are *dictated by the prompt* (an
+    extraction, not a knowledge recall), so the correct answer is fully
+    deterministic and within reach of every supported model regardless of how
+    much geography it knows.
+    """
 
     country: str
     capital: str
+    continent: str
+    eu_member: bool
+    land_borders: int
+    largest_cities: list[str]
 
 
 # Cheap, broadly-available default models per provider. Override via the
@@ -104,17 +118,35 @@ async def _assert_structured_roundtrip(
     pairs accept it (Gemini's 2.5 thinking models do; e.g. OpenRouter's
     ``gemini-2.0-flash-001`` does not, and litellm raises rather than drop
     it). Default ``None`` sends nothing, so the call works everywhere.
+
+    Every field of :class:`CountryProfile` is asserted: a half-working mode
+    that empties or drops any field fails *deterministically* here rather
+    than flaking green on the one easy field.
     """
     result = await structured_llm_call(
-        "What is the capital of France? Answer with the country and its capital.",
-        Capital,
+        # An extraction with the answer fully specified, so the result is
+        # deterministic and a dropped/empty field is unambiguously wrong.
+        "Extract the following facts about France into the schema. "
+        "Country: France. Capital: Paris. Continent: Europe. "
+        "Member of the European Union: yes. Number of bordering countries: 8. "
+        "Three largest cities by population: Paris, Marseille, Lyon.",
+        CountryProfile,
         feature="integration-smoke",
         label=provider.name,
         provider=provider,
         reasoning_effort=reasoning_effort,
     )
-    assert isinstance(result, Capital)
+    assert isinstance(result, CountryProfile)
+    assert result.country.strip().lower() == "france"
     assert result.capital.strip().lower() == "paris"
+    assert result.continent.strip().lower() == "europe"
+    assert result.eu_member is True
+    assert result.land_borders == 8
+    assert {city.strip().lower() for city in result.largest_cities} == {
+        "paris",
+        "marseille",
+        "lyon",
+    }
 
 
 def _ollama_up() -> bool:
