@@ -17,9 +17,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   optional `base_url` points the provider at OpenAI-compatible gateways; left
   unset, LiteLLM uses OpenAI's default endpoint. `OpenAIProvider` is exported
   from the package root.
+- The retry helpers (`with_retries`, `retry_progress_callback`,
+  `RetryProgressCallback`) are now exported from the package root, so callers
+  no longer reach into `llmkit.retry` directly.
 
 ### Changed
 
+- README now describes `with_retries()` as a composable helper the caller wraps
+  a call in — the public call functions do not retry on their own — instead of
+  implying transient-error retries happen automatically "out of the box".
 - `anthropic` is now a required runtime dependency. `instructor` imports the
   Anthropic SDK to account usage for its native `ANTHROPIC_JSON` mode, so the
   Anthropic provider needs it present at call time.

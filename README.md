@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, and local Ollama**, with validated structured output, a global async rate limiter, transient-error retries, and **agent-readable per-call logging** out of the box.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, and local Ollama**, with validated structured output, a global async rate limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -151,7 +151,25 @@ Register the config with `configure_llm_client(source)`, where `source` is a zer
 
 Two retry layers, kept deliberately separate:
 
-- **`with_retries()`** ([`retry.py`](src/llmkit/retry.py)) handles *transient provider* errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`).
+- **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) handles *transient provider* errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`). It is a composable helper you wrap a call in — the call functions do **not** retry on their own:
+
+  ```python
+  from llmkit import structured_llm_call, with_retries
+
+  result = await with_retries(
+      lambda: structured_llm_call(
+          prompt="Summarize the attached report.",
+          output_schema=Summary,
+          feature="reports",
+          label="exec_summary",
+      ),
+      max_retries=3,
+      backoff_base_seconds=0.5,
+  )
+  ```
+
+  Wrap a `retry_progress_callback(...)` scope around the call to observe per-attempt failures (e.g. for a progress UI).
+
 - **instructor's own low `max_retries`** handles *schema-validation* repair (re-ask the model to fix malformed JSON).
 
 ## Development

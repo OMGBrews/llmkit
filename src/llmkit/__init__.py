@@ -37,6 +37,11 @@ from llmkit.rate_limiting import (
     GlobalRateLimiter,
     configure_rate_limit,
 )
+from llmkit.retry import (
+    RetryProgressCallback,
+    retry_progress_callback,
+    with_retries,
+)
 from llmkit.structured_output import (
     capture_llm_log_paths,
     stream_text_with_log,
@@ -67,6 +72,10 @@ __all__ = [
     # Rate limiting
     "GlobalRateLimiter",
     "configure_rate_limit",
+    # Retries (composable helper you wrap calls in — not automatic)
+    "with_retries",
+    "retry_progress_callback",
+    "RetryProgressCallback",
     # Structured + plain-text call functions (the public call surface)
     "structured_llm_call",
     "structured_llm_call_sync",
