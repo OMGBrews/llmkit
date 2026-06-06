@@ -11,6 +11,14 @@ each test reads its provider's key from an environment variable and *skips*
 (never fails) when that key is absent. With no keys set, the whole module
 skips and ``pytest`` stays green — safe to ship in the public repo.
 
+Set ``LLMKIT_REQUIRE_ALL_PROVIDERS=1`` to flip every skip into a hard
+**failure**. A silent skip is indistinguishable from a pass at the summary
+line, so a typo'd key or a forgotten provider would otherwise leave a provider
+untested while the run still looks green. Maintainers export every credential
+(and start a local Ollama server) and set this flag as a release gate, so
+"tested against all supported providers" is enforced rather than hoped for.
+Default-off keeps the contributor/CI experience unchanged.
+
 Run just these (after exporting keys — see ``docs/operations`` in the
 maintainer workspace, or the table below):
 
@@ -31,6 +39,7 @@ from __future__ import annotations
 
 import os
 import socket
+from typing import NoReturn
 
 import pytest
 from pydantic import BaseModel
@@ -60,6 +69,22 @@ _OPENROUTER_MODEL = os.getenv("OPENROUTER_SMOKE_MODEL", "mistralai/mistral-nemo"
 _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
+
+# Maintainer release gate: when set, a missing key/server is a hard failure
+# instead of a silently-green skip, so the release can't ship with a provider
+# left untested. Off by default — contributors and CI without keys stay green.
+_REQUIRE_ALL = os.getenv("LLMKIT_REQUIRE_ALL_PROVIDERS", "") not in ("", "0", "false", "False")
+
+
+def _unavailable(reason: str) -> NoReturn:
+    """Skip this provider, or fail it under ``LLMKIT_REQUIRE_ALL_PROVIDERS``.
+
+    Always raises (both branches call out of ``pytest``), so callers can treat
+    it like ``pytest.skip`` for type-narrowing a just-checked key to non-None.
+    """
+    if _REQUIRE_ALL:
+        pytest.fail(f"{reason} — required by LLMKIT_REQUIRE_ALL_PROVIDERS")
+    pytest.skip(reason)
 
 
 async def _assert_structured_roundtrip(
@@ -100,7 +125,7 @@ def _ollama_up() -> bool:
 async def test_openrouter_live() -> None:
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
-        pytest.skip("OPENROUTER_API_KEY not set")
+        _unavailable("OPENROUTER_API_KEY not set")
     await _assert_structured_roundtrip(OpenRouterProvider(api_key=key, model=_OPENROUTER_MODEL))
 
 
@@ -108,7 +133,7 @@ async def test_openrouter_live() -> None:
 async def test_google_live() -> None:
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
-        pytest.skip("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
+        _unavailable("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
     # Gemini 2.5 thinks by default; disable it so the smoke call doesn't
     # burn reasoning tokens on a trivial prompt.
     await _assert_structured_roundtrip(
@@ -120,12 +145,12 @@ async def test_google_live() -> None:
 async def test_anthropic_live() -> None:
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
-        pytest.skip("ANTHROPIC_API_KEY not set")
+        _unavailable("ANTHROPIC_API_KEY not set")
     await _assert_structured_roundtrip(AnthropicProvider(api_key=key, model=_ANTHROPIC_MODEL))
 
 
 @pytest.mark.asyncio
 async def test_ollama_live() -> None:
     if not _ollama_up():
-        pytest.skip("no Ollama server on localhost:11434")
+        _unavailable("no Ollama server on localhost:11434 (run `ollama serve`)")
     await _assert_structured_roundtrip(OllamaProvider(model=_OLLAMA_MODEL))
