@@ -6,28 +6,31 @@ instance back — the one thing mocks can never prove: that our model
 strings, ``instructor.Mode`` pinning, and credential kwargs are actually
 accepted by the provider's API.
 
-These cost money and require network + credentials, so they are **opt-in**:
-each test reads its provider's key from an environment variable and *skips*
-(never fails) when that key is absent. With no keys set, the whole module
-skips and ``pytest`` stays green — safe to ship in the public repo.
+**These are the live half of an explicit split.** Every test in this module is
+marked ``@pytest.mark.live`` (via ``pytestmark`` below) and runs *only* when
+``--run-live`` is passed. The ``conftest.py`` switch — never the presence of a
+key — decides whether they run, so the same command behaves identically on every
+machine. Plain ``pytest`` (CI, contributors, no keys) never collects a live
+call; offline tests, conversely, never touch the network or read a credential.
+There is no in-between and no test that quietly changes mode with the
+environment.
 
-Set ``LLMKIT_REQUIRE_ALL_PROVIDERS=1`` to flip every skip into a hard
-**failure**. A silent skip is indistinguishable from a pass at the summary
-line, so a typo'd key or a forgotten provider would otherwise leave a provider
-untested while the run still looks green. Maintainers export every credential
-(and start a local Ollama server) and set this flag as a release gate, so
-"tested against all supported providers" is enforced rather than hoped for.
-Default-off keeps the contributor/CI experience unchanged.
-
-Run just these (after exporting keys — see ``docs/operations`` in the
-maintainer workspace, or the table below):
+Under ``--run-live`` every test here **must pass**: a missing key or an
+unreachable Ollama server is a hard **failure**, not a skip — you asked for live
+coverage, so a provider can't be silently dropped. Export every credential and
+start a local Ollama server first (this is the release gate; see
+``docs/operations`` in the maintainer workspace):
 
     OPENROUTER_API_KEY=sk-or-...  \
     GEMINI_API_KEY=...            \
     ANTHROPIC_API_KEY=...         \
     OPENAI_API_KEY=sk-...         \
     DEEPSEEK_API_KEY=sk-...       \
-    uv run pytest tests/integration -v
+    uv run pytest tests/integration --run-live -v
+
+To exercise a single provider you have a key for, select it explicitly rather
+than relying on which keys happen to be set, e.g.
+``uv run pytest tests/integration --run-live -k openai``.
 
 Provider -> credential it reads:
 
@@ -37,6 +40,10 @@ Provider -> credential it reads:
     OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
     DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
     Ollama      (local server on :11434)    https://ollama.com  (no key)
+
+Ollama reads no key — it needs a reachable server instead. Point ``OLLAMA_HOST``
+at it (default ``http://localhost:11434``); in the maintainer devcontainer
+Ollama runs on the host, reached at ``http://host.docker.internal:11434``.
 """
 
 from __future__ import annotations
@@ -58,6 +65,12 @@ from llmkit import (
     OpenRouterProvider,
     structured_llm_call,
 )
+
+# Every test in this module makes a real API call. The marker is what the
+# ``--run-live`` switch in conftest.py keys off of: without the flag these are
+# skipped at collection (deterministically, regardless of any credentials in the
+# environment); with it, they all run and must pass.
+pytestmark = pytest.mark.live
 
 
 class CountryProfile(BaseModel):
@@ -91,22 +104,25 @@ _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001
 _OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
 _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
+# Where the Ollama server lives. Default is an in-process localhost server; in
+# the maintainer devcontainer Ollama runs on the *host*, so the container sets
+# OLLAMA_HOST=http://host.docker.internal:11434. Both the up-check and the
+# provider read this same value, so the guard and the real call can't disagree.
+# This configures *where* the one server is — it never changes whether the test
+# runs (that's --run-live's job).
+_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-# Maintainer release gate: when set, a missing key/server is a hard failure
-# instead of a silently-green skip, so the release can't ship with a provider
-# left untested. Off by default — contributors and CI without keys stay green.
-_REQUIRE_ALL = os.getenv("LLMKIT_REQUIRE_ALL_PROVIDERS", "") not in ("", "0", "false", "False")
 
+def _missing(dep: str) -> NoReturn:
+    """Fail a live test whose credential or server is unavailable.
 
-def _unavailable(reason: str) -> NoReturn:
-    """Skip this provider, or fail it under ``LLMKIT_REQUIRE_ALL_PROVIDERS``.
-
-    Always raises (both branches call out of ``pytest``), so callers can treat
-    it like ``pytest.skip`` for type-narrowing a just-checked key to non-None.
+    Only reachable under ``--run-live`` (otherwise the whole module is skipped at
+    collection), so a missing dependency is an *error*, not a skip: opting into
+    live coverage and then silently dropping a provider is exactly the
+    looks-green-but-untested trap this split exists to prevent. Returns
+    ``NoReturn`` so callers get type-narrowing on a just-checked key.
     """
-    if _REQUIRE_ALL:
-        pytest.fail(f"{reason} — required by LLMKIT_REQUIRE_ALL_PROVIDERS")
-    pytest.skip(reason)
+    pytest.fail(f"{dep} — required when --run-live is set")
 
 
 async def _assert_structured_roundtrip(
@@ -150,9 +166,8 @@ async def _assert_structured_roundtrip(
 
 
 def _ollama_up() -> bool:
-    """True if an Ollama server answers on localhost:11434."""
-    host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    netloc = host.split("://", 1)[-1]
+    """True if an Ollama server answers at ``OLLAMA_HOST`` (default localhost)."""
+    netloc = _OLLAMA_HOST.split("://", 1)[-1]
     name, _, port = netloc.partition(":")
     try:
         with socket.create_connection((name or "localhost", int(port or 11434)), timeout=2):
@@ -165,7 +180,7 @@ def _ollama_up() -> bool:
 async def test_openrouter_live() -> None:
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
-        _unavailable("OPENROUTER_API_KEY not set")
+        _missing("OPENROUTER_API_KEY not set")
     await _assert_structured_roundtrip(OpenRouterProvider(api_key=key, model=_OPENROUTER_MODEL))
 
 
@@ -173,7 +188,7 @@ async def test_openrouter_live() -> None:
 async def test_google_live() -> None:
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
-        _unavailable("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
+        _missing("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
     # Gemini 2.5 thinks by default; disable it so the smoke call doesn't
     # burn reasoning tokens on a trivial prompt.
     await _assert_structured_roundtrip(
@@ -185,7 +200,7 @@ async def test_google_live() -> None:
 async def test_anthropic_live() -> None:
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
-        _unavailable("ANTHROPIC_API_KEY not set")
+        _missing("ANTHROPIC_API_KEY not set")
     await _assert_structured_roundtrip(AnthropicProvider(api_key=key, model=_ANTHROPIC_MODEL))
 
 
@@ -193,7 +208,7 @@ async def test_anthropic_live() -> None:
 async def test_openai_live() -> None:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
-        _unavailable("OPENAI_API_KEY not set")
+        _missing("OPENAI_API_KEY not set")
     await _assert_structured_roundtrip(OpenAIProvider(api_key=key, model=_OPENAI_MODEL))
 
 
@@ -201,7 +216,7 @@ async def test_openai_live() -> None:
 async def test_deepseek_live() -> None:
     key = os.getenv("DEEPSEEK_API_KEY")
     if not key:
-        _unavailable("DEEPSEEK_API_KEY not set")
+        _missing("DEEPSEEK_API_KEY not set")
     # Mode.JSON (not JSON_SCHEMA, which DeepSeek's API rejects) validates on
     # both deepseek-chat and deepseek-reasoner; the default smoke model is
     # deepseek-chat (V3). reasoning_effort is omitted: it's only meaningful for
@@ -212,5 +227,5 @@ async def test_deepseek_live() -> None:
 @pytest.mark.asyncio
 async def test_ollama_live() -> None:
     if not _ollama_up():
-        _unavailable("no Ollama server on localhost:11434 (run `ollama serve`)")
-    await _assert_structured_roundtrip(OllamaProvider(model=_OLLAMA_MODEL))
+        _missing(f"no Ollama server at {_OLLAMA_HOST} (run `ollama serve`)")
+    await _assert_structured_roundtrip(OllamaProvider(base_url=_OLLAMA_HOST, model=_OLLAMA_MODEL))

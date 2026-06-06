@@ -96,3 +96,6 @@ known-first-party = ["llmkit", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "live: makes real API calls and needs real credentials; only runs with --run-live (see tests/conftest.py)",
+]
