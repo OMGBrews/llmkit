@@ -26,6 +26,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `text_llm_call` now coerces provider **list-content** responses to a single
+  string. Some providers return `message.content` as a list of content blocks
+  rather than a string; the call previously returned that list verbatim,
+  violating its `str` return annotation (and the README's documented coercion).
+  Text blocks are now joined and non-text blocks skipped, so the return value
+  is always a string.
 - The Anthropic provider raised `ModuleNotFoundError: No module named
   'anthropic'` on the first call, because the SDK `instructor` requires for
   `ANTHROPIC_JSON` usage accounting was never declared as a dependency. A clean

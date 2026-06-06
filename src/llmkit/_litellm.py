@@ -70,6 +70,31 @@ def _response_cost(
     return None
 
 
+def _coerce_text_content(content: object) -> str:
+    """Coerce a completion's ``message.content`` to a single string.
+
+    Most providers return a plain ``str`` for a text completion, but some
+    return a *list* of content blocks — dicts shaped like
+    ``{"type": "text", "text": "..."}`` (or SDK objects exposing a ``text``
+    attribute). This concatenates the text of every such block so
+    :func:`acompletion_text` always honours its ``str`` return annotation
+    (and the README's "coerces provider list-content blocks" promise), and
+    degrades to ``""`` for ``None``/empty. Best-effort: blocks without
+    string text (images, thinking, unknown shapes) are skipped rather than
+    breaking the call.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
 async def acompletion_structured[T: BaseModel](
     prompt: str | list[dict[str, str]],
     output_schema: type[T],
@@ -147,7 +172,9 @@ async def acompletion_text(
     call only (``None`` uses the globally-configured one).
 
     Returns ``(text, approximate_cost)``. The text is the first choice's
-    message content (an empty string when the provider returns none).
+    message content coerced to a string via :func:`_coerce_text_content`
+    (list content blocks joined; an empty string when the provider returns
+    none).
     """
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
@@ -163,7 +190,7 @@ async def acompletion_text(
             **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
         )
     content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
-    return (content or ""), _response_cost(resp)
+    return _coerce_text_content(content), _response_cost(resp)
 
 
 async def astream_text(
