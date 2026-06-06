@@ -29,6 +29,7 @@ from llmkit.providers.base import (
     _active_config,
     configure_llm_client,
 )
+from llmkit.providers.deepseek import DeepSeekProvider
 from llmkit.providers.google import GoogleProvider
 from llmkit.providers.ollama import OllamaProvider
 from llmkit.providers.openai import OpenAIProvider
@@ -63,6 +64,8 @@ def get_provider(config: LLMClientConfig | None = None) -> BaseProvider:
             return AnthropicProvider.build(config)
         case Provider.OPENAI:
             return OpenAIProvider.build(config)
+        case Provider.DEEPSEEK:
+            return DeepSeekProvider.build(config)
     # Every Provider member is handled above, so the subject narrows to Never
     # here. assert_never makes that a *static* guarantee: basedpyright reports
     # a type error if a newly-added Provider member is missing its case, and it
@@ -96,6 +99,7 @@ __all__ = [
     "GoogleProvider",
     "AnthropicProvider",
     "OpenAIProvider",
+    "DeepSeekProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

@@ -7,7 +7,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to its *native* JSON-schema mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs truncated JSON. You pass a Pydantic model; you get a validated instance back.
-- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
+- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / DeepSeek / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -134,7 +134,7 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK
     model: str                       # the provider's default model
     api_key: str | None = None
     base_url: str | None = None      # OpenRouter / OpenAI-compatible endpoints; unused by Google/Anthropic

@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Direct **DeepSeek** provider (`Provider.DEEPSEEK` / `DeepSeekProvider`,
+  `deepseek/` LiteLLM prefix), giving first-class access to `deepseek-chat` (V3)
+  and `deepseek-reasoner` (R1) on a first-party key rather than the indirect
+  `openrouter/deepseek/...` hop (which adds a gateway markup). Structured output
+  is pinned to DeepSeek's native JSON mode (`instructor.Mode.JSON`); the strict
+  `Mode.JSON_SCHEMA` the other direct providers use is rejected by DeepSeek's
+  API, while `Mode.JSON` is measured to validate on both models (live smoke
+  test). `reasoning_effort` is forwarded for `deepseek-reasoner` and is harmless
+  on `deepseek-chat`. `DeepSeekProvider` is exported from the package root.
 - Direct **OpenAI** provider (`Provider.OPENAI` / `OpenAIProvider`, `openai/`
   LiteLLM prefix), giving first-class access to GPT / o-series / GPT-5 models
   without the indirect `openrouter/openai/...` hop (which adds a markup and a

@@ -26,6 +26,7 @@ maintainer workspace, or the table below):
     GEMINI_API_KEY=...            \
     ANTHROPIC_API_KEY=...         \
     OPENAI_API_KEY=sk-...         \
+    DEEPSEEK_API_KEY=sk-...       \
     uv run pytest tests/integration -v
 
 Provider -> credential it reads:
@@ -34,6 +35,7 @@ Provider -> credential it reads:
     Google      GEMINI_API_KEY              https://aistudio.google.com/apikey
     Anthropic   ANTHROPIC_API_KEY           https://console.anthropic.com/settings/keys
     OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
+    DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
     Ollama      (local server on :11434)    https://ollama.com  (no key)
 """
 
@@ -48,6 +50,7 @@ from pydantic import BaseModel
 
 from llmkit import (
     AnthropicProvider,
+    DeepSeekProvider,
     GoogleProvider,
     LLMProviderInterface,
     OllamaProvider,
@@ -72,6 +75,7 @@ _OPENROUTER_MODEL = os.getenv("OPENROUTER_SMOKE_MODEL", "mistralai/mistral-nemo"
 _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
 _OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
+_DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 
 # Maintainer release gate: when set, a missing key/server is a hard failure
@@ -159,6 +163,18 @@ async def test_openai_live() -> None:
     if not key:
         _unavailable("OPENAI_API_KEY not set")
     await _assert_structured_roundtrip(OpenAIProvider(api_key=key, model=_OPENAI_MODEL))
+
+
+@pytest.mark.asyncio
+async def test_deepseek_live() -> None:
+    key = os.getenv("DEEPSEEK_API_KEY")
+    if not key:
+        _unavailable("DEEPSEEK_API_KEY not set")
+    # Mode.JSON (not JSON_SCHEMA, which DeepSeek's API rejects) validates on
+    # both deepseek-chat and deepseek-reasoner; the default smoke model is
+    # deepseek-chat (V3). reasoning_effort is omitted: it's only meaningful for
+    # deepseek-reasoner, and the provider forwards it when configured.
+    await _assert_structured_roundtrip(DeepSeekProvider(api_key=key, model=_DEEPSEEK_MODEL))
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ class Provider(StrEnum):
     GOOGLE = "google"
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    DEEPSEEK = "deepseek"
 
 
 @dataclass(frozen=True)
