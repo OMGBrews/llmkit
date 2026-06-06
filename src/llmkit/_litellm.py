@@ -198,6 +198,8 @@ async def astream_text(
     *,
     temperature: float,
     model: str | None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> AsyncIterator[str]:
     """Stream plain-text deltas via LiteLLM.
@@ -205,9 +207,16 @@ async def astream_text(
     Yields each chunk's textual delta as it arrives. The rate-limit slot
     is held for the lifetime of the stream. ``provider`` overrides the
     configured provider for this call only (``None`` uses the global one).
+
+    ``max_tokens`` caps the streamed completion length and ``reasoning_effort``
+    controls provider thinking tokens — parity with the non-streaming text and
+    structured paths. Each is only forwarded when set (``reasoning_effort``
+    resolved against the provider's configured value when ``None``), so the
+    default request is byte-identical to the prior stream call.
     """
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
+    effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async():
         stream = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
             model=provider.litellm_model(model),
@@ -216,6 +225,8 @@ async def astream_text(
             stream=True,
             api_key=creds.get("api_key"),
             api_base=creds.get("api_base"),
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional max_tokens
+            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
         )
         async for chunk in stream:  # pyright: ignore[reportGeneralTypeIssues]  # raw-llm — litellm stream wrapper is async-iterable
             delta = chunk.choices[0].delta.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm stream chunk

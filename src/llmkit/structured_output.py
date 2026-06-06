@@ -306,6 +306,8 @@ async def text_llm_call(
             provider=provider,
             error=error,
             approximate_cost=cost,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
         )
         captured = _captured_log_paths.get()
         if captured is not None and path is not None:
@@ -319,6 +321,8 @@ async def stream_text_with_log(
     label: str | None = None,
     temperature: float = 0.2,
     model: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> AsyncIterator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
@@ -329,6 +333,13 @@ async def stream_text_with_log(
     written to ``data/llm-logs/`` after the stream finishes (or errors),
     mirroring :func:`structured_llm_call`'s logging contract so the
     invocation appears in the same per-feature analysis tooling.
+
+    ``max_tokens`` caps the streamed completion length and
+    ``reasoning_effort`` controls provider thinking tokens — parity with
+    :func:`text_llm_call` and :func:`structured_llm_call`. Each is forwarded
+    to the provider only when set (``reasoning_effort`` resolved against the
+    configured :class:`~llmkit.LLMClientConfig` value when ``None``) and is
+    recorded on the call's :class:`~llmkit.logging.LLMCallRecord`.
 
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. Streamed responses
@@ -343,7 +354,12 @@ async def stream_text_with_log(
     error: str | None = None
     try:
         async for chunk in _litellm.astream_text(
-            prompt, temperature=temperature, model=model, provider=provider
+            prompt,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
         ):
             if chunk:
                 accumulated.append(chunk)
@@ -365,6 +381,8 @@ async def stream_text_with_log(
             provider=provider,
             error=error,
             approximate_cost=None,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
         )
         captured = _captured_log_paths.get()
         if captured is not None and path is not None:
@@ -384,6 +402,8 @@ def _log_text_call(
     provider: LLMProviderInterface | None,
     error: str | None,
     approximate_cost: float | None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> Path | None:
     """Build and write an ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -393,6 +413,10 @@ def _log_text_call(
     the effective model (provider default substituted when the caller
     passed ``None``); ``provider`` is the per-call override (``None`` uses
     the globally-configured one) and names the provider the log records.
+    ``max_tokens``/``reasoning_effort`` are recorded as on the structured
+    path, so the cap and thinking setting appear in the log for these calls
+    too (both default ``None`` — absent from the request and unset on the
+    record).
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
@@ -410,5 +434,7 @@ def _log_text_call(
             response=text,
             error=error,
             approximate_cost=approximate_cost,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
         )
     )
