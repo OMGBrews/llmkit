@@ -1,9 +1,9 @@
 """Tests for :mod:`llmkit.retry`.
 
-Covers the progress-callback channel that the report eval uses to
-surface section-level retries on its stderr progress stream. The
-default `logger.warning` path is exercised implicitly by the section
-narrative tests; these tests pin the callback contract specifically.
+Covers the progress-callback channel a caller can use to surface
+per-attempt retries on its own progress stream. The default
+`logger.warning` path is exercised implicitly elsewhere; these tests
+pin the callback contract specifically.
 """
 
 from __future__ import annotations

@@ -12,10 +12,10 @@ The actual provider transport lives in :mod:`llmkit._litellm`
 (LiteLLM, with ``instructor`` for structured output); these functions own
 the logging + cost-recording contract around it.
 
-Callers that need to cross-reference these records (e.g. the suggestion
-engine, which writes a higher-level engine trace) can install a
-``capture_llm_log_paths()`` context manager around the call to receive
-the per-call log paths.
+Callers that need to cross-reference these records (e.g. a higher-level
+orchestrator that writes its own trace spanning several LLM calls) can
+install a ``capture_llm_log_paths()`` context manager around the call to
+receive the per-call log paths.
 """
 
 from __future__ import annotations
@@ -49,8 +49,7 @@ def _resolve_model_and_provider(
     When the caller passes ``model=None`` the provider's configured
     default is what actually ran — record that instead of ``null`` so
     cost attribution is a ``grep | sort | uniq -c`` over the logs, not a
-    code trace (the recurrence fix the route-coach-eval-judges task
-    calls for). An explicit ``provider`` (the per-call override) is used
+    code trace. An explicit ``provider`` (the per-call override) is used
     as-is so the log names the provider that *actually* ran, not the
     globally-configured one. Best-effort: any failure resolving the
     provider degrades to ``(model, None)`` rather than breaking the log
@@ -104,9 +103,9 @@ async def structured_llm_call[T](
         output_schema: Pydantic model class the LLM response is parsed
             into, via ``instructor`` pinned to the provider's native
             JSON-schema mode.
-        feature: Caller feature name (e.g. ``"reports"``, ``"suggestions"``,
-            ``"classification"``, ``"multi_field"``, ``"schema"``,
-            ``"interviewer"``). Embedded in the log filename and YAML body.
+        feature: Caller feature name (e.g. ``"summarization"``,
+            ``"extraction"``, ``"classification"``, ``"multi_field"``,
+            ``"schema"``). Embedded in the log filename and YAML body.
         label: Optional finer-grained identifier (e.g. ``"risk_register"``);
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
@@ -208,8 +207,8 @@ def structured_llm_call_sync[T](
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
 
-    For the handful of sync call sites (e.g. the interviewer's extraction
-    service) that cannot ``await``. Same arguments, same logging, same
+    For the handful of synchronous call sites that cannot ``await``.
+    Same arguments, same logging, same
     output as the async version; the coroutine is driven to completion
     via :func:`run_sync`, which handles running-event-loop detection. The
     rate-limit slot is acquired inside the async path, so the sync caller

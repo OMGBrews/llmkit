@@ -4,7 +4,7 @@ The log used to record ``model: null`` whenever a caller passed
 ``model=None`` (provider default), so cost attribution had to be
 reverse-engineered from code. These tests pin the fix: the log records
 the *resolved* effective model + the provider name, so a sweep's tier is
-a ``grep`` away. See route-coach-eval-judges-off-gemini-flash.
+a ``grep`` away.
 """
 
 from __future__ import annotations
@@ -97,8 +97,8 @@ def test_resolve_degrades_gracefully_when_provider_unavailable() -> None:
 def _record(**overrides: object) -> LLMCallRecord:
     base: dict[str, object] = {
         "started_at": datetime(2026, 5, 31, tzinfo=UTC),
-        "feature": "coaches",
-        "label": "verdict_guide",
+        "feature": "extraction",
+        "label": "summary",
         "model": "gemini-2.5-flash-lite",
         "provider": "Google AI Studio",
         "temperature": 0.0,
@@ -156,7 +156,7 @@ def test_summary_header_is_verdict_first(tmp_path: Path) -> None:
     ok_path = LocalYamlLogSink(tmp_path).write(_record(approximate_cost=5.9e-06))
     assert ok_path is not None
     first_line = ok_path.read_text().splitlines()[0]
-    assert first_line.startswith("# ok | coaches/verdict_guide | gemini-2.5-flash-lite | Schema |")
+    assert first_line.startswith("# ok | extraction/summary | gemini-2.5-flash-lite | Schema |")
     assert "$5.9e-06" in first_line
 
     err_path = LocalYamlLogSink(tmp_path).write(_record(error="APIError: boom"))
@@ -189,7 +189,7 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
 
     first = json.loads(lines[0])
     assert first["file"] == p1.name
-    assert first["feature"] == "coaches"
+    assert first["feature"] == "extraction"
     assert first["label"] == "first"
     assert first["model"] == "gemini-2.5-flash-lite"
     assert first["approximate_cost"] == 1e-06

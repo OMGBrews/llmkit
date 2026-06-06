@@ -25,9 +25,9 @@ class GlobalRateLimiter:
     process.
 
     The async path (:meth:`acquire_async`) is what the LiteLLM call layer
-    uses; the sync path (:meth:`acquire_sync`) is retained for the
-    eval-owned LangChain chat-model wrappers (``evals/shared``), whose
-    synchronous ``_generate``/``_stream`` cannot drive the async acquire.
+    uses; the sync path (:meth:`acquire_sync`) is retained for
+    synchronous LangChain-style chat-model wrappers whose
+    ``_generate``/``_stream`` methods cannot drive the async acquire.
 
     Lazy initialization is guarded by a ``threading.Lock`` so first-touch
     races can't construct competing semaphores. Each acquirer snapshots
