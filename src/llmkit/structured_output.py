@@ -93,6 +93,7 @@ async def structured_llm_call[T](
     temperature: float = 0.2,
     model: str | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
@@ -113,6 +114,12 @@ async def structured_llm_call[T](
         max_tokens: Optional cap on the completion length, forwarded to the
             provider when set (no cap when ``None`` — byte-identical to the
             prior request). Parity with :func:`text_llm_call`.
+        reasoning_effort: Optional per-call override of the provider's
+            reasoning/thinking effort (``"disable" | "low" | "medium" |
+            "high"``). ``None`` (the default) defers to the value configured
+            on :class:`~llmkit.LLMClientConfig`; an explicit value wins for
+            this call. ``"disable"`` turns Gemini thinking off so it doesn't
+            consume the ``max_tokens`` budget.
         provider: Optional provider override for THIS call only. ``None``
             (the default) uses the globally-configured provider — so every
             existing caller is unchanged. Pass an explicit provider (e.g. an
@@ -148,6 +155,7 @@ async def structured_llm_call[T](
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             provider=provider,
         )
         response = cast("T", parsed)
@@ -178,6 +186,7 @@ async def structured_llm_call[T](
                 error=error,
                 approximate_cost=cost,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
             )
         )
         captured = _captured_log_paths.get()
@@ -194,6 +203,7 @@ def structured_llm_call_sync[T](
     temperature: float = 0.2,
     model: str | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
@@ -205,6 +215,8 @@ def structured_llm_call_sync[T](
     rate-limit slot is acquired inside the async path, so the sync caller
     inherits it. ``max_tokens`` caps the completion length when set
     (parity with :func:`text_llm_call`); ``None`` leaves it uncapped.
+    ``reasoning_effort`` is forwarded identically (``None`` defers to the
+    configured :class:`~llmkit.LLMClientConfig` value).
     """
     return run_sync(
         structured_llm_call(
@@ -215,6 +227,7 @@ def structured_llm_call_sync[T](
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             provider=provider,
         )
     )
@@ -228,6 +241,7 @@ async def text_llm_call(
     temperature: float = 0.2,
     model: str | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
@@ -246,6 +260,9 @@ async def text_llm_call(
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set (e.g. the readiness healthcheck uses
             ``max_tokens=1`` to keep its ping cheap).
+        reasoning_effort: Optional per-call override of the provider's
+            reasoning/thinking effort; ``None`` defers to the configured
+            :class:`~llmkit.LLMClientConfig` value.
         provider: Optional provider override for THIS call only (``None``
             uses the globally-configured provider).
 
@@ -266,7 +283,12 @@ async def text_llm_call(
     error: str | None = None
     try:
         text, cost = await _litellm.acompletion_text(
-            prompt, temperature=temperature, model=model, max_tokens=max_tokens, provider=provider
+            prompt,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
         )
         return text
     except Exception as exc:

@@ -55,12 +55,21 @@ class LLMClientConfig:
     ``model`` overrides (e.g. the strong/small roles the host resolves)
     are passed at call time and are not part of this config — this carries
     only the provider's *default* model.
+
+    ``reasoning_effort`` controls provider "thinking"/reasoning tokens,
+    mirroring LiteLLM's standard param (``"disable" | "low" | "medium" |
+    "high"``). ``None`` (the default) sends no reasoning kwarg, leaving the
+    provider's own default in place — byte-identical to prior behaviour. Set
+    it once here (e.g. ``"disable"``) to have **every** call inherit the
+    setting; Gemini's default-on thinking otherwise spends reasoning tokens
+    against ``max_tokens`` and can truncate small-capped structured output.
     """
 
     provider: Provider
     model: str
     api_key: str | None = None
     base_url: str | None = None
+    reasoning_effort: str | None = None
 
 
 # Module-level config source, registered once by the host application at a
@@ -111,6 +120,11 @@ class LLMProviderInterface(Protocol):
         """The instructor mode pinning structured output for this provider."""
         ...
 
+    @property
+    def reasoning_effort(self) -> str | None:
+        """Configured reasoning/thinking effort, or ``None`` for provider default."""
+        ...
+
     def litellm_model(self, model: str | None = None) -> str:
         """The provider-prefixed LiteLLM model string for ``model`` (or the default)."""
         ...
@@ -132,8 +146,9 @@ class BaseProvider(ABC):
     _model_prefix: str = ""
     _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, reasoning_effort: str | None = None) -> None:
         self._model = model
+        self._reasoning_effort = reasoning_effort
 
     @property
     def name(self) -> str:
@@ -149,6 +164,16 @@ class BaseProvider(ABC):
     def instructor_mode(self) -> instructor.Mode:
         """The instructor mode pinning structured output for this provider."""
         return self._mode
+
+    @property
+    def reasoning_effort(self) -> str | None:
+        """Configured reasoning/thinking effort, or ``None`` for provider default.
+
+        Forwarded to LiteLLM as ``reasoning_effort`` when set (see
+        :mod:`llmkit._litellm`); ``None`` sends nothing, so the provider's
+        own thinking default stands.
+        """
+        return self._reasoning_effort
 
     def litellm_model(self, model: str | None = None) -> str:
         """Return the provider-prefixed LiteLLM model string.
@@ -180,8 +205,9 @@ class OpenRouterProvider(BaseProvider):
         api_key: str,
         model: str = "google/gemini-2.0-flash-001",
         base_url: str = "https://openrouter.ai/api/v1",
+        reasoning_effort: str | None = None,
     ):
-        super().__init__(model)
+        super().__init__(model, reasoning_effort)
         self._api_key = api_key
         self._base_url = base_url
 
@@ -204,8 +230,9 @@ class OllamaProvider(BaseProvider):
         self,
         base_url: str = "http://localhost:11434",
         model: str = "llama3.2",
+        reasoning_effort: str | None = None,
     ):
-        super().__init__(model)
+        super().__init__(model, reasoning_effort)
         self._base_url = base_url
 
     def completion_kwargs(self) -> dict[str, str]:
@@ -227,8 +254,9 @@ class GoogleProvider(BaseProvider):
         self,
         api_key: str,
         model: str = "gemini-2.5-flash-lite",
+        reasoning_effort: str | None = None,
     ):
-        super().__init__(model)
+        super().__init__(model, reasoning_effort)
         self._api_key = api_key
 
     def completion_kwargs(self) -> dict[str, str]:
@@ -250,8 +278,9 @@ class AnthropicProvider(BaseProvider):
         self,
         api_key: str,
         model: str = "claude-sonnet-4-6",
+        reasoning_effort: str | None = None,
     ):
-        super().__init__(model)
+        super().__init__(model, reasoning_effort)
         self._api_key = api_key
 
     def completion_kwargs(self) -> dict[str, str]:
@@ -291,21 +320,25 @@ def get_provider(config: LLMClientConfig | None = None) -> BaseProvider:
             api_key=config.api_key or "",
             model=config.model,
             base_url=config.base_url or "https://openrouter.ai/api/v1",
+            reasoning_effort=config.reasoning_effort,
         )
     elif config.provider == Provider.GOOGLE:
         return GoogleProvider(
             api_key=config.api_key or "",
             model=config.model,
+            reasoning_effort=config.reasoning_effort,
         )
     elif config.provider == Provider.ANTHROPIC:
         return AnthropicProvider(
             api_key=config.api_key or "",
             model=config.model,
+            reasoning_effort=config.reasoning_effort,
         )
     else:
         return OllamaProvider(
             base_url=config.base_url or "http://localhost:11434",
             model=config.model,
+            reasoning_effort=config.reasoning_effort,
         )
 
 

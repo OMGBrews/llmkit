@@ -132,6 +132,7 @@ def _capture_provider_kwargs(*, max_tokens: int | None) -> dict[str, object]:
     provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
     provider.instructor_mode = "json"
     provider.litellm_model.return_value = "fake/model"
+    provider.reasoning_effort = None
 
     with patch("llmkit._litellm.instructor.from_litellm", return_value=fake_client):
         parsed, _cost = asyncio.run(

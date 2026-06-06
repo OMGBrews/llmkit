@@ -39,6 +39,20 @@ def _messages(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:
     return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
 
 
+def _resolve_reasoning_effort(override: str | None, provider: LLMProviderInterface) -> str | None:
+    """Resolve the effective reasoning effort for a call.
+
+    A per-call ``override`` wins when set; otherwise the provider's
+    configured value (from :class:`~llmkit.LLMClientConfig`) applies. Both
+    ``None`` means no reasoning kwarg is forwarded — byte-identical to the
+    pre-feature request. ``getattr`` keeps third-party providers that predate
+    the ``reasoning_effort`` property working (they degrade to ``None``).
+    """
+    if override is not None:
+        return override
+    return getattr(provider, "reasoning_effort", None)
+
+
 def _response_cost(
     raw: object,
 ) -> float | None:
@@ -63,6 +77,7 @@ async def acompletion_structured[T: BaseModel](
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     validation_retries: int = 1,
 ) -> tuple[T, float | None]:
@@ -81,6 +96,13 @@ async def acompletion_structured[T: BaseModel](
     instructor forwards extra kwargs to the wrapped completion, so no
     per-provider branching is needed.
 
+    ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
+    ``"disable"`` turns Gemini thinking off). When ``None``, the provider's
+    configured :pyattr:`~llmkit.providers.LLMProviderInterface.reasoning_effort`
+    (from :class:`~llmkit.LLMClientConfig`) is used; an explicit value here
+    overrides it for this call. The kwarg is only included when the resolved
+    value is not ``None``, so the default request is byte-identical to before.
+
     ``provider`` overrides the configured provider for this call only
     (``None`` uses the globally-configured one) — the seam that lets a
     single call route through a different provider family without changing
@@ -90,6 +112,7 @@ async def acompletion_structured[T: BaseModel](
     """
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
+    effort = _resolve_reasoning_effort(reasoning_effort, provider)
     client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
     async with GlobalRateLimiter.acquire_async():
         parsed, completion = await client.chat.completions.create_with_completion(
@@ -101,6 +124,7 @@ async def acompletion_structured[T: BaseModel](
             api_key=creds.get("api_key"),
             api_base=creds.get("api_base"),
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional max_tokens
+            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional reasoning_effort
         )
     return parsed, _response_cost(completion)
 
@@ -111,18 +135,23 @@ async def acompletion_text(
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> tuple[str, float | None]:
     """Plain-text completion via LiteLLM.
 
-    ``provider`` overrides the configured provider for this call only
-    (``None`` uses the globally-configured one).
+    ``reasoning_effort`` controls provider thinking tokens, resolved against
+    the provider's configured value when ``None`` (an explicit value
+    overrides it); the kwarg is only forwarded when the resolved value is
+    not ``None``. ``provider`` overrides the configured provider for this
+    call only (``None`` uses the globally-configured one).
 
     Returns ``(text, approximate_cost)``. The text is the first choice's
     message content (an empty string when the provider returns none).
     """
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
+    effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async():
         resp = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
             model=provider.litellm_model(model),
@@ -131,6 +160,7 @@ async def acompletion_text(
             max_tokens=max_tokens,
             api_key=creds.get("api_key"),
             api_base=creds.get("api_base"),
+            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
         )
     content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
     return (content or ""), _response_cost(resp)

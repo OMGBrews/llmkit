@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-06-06
+
+### Added
+
+- Reasoning/thinking control via `LLMClientConfig.reasoning_effort` (and a
+  per-call `reasoning_effort` override on `structured_llm_call` /
+  `structured_llm_call_sync` / `text_llm_call`), forwarded to LiteLLM. Lets
+  callers disable Gemini thinking (`reasoning_effort="disable"`) so it
+  doesn't consume the `max_tokens` budget and truncate structured output.
+  Set once on the config and every call inherits it; the per-call value
+  overrides it. Backward-compatible; defaults to provider behaviour — when
+  unset (`None`) no `reasoning_effort` kwarg is sent, so the outbound
+  request is byte-identical to before. `LLMCallRecord` also records the
+  per-call setting for log completeness.
+
 ## [0.1.2] — 2026-06-05
 
 ### Added

@@ -62,6 +62,7 @@ class LLMCallRecord:
     error: str | None
     approximate_cost: float | None = None
     max_tokens: int | None = None
+    reasoning_effort: str | None = None
 
 
 class LogSink(Protocol):

@@ -134,13 +134,16 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider          # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC
-    model: str                  # the provider's default model
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC
+    model: str                       # the provider's default model
     api_key: str | None = None
     base_url: str | None = None
+    reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
 ```
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
+
+`reasoning_effort` controls provider "thinking"/reasoning tokens, forwarded to LiteLLM. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output.
 
 Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
 
