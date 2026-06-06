@@ -50,7 +50,7 @@ class Summary(BaseModel):
 
 result: Summary = await structured_llm_call(
     prompt="Summarize the attached report.",
-    schema=Summary,
+    output_schema=Summary,
     feature="reports",      # groups calls in the logs
     label="exec_summary",   # names this specific call in the logs
 )
@@ -60,7 +60,7 @@ The public call surface:
 
 | Function | Use |
 |----------|-----|
-| `structured_llm_call(prompt, schema, feature, label, ...)` | Async, returns a validated Pydantic instance |
+| `structured_llm_call(prompt, output_schema, feature, label, ...)` | Async, returns a validated Pydantic instance |
 | `structured_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
