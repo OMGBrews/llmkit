@@ -12,7 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   LiteLLM prefix), giving first-class access to GPT / o-series / GPT-5 models
   without the indirect `openrouter/openai/...` hop (which adds a markup and a
   different structured-output mode). Structured output is pinned to OpenAI's
-  native strict mode (`instructor.Mode.TOOLS_STRICT`), and `reasoning_effort`
+  native structured-outputs mode (`instructor.Mode.JSON_SCHEMA`), and
+  `reasoning_effort`
   is forwarded for reasoning models on the same seam as the other providers. An
   optional `base_url` points the provider at OpenAI-compatible gateways; left
   unset, LiteLLM uses OpenAI's default endpoint. `OpenAIProvider` is exported

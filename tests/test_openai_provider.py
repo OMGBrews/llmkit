@@ -2,7 +2,7 @@
 
 Parity with the other curated providers: the OpenAI provider must expose the
 right LiteLLM model-prefix string (``openai/<model>``), pin OpenAI's native
-strict structured-outputs mode (``Mode.TOOLS_STRICT``) rather than relying on
+structured-outputs mode (``Mode.JSON_SCHEMA``) rather than relying on
 instructor's ``Mode.TOOLS`` fallback, and forward credentials correctly —
 ``api_key`` always, ``api_base`` only when a ``base_url`` is given (so the
 default uses OpenAI's own endpoint). ``get_provider`` must map
@@ -26,12 +26,12 @@ from llmkit import (
 
 
 def test_model_prefix_and_mode() -> None:
-    """LiteLLM ``openai/`` prefix and OpenAI's strict structured-outputs mode."""
+    """LiteLLM ``openai/`` prefix and OpenAI's native structured-outputs mode."""
     provider = OpenAIProvider(api_key="sk-test", model="gpt-4.1-mini")
     assert provider.name == "OpenAI"
     assert provider.litellm_model() == "openai/gpt-4.1-mini"
     assert provider.litellm_model("o4-mini") == "openai/o4-mini"
-    assert provider.instructor_mode is instructor.Mode.TOOLS_STRICT
+    assert provider.instructor_mode is instructor.Mode.JSON_SCHEMA
 
 
 def test_completion_kwargs_without_base_url() -> None:

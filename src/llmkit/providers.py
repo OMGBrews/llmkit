@@ -292,11 +292,17 @@ class OpenAIProvider(BaseProvider):
     """OpenAI LLM provider.
 
     Calls OpenAI (GPT / o-series / GPT-5) directly (``openai/<model>``),
-    pinned to OpenAI's native *strict* structured-outputs mode
-    (``Mode.TOOLS_STRICT`` — a ``strict: true`` function schema with a
-    forced tool call), instructor's best-supported OpenAI path. This is the
+    pinned to OpenAI's native structured-outputs mode (``Mode.JSON_SCHEMA``
+    — a ``strict: true`` ``response_format`` JSON schema). This is the
     direct alternative to the indirect ``openrouter/openai/...`` hop, which
     adds a markup and a different structured-output mode.
+
+    ``Mode.TOOLS_STRICT`` (forced strict function call) was the original
+    pick but the live smoke test caught it silently returning empty fields
+    on ``gpt-4.1-mini`` (0/4 valid; ``gpt-4o-mini`` / GPT-5 affected too) —
+    the exact silent-regression failure mode this map exists to prevent.
+    ``Mode.JSON_SCHEMA`` round-trips cleanly across GPT-4.1 / 4o / o-series
+    / GPT-5, and matches the JSON-schema mode the other providers pin.
 
     An optional ``base_url`` points the same provider at an OpenAI-compatible
     gateway; left unset, LiteLLM uses OpenAI's default endpoint (so
@@ -305,7 +311,7 @@ class OpenAIProvider(BaseProvider):
 
     _provider_name = "OpenAI"
     _model_prefix = "openai/"
-    _mode = instructor.Mode.TOOLS_STRICT
+    _mode = instructor.Mode.JSON_SCHEMA
 
     def __init__(
         self,
