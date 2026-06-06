@@ -1,0 +1,40 @@
+"""Anthropic (Claude) LLM provider."""
+
+from __future__ import annotations
+
+import instructor
+
+from llmkit.providers.base import BaseProvider, LLMClientConfig
+
+
+class AnthropicProvider(BaseProvider):
+    """Anthropic (Claude) LLM provider.
+
+    Routes Claude through the Anthropic API (``anthropic/<model>``), pinned
+    to Anthropic's native JSON mode for instructor.
+    """
+
+    _provider_name = "Anthropic"
+    _model_prefix = "anthropic/"
+    _mode = instructor.Mode.ANTHROPIC_JSON
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-6",
+        reasoning_effort: str | None = None,
+    ):
+        super().__init__(model, reasoning_effort)
+        self._api_key = api_key
+
+    def completion_kwargs(self) -> dict[str, str]:
+        return {"api_key": self._api_key}
+
+    @classmethod
+    def build(cls, config: LLMClientConfig) -> AnthropicProvider:
+        """Construct from an :class:`LLMClientConfig`."""
+        return cls(
+            api_key=config.api_key or "",
+            model=config.model,
+            reasoning_effort=config.reasoning_effort,
+        )

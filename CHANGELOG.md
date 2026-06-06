@@ -24,6 +24,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `get_provider` now **fails loud** on an unknown provider instead of silently
+  constructing an `OllamaProvider`. The previous `else` catch-all meant a
+  newly-added `Provider` enum member routed to a confusing local-Ollama failure;
+  dispatch is now an exhaustive `match` whose fall-through calls
+  `typing.assert_never`, so an unwired member is caught statically by
+  basedpyright, raises `AssertionError` at runtime, and fails a dedicated
+  exhaustiveness test. No behaviour change for the five existing providers.
+- The provider layer is reorganized from a single `providers.py` module into a
+  `llmkit.providers` **package** with one module per provider (`openrouter`,
+  `ollama`, `google`, `anthropic`, `openai`) over a provider-agnostic
+  `base` module, so adding a provider is a self-contained new file plus one
+  wiring line. Purely internal: the public API is unchanged — every symbol
+  (`Provider`, `LLMClientConfig`, the `*Provider` classes, `get_provider`,
+  `get_llm_config`, …) imports from `llmkit` and `llmkit.providers` exactly as
+  before.
 - README now describes `with_retries()` as a composable helper the caller wraps
   a call in — the public call functions do not retry on their own — instead of
   implying transient-error retries happen automatically "out of the box".
