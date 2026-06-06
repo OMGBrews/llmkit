@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `anthropic` is now a required runtime dependency. `instructor` imports the
+  Anthropic SDK to account usage for its native `ANTHROPIC_JSON` mode, so the
+  Anthropic provider needs it present at call time.
+
+### Fixed
+
+- The Anthropic provider raised `ModuleNotFoundError: No module named
+  'anthropic'` on the first call, because the SDK `instructor` requires for
+  `ANTHROPIC_JSON` usage accounting was never declared as a dependency. A clean
+  `pip install omg-llmkit` can now call the Anthropic provider out of the box.
+
 ## [0.1.3] — 2026-06-06
 
 ### Added
@@ -62,4 +77,5 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.1.3...HEAD
 [0.1.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.0
