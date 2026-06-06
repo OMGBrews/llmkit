@@ -1,13 +1,13 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, and local Ollama**, with validated structured output, a global async rate limiter, transient-error retries, and **agent-readable per-call logging** out of the box.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, and local Ollama**, with validated structured output, a global async rate limiter, transient-error retries, and **agent-readable per-call logging** out of the box.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to its *native* JSON-schema mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs truncated JSON. You pass a Pydantic model; you get a validated instance back.
-- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
+- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -134,10 +134,10 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI
     model: str                       # the provider's default model
     api_key: str | None = None
-    base_url: str | None = None
+    base_url: str | None = None      # OpenRouter / OpenAI-compatible endpoints; unused by Google/Anthropic
     reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
 ```
 

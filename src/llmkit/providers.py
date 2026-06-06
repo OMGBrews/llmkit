@@ -1,7 +1,7 @@
 """LLM provider implementations.
 
 Defines the provider protocol and concrete implementations for
-OpenRouter, Ollama, Google AI Studio, and Anthropic.
+OpenRouter, Ollama, Google AI Studio, Anthropic, and OpenAI.
 
 Each provider supplies what the LiteLLM call layer needs: a LiteLLM
 **model string** (provider-prefixed, e.g. ``openrouter/<model>``,
@@ -38,6 +38,7 @@ class Provider(StrEnum):
     OLLAMA = "ollama"
     GOOGLE = "google"
     ANTHROPIC = "anthropic"
+    OPENAI = "openai"
 
 
 @dataclass(frozen=True)
@@ -287,6 +288,43 @@ class AnthropicProvider(BaseProvider):
         return {"api_key": self._api_key}
 
 
+class OpenAIProvider(BaseProvider):
+    """OpenAI LLM provider.
+
+    Calls OpenAI (GPT / o-series / GPT-5) directly (``openai/<model>``),
+    pinned to OpenAI's native *strict* structured-outputs mode
+    (``Mode.TOOLS_STRICT`` — a ``strict: true`` function schema with a
+    forced tool call), instructor's best-supported OpenAI path. This is the
+    direct alternative to the indirect ``openrouter/openai/...`` hop, which
+    adds a markup and a different structured-output mode.
+
+    An optional ``base_url`` points the same provider at an OpenAI-compatible
+    gateway; left unset, LiteLLM uses OpenAI's default endpoint (so
+    ``api_base`` is only forwarded when a ``base_url`` is given).
+    """
+
+    _provider_name = "OpenAI"
+    _model_prefix = "openai/"
+    _mode = instructor.Mode.TOOLS_STRICT
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4.1-mini",
+        base_url: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
+        super().__init__(model, reasoning_effort)
+        self._api_key = api_key
+        self._base_url = base_url
+
+    def completion_kwargs(self) -> dict[str, str]:
+        kwargs = {"api_key": self._api_key}
+        if self._base_url:
+            kwargs["api_base"] = self._base_url
+        return kwargs
+
+
 @dataclass
 class LLMInfo:
     """Descriptive metadata about the active LLM configuration.
@@ -332,6 +370,13 @@ def get_provider(config: LLMClientConfig | None = None) -> BaseProvider:
         return AnthropicProvider(
             api_key=config.api_key or "",
             model=config.model,
+            reasoning_effort=config.reasoning_effort,
+        )
+    elif config.provider == Provider.OPENAI:
+        return OpenAIProvider(
+            api_key=config.api_key or "",
+            model=config.model,
+            base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
         )
     else:

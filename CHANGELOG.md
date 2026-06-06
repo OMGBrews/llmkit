@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Direct **OpenAI** provider (`Provider.OPENAI` / `OpenAIProvider`, `openai/`
+  LiteLLM prefix), giving first-class access to GPT / o-series / GPT-5 models
+  without the indirect `openrouter/openai/...` hop (which adds a markup and a
+  different structured-output mode). Structured output is pinned to OpenAI's
+  native strict mode (`instructor.Mode.TOOLS_STRICT`), and `reasoning_effort`
+  is forwarded for reasoning models on the same seam as the other providers. An
+  optional `base_url` points the provider at OpenAI-compatible gateways; left
+  unset, LiteLLM uses OpenAI's default endpoint. `OpenAIProvider` is exported
+  from the package root.
+
 ### Changed
 
 - `anthropic` is now a required runtime dependency. `instructor` imports the

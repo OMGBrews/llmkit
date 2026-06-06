@@ -3,7 +3,7 @@
 Provides a thin, opinionated layer over **LiteLLM** (with ``instructor``
 for structured output) that gives the application a unified, provider-
 agnostic call surface across cloud providers (OpenRouter, Google,
-Anthropic) and local Ollama.
+Anthropic, OpenAI) and local Ollama.
 
 This package provides:
 - The structured / plain-text / streaming call functions
@@ -26,6 +26,7 @@ from llmkit.providers import (
     LLMInfo,
     LLMProviderInterface,
     OllamaProvider,
+    OpenAIProvider,
     OpenRouterProvider,
     Provider,
     configure_llm_client,
@@ -51,6 +52,7 @@ __all__ = [
     "OllamaProvider",
     "GoogleProvider",
     "AnthropicProvider",
+    "OpenAIProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

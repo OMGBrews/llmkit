@@ -25,6 +25,7 @@ maintainer workspace, or the table below):
     OPENROUTER_API_KEY=sk-or-...  \
     GEMINI_API_KEY=...            \
     ANTHROPIC_API_KEY=...         \
+    OPENAI_API_KEY=sk-...         \
     uv run pytest tests/integration -v
 
 Provider -> credential it reads:
@@ -32,6 +33,7 @@ Provider -> credential it reads:
     OpenRouter  OPENROUTER_API_KEY          https://openrouter.ai/keys
     Google      GEMINI_API_KEY              https://aistudio.google.com/apikey
     Anthropic   ANTHROPIC_API_KEY           https://console.anthropic.com/settings/keys
+    OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
     Ollama      (local server on :11434)    https://ollama.com  (no key)
 """
 
@@ -49,6 +51,7 @@ from llmkit import (
     GoogleProvider,
     LLMProviderInterface,
     OllamaProvider,
+    OpenAIProvider,
     OpenRouterProvider,
     structured_llm_call,
 )
@@ -68,6 +71,7 @@ class Capital(BaseModel):
 _OPENROUTER_MODEL = os.getenv("OPENROUTER_SMOKE_MODEL", "mistralai/mistral-nemo")
 _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
+_OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 
 # Maintainer release gate: when set, a missing key/server is a hard failure
@@ -147,6 +151,14 @@ async def test_anthropic_live() -> None:
     if not key:
         _unavailable("ANTHROPIC_API_KEY not set")
     await _assert_structured_roundtrip(AnthropicProvider(api_key=key, model=_ANTHROPIC_MODEL))
+
+
+@pytest.mark.asyncio
+async def test_openai_live() -> None:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        _unavailable("OPENAI_API_KEY not set")
+    await _assert_structured_roundtrip(OpenAIProvider(api_key=key, model=_OPENAI_MODEL))
 
 
 @pytest.mark.asyncio
