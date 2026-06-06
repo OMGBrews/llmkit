@@ -25,6 +25,23 @@ uv run pytest
 
 Please run them locally before opening a PR. New behavior needs a test.
 
+### Live provider tests (optional)
+
+`tests/integration/` makes a real structured call against each supported
+provider to prove the model strings, `instructor.Mode` pinning, and credential
+kwargs are accepted by the live APIs. They cost money and need credentials, so
+each test **skips** unless its key is set — `uv run pytest` stays green with no
+keys. To exercise them, export the keys for the providers you have and run:
+
+```bash
+OPENROUTER_API_KEY=sk-or-...   # https://openrouter.ai/keys
+GEMINI_API_KEY=...             # https://aistudio.google.com/apikey
+ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
+uv run pytest tests/integration -v
+```
+
+Ollama needs no key — just a local server (`ollama serve`) on `:11434`.
+
 ## Conventions
 
 - Keep the public surface small — `llmkit` owns the call ergonomics, not transport.

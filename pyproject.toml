@@ -24,6 +24,11 @@ dependencies = [
     "litellm>=1.87.1",
     "instructor>=1.15.1",
     "openai>=2.0.0",
+    # instructor imports the Anthropic SDK to account usage for its native
+    # ANTHROPIC_JSON mode (instructor/core/retry.py), so the Anthropic
+    # provider fails at call time without it. Required, not optional, because
+    # llmkit treats Anthropic as a first-class provider.
+    "anthropic>=0.69",
     "pydantic>=2.5.0",
     "pyyaml>=6.0.0",
     "httpx>=0.27.0",
