@@ -18,6 +18,7 @@ from llmkit.exceptions import (
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
 )
+from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
     LLMCallRecord,
     LocalYamlLogSink,
@@ -102,6 +103,8 @@ __all__ = [
     "text_llm_call",
     "stream_text_with_log",
     "capture_llm_log_paths",
+    # JSON-schema-dict structured output (build-once-reuse helper)
+    "model_from_json_schema",
     # Exception handling
     "LLM_RECOVERABLE_ERRORS",
     "LLM_TRANSPORT_ERRORS",

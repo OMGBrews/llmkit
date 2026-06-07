@@ -12,6 +12,30 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Added
 
+- `model_from_json_schema(schema, *, name=None)` — converts a **JSON-schema
+  dict** into a Pydantic model class at runtime, so consumers who declare their
+  structured-output contracts as JSON-schema dicts (shared across Node /
+  frontend / Python) no longer hand-write a converter before calling
+  `structured_llm_call`. The intended pattern is **build-once-reuse**
+  (`Invoice = model_from_json_schema(schema)` at import, then pass `Invoice` as
+  `output_schema` on every call); `structured_llm_call`'s signature is
+  unchanged (still `output_schema: type[T] -> T`, no `dict` overload). Built on
+  `pydantic.create_model` (no new third-party dependency). Supported subset:
+  `object` with `properties` and a `required` array; scalars (`string` /
+  `integer` / `number` / `boolean`, plus `null` / nullable via
+  `["string", "null"]` or an `anyOf` null branch); `array` with `items`
+  (including arrays of objects); `enum` (string or integer members); and nested
+  objects inline or via local `$ref` (`#/$defs/...` / `#/definitions/...`).
+  Anything outside the subset raises a clear `ValueError` naming the construct
+  and its path, rather than silently producing a wrong model. Two footguns the
+  CaCL dogfood hit are handled and tested: (1) a non-required field maps to an
+  *optional* Pydantic field defaulting to `None`, and the generated model's
+  `model_dump` / `model_dump_json` default to `exclude_none=True`, so an
+  omitted optional is **absent** rather than `"field": null` (which would fail
+  downstream re-validation against the same schema); pass `exclude_none=False`
+  to keep the nulls. (2) A title-less or empty-titled schema still yields a
+  validly-named class (default `JsonSchemaModel`), which `create_model` and
+  `instructor` both require. Exported from the package root.
 - A `py.typed` marker so consumers' type checkers honor llmkit's type hints
   (the package is basedpyright-clean and already declares the `Typing :: Typed`
   classifier, but without the PEP 561 marker downstream tools treated it as

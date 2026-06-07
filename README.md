@@ -82,6 +82,44 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 
+### Contracts as JSON-schema dicts
+
+If your structured-output contract is a **JSON-schema dict** — typically because the same schema is shared with a Node backend or a frontend — `model_from_json_schema(schema)` converts it to a Pydantic model at runtime, so you don't hand-write the converter (and re-discover its footguns). Build the model **once and reuse it**; `structured_llm_call` stays Pydantic-model-only and takes the result as `output_schema`.
+
+```python
+from llmkit import model_from_json_schema, structured_llm_call
+
+INVOICE_SCHEMA = {                       # shared with Node / the frontend
+    "title": "Invoice",
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "total": {"type": "number"},
+        "status": {"enum": ["open", "closed", "void"]},
+        "note": {"type": ["string", "null"]},          # optional, nullable
+        "lines": {"type": "array", "items": {"$ref": "#/$defs/Line"}},
+    },
+    "required": ["id", "total", "status", "lines"],
+    "$defs": {
+        "Line": {
+            "type": "object",
+            "properties": {"sku": {"type": "string"}, "qty": {"type": "integer"}},
+            "required": ["sku"],
+        }
+    },
+}
+
+Invoice = model_from_json_schema(INVOICE_SCHEMA)   # build once, at import
+
+result = await structured_llm_call(
+    prompt="Extract the invoice.",
+    output_schema=Invoice,                         # reuse on every call
+    feature="billing",
+)
+```
+
+**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); and nested objects inline or via local `$ref` (`#/$defs/...`). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` default to **`exclude_none=True`** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). Pass `exclude_none=False` to keep the nulls. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly.
+
 Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a default cap of **8 concurrent calls per provider** — enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off, and `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
 
 ## Logging: agent-readable by default
