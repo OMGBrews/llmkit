@@ -34,7 +34,7 @@ The call surface is async-first, because LLM calls are I/O-bound and usually fan
 
 ## Built for reliable calls
 
-Reliability is the point, not an add-on. Structured output is validated before you ever see it (above); a curated `LLM_RECOVERABLE_ERRORS` set names exactly what's worth retrying; instructor repairs malformed JSON in-call; and `with_retries()` is a composable helper you wrap a call in to recover transient provider errors with backoff. A built-in concurrency limiter — enabled and sized with `configure_rate_limit(...)` — keeps a burst of parallel calls from overrunning a provider's rate limits.
+Reliability is the point, not an add-on. Structured output is validated before you ever see it (above); a curated `LLM_RECOVERABLE_ERRORS` set names exactly what's worth retrying; instructor repairs malformed JSON in-call; and `with_retries()` is a composable helper you wrap a call in to recover transient provider errors with backoff. A built-in concurrency limiter is on by default, bounded per provider (a conservative 2 concurrent calls each, keyed by the effective provider name the logs record) so fan-out to one provider can't overrun its rate limits or eat another's budget; raise the cap or disable it with `configure_rate_limit(...)`.
 
 ## A thin layer, not a gateway
 
