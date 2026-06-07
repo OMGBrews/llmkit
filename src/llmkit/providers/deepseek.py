@@ -34,11 +34,12 @@ class DeepSeekProvider(BaseProvider):
     _provider_name = "DeepSeek"
     _model_prefix = "deepseek/"
     _mode = instructor.Mode.JSON
+    _default_model = "deepseek-chat"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
+        model: str | None = None,
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)

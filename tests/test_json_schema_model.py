@@ -406,6 +406,179 @@ def test_mutually_recursive_schema_raises_clear_value_error() -> None:
         model_from_json_schema(schema)
 
 
+# --- Per-field constraints carry into Field --------------------------------
+
+
+def test_numeric_inclusive_bounds_enforced() -> None:
+    """``minimum``/``maximum`` map to ``ge``/``le``: in-bounds accepted,
+    out-of-bounds rejected."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"score": {"type": "integer", "minimum": 1, "maximum": 5}},
+        "required": ["score"],
+    }
+    model = model_from_json_schema(schema)
+    # In-bounds (including the endpoints) accepted.
+    assert model(score=1).score == 1  # pyright: ignore[reportAttributeAccessIssue]
+    assert model(score=5).score == 5  # pyright: ignore[reportAttributeAccessIssue]
+    assert model(score=3).score == 3  # pyright: ignore[reportAttributeAccessIssue]
+    # Out-of-bounds rejected on both ends.
+    with pytest.raises(ValidationError):
+        model(score=0)
+    with pytest.raises(ValidationError):
+        model(score=6)
+
+
+def test_numeric_exclusive_bounds_enforced() -> None:
+    """``exclusiveMinimum``/``exclusiveMaximum`` map to ``gt``/``lt``: the
+    endpoints themselves are rejected."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"ratio": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1}},
+        "required": ["ratio"],
+    }
+    model = model_from_json_schema(schema)
+    assert model(ratio=0.5).ratio == 0.5  # pyright: ignore[reportAttributeAccessIssue]
+    # Endpoints rejected (exclusive).
+    with pytest.raises(ValidationError):
+        model(ratio=0)
+    with pytest.raises(ValidationError):
+        model(ratio=1)
+    with pytest.raises(ValidationError):
+        model(ratio=-0.1)
+
+
+def test_string_length_bounds_enforced() -> None:
+    """``minLength``/``maxLength`` map to ``min_length``/``max_length``."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"code": {"type": "string", "minLength": 2, "maxLength": 4}},
+        "required": ["code"],
+    }
+    model = model_from_json_schema(schema)
+    assert model(code="ab").code == "ab"  # pyright: ignore[reportAttributeAccessIssue]
+    assert model(code="abcd").code == "abcd"  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        model(code="a")
+    with pytest.raises(ValidationError):
+        model(code="abcde")
+
+
+def test_array_item_count_bounds_enforced() -> None:
+    """``minItems``/``maxItems`` map to ``min_length``/``max_length`` on the
+    list field."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 2,
+            }
+        },
+        "required": ["tags"],
+    }
+    model = model_from_json_schema(schema)
+    assert model(tags=["a"]).tags == ["a"]  # pyright: ignore[reportAttributeAccessIssue]
+    assert model(tags=["a", "b"]).tags == ["a", "b"]  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        model(tags=[])
+    with pytest.raises(ValidationError):
+        model(tags=["a", "b", "c"])
+
+
+def test_bounds_on_optional_field_enforced_when_present() -> None:
+    """A bound on an optional field still applies once the field is supplied,
+    but the field may be omitted."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"score": {"type": "integer", "minimum": 0}},
+    }
+    model = model_from_json_schema(schema)
+    assert model().model_dump() == {}  # omitted: fine
+    assert model(score=0).score == 0  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        model(score=-1)
+
+
+def test_description_passthrough_preserved() -> None:
+    """Per-field ``description`` is carried into ``Field`` (instructor relies on
+    it for per-field guidance) — pinned so the constraint work can't regress it."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "amount": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Total in cents, must be non-negative.",
+            },
+            "plain": {"type": "string"},
+        },
+        "required": ["amount", "plain"],
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["amount"].description == "Total in cents, must be non-negative."
+    # A field without a description stays ``None`` (no spurious default).
+    assert model.model_fields["plain"].description is None
+    # And the description coexists with the bound: bound still enforced.
+    with pytest.raises(ValidationError):
+        model(amount=-1, plain="x")
+
+
+def test_unsupported_constraint_dropped_without_error() -> None:
+    """An unsupported constraint (``pattern``) is silently dropped — no error,
+    and (critically) NOT partially enforced: a value violating ``pattern`` is
+    accepted because pattern is not in the supported set."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"code": {"type": "string", "pattern": "^[0-9]+$", "format": "uuid"}},
+        "required": ["code"],
+    }
+    model = model_from_json_schema(schema)
+    # Builds without error and accepts a value the pattern would have rejected.
+    assert model(code="not-a-number").code == "not-a-number"  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_bound_on_referenced_def_is_found() -> None:
+    """A bound declared inside a ``$def`` (resolved via ``$ref``) is still
+    applied — the constraint extractor unwraps refs like the type resolver."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/Bounded"}},
+        "required": ["n"],
+        "$defs": {"Bounded": {"type": "integer", "minimum": 10}},
+    }
+    model = model_from_json_schema(schema)
+    assert model(n=10).n == 10  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        model(n=9)
+
+
+def test_bound_on_nullable_branch_is_found() -> None:
+    """A bound on the non-null branch of a nullable field is applied; ``null``
+    still passes (the bound only gates non-null values)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"type": ["integer", "null"], "minimum": 0}},
+        "required": ["n"],
+    }
+    model = model_from_json_schema(schema)
+    assert model(n=None).n is None  # pyright: ignore[reportAttributeAccessIssue]
+    assert model(n=5).n == 5  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        model(n=-1)
+
+
 # --- Round-trip through structured_llm_call against a faked transport -------
 
 

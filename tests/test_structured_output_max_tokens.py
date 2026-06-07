@@ -91,9 +91,8 @@ def test_log_record_carries_max_tokens(tmp_path: Path) -> None:
     captured: list[LLMCallRecord] = []
 
     class _CapturingSink:
-        def write(self, record: LLMCallRecord) -> Path | None:
+        def write(self, record: LLMCallRecord) -> None:
             captured.append(record)
-            return None
 
     async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
         return _Schema(ok=True), None

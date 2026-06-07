@@ -210,7 +210,8 @@ def get_rate_limit_config() -> RateLimitConfig:
 
     The symmetric read for :func:`configure_rate_limit`: lets a host log or
     assert its effective limits at startup without touching limiter internals
-    (e.g. ``GlobalRateLimiter._max_concurrent``).
+    (e.g. ``GlobalRateLimiter._max_concurrent``). The ``enabled`` flag on the
+    returned snapshot is the public way to check whether limiting is active.
 
     Returns:
         A :class:`RateLimitConfig` snapshot of the current ``enabled`` flag and
@@ -220,3 +221,46 @@ def get_rate_limit_config() -> RateLimitConfig:
         enabled=GlobalRateLimiter.is_enabled(),
         max_concurrent=GlobalRateLimiter.max_concurrent(),
     )
+
+
+@contextlib.asynccontextmanager
+async def rate_limit_acquire_async(provider_key: str) -> AsyncIterator[None]:
+    """Hold an async slot on the global per-provider limit for the block.
+
+    The public way to join the process-global, per-provider concurrency limit
+    by hand — for a host that issues provider calls outside llmkit's own call
+    functions (e.g. a LangChain chat-model wrapper) and still wants them
+    bounded by the same budget. ``provider_key`` is the provider name
+    (``provider.name``, e.g. ``"openai"``); each provider has an independent
+    budget capped at :func:`get_rate_limit_config`'s ``max_concurrent`` (8 by
+    default). A no-op when limiting is disabled.
+
+    Usage::
+
+        async with rate_limit_acquire_async("openai"):
+            ...  # one slot held against openai's budget
+
+    Behaviour is identical to the throttle llmkit's own async call path uses.
+    """
+    async with GlobalRateLimiter.acquire_async(provider_key):
+        yield
+
+
+@contextlib.contextmanager
+def rate_limit_acquire_sync(provider_key: str) -> Iterator[None]:
+    """Hold a sync slot on the global per-provider limit for the block.
+
+    The synchronous counterpart to :func:`rate_limit_acquire_async`, for a host
+    joining the global per-provider limit from a sync code path (e.g. a
+    synchronous LangChain ``_generate``/``_stream`` wrapper). ``provider_key``
+    is the provider name (``provider.name``); each provider has an independent
+    budget capped at :func:`get_rate_limit_config`'s ``max_concurrent`` (8 by
+    default). A no-op when limiting is disabled.
+
+    Usage::
+
+        with rate_limit_acquire_sync("openai"):
+            ...  # one slot held against openai's budget
+    """
+    with GlobalRateLimiter.acquire_sync(provider_key):
+        yield

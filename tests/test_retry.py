@@ -27,10 +27,10 @@ class _Callback:
         *,
         label: str,
         attempt: int,
-        max_retries: int,
+        max_attempts: int,
         error: BaseException,
     ) -> None:
-        self.calls.append((label, attempt, max_retries, str(error)))
+        self.calls.append((label, attempt, max_attempts, str(error)))
 
 
 @pytest.mark.asyncio
@@ -50,6 +50,36 @@ async def test_progress_callback_invoked_on_non_final_failure() -> None:
 
     assert result == "ok"
     assert cb.calls == [("x", 1, 2, "first try fails")]
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_receives_max_attempts_keyword() -> None:
+    """The callback is invoked with the ``max_attempts`` keyword (the unified
+    name) carrying the budget for the failing class — not the removed
+    ``max_retries`` alias."""
+    seen: list[dict[str, object]] = []
+
+    def record(**kwargs: object) -> None:
+        seen.append(kwargs)
+
+    attempts = [0]
+
+    async def flaky() -> str:
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise ValueError("first try fails")
+        return "ok"
+
+    with retry_progress_callback(record):
+        result = await with_retries(flaky, max_attempts=2, label="x")
+
+    assert result == "ok"
+    assert len(seen) == 1
+    kwargs = seen[0]
+    assert kwargs["max_attempts"] == 2
+    assert "max_retries" not in kwargs
+    assert kwargs["label"] == "x"
+    assert kwargs["attempt"] == 1
 
 
 @pytest.mark.asyncio

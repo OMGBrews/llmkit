@@ -12,10 +12,12 @@ The actual provider transport lives in :mod:`llmkit._litellm`
 (LiteLLM, with ``instructor`` for structured output); these functions own
 the logging + cost-recording contract around it.
 
-Callers that need to cross-reference these records (e.g. a higher-level
+Callers that need to cross-reference these calls (e.g. a higher-level
 orchestrator that writes its own trace spanning several LLM calls) can
-install a ``capture_llm_log_paths()`` context manager around the call to
-receive the per-call log paths.
+install one of two context managers around the call: ``capture_llm_records()``
+to receive the per-call :class:`~llmkit.logging.LLMCallRecord` objects
+(approximate cost, resolved model/provider, duration — no sink to author),
+or ``capture_llm_log_paths()`` to receive the per-call log-file paths.
 """
 
 from __future__ import annotations
@@ -23,12 +25,17 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+from pydantic import JsonValue
+
+from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import LLMCallRecord, write_llm_log
 from llmkit.providers import LLMProviderInterface
 from llmkit.retry import (
@@ -42,9 +49,190 @@ from llmkit.sync import run_sync
 logger = logging.getLogger(__name__)
 
 
+class _Unset(Enum):
+    """Sentinel type for an unset :class:`LLMCallOptions` field.
+
+    A single-member ``Enum`` rather than a bare ``object()`` so the type
+    checker can narrow ``field is _UNSET`` precisely: an option left unset
+    is typed ``Literal[_Unset.UNSET]`` and a set one is its real type, so
+    the merge helper resolves to the right branch with no ``cast``.
+    """
+
+    UNSET = "unset"
+
+
+#: The "this option was not provided" sentinel. An unset option field defers
+#: to the per-call kwarg (and, through it, to the configured client) — it
+#: never clobbers a config value with a default.
+_UNSET = _Unset.UNSET
+
+
+@dataclass(frozen=True)
+class LLMCallOptions:
+    """A reusable bundle of the per-call keyword arguments.
+
+    Opt-in ergonomics for the call functions
+    (:func:`structured_llm_call`, :func:`structured_llm_call_sync`,
+    :func:`text_llm_call`, :func:`stream_text_with_log`, and
+    :func:`~llmkit.structured_data_call`): a feature module builds one
+    ``LLMCallOptions`` once and passes it as ``options=`` to every call,
+    instead of repeating the same nine-keyword block at each site. The flat
+    keyword path is untouched — pass no ``options`` and nothing changes.
+
+    Every field is **optional and unset by default** (the private
+    :data:`_UNSET` sentinel, not ``None``): an unset field defers to the
+    per-call keyword, which in turn defers to the configured
+    :class:`~llmkit.LLMClientConfig` for the dual-homed ``model`` /
+    ``reasoning_effort``. This is what makes "unset option does not clobber
+    config" work — only a field you *set* on the options participates in the
+    merge. Precedence, lowest to highest: **config < options < explicit
+    per-call keyword.**
+
+    ``feature`` is deliberately **not** part of this bundle: it stays a
+    required per-call keyword as a telemetry forcing function (it scopes the
+    per-call log filenames and ``index.jsonl`` grouping operators grep), so
+    it cannot be defaulted-away into a shared object and forgotten.
+
+    Attributes:
+        temperature: Sampling temperature. Unset defers to the per-call
+            ``temperature`` keyword (which defaults to ``0.2``).
+        model: Model override. Unset defers to the per-call ``model``
+            keyword, then to the provider default.
+        max_tokens: Completion-length cap. Unset defers to the per-call
+            ``max_tokens`` keyword (uncapped when also unset).
+        reasoning_effort: Provider reasoning/thinking effort. Unset defers
+            to the per-call keyword, then to the configured client value.
+        retry: Transient-error retry budget. Unset defers to the per-call
+            ``retry`` keyword (:data:`~llmkit.DEFAULT_RETRY_POLICY`).
+        provider: Per-call provider override. Unset defers to the per-call
+            ``provider`` keyword (the globally-configured provider).
+    """
+
+    temperature: float | _Unset = _UNSET
+    model: str | None | _Unset = _UNSET
+    max_tokens: int | None | _Unset = _UNSET
+    reasoning_effort: str | None | _Unset = _UNSET
+    retry: RetryPolicy | _Unset = _UNSET
+    provider: LLMProviderInterface | None | _Unset = _UNSET
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedCallArgs:
+    """The per-call arguments after merging ``options`` with the keywords.
+
+    The single shape every call function forwards to the transport once the
+    three-layer precedence (config < options < explicit keyword) has been
+    collapsed. Internal — stage 3's :func:`~llmkit.structured_data_call`
+    reuses :func:`_resolve_call_args` to obtain one of these.
+    """
+
+    temperature: float
+    model: str | None
+    max_tokens: int | None
+    reasoning_effort: str | None
+    retry: RetryPolicy
+    provider: LLMProviderInterface | None
+
+
+def _resolve_call_args(
+    options: LLMCallOptions | None,
+    *,
+    temperature: float,
+    model: str | None,
+    max_tokens: int | None,
+    reasoning_effort: str | None,
+    retry: RetryPolicy,
+    provider: LLMProviderInterface | None,
+) -> _ResolvedCallArgs:
+    """Merge ``options`` under the explicit per-call keywords.
+
+    The shared seam all four call functions (and stage 3's
+    :func:`~llmkit.structured_data_call`) funnel through, so the
+    precedence is defined in exactly one place. The keyword arguments are
+    the values the call function received with its *own* defaults already
+    applied; for each field the rule is:
+
+    * an explicit keyword that differs from the call function's default
+      wins outright (highest precedence);
+    * otherwise a field that is *set* on ``options`` is used;
+    * otherwise the call function's default stands.
+
+    A keyword left at its default (``model=None``, ``temperature=0.2``,
+    ``retry=DEFAULT_RETRY_POLICY``, …) is indistinguishable from "not
+    passed", so it yields to ``options`` — which is exactly what lets a
+    shared ``LLMCallOptions`` supply values while an explicit keyword still
+    overrides it. When ``options is None`` the keywords pass straight
+    through, so the flat-kwarg path is byte-for-byte unchanged.
+    """
+    if options is None:
+        return _ResolvedCallArgs(
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            retry=retry,
+            provider=provider,
+        )
+    return _ResolvedCallArgs(
+        temperature=_pick(temperature, _DEFAULT_TEMPERATURE, options.temperature),
+        model=_pick(model, None, options.model),
+        max_tokens=_pick(max_tokens, None, options.max_tokens),
+        reasoning_effort=_pick(reasoning_effort, None, options.reasoning_effort),
+        retry=_pick(retry, DEFAULT_RETRY_POLICY, options.retry),
+        provider=_pick(provider, None, options.provider),
+    )
+
+
+def _pick[V](keyword: V, default: V, option: V | _Unset) -> V:
+    """Resolve one field: explicit keyword > set option > keyword default.
+
+    A ``keyword`` that differs from this call function's ``default`` was
+    passed explicitly and wins. Otherwise a ``option`` that is set (not
+    :data:`_UNSET`) is used; an unset option falls through to the
+    (default) keyword, so it never clobbers a config-backed value.
+    """
+    if keyword != default:
+        return keyword
+    if option is _UNSET:
+        return keyword
+    return option
+
+
+#: The shared default sampling temperature for the call functions — the
+#: value a per-call ``temperature`` keyword carries when the caller does not
+#: override it. Named so :func:`_resolve_call_args` and every call signature
+#: stay in agreement on what "unset temperature" means.
+_DEFAULT_TEMPERATURE = 0.2
+
+
 _captured_log_paths: contextvars.ContextVar[list[Path] | None] = contextvars.ContextVar(
     "_llm_captured_log_paths", default=None
 )
+
+_captured_records: contextvars.ContextVar[list[LLMCallRecord] | None] = contextvars.ContextVar(
+    "_llm_captured_records", default=None
+)
+
+
+def _record_call(record: LLMCallRecord) -> Path | None:
+    """Write *record* to the configured sink and feed the active captures.
+
+    The single seam every call path funnels its built
+    :class:`~llmkit.logging.LLMCallRecord` through, so the two capture
+    primitives stay in lock-step: the record itself is appended to any
+    active :func:`capture_llm_records` buffer, and the returned file path
+    (when a file sink wrote one) is appended to any active
+    :func:`capture_llm_log_paths` buffer. Returns the path so the existing
+    path-capture call sites keep working unchanged.
+    """
+    captured_records = _captured_records.get()
+    if captured_records is not None:
+        captured_records.append(record)
+    path = write_llm_log(record)
+    captured_paths = _captured_log_paths.get()
+    if captured_paths is not None and path is not None:
+        captured_paths.append(path)
+    return path
 
 
 def _resolve_model_and_provider(
@@ -63,9 +251,9 @@ def _resolve_model_and_provider(
     """
     try:
         if provider is None:
-            from llmkit.providers import get_provider
+            from llmkit.providers import build_provider
 
-            provider = get_provider()
+            provider = build_provider()
         return (model or provider.model, provider.name)
     except Exception:
         # Logging must never break the LLM call; degrade to (model, None).
@@ -74,12 +262,43 @@ def _resolve_model_and_provider(
 
 
 @contextmanager
+def capture_llm_records() -> Iterator[list[LLMCallRecord]]:
+    """Capture the :class:`~llmkit.logging.LLMCallRecord` for each call here.
+
+    The records-oriented counterpart to :func:`capture_llm_log_paths`:
+    yields a list that is appended to once per LLM call inside the ``with``
+    block, giving the host the full record — ``approximate_cost``, resolved
+    ``model``/``provider``, ``duration_ms``, ``error`` and the rest —
+    without authoring a :class:`~llmkit.logging.LogSink`. Captures every
+    call function (:func:`structured_llm_call`, :func:`text_llm_call`,
+    :func:`stream_text_with_log`) and works across the ``run_sync`` bridge
+    (e.g. :func:`structured_llm_call_sync`), since the record is appended
+    inside the async call path the bridge drives.
+
+    Like path-capture, one record is appended *per attempt* — retries each
+    produce their own logged record — and capture is independent of the
+    configured sink, so it works even when logging is disabled
+    (``configure_llm_logging(None)``).
+    """
+    records: list[LLMCallRecord] = []
+    token = _captured_records.set(records)
+    try:
+        yield records
+    finally:
+        _captured_records.reset(token)
+
+
+@contextmanager
 def capture_llm_log_paths() -> Iterator[list[Path]]:
     """Capture log paths written by the call functions in this scope.
 
     The returned list is appended to once per LLM call inside the
     ``with`` block — including retries, since ``with_retries`` lives
-    outside the call functions and each attempt is its own call.
+    outside the call functions and each attempt is its own call. Only the
+    configured file sink (:class:`~llmkit.LocalYamlLogSink`) yields a path;
+    with a third-party :class:`~llmkit.logging.LogSink` (or logging
+    disabled) the list stays empty — use :func:`capture_llm_records` to
+    capture cost/metadata regardless of the sink.
     """
     paths: list[Path] = []
     token = _captured_log_paths.set(paths)
@@ -95,12 +314,13 @@ async def structured_llm_call[T](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = 0.2,
+    temperature: float = _DEFAULT_TEMPERATURE,
     model: str | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
 
@@ -113,10 +333,16 @@ async def structured_llm_call[T](
         feature: Caller feature name (e.g. ``"summarization"``,
             ``"extraction"``, ``"classification"``, ``"multi_field"``,
             ``"schema"``). Embedded in the log filename and YAML body.
+            **Required on purpose** — a telemetry forcing function that
+            scopes the per-call logs; it is *not* part of
+            :class:`LLMCallOptions` so it cannot be defaulted-away.
         label: Optional finer-grained identifier (e.g. ``"risk_register"``);
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
         model: Optional model override (provider default when ``None``).
+            *Dual-homed* — also settable on
+            :class:`~llmkit.LLMClientConfig`; this per-call value overrides
+            the config (with ``options`` sitting between, see ``options``).
         max_tokens: Optional cap on the completion length, forwarded to the
             provider when set (no cap when ``None`` — byte-identical to the
             prior request). Parity with :func:`text_llm_call`.
@@ -125,7 +351,8 @@ async def structured_llm_call[T](
             "high"``). ``None`` (the default) defers to the value configured
             on :class:`~llmkit.LLMClientConfig`; an explicit value wins for
             this call. ``"disable"`` turns Gemini thinking off so it doesn't
-            consume the ``max_tokens`` budget.
+            consume the ``max_tokens`` budget. *Dual-homed* like ``model``:
+            per-call overrides ``options`` overrides config.
         provider: Optional provider override for THIS call only. ``None``
             (the default) uses the globally-configured provider — so every
             existing caller is unchanged. Pass an explicit provider (e.g. an
@@ -140,6 +367,13 @@ async def structured_llm_call[T](
             :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
             its own logged call; this layer stays separate from instructor's
             in-call schema-repair budget.
+        options: Optional :class:`LLMCallOptions` supplying any of
+            ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
+            ``retry``/``provider`` once for reuse across many calls.
+            Precedence is **config < options < explicit keyword**: a keyword
+            you pass here overrides the matching ``options`` field, an
+            unset ``options`` field defers to the config, and ``options=None``
+            (the default) leaves the flat-keyword path unchanged.
 
     Returns:
         An instance of *output_schema* populated by the LLM.
@@ -151,6 +385,21 @@ async def structured_llm_call[T](
         immediately. The log is still written on every attempt with the
         error recorded.
     """
+    resolved = _resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+    )
+    temperature = resolved.temperature
+    model = resolved.model
+    max_tokens = resolved.max_tokens
+    reasoning_effort = resolved.reasoning_effort
+    retry = resolved.retry
+    provider = resolved.provider
 
     async def _attempt() -> T:
         # Deferred import so test patches on ``llmkit._litellm``
@@ -188,7 +437,7 @@ async def structured_llm_call[T](
                 if response is not None and hasattr(response, "model_dump")
                 else None
             )
-            path = write_llm_log(
+            _ = _record_call(
                 LLMCallRecord(
                     started_at=started_at,
                     feature=feature,
@@ -206,9 +455,6 @@ async def structured_llm_call[T](
                     reasoning_effort=reasoning_effort,
                 )
             )
-            captured = _captured_log_paths.get()
-            if captured is not None and path is not None:
-                captured.append(path)
 
     return await with_retries(
         _attempt,
@@ -227,12 +473,13 @@ def structured_llm_call_sync[T](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = 0.2,
+    temperature: float = _DEFAULT_TEMPERATURE,
     model: str | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
 
@@ -246,7 +493,10 @@ def structured_llm_call_sync[T](
     ``reasoning_effort`` is forwarded identically (``None`` defers to the
     configured :class:`~llmkit.LLMClientConfig` value). ``retry`` is the
     transient-error budget, inherited from the async path (default-on; pass
-    :data:`~llmkit.NO_RETRY` to opt out).
+    :data:`~llmkit.NO_RETRY` to opt out). ``options`` is the same opt-in
+    :class:`LLMCallOptions` bundle the async call takes, with the same
+    **config < options < explicit keyword** precedence; it is forwarded
+    untouched so the merge happens once, in :func:`structured_llm_call`.
     """
     return run_sync(
         structured_llm_call(
@@ -260,6 +510,137 @@ def structured_llm_call_sync[T](
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,
+            options=options,
+        )
+    )
+
+
+async def structured_data_call(
+    prompt: str | list[dict[str, str]],
+    schema: Mapping[str, JsonValue],
+    *,
+    feature: str,
+    label: str | None = None,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
+    """Dict-in / data-out structured call for JSON-schema-dict consumers.
+
+    The dict→dict sibling of :func:`structured_llm_call`, for callers whose
+    contract is *literally* "JSON-schema dict in, plain data out" — they
+    declare their schema as a dict and never want the intermediate Pydantic
+    instance. Internally it builds a model from *schema* via
+    :func:`~llmkit.model_from_json_schema`, runs the exact same machinery as
+    :func:`structured_llm_call` (logging, default-on retries, the per-call
+    ``provider=`` override, ``model`` / ``temperature`` / ``max_tokens`` /
+    ``reasoning_effort``, and the :class:`LLMCallOptions` bundle), then
+    returns the validated instance's ``model_dump()`` — so there is *one*
+    call path, not a duplicated one.
+
+    :func:`~llmkit.model_from_json_schema` stays exported as the lower-level
+    primitive (build-once-reuse, when you want the model class itself); this
+    is the convenience surface for the dict-in/dict-out case.
+
+    Args:
+        prompt: Either a plain string or a list of message dicts
+            (``[{"role": "system", "content": "..."}, ...]``).
+        schema: The output contract as a JSON-schema dict. The root must be
+            an object (or a ``$ref`` to one); see
+            :func:`~llmkit.model_from_json_schema` for the supported subset.
+        feature: Caller feature name; embedded in the log filename/body.
+            Required as a telemetry forcing function (see
+            :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
+        label: Optional finer-grained identifier for the log filename.
+        temperature: Sampling temperature passed to the provider.
+        model: Optional model override (provider default when ``None``).
+            *Dual-homed* with :class:`~llmkit.LLMClientConfig`: per-call
+            overrides ``options`` overrides config.
+        max_tokens: Optional cap on the completion length (uncapped when
+            ``None``).
+        reasoning_effort: Optional per-call override of the provider's
+            reasoning/thinking effort; ``None`` defers to the configured
+            :class:`~llmkit.LLMClientConfig` value. *Dual-homed* like
+            ``model``.
+        provider: Optional provider override for THIS call only (``None``
+            uses the globally-configured provider).
+        retry: Transient-error retry budget (default-on; see
+            :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
+            opt out.
+        options: Optional :class:`LLMCallOptions` bundle (see
+            :func:`structured_llm_call`); explicit keywords here override it,
+            it overrides config, and ``None`` leaves the flat path unchanged.
+
+    Returns:
+        The validated response as a plain ``dict`` (the generated model's
+        ``model_dump()``). Because the generated model dumps with
+        ``exclude_none=True``, an omitted optional field is *absent* from the
+        result, not present-as-``null``.
+
+    Raises:
+        ValueError: If *schema* is outside the supported subset (raised by
+            :func:`~llmkit.model_from_json_schema` before any LLM call).
+        Any exception from the LLM provider or output parser — transient ones
+        are retried per *retry*, others propagate; the log is written on
+        every attempt with the error recorded (see :func:`structured_llm_call`).
+    """
+    output_model = model_from_json_schema(schema)
+    result = await structured_llm_call(
+        prompt,
+        output_model,
+        feature=feature,
+        label=label,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        provider=provider,
+        retry=retry,
+        options=options,
+    )
+    return result.model_dump()
+
+
+def structured_data_call_sync(
+    prompt: str | list[dict[str, str]],
+    schema: Mapping[str, JsonValue],
+    *,
+    feature: str,
+    label: str | None = None,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
+    """Synchronous wrapper around :func:`structured_data_call`.
+
+    The dict-in/data-out counterpart to :func:`structured_llm_call_sync`,
+    for the synchronous call sites that cannot ``await`` (e.g. FiW). Same
+    arguments, same logging, same data-out result; the coroutine is driven to
+    completion via the same :func:`run_sync` bridge, so the rate-limit slot,
+    retries, and ``options`` precedence are all inherited from the async path
+    unchanged.
+    """
+    return run_sync(
+        structured_data_call(
+            prompt,
+            schema,
+            feature=feature,
+            label=label,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            retry=retry,
+            options=options,
         )
     )
 
@@ -269,12 +650,13 @@ async def text_llm_call(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = 0.2,
+    temperature: float = _DEFAULT_TEMPERATURE,
     model: str | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
 
@@ -286,20 +668,28 @@ async def text_llm_call(
         prompt: Either a plain string or a list of message dicts
             (``[{"role": "system", "content": "..."}, ...]``).
         feature: Caller feature name; embedded in the log filename/body.
+            Required as a telemetry forcing function (see
+            :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
         label: Optional finer-grained identifier for the log filename.
         temperature: Sampling temperature passed to the provider.
         model: Optional model override (provider default when ``None``).
+            *Dual-homed* with :class:`~llmkit.LLMClientConfig`: per-call
+            overrides ``options`` overrides config.
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set (e.g. the readiness healthcheck uses
             ``max_tokens=1`` to keep its ping cheap).
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort; ``None`` defers to the configured
-            :class:`~llmkit.LLMClientConfig` value.
+            :class:`~llmkit.LLMClientConfig` value. *Dual-homed* like
+            ``model``.
         provider: Optional provider override for THIS call only (``None``
             uses the globally-configured provider).
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
             opt out. Each attempt is its own logged call.
+        options: Optional :class:`LLMCallOptions` bundle (see
+            :func:`structured_llm_call`); explicit keywords here override it,
+            it overrides config, and ``None`` leaves the flat path unchanged.
 
     Returns:
         The model's textual response.
@@ -310,6 +700,21 @@ async def text_llm_call(
         propagate immediately. The log is still written on every attempt
         with the error recorded.
     """
+    resolved = _resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+    )
+    temperature = resolved.temperature
+    model = resolved.model
+    max_tokens = resolved.max_tokens
+    reasoning_effort = resolved.reasoning_effort
+    retry = resolved.retry
+    provider = resolved.provider
 
     async def _attempt() -> str:
         from llmkit import _litellm
@@ -333,7 +738,7 @@ async def text_llm_call(
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            path = _log_text_call(
+            _log_text_call(
                 started_at=started_at,
                 feature=feature,
                 label=label,
@@ -348,9 +753,6 @@ async def text_llm_call(
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
             )
-            captured = _captured_log_paths.get()
-            if captured is not None and path is not None:
-                captured.append(path)
 
     return await with_retries(
         _attempt,
@@ -368,12 +770,13 @@ async def stream_text_with_log(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = 0.2,
+    temperature: float = _DEFAULT_TEMPERATURE,
     model: str | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    options: LLMCallOptions | None = None,
 ) -> AsyncIterator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
@@ -402,7 +805,27 @@ async def stream_text_with_log(
     transient failure that occurs *before the first chunk is yielded*:
     once any chunk has reached the caller, a mid-stream error propagates
     unretried. Each attempt is its own logged call.
+
+    ``options`` is the same opt-in :class:`LLMCallOptions` bundle the other
+    call functions accept, with the same **config < options < explicit
+    keyword** precedence (see :func:`structured_llm_call`); ``None`` leaves
+    the flat-keyword path unchanged.
     """
+    resolved = _resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+    )
+    temperature = resolved.temperature
+    model = resolved.model
+    max_tokens = resolved.max_tokens
+    reasoning_effort = resolved.reasoning_effort
+    retry = resolved.retry
+    provider = resolved.provider
     tag = label or feature
     for attempt in range(1, retry.max_attempts + 1):
         yielded_any = False
@@ -486,7 +909,7 @@ async def _stream_once(
         raise
     finally:
         full_text = "".join(accumulated)
-        path = _log_text_call(
+        _log_text_call(
             started_at=started_at,
             feature=feature,
             label=label,
@@ -501,9 +924,6 @@ async def _stream_once(
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
         )
-        captured = _captured_log_paths.get()
-        if captured is not None and path is not None:
-            captured.append(path)
 
 
 def _log_text_call(
@@ -521,8 +941,8 @@ def _log_text_call(
     approximate_cost: float | None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
-) -> Path | None:
-    """Build and write an ``LLMCallRecord`` for a plain-text/stream call.
+) -> None:
+    """Build and record an ``LLMCallRecord`` for a plain-text/stream call.
 
     Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
     ``schema`` is the literal ``"stream"`` and ``response`` is the
@@ -533,11 +953,12 @@ def _log_text_call(
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the
-    record).
+    record). Routes through :func:`_record_call` so both capture primitives
+    (records and file paths) see the call, exactly like the structured path.
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
-    return write_llm_log(
+    _ = _record_call(
         LLMCallRecord(
             started_at=started_at,
             feature=feature,

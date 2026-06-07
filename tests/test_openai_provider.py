@@ -5,7 +5,7 @@ right LiteLLM model-prefix string (``openai/<model>``), pin OpenAI's native
 structured-outputs mode (``Mode.JSON_SCHEMA``) rather than relying on
 instructor's ``Mode.TOOLS`` fallback, and forward credentials correctly —
 ``api_key`` always, ``api_base`` only when a ``base_url`` is given (so the
-default uses OpenAI's own endpoint). ``get_provider`` must map
+default uses OpenAI's own endpoint). ``build_provider`` must map
 ``Provider.OPENAI`` explicitly and thread model / key / base_url /
 reasoning_effort through.
 
@@ -19,10 +19,10 @@ import instructor
 
 from llmkit import (
     LLMClientConfig,
-    OpenAIProvider,
     Provider,
-    get_provider,
+    build_provider,
 )
+from llmkit.providers import OpenAIProvider
 
 
 def test_model_prefix_and_mode() -> None:
@@ -54,9 +54,9 @@ def test_default_model() -> None:
     assert OpenAIProvider(api_key="sk-test").model == "gpt-4.1-mini"
 
 
-def test_get_provider_maps_openai() -> None:
-    """``get_provider`` constructs an ``OpenAIProvider`` and threads every field."""
-    provider = get_provider(
+def test_build_provider_maps_openai() -> None:
+    """``build_provider`` constructs an ``OpenAIProvider`` and threads every field."""
+    provider = build_provider(
         LLMClientConfig(
             provider=Provider.OPENAI,
             model="gpt-4.1",
@@ -74,9 +74,9 @@ def test_get_provider_maps_openai() -> None:
     }
 
 
-def test_get_provider_openai_defaults() -> None:
+def test_build_provider_openai_defaults() -> None:
     """Without a base_url / reasoning_effort, the provider stays on OpenAI defaults."""
-    provider = get_provider(
+    provider = build_provider(
         LLMClientConfig(provider=Provider.OPENAI, model="gpt-4.1-mini", api_key="sk-test")
     )
     assert isinstance(provider, OpenAIProvider)

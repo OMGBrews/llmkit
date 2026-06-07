@@ -23,17 +23,16 @@ from unittest.mock import MagicMock, patch
 from pydantic import BaseModel
 
 from llmkit import (
-    GoogleProvider,
     LLMCallRecord,
     LLMClientConfig,
     LocalYamlLogSink,
-    OllamaProvider,
     Provider,
+    build_provider,
     configure_llm_logging,
-    get_provider,
     structured_output,
 )
 from llmkit.logging import LogSink
+from llmkit.providers import GoogleProvider, OllamaProvider
 
 
 class _Schema(BaseModel):
@@ -57,9 +56,9 @@ def test_config_carries_reasoning_effort() -> None:
     assert cfg.reasoning_effort == "disable"
 
 
-def test_get_provider_wires_reasoning_effort() -> None:
+def test_build_provider_wires_reasoning_effort() -> None:
     """The config value reaches the constructed provider's property."""
-    provider = get_provider(
+    provider = build_provider(
         LLMClientConfig(
             provider=Provider.GOOGLE, model="gemini-2.5-flash", reasoning_effort="disable"
         )
@@ -69,11 +68,11 @@ def test_get_provider_wires_reasoning_effort() -> None:
 
     # Default stays None (provider default — no behaviour change).
     assert (
-        get_provider(LLMClientConfig(provider=Provider.OLLAMA, model="llama3.2")).reasoning_effort
+        build_provider(LLMClientConfig(provider=Provider.OLLAMA, model="llama3.2")).reasoning_effort
         is None
     )
     assert isinstance(
-        get_provider(LLMClientConfig(provider=Provider.OLLAMA, model="llama3.2")), OllamaProvider
+        build_provider(LLMClientConfig(provider=Provider.OLLAMA, model="llama3.2")), OllamaProvider
     )
 
 
@@ -170,9 +169,8 @@ def test_log_record_carries_reasoning_effort(tmp_path: Path) -> None:
     captured: list[LLMCallRecord] = []
 
     class _CapturingSink:
-        def write(self, record: LLMCallRecord) -> Path | None:
+        def write(self, record: LLMCallRecord) -> None:
             captured.append(record)
-            return None
 
     async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
         return _Schema(ok=True), None

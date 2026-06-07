@@ -133,10 +133,9 @@ class RetryProgressCallback(Protocol):
     does not call back — callers learn about exhaustion by catching the
     re-raised exception. Implementations must not raise.
 
-    The ``max_retries`` keyword is retained for backward compatibility (it
-    carries the *total attempts* for the budget the failing error is charged
-    against — transport or validation); the rest of the public surface uses
-    the ``max_attempts`` name.
+    The ``max_attempts`` keyword carries the *total attempts* for the budget
+    the failing error is charged against (transport or validation), matching
+    the name used across the rest of the retry surface.
     """
 
     def __call__(
@@ -144,7 +143,7 @@ class RetryProgressCallback(Protocol):
         *,
         label: str,
         attempt: int,
-        max_retries: int,
+        max_attempts: int,
         error: BaseException,
     ) -> None: ...
 
@@ -196,10 +195,7 @@ async def handle_retry_failure(
     callback = _progress_callback.get()
     if callback is not None:
         try:
-            # The public callback kwarg stays ``max_retries`` for backward
-            # compatibility, even though the loop now reasons in terms of
-            # ``max_attempts`` (the two carry the same value: total attempts).
-            callback(label=tag, attempt=attempt, max_retries=max_attempts, error=error)
+            callback(label=tag, attempt=attempt, max_attempts=max_attempts, error=error)
         except Exception:
             logger.exception("%s: retry progress callback raised", tag)
     if backoff_base_seconds > 0:
@@ -216,7 +212,6 @@ async def with_retries[T](
     retry_on: tuple[type[BaseException], ...] | None = None,
     validation_max_attempts: int | None = None,
     validation_retry_on: tuple[type[BaseException], ...] | None = None,
-    max_retries: int | None = None,
 ) -> T:
     """Retry an async callable up to *max_attempts* times.
 
@@ -241,8 +236,7 @@ async def with_retries[T](
     Args:
         fn: Zero-argument async callable to execute.
         max_attempts: Total number of *transport* attempts (1 = no retry).
-            Defaults to ``1`` when neither this nor the deprecated
-            ``max_retries`` is given.
+            Defaults to ``1`` when not given.
         label: Optional identifier for log messages (e.g. an op_id).
         backoff_base_seconds: When > 0, sleep before each retry using
             exponential "full jitter" backoff — a random delay in
@@ -266,10 +260,6 @@ async def with_retries[T](
         validation_retry_on: The exception types charged against
             ``validation_max_attempts``. Only meaningful when
             ``validation_max_attempts`` is set.
-        max_retries: **Deprecated** alias for ``max_attempts`` (same
-            semantics: *total* attempts including the first, not ``1 + N``).
-            Emits a :class:`DeprecationWarning`; ``max_attempts`` wins if
-            both are given.
 
     Returns:
         The result of the first successful call.
@@ -279,15 +269,6 @@ async def with_retries[T](
         are exhausted, or any non-matching exception immediately when
         ``retry_on`` is set.
     """
-    if max_retries is not None:
-        warnings.warn(
-            "with_retries(max_retries=...) is deprecated; use max_attempts=... "
-            "(same meaning: total attempts including the first).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if max_attempts is None:
-            max_attempts = max_retries
     if max_attempts is None:
         max_attempts = 1
 

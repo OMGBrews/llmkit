@@ -68,15 +68,17 @@ import pytest
 from pydantic import BaseModel
 
 from llmkit import (
+    LLMProviderInterface,
+    structured_llm_call,
+)
+from llmkit.providers import (
     AnthropicProvider,
     BedrockProvider,
     DeepSeekProvider,
     GoogleProvider,
-    LLMProviderInterface,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
-    structured_llm_call,
 )
 
 # Every test in this module makes a real API call. The marker is what the
