@@ -10,6 +10,7 @@ the same seam the other offline tests use).
 from __future__ import annotations
 
 import asyncio
+from enum import Enum
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -308,9 +309,51 @@ def test_integer_enum_accepts_rejects_and_dumps_raw_int() -> None:
     assert dumped["level"] == 2
     assert isinstance(dumped["level"], int)
     assert "2" in model(level=2).model_dump_json()
+    # Genuinely the raw scalar, not the Enum member (use_enum_values).
+    assert not isinstance(dumped["level"], Enum)
     # Out-of-enum value rejected.
     with pytest.raises(ValidationError):
         model(level=9)
+
+
+def test_signed_integer_enum_builds_and_dumps_raw() -> None:
+    """A non-contiguous integer enum with a negative sentinel (FiW's eval-judge
+    schema) must build without raising and round-trip as raw ints.
+
+    Regression: ``-1`` and ``1`` both reduced to the member key ``"1"`` (the
+    sign was stripped), so the collision suffix bumped one to ``_1_`` — a
+    reserved ``_sunder_`` name Python's ``Enum`` rejects."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"score": {"type": "integer", "enum": [-1, 1, 2, 3, 4, 5]}},
+        "required": ["score"],
+    }
+    model = model_from_json_schema(schema)  # must not raise
+    # Every member is accepted and the non-contiguous gaps are rejected.
+    for value in (-1, 1, 2, 3, 4, 5):
+        dumped = model(score=value).model_dump()
+        assert dumped == {"score": value}
+        assert type(dumped["score"]) is int  # raw scalar, not an Enum member
+    for bad in (0, -2, 6):
+        with pytest.raises(ValidationError):
+            model(score=bad)
+
+
+def test_enum_member_names_are_never_reserved() -> None:
+    """Generated enum member names must never be ``_sunder_`` / ``__dunder__``
+    (Python's ``Enum`` reserves them), whatever digit-led or colliding values
+    the schema carries."""
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "properties": {"v": {"type": "integer", "enum": [-1, 0, 1, -2, 2]}},
+            "required": ["v"],
+        }
+    )
+    names = list(model.model_fields["v"].annotation.__members__)  # type: ignore[union-attr]
+    assert len(names) == 5  # no collisions collapsed members
+    for name in names:
+        assert not (name.startswith("_") and name.endswith("_")), name  # not _sunder_/__dunder__
 
 
 # --- $defs sharing a title must NOT collapse to one class ------------------

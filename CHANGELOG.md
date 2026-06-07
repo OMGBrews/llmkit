@@ -306,6 +306,18 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Fixed
 
+- **`model_from_json_schema` no longer crashes on signed / colliding integer
+  enums, and enum fields now dump as raw scalars.** A non-contiguous integer
+  enum such as `[-1, 1, 2, 3, 4, 5]` (FiW's eval-judge schema, where `-1` is an
+  "Unknown" sentinel) raised `ValueError: _sunder_ names ... are reserved`: the
+  member-name builder stripped the sign, so `-1` and `1` collided on key `"1"`
+  and the collision suffix bumped one to the reserved `_1_`. Member names are
+  now letter-led and sign-preserving (`NEG_1`, `N_1`), so they can never form a
+  reserved `_sunder_`/`__dunder__` name. Generated models also set
+  `use_enum_values=True`, so a validated instance stores the raw scalar —
+  `model_dump()` yields `2`, not `<Enum._2: 2>` (this also makes
+  `structured_data_call` hand dict consumers raw values). Surfaced by the FiW
+  0.2.0 RC dogfood.
 - **Synchronous calls no longer leak a `coroutine 'Logging.async_success_handler'
   was never awaited` `RuntimeWarning` to stderr.** LiteLLM logs successes
   asynchronously without awaiting inline — it queues the

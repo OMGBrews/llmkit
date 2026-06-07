@@ -129,7 +129,7 @@ class _JsonSchemaModel(BaseModel):
     to opt back in to the nulls.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", use_enum_values=True)
 
     def model_dump(
         self,
@@ -363,9 +363,18 @@ class _Converter:
                 )
             if not isinstance(value, int):
                 all_int = False
-            key = re.sub(r"\W+", "_", str(value)).strip("_").upper() or "VALUE"
-            if key[0].isdigit():
-                key = f"_{key}"
+            raw = str(value)
+            key = re.sub(r"\W+", "_", raw).strip("_").upper() or "VALUE"
+            # Prefix with a LETTER, never a leading underscore. Stripping ``_``
+            # above drops a leading sign, so ``-1`` and ``1`` both reduce to
+            # ``"1"`` — re-encode the sign here so they stay distinct, and keep
+            # the name letter-led so the collision suffix below can never form a
+            # reserved ``_sunder_`` / ``__dunder__`` name (Python's Enum rejects
+            # those: ``_1_`` from a digit-led ``_1`` was the original crash).
+            if raw.lstrip().startswith("-"):
+                key = f"NEG_{key}"
+            elif key[0].isdigit():
+                key = f"N_{key}"
             while key in members:
                 key = f"{key}_"
             members[key] = value
@@ -373,9 +382,12 @@ class _Converter:
         name = (
             _safe_model_name(title) if isinstance(title, str) and title else self._anon_name("Enum")
         )
-        # Mix in str/int so members compare equal to and serialise as their raw
-        # value (e.g. ``"open"``, not ``Status.OPEN``) — matching the JSON the
-        # provider returns and keeping ``model_dump`` JSON-clean.
+        # Mix in str/int so members compare equal to their raw value and stay
+        # JSON-clean. The generated models also set ``use_enum_values=True``
+        # (see ``_JsonSchemaModel``), so a validated instance stores the raw
+        # scalar — ``model_dump()`` yields ``2``, not ``<Enum._2: 2>`` — which
+        # is what dict consumers (``structured_data_call``) and the provider
+        # JSON both expect.
         base: type = int if all_int else str
         return Enum(name, members, type=base)  # type: ignore[return-value]  # runtime str/int-mixin enum
 
