@@ -1,13 +1,13 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, and local Ollama**, with validated structured output, a global async rate limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a global async rate limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to its *native* JSON-schema mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs truncated JSON. You pass a Pydantic model; you get a validated instance back.
-- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / DeepSeek / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
+- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -134,12 +134,21 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK
     model: str                       # the provider's default model
     api_key: str | None = None
     base_url: str | None = None      # OpenRouter / OpenAI-compatible endpoints; unused by Google/Anthropic
     reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
+    aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
 ```
+
+`aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
+
+```bash
+pip install "omg-llmkit[bedrock]"
+```
+
+The first cut targets plain **on-demand** Claude-on-Bedrock models (default `anthropic.claude-3-5-sonnet-20240620-v1:0`). Newer Claude 4.x models on Bedrock are typically reached through a cross-region inference profile — pass the profile-prefixed id as `model` (e.g. `us.anthropic.claude-sonnet-4-...`).
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 

@@ -21,6 +21,7 @@ from llmkit.logging import (
 )
 from llmkit.providers import (
     AnthropicProvider,
+    BedrockProvider,
     DeepSeekProvider,
     GoogleProvider,
     LLMClientConfig,
@@ -60,6 +61,7 @@ __all__ = [
     "AnthropicProvider",
     "OpenAIProvider",
     "DeepSeekProvider",
+    "BedrockProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

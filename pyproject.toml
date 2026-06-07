@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omg-llmkit"
-version = "0.1.3"
+version = "0.1.4"
 description = "A thin, opinionated, local-first structured-output + logging layer over LiteLLM"
 readme = "README.md"
 requires-python = ">=3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "OMGBrews" }]
-keywords = ["llm", "litellm", "instructor", "structured-output", "openai", "anthropic", "gemini"]
+keywords = ["llm", "litellm", "instructor", "structured-output", "openai", "anthropic", "gemini", "bedrock", "aws"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -40,6 +40,11 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff==0.15.0",
     "basedpyright>=1.39",
+]
+# AWS Bedrock routing. LiteLLM's bedrock/ path needs boto3 for SigV4 request
+# signing; it is opt-in so non-Bedrock installs take on no AWS dependency.
+bedrock = [
+    "boto3>=1.34",
 ]
 
 [project.urls]

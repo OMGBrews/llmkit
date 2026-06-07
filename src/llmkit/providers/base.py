@@ -49,6 +49,7 @@ class Provider(StrEnum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
+    BEDROCK = "bedrock"
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,15 @@ class LLMClientConfig:
     it once here (e.g. ``"disable"``) to have **every** call inherit the
     setting; Gemini's default-on thinking otherwise spends reasoning tokens
     against ``max_tokens`` and can truncate small-capped structured output.
+
+    ``aws_region_name`` carries the AWS region for the Bedrock provider and
+    is unused by every other provider (which authenticate with ``api_key`` /
+    ``base_url``). It is the *only* AWS-shaped field on this config on
+    purpose: Bedrock's secrets (access key / secret / session token, or
+    instance-role credentials) resolve from the **ambient AWS credential
+    chain** — environment, shared config, or instance/role — so they never
+    pass through ``LLMClientConfig``. Leave it ``None`` to let the region
+    resolve from the chain too (``AWS_REGION_NAME`` / ``AWS_REGION``).
     """
 
     provider: Provider
@@ -81,6 +91,7 @@ class LLMClientConfig:
     api_key: str | None = None
     base_url: str | None = None
     reasoning_effort: str | None = None
+    aws_region_name: str | None = None
 
 
 # Module-level config source, registered once by the host application at a

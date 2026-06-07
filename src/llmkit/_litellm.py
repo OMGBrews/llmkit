@@ -146,8 +146,7 @@ async def acompletion_structured[T: BaseModel](
             response_model=output_schema,
             temperature=temperature,
             max_retries=validation_retries,
-            api_key=creds.get("api_key"),
-            api_base=creds.get("api_base"),
+            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional max_tokens
             **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional reasoning_effort
         )
@@ -185,8 +184,7 @@ async def acompletion_text(
             messages=_messages(prompt),
             temperature=temperature,
             max_tokens=max_tokens,
-            api_key=creds.get("api_key"),
-            api_base=creds.get("api_base"),
+            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
             **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
         )
     content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
@@ -223,8 +221,7 @@ async def astream_text(
             messages=_messages(prompt),
             temperature=temperature,
             stream=True,
-            api_key=creds.get("api_key"),
-            api_base=creds.get("api_base"),
+            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional max_tokens
             **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
         )

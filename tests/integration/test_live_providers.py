@@ -40,10 +40,22 @@ Provider -> credential it reads:
     OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
     DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
     Ollama      (local server on :11434)    https://ollama.com  (no key)
+    Bedrock     AWS chain + AWS_REGION_NAME https://console.aws.amazon.com  (see below)
 
 Ollama reads no key — it needs a reachable server instead. Point ``OLLAMA_HOST``
 at it (default ``http://localhost:11434``); in the maintainer devcontainer
 Ollama runs on the host, reached at ``http://host.docker.internal:11434``.
+
+Bedrock is the one deliberate exception to "every live test must pass under
+``--run-live``". It needs both an AWS account *and* the optional ``boto3``
+dependency, which ships only with the ``omg-llmkit[bedrock]`` extra. Its test
+is therefore gated with ``pytest.importorskip("boto3")`` — a *structural*
+skip (the dependency isn't installed), not the env-driven mode switch this
+module otherwise forbids. Install the extra (``uv sync --extra dev --extra
+bedrock``) and export ``AWS_REGION_NAME`` plus ambient AWS credentials to run
+it; once boto3 is present, a missing region/credential is a hard failure like
+every other provider, not a skip. Secrets come from the AWS chain — they are
+never passed through ``LLMClientConfig``.
 """
 
 from __future__ import annotations
@@ -57,6 +69,7 @@ from pydantic import BaseModel
 
 from llmkit import (
     AnthropicProvider,
+    BedrockProvider,
     DeepSeekProvider,
     GoogleProvider,
     LLMProviderInterface,
@@ -103,6 +116,10 @@ _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
 _OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
 _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
+# A plain on-demand Claude-on-Bedrock id (no cross-region inference profile).
+# Override with a profile-prefixed id (e.g. ``us.anthropic.claude-...``) when a
+# region/account only exposes a 4.x model through an inference profile.
+_BEDROCK_MODEL = os.getenv("BEDROCK_SMOKE_MODEL", "anthropic.claude-3-5-sonnet-20240620-v1:0")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 # Where the Ollama server lives. Default is an in-process localhost server; in
 # the maintainer devcontainer Ollama runs on the *host*, so the container sets
@@ -229,3 +246,23 @@ async def test_ollama_live() -> None:
     if not _ollama_up():
         _missing(f"no Ollama server at {_OLLAMA_HOST} (run `ollama serve`)")
     await _assert_structured_roundtrip(OllamaProvider(base_url=_OLLAMA_HOST, model=_OLLAMA_MODEL))
+
+
+@pytest.mark.asyncio
+async def test_bedrock_live() -> None:
+    # boto3 ships only with the optional `omg-llmkit[bedrock]` extra. Skipping
+    # when it's absent is a *structural* gate (the dependency isn't installed),
+    # not the env-driven mode switch this module forbids — and Bedrock uniquely
+    # needs both that extra and an AWS account, which plain `--run-live` cannot
+    # assume. Once the extra IS installed, the usual hard-fail rule applies:
+    # a missing region/credential fails the test rather than skipping it.
+    boto3 = pytest.importorskip("boto3", reason="install omg-llmkit[bedrock] for live Bedrock")
+    region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION")
+    if not region:
+        _missing("AWS_REGION_NAME (or AWS_REGION) not set")
+    if boto3.Session().get_credentials() is None:
+        _missing("no resolvable AWS credentials in the chain (env / profile / role)")
+    # Secrets resolve from the ambient AWS chain; only the region is explicit.
+    await _assert_structured_roundtrip(
+        BedrockProvider(model=_BEDROCK_MODEL, aws_region_name=region)
+    )

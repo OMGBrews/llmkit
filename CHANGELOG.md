@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **AWS Bedrock** provider (`Provider.BEDROCK` / `BedrockProvider`, `bedrock/`
+  LiteLLM prefix), giving first-class access to Claude-on-Bedrock. Unlike every
+  other provider, Bedrock authenticates through the standard **AWS credential
+  chain** rather than a bearer `api_key`: the new optional
+  `LLMClientConfig.aws_region_name` carries only the region (the single
+  AWS-shaped field; unused by all other providers), while secrets resolve from
+  the ambient chain (environment / shared config / instance role) and never
+  pass through the config. Structured output is pinned to
+  `instructor.Mode.ANTHROPIC_JSON` — the same Claude-native mode the direct
+  Anthropic provider uses (the model is Claude). `Mode.BEDROCK_JSON` is
+  deliberately avoided: it targets instructor's `from_bedrock` (boto3) client
+  and drops `model` when driven through `from_litellm`, this library's call
+  seam. `reasoning_effort` is forwarded where the underlying model supports it. The
+  first cut targets plain on-demand models (default
+  `anthropic.claude-3-5-sonnet-20240620-v1:0`); 4.x models reachable only via a
+  cross-region inference profile are supported by passing the profile-prefixed
+  id as `model`. `boto3` (for SigV4 signing) ships via the opt-in
+  `omg-llmkit[bedrock]` extra, so non-Bedrock installs gain no AWS dependency.
+  `BedrockProvider` is exported from the package root.
 - Direct **DeepSeek** provider (`Provider.DEEPSEEK` / `DeepSeekProvider`,
   `deepseek/` LiteLLM prefix), giving first-class access to `deepseek-chat` (V3)
   and `deepseek-reasoner` (R1) on a first-party key rather than the indirect
@@ -33,6 +52,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The internal LiteLLM call layer now forwards a provider's **full**
+  `completion_kwargs()` dict (splatting it into the call) instead of
+  cherry-picking `api_key` / `api_base`. This lets a provider carry whatever
+  credential kwargs LiteLLM needs — e.g. Bedrock's `aws_region_name` — without
+  the shared call layer growing per-provider knowledge. No change for the
+  existing providers (their kwarg dicts are unchanged); the request shape is
+  byte-identical for `api_key` / `api_base` providers.
 - `get_provider` now **fails loud** on an unknown provider instead of silently
   constructing an `OllamaProvider`. The previous `else` catch-all meant a
   newly-added `Provider` enum member routed to a confusing local-Ollama failure;
