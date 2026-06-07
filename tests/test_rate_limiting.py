@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Iterator
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,8 @@ from llmkit.rate_limiting import (
     GlobalRateLimiter,
     configure_rate_limit,
     get_rate_limit_config,
+    rate_limit_acquire_async,
+    rate_limit_acquire_sync,
 )
 
 
@@ -236,3 +239,156 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     updated = get_rate_limit_config()
     assert updated.enabled is False
     assert updated.max_concurrent == 3
+
+
+class _AsyncFunctionProbe:
+    """``_ConcurrencyProbe`` analogue that joins via ``rate_limit_acquire_async``.
+
+    Exercises the module-level public function rather than
+    ``GlobalRateLimiter.acquire_async`` directly, so the test pins the function
+    path a host actually uses to join the global limit by hand.
+    """
+
+    def __init__(self) -> None:
+        self.current = 0
+        self.peak = 0
+        self._lock = asyncio.Lock()
+
+    async def run(self, key: str, hold: asyncio.Event) -> None:
+        """Join via the public async function, record peak, hold until set."""
+        async with rate_limit_acquire_async(key):
+            async with self._lock:
+                self.current += 1
+                self.peak = max(self.peak, self.current)
+            try:
+                await hold.wait()
+            finally:
+                async with self._lock:
+                    self.current -= 1
+
+
+async def test_rate_limit_acquire_async_respects_configured_cap() -> None:
+    """The public async function bounds concurrency at the configured cap."""
+    probe = _AsyncFunctionProbe()
+    hold = asyncio.Event()
+
+    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(11)]
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert probe.current == 8  # default per-provider cap
+    assert probe.peak == 8
+
+    hold.set()
+    await asyncio.gather(*tasks)
+    assert probe.peak == 8
+
+
+async def test_rate_limit_acquire_async_acquires_and_releases() -> None:
+    """A held slot releases on block exit, so the next acquire proceeds.
+
+    Saturate the cap by hand through the public function; a further acquire
+    blocks until one holder exits, then runs.
+    """
+    configure_rate_limit(max_concurrent=1)
+    entered_second = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def first() -> None:
+        async with rate_limit_acquire_async("openai"):
+            await release_first.wait()
+
+    async def second() -> None:
+        async with rate_limit_acquire_async("openai"):
+            entered_second.set()
+
+    first_task = asyncio.create_task(first())
+    second_task = asyncio.create_task(second())
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # The single slot is held by first(); second() must be blocked.
+    assert not entered_second.is_set()
+
+    release_first.set()  # free the slot
+    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1.0)
+    assert entered_second.is_set()
+
+
+async def test_rate_limit_acquire_async_disabled_bypass() -> None:
+    """With limiting disabled, the public async function is an unbounded no-op."""
+    configure_rate_limit(enabled=False)
+    probe = _AsyncFunctionProbe()
+    hold = asyncio.Event()
+
+    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(7)]
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert probe.current == 7  # all in flight, unbounded
+    assert probe.peak == 7
+
+    hold.set()
+    await asyncio.gather(*tasks)
+
+
+def test_rate_limit_acquire_sync_respects_configured_cap() -> None:
+    """The public sync function bounds concurrency at the configured cap.
+
+    Saturate a cap of 1 from one thread, then assert a second thread cannot
+    enter until the first releases — proving the sync function holds the slot.
+    """
+    configure_rate_limit(max_concurrent=1)
+    entered_second = threading.Event()
+    release_first = threading.Event()
+    first_holds = threading.Event()
+
+    def first() -> None:
+        with rate_limit_acquire_sync("openai"):
+            first_holds.set()
+            release_first.wait(timeout=1.0)
+
+    def second() -> None:
+        with rate_limit_acquire_sync("openai"):
+            entered_second.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    assert first_holds.wait(timeout=1.0)
+
+    second_thread.start()
+    # The single slot is held; second() must block.
+    assert not entered_second.wait(timeout=0.1)
+
+    release_first.set()  # free the slot
+    second_thread.join(timeout=1.0)
+    first_thread.join(timeout=1.0)
+    assert entered_second.is_set()
+
+
+def test_rate_limit_acquire_sync_disabled_bypass() -> None:
+    """With limiting disabled, the public sync function is an unbounded no-op.
+
+    A cap of 1 would otherwise serialise; disabled, two threads hold the
+    "slot" simultaneously.
+    """
+    configure_rate_limit(max_concurrent=1, enabled=False)
+    # If limiting were active (cap 1) the barrier would never reach 2 and time
+    # out; disabled, both threads sit inside the acquire at once and trip it.
+    both_in = threading.Barrier(2, timeout=1.0)
+    release = threading.Event()
+    reached_barrier = threading.Event()
+
+    def worker() -> None:
+        with rate_limit_acquire_sync("openai"):
+            both_in.wait()  # both threads must be inside at once
+            reached_barrier.set()
+            release.wait(timeout=1.0)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert reached_barrier.wait(timeout=1.0), "disabled sync acquire serialised callers"
+
+    release.set()
+    for thread in threads:
+        thread.join(timeout=1.0)

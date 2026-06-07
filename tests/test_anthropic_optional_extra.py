@@ -21,14 +21,16 @@ import importlib.util
 import pytest
 
 from llmkit import (
+    LLMClientConfig,
+    Provider,
+    build_provider,
+)
+from llmkit.providers import (
     AnthropicProvider,
     BedrockProvider,
     GoogleProvider,
-    LLMClientConfig,
-    Provider,
-    get_provider,
+    base,
 )
-from llmkit.providers import base
 
 
 @pytest.fixture
@@ -56,17 +58,17 @@ def test_bedrock_provider_raises_clearly_without_sdk(anthropic_absent: None) -> 
         BedrockProvider()
 
 
-def test_get_provider_anthropic_raises_without_sdk(anthropic_absent: None) -> None:
+def test_build_provider_anthropic_raises_without_sdk(anthropic_absent: None) -> None:
     """The error surfaces through the dispatch entrypoint, not just direct construction."""
     with pytest.raises(ModuleNotFoundError, match=r"omg-llmkit\[anthropic\]"):
-        get_provider(
+        build_provider(
             LLMClientConfig(provider=Provider.ANTHROPIC, model="claude-sonnet-4-6", api_key="x")
         )
 
 
 def test_non_anthropic_provider_builds_without_sdk(anthropic_absent: None) -> None:
     """A Google-only flow constructs cleanly with the Anthropic SDK absent."""
-    provider = get_provider(
+    provider = build_provider(
         LLMClientConfig(provider=Provider.GOOGLE, model="gemini-2.5-flash", api_key="x")
     )
     assert isinstance(provider, GoogleProvider)

@@ -53,10 +53,11 @@ class BedrockProvider(BaseProvider):
     _provider_name = "AWS Bedrock"
     _model_prefix = "bedrock/"
     _mode = instructor.Mode.ANTHROPIC_JSON
+    _default_model = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
     def __init__(
         self,
-        model: str = "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        model: str | None = None,
         aws_region_name: str | None = None,
         reasoning_effort: str | None = None,
     ):

@@ -8,7 +8,7 @@ provider module and maps a :class:`Provider` to its implementation.
 
 Adding a provider: create a ``providers/<name>.py`` with a
 :class:`BaseProvider` subclass and a ``build(config)`` classmethod, then
-wire it here — one import and one ``case`` in :func:`get_provider`. The
+wire it here — one import and one ``case`` in :func:`build_provider`. The
 ``match`` has no catch-all, so a new :class:`Provider` enum member left
 unwired is reported by the type checker (non-exhaustive match), raises a
 clear error at runtime, and fails the exhaustiveness unit test — it can
@@ -37,15 +37,21 @@ from llmkit.providers.openai import OpenAIProvider
 from llmkit.providers.openrouter import OpenRouterProvider
 
 
-def get_provider(config: LLMClientConfig | None = None) -> BaseProvider:
-    """Get an LLM provider instance for the given (or configured) config.
+def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
+    """Construct an LLM provider instance from a config.
+
+    The canonical *construct-from-config* entry point. ``build_*`` /
+    ``make_*`` name construction; ``get_*`` is reserved for *reading*
+    effective state (see :func:`describe_llm`,
+    :func:`llmkit.get_rate_limit_config`).
 
     Args:
         config: Explicit config to build from. When ``None``, the source
             registered via :func:`configure_llm_client` supplies it.
 
     Returns:
-        A provider constructed from the config's credentials.
+        A provider constructed from the config's credentials. A falsy
+        ``config.model`` resolves to the provider's own default model.
 
     Raises:
         AssertionError: If ``config.provider`` is not wired to a provider
@@ -76,15 +82,114 @@ def get_provider(config: LLMClientConfig | None = None) -> BaseProvider:
     assert_never(config.provider)
 
 
-def get_llm_config(config: LLMClientConfig | None = None) -> LLMInfo:
-    """Get descriptive metadata for the active (or given) configuration.
+def make_provider(
+    provider: Provider,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    reasoning_effort: str | None = None,
+    aws_region_name: str | None = None,
+) -> BaseProvider:
+    """Construct a provider directly from raw credentials.
+
+    The one-liner for the per-call ``provider=`` override: build a provider
+    from a tenant's key (and optional model) without standing up an
+    :class:`LLMClientConfig` or touching the module-level config source.
+    Multi-tenant hosts that hold a per-request key reach for exactly this::
+
+        provider = make_provider(Provider.ANTHROPIC, api_key=tenant_key)
+        result = structured_llm_call_sync(..., provider=provider)
+
+    The accepted knobs mirror the fields each concrete provider reads;
+    irrelevant ones are simply ignored (e.g. ``base_url`` for Anthropic,
+    ``api_key`` for Ollama/Bedrock). A falsy ``model`` resolves to the
+    provider's own default, so the assembled LiteLLM id is always
+    well-formed.
+
+    Args:
+        provider: Which provider to construct.
+        api_key: Bearer credential (unused by Ollama; Bedrock signs via the
+            ambient AWS credential chain).
+        model: Default model for this provider; ``None`` uses the provider's
+            built-in default.
+        base_url: Endpoint override (OpenRouter / Ollama / OpenAI-compatible
+            gateways); ignored by providers with fixed endpoints.
+        reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
+            ``None`` leaves the provider default in place.
+        aws_region_name: AWS region for Bedrock; ignored by every other
+            provider.
+
+    Returns:
+        A constructed provider, ready to pass as a per-call ``provider=``.
+
+    Raises:
+        AssertionError: If ``provider`` is not wired here (an unwired enum
+            member). See :func:`typing.assert_never`.
+    """
+    match provider:
+        case Provider.OPENROUTER:
+            return OpenRouterProvider(
+                api_key=api_key or "",
+                model=model,
+                base_url=base_url or "https://openrouter.ai/api/v1",
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.OLLAMA:
+            return OllamaProvider(
+                base_url=base_url or "http://localhost:11434",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.GOOGLE:
+            return GoogleProvider(
+                api_key=api_key or "",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.ANTHROPIC:
+            return AnthropicProvider(
+                api_key=api_key or "",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.OPENAI:
+            return OpenAIProvider(
+                api_key=api_key or "",
+                model=model,
+                base_url=base_url,
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.DEEPSEEK:
+            return DeepSeekProvider(
+                api_key=api_key or "",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        case Provider.BEDROCK:
+            return BedrockProvider(
+                model=model,
+                aws_region_name=aws_region_name,
+                reasoning_effort=reasoning_effort,
+            )
+    # See build_provider: every member is handled, so this narrows to Never and
+    # assert_never makes a missing case a static + runtime + test failure.
+    assert_never(provider)
+
+
+def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:
+    """Read descriptive metadata for the active (or given) configuration.
+
+    A *read* accessor (``get_*``/``describe_*`` semantics), distinct from the
+    ``build_*`` / ``make_*`` constructors: it builds a provider only to read
+    back the resolved provider + model for display/telemetry.
 
     Returns:
         :class:`LLMInfo` snapshot of the resolved provider + model.
     """
     if config is None:
         config = _active_config()
-    provider = get_provider(config)
+    provider = build_provider(config)
 
     return LLMInfo(
         provider=config.provider,
@@ -108,6 +213,7 @@ __all__ = [
     "LLMClientConfig",
     "LLMInfo",
     "configure_llm_client",
-    "get_provider",
-    "get_llm_config",
+    "build_provider",
+    "make_provider",
+    "describe_llm",
 ]

@@ -25,7 +25,7 @@ def test_resolve_substitutes_provider_default_when_model_none() -> None:
     fake_provider = MagicMock()
     fake_provider.model = "gemini-2.5-flash-lite"
     fake_provider.name = "Google AI Studio"
-    with patch("llmkit.providers.get_provider", return_value=fake_provider):
+    with patch("llmkit.providers.build_provider", return_value=fake_provider):
         resolved, provider = structured_output._resolve_model_and_provider(None)
     assert resolved == "gemini-2.5-flash-lite"
     assert provider == "Google AI Studio"
@@ -35,7 +35,7 @@ def test_resolve_keeps_explicit_model_and_records_provider() -> None:
     fake_provider = MagicMock()
     fake_provider.model = "gemini-2.5-flash-lite"
     fake_provider.name = "Google AI Studio"
-    with patch("llmkit.providers.get_provider", return_value=fake_provider):
+    with patch("llmkit.providers.build_provider", return_value=fake_provider):
         resolved, provider = structured_output._resolve_model_and_provider("gemini-2.5-flash")
     assert resolved == "gemini-2.5-flash"
     assert provider == "Google AI Studio"
@@ -43,13 +43,13 @@ def test_resolve_keeps_explicit_model_and_records_provider() -> None:
 
 def test_resolve_uses_explicit_provider_without_global_lookup() -> None:
     """An explicit per-call provider is recorded as-is, and the global
-    ``get_provider`` source is never consulted."""
+    ``build_provider`` source is never consulted."""
     override = MagicMock()
     override.model = "anthropic/claude-sonnet-4-6"
     override.name = "OpenRouter"
     with patch(
-        "llmkit.providers.get_provider",
-        side_effect=AssertionError("global get_provider must not be called"),
+        "llmkit.providers.build_provider",
+        side_effect=AssertionError("global build_provider must not be called"),
     ):
         resolved, provider = structured_output._resolve_model_and_provider(None, override)
     assert resolved == "anthropic/claude-sonnet-4-6"
@@ -86,7 +86,7 @@ def test_resolve_degrades_gracefully_when_provider_unavailable() -> None:
     degrades to (model, None) rather than raising into the call's finally
     block."""
     with patch(
-        "llmkit.providers.get_provider",
+        "llmkit.providers.build_provider",
         side_effect=RuntimeError("no provider configured"),
     ):
         resolved, provider = structured_output._resolve_model_and_provider("explicit-model")
@@ -116,24 +116,69 @@ def test_local_yaml_sink_records_model_and_provider(tmp_path: Path) -> None:
     """The written YAML carries both the resolved model and provider."""
     import yaml
 
-    path = LocalYamlLogSink(tmp_path).write(_record())
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert path is not None
     doc = yaml.safe_load(path.read_text())
     assert doc["model"] == "gemini-2.5-flash-lite"
     assert doc["provider"] == "Google AI Studio"
 
 
+def test_sink_write_returns_none_per_contract(tmp_path: Path) -> None:
+    """The ``LogSink`` contract is ``write(record) -> None``: the file
+    sink's ``write`` writes the YAML but returns nothing; the path is
+    exposed via the file-specific ``write_returning_path`` instead."""
+    sink = LocalYamlLogSink(tmp_path)
+    assert sink.write(_record()) is None
+    path = sink.write_returning_path(_record())
+    assert path is not None and path.exists()
+
+
+def test_write_llm_log_returns_path_for_file_sink(tmp_path: Path) -> None:
+    """``write_llm_log`` returns the file path for the configured file
+    sink (so path-capture keeps working) even though the shared contract
+    return is ``None``."""
+    from llmkit.logging import write_llm_log
+
+    configure_llm_logging(LocalYamlLogSink(tmp_path))
+    try:
+        path = write_llm_log(_record())
+    finally:
+        configure_llm_logging(LocalYamlLogSink())
+    assert path is not None and path.exists()
+
+
+def test_write_llm_log_returns_none_for_third_party_sink() -> None:
+    """A third-party sink implements only ``write(record) -> None``;
+    ``write_llm_log`` honors that and returns ``None`` (no leaked path),
+    while the sink still receives the record."""
+    from llmkit.logging import write_llm_log
+
+    received: list[LLMCallRecord] = []
+
+    class _MemorySink:
+        def write(self, record: LLMCallRecord) -> None:
+            received.append(record)
+
+    configure_llm_logging(_MemorySink())
+    try:
+        result = write_llm_log(_record())
+    finally:
+        configure_llm_logging(LocalYamlLogSink())
+    assert result is None
+    assert len(received) == 1
+
+
 def test_local_yaml_sink_includes_approximate_cost_field(tmp_path: Path) -> None:
     """The record gains an ``approximate_cost`` field — ``None`` until Step 2c."""
     import yaml
 
-    default_path = LocalYamlLogSink(tmp_path).write(_record())
+    default_path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert default_path is not None
     doc = yaml.safe_load(default_path.read_text())
     assert "approximate_cost" in doc
     assert doc["approximate_cost"] is None
 
-    priced_path = LocalYamlLogSink(tmp_path).write(_record(approximate_cost=0.0123))
+    priced_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(approximate_cost=0.0123))
     assert priced_path is not None
     priced = yaml.safe_load(priced_path.read_text())
     assert priced["approximate_cost"] == 0.0123
@@ -153,13 +198,13 @@ def test_configure_llm_logging_none_disables_writes() -> None:
 def test_summary_header_is_verdict_first(tmp_path: Path) -> None:
     """The first comment line is a single-glance ``ok`` verdict with the
     key metadata; an errored call leads with ``ERROR``."""
-    ok_path = LocalYamlLogSink(tmp_path).write(_record(approximate_cost=5.9e-06))
+    ok_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(approximate_cost=5.9e-06))
     assert ok_path is not None
     first_line = ok_path.read_text().splitlines()[0]
     assert first_line.startswith("# ok | extraction/summary | gemini-2.5-flash-lite | Schema |")
     assert "$5.9e-06" in first_line
 
-    err_path = LocalYamlLogSink(tmp_path).write(_record(error="APIError: boom"))
+    err_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(error="APIError: boom"))
     assert err_path is not None
     assert err_path.read_text().splitlines()[0].startswith("# ERROR |")
 
@@ -167,7 +212,9 @@ def test_summary_header_is_verdict_first(tmp_path: Path) -> None:
 def test_yaml_body_puts_blobs_last(tmp_path: Path) -> None:
     """High-signal metadata (incl. error/cost) precedes the big
     response/prompt blobs, and response precedes prompt."""
-    path = LocalYamlLogSink(tmp_path).write(_record(prompt="PROMPT_TEXT", response="RESP_TEXT"))
+    path = LocalYamlLogSink(tmp_path).write_returning_path(
+        _record(prompt="PROMPT_TEXT", response="RESP_TEXT")
+    )
     assert path is not None
     body = path.read_text()
     assert body.index("error:") < body.index("response:") < body.index("prompt:")
@@ -179,8 +226,8 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
     import json
 
     sink = LocalYamlLogSink(tmp_path)
-    p1 = sink.write(_record(label="first", approximate_cost=1e-06))
-    p2 = sink.write(_record(label="second", error="Timeout: slow"))
+    p1 = sink.write_returning_path(_record(label="first", approximate_cost=1e-06))
+    p2 = sink.write_returning_path(_record(label="second", error="Timeout: slow"))
     assert p1 is not None and p2 is not None
 
     index = tmp_path / "index.jsonl"

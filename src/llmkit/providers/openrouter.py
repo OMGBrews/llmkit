@@ -17,11 +17,12 @@ class OpenRouterProvider(BaseProvider):
     _provider_name = "OpenRouter"
     _model_prefix = "openrouter/"
     _mode = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
+    _default_model = "google/gemini-2.0-flash-001"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "google/gemini-2.0-flash-001",
+        model: str | None = None,
         base_url: str = "https://openrouter.ai/api/v1",
         reasoning_effort: str | None = None,
     ):

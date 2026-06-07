@@ -3,7 +3,7 @@
 Parity with the other curated providers: the DeepSeek provider must expose the
 right LiteLLM model-prefix string (``deepseek/<model>``), pin DeepSeek's native
 JSON mode (``Mode.JSON``) rather than relying on instructor's ``Mode.TOOLS``
-fallback, and forward credentials correctly (``api_key`` only). ``get_provider``
+fallback, and forward credentials correctly (``api_key`` only). ``build_provider``
 must map ``Provider.DEEPSEEK`` explicitly and thread model / key /
 reasoning_effort through.
 
@@ -20,11 +20,11 @@ from __future__ import annotations
 import instructor
 
 from llmkit import (
-    DeepSeekProvider,
     LLMClientConfig,
     Provider,
-    get_provider,
+    build_provider,
 )
+from llmkit.providers import DeepSeekProvider
 
 
 def test_model_prefix_and_mode() -> None:
@@ -47,9 +47,9 @@ def test_default_model() -> None:
     assert DeepSeekProvider(api_key="sk-test").model == "deepseek-chat"
 
 
-def test_get_provider_maps_deepseek() -> None:
-    """``get_provider`` constructs a ``DeepSeekProvider`` and threads every field."""
-    provider = get_provider(
+def test_build_provider_maps_deepseek() -> None:
+    """``build_provider`` constructs a ``DeepSeekProvider`` and threads every field."""
+    provider = build_provider(
         LLMClientConfig(
             provider=Provider.DEEPSEEK,
             model="deepseek-reasoner",
@@ -63,9 +63,9 @@ def test_get_provider_maps_deepseek() -> None:
     assert provider.completion_kwargs() == {"api_key": "sk-test"}
 
 
-def test_get_provider_deepseek_defaults() -> None:
+def test_build_provider_deepseek_defaults() -> None:
     """Without a reasoning_effort, the provider stays on the DeepSeek default."""
-    provider = get_provider(
+    provider = build_provider(
         LLMClientConfig(provider=Provider.DEEPSEEK, model="deepseek-chat", api_key="sk-test")
     )
     assert isinstance(provider, DeepSeekProvider)

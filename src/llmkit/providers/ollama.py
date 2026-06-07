@@ -17,11 +17,12 @@ class OllamaProvider(BaseProvider):
     _provider_name = "Ollama"
     _model_prefix = "ollama_chat/"
     _mode = instructor.Mode.JSON_SCHEMA
+    _default_model = "llama3.2"
 
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "llama3.2",
+        model: str | None = None,
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)

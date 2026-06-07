@@ -23,11 +23,12 @@ class AnthropicProvider(BaseProvider):
     _provider_name = "Anthropic"
     _model_prefix = "anthropic/"
     _mode = instructor.Mode.ANTHROPIC_JSON
+    _default_model = "claude-sonnet-4-6"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "claude-sonnet-4-6",
+        model: str | None = None,
         reasoning_effort: str | None = None,
     ):
         require_anthropic_sdk(self._provider_name)

@@ -9,7 +9,7 @@ since the model is Claude; ``Mode.BEDROCK_JSON`` is for instructor's
 ``from_bedrock`` client and drops ``model`` over ``from_litellm``), and carry
 only ``aws_region_name`` — and only when set, so an
 unset region (and the secrets, always) resolve from the ambient AWS chain.
-``get_provider`` must map ``Provider.BEDROCK`` explicitly and thread model /
+``build_provider`` must map ``Provider.BEDROCK`` explicitly and thread model /
 region / reasoning_effort.
 
 These are mocked-shape assertions; a real round-trip lives in
@@ -22,11 +22,11 @@ from __future__ import annotations
 import instructor
 
 from llmkit import (
-    BedrockProvider,
     LLMClientConfig,
     Provider,
-    get_provider,
+    build_provider,
 )
+from llmkit.providers import BedrockProvider
 
 
 def test_model_prefix_and_mode() -> None:
@@ -57,9 +57,9 @@ def test_default_model() -> None:
     assert BedrockProvider().model == "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
 
-def test_get_provider_maps_bedrock() -> None:
-    """``get_provider`` builds a ``BedrockProvider`` and threads every field."""
-    provider = get_provider(
+def test_build_provider_maps_bedrock() -> None:
+    """``build_provider`` builds a ``BedrockProvider`` and threads every field."""
+    provider = build_provider(
         LLMClientConfig(
             provider=Provider.BEDROCK,
             model="anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -73,9 +73,9 @@ def test_get_provider_maps_bedrock() -> None:
     assert provider.completion_kwargs() == {"aws_region_name": "eu-west-1"}
 
 
-def test_get_provider_bedrock_defaults() -> None:
+def test_build_provider_bedrock_defaults() -> None:
     """Without region/effort, kwargs are empty (ambient chain) and effort is None."""
-    provider = get_provider(
+    provider = build_provider(
         LLMClientConfig(
             provider=Provider.BEDROCK,
             model="anthropic.claude-3-5-sonnet-20240620-v1:0",

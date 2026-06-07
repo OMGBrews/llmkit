@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from llmkit import (
@@ -97,9 +96,8 @@ def test_log_record_carries_kwargs() -> None:
     captured: list[LLMCallRecord] = []
 
     class _CapturingSink:
-        def write(self, record: LLMCallRecord) -> Path | None:
+        def write(self, record: LLMCallRecord) -> None:
             captured.append(record)
-            return None
 
     async def _fake_astream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
         yield "hello"

@@ -31,11 +31,12 @@ class OpenAIProvider(BaseProvider):
     _provider_name = "OpenAI"
     _model_prefix = "openai/"
     _mode = instructor.Mode.JSON_SCHEMA
+    _default_model = "gpt-4.1-mini"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4.1-mini",
+        model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: str | None = None,
     ):

@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import yaml
 
@@ -68,11 +68,32 @@ class LLMCallRecord:
 class LogSink(Protocol):
     """Destination for :class:`LLMCallRecord`s.
 
-    ``write`` returns the path it wrote (so callers tracking log paths can
-    cross-reference), or ``None`` if nothing was persisted.
+    ``write`` consumes a record and returns nothing. A sink that persists
+    to a file (e.g. :class:`LocalYamlLogSink`) exposes the written path via
+    its own method/attribute — the shared contract stays file-agnostic so a
+    third-party sink (a database, an in-memory buffer, a metrics pipe) is a
+    one-method object. To capture per-call *records* (cost/metadata) or
+    *file paths* without authoring a sink, use
+    :func:`~llmkit.structured_output.capture_llm_records` or
+    :func:`~llmkit.structured_output.capture_llm_log_paths`.
     """
 
-    def write(self, record: LLMCallRecord) -> Path | None: ...
+    def write(self, record: LLMCallRecord) -> None: ...
+
+
+@runtime_checkable
+class _PathReturningLogSink(Protocol):
+    """A :class:`LogSink` that also exposes the file path it wrote.
+
+    Internal capability protocol: a file-backed sink (e.g.
+    :class:`LocalYamlLogSink`) advertises ``write_returning_path`` so
+    :func:`write_llm_log` can hand the path to the path-capture primitive
+    without that file detail leaking into the public :class:`LogSink`
+    contract. Third-party sinks implement only :class:`LogSink` and never
+    match this check.
+    """
+
+    def write_returning_path(self, record: LLMCallRecord) -> Path | None: ...
 
 
 class LocalYamlLogSink:
@@ -94,7 +115,26 @@ class LocalYamlLogSink:
     def __init__(self, log_dir: Path = DEFAULT_LOG_DIR) -> None:
         self.log_dir = log_dir
 
-    def write(self, record: LLMCallRecord) -> Path | None:
+    def write(self, record: LLMCallRecord) -> None:
+        """Persist *record* as a YAML file (the :class:`LogSink` contract).
+
+        Returns nothing, per the shared sink contract. Callers that need
+        the written path use :meth:`write_returning_path` (or the
+        :func:`~llmkit.structured_output.capture_llm_log_paths` context
+        manager, which calls it for the configured file sink).
+        """
+        _ = self.write_returning_path(record)
+
+    def write_returning_path(self, record: LLMCallRecord) -> Path | None:
+        """Persist *record* and return the file path it wrote (or ``None``).
+
+        The file-specific counterpart to :meth:`write`: the per-call YAML
+        path is returned so the path-capture primitive
+        (:func:`~llmkit.structured_output.capture_llm_log_paths`) can
+        cross-reference it, without that file detail leaking into the shared
+        :class:`LogSink` contract. ``None`` is returned when the write
+        failed (best-effort: logging must never break the LLM call).
+        """
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
@@ -212,12 +252,25 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
 
     Logging must never break the LLM call, so a sink that raises is
     caught here in addition to the sink's own best-effort handling.
-    Returns the written path, or ``None`` when nothing was persisted.
+
+    Returns the written file path when the configured sink is a
+    file sink that exposes one (it advertises a ``write_returning_path``
+    method, as :class:`LocalYamlLogSink` does), so the
+    :func:`~llmkit.structured_output.capture_llm_log_paths` primitive can
+    cross-reference it. For a third-party sink that only implements the
+    file-agnostic :class:`LogSink` contract (``write(record) -> None``),
+    there is no path to return, so this returns ``None`` — path-capture is
+    simply empty for such sinks, while
+    :func:`~llmkit.structured_output.capture_llm_records` still captures
+    the record itself.
     """
     if _sink is None:
         return None
     try:
-        return _sink.write(record)
+        if isinstance(_sink, _PathReturningLogSink):
+            return _sink.write_returning_path(record)
+        _sink.write(record)
+        return None
     except Exception:
         logger.warning("LLM log sink raised for %s/%s", record.feature, record.label, exc_info=True)
         return None

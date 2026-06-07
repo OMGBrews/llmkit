@@ -39,10 +39,10 @@ from llmkit import (
     RetryPolicy,
     configure_llm_logging,
     structured_output,
-    with_retries,
 )
 from llmkit import retry as retry_mod
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
+from llmkit.retry import with_retries
 from llmkit.structured_output import capture_llm_log_paths
 
 
@@ -490,7 +490,7 @@ async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
     assert calls[0] == 2
 
 
-# --- unified naming: max_attempts + deprecated max_retries alias ----------
+# --- unified naming: max_attempts is the only name ------------------------
 
 
 def test_recoverable_set_is_union_of_transport_and_schema() -> None:
@@ -521,62 +521,20 @@ async def test_with_retries_max_attempts_runs_exactly_n_attempts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_with_retries_deprecated_max_retries_alias_works_and_warns() -> None:
-    """The deprecated ``max_retries`` alias still drives the same budget (3
-    attempts) and emits a ``DeprecationWarning``."""
+async def test_with_retries_max_retries_kwarg_raises_type_error() -> None:
+    """The ``max_retries`` alias is hard-cut: passing it is an unexpected
+    keyword argument and raises ``TypeError`` (no shim, no warning)."""
     calls = [0]
 
     async def _fn() -> str:
         calls[0] += 1
         raise TimeoutError("always")
 
-    with (
-        pytest.warns(DeprecationWarning, match="max_retries"),
-        pytest.raises(TimeoutError, match="always"),
-    ):
-        await with_retries(_fn, max_retries=3, retry_on=(TimeoutError,))
+    with pytest.raises(TypeError, match="max_retries"):
+        await with_retries(_fn, max_retries=3, retry_on=(TimeoutError,))  # type: ignore[call-arg]  # hard-cut alias
 
-    assert calls[0] == 3
-
-
-@pytest.mark.asyncio
-async def test_with_retries_deprecated_max_retries_alias_on_success_path() -> None:
-    """The deprecated ``max_retries`` alias also drives the *success* path: a
-    transient-then-success run returns the value after one retry (2 calls) and
-    still emits a ``DeprecationWarning`` — pinning alias accounting on success,
-    not just on exhaustion."""
-    calls = [0]
-
-    async def _fn() -> str:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return "ok"
-
-    with pytest.warns(DeprecationWarning, match="max_retries"):
-        result = await with_retries(_fn, max_retries=2, retry_on=(TimeoutError,))
-
-    assert result == "ok"
-    assert calls[0] == 2
-
-
-@pytest.mark.asyncio
-async def test_with_retries_max_attempts_wins_over_max_retries() -> None:
-    """When both are passed, ``max_attempts`` wins (and a warning still fires
-    for the deprecated alias)."""
-    calls = [0]
-
-    async def _fn() -> str:
-        calls[0] += 1
-        raise TimeoutError("always")
-
-    with (
-        pytest.warns(DeprecationWarning),
-        pytest.raises(TimeoutError),
-    ):
-        await with_retries(_fn, max_attempts=2, max_retries=5, retry_on=(TimeoutError,))
-
-    assert calls[0] == 2
+    # The callable was never invoked: the bad kwarg is rejected at the call.
+    assert calls[0] == 0
 
 
 def test_retry_policy_and_with_retries_agree_on_max_attempts() -> None:

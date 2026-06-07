@@ -29,7 +29,7 @@ import instructor
 import litellm
 from pydantic import BaseModel
 
-from llmkit.providers import LLMProviderInterface, get_provider
+from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -170,7 +170,7 @@ async def acompletion_structured[T: BaseModel](
 
     Returns ``(parsed, approximate_cost)``.
     """
-    provider = provider if provider is not None else get_provider()
+    provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
@@ -210,7 +210,7 @@ async def acompletion_text(
     (list content blocks joined; an empty string when the provider returns
     none).
     """
-    provider = provider if provider is not None else get_provider()
+    provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):
@@ -247,7 +247,7 @@ async def astream_text(
     resolved against the provider's configured value when ``None``), so the
     default request is byte-identical to the prior stream call.
     """
-    provider = provider if provider is not None else get_provider()
+    provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):

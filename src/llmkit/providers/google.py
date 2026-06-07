@@ -17,11 +17,12 @@ class GoogleProvider(BaseProvider):
     _provider_name = "Google AI Studio"
     _model_prefix = "gemini/"
     _mode = instructor.Mode.JSON_SCHEMA
+    _default_model = "gemini-2.5-flash-lite"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash-lite",
+        model: str | None = None,
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)

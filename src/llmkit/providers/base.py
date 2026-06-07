@@ -93,6 +93,12 @@ class LLMClientConfig:
     are passed at call time and are not part of this config — this carries
     only the provider's *default* model.
 
+    ``model`` is optional: leave it ``None`` (or empty) to inherit the
+    selected provider's own default model rather than naming one here. A
+    falsy ``model`` resolves to the concrete provider's built-in default
+    (e.g. ``claude-sonnet-4-6`` for Anthropic), so the assembled LiteLLM
+    id is always well-formed — never a dangling ``"anthropic/"``.
+
     ``reasoning_effort`` controls provider "thinking"/reasoning tokens,
     mirroring LiteLLM's standard param (``"disable" | "low" | "medium" |
     "high"``). ``None`` (the default) sends no reasoning kwarg, leaving the
@@ -112,7 +118,7 @@ class LLMClientConfig:
     """
 
     provider: Provider
-    model: str
+    model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
     reasoning_effort: str | None = None
@@ -129,7 +135,7 @@ _config_source: Callable[[], LLMClientConfig] | None = None
 def configure_llm_client(config_source: Callable[[], LLMClientConfig]) -> None:
     """Register the source that supplies the active :class:`LLMClientConfig`.
 
-    The source is a zero-arg callable invoked on each :func:`get_provider`
+    The source is a zero-arg callable invoked on each :func:`build_provider`
     call, mirroring the previous behaviour of reading the host's
     (cached) settings on every provider construction — so a settings
     change is picked up without re-registration.
@@ -192,7 +198,7 @@ class BaseProvider(ABC):
     that maps an :class:`LLMClientConfig` to a constructed instance
     (including the provider's own credential/endpoint defaults). ``build``
     is a package-internal construction convention used by
-    :func:`llmkit.providers.get_provider`; it is deliberately **not** part
+    :func:`llmkit.providers.build_provider`; it is deliberately **not** part
     of :class:`LLMProviderInterface`, which is the surface consumers type
     against.
     """
@@ -200,9 +206,16 @@ class BaseProvider(ABC):
     _provider_name: str = ""
     _model_prefix: str = ""
     _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
+    _default_model: str = ""
 
-    def __init__(self, model: str, reasoning_effort: str | None = None) -> None:
-        self._model = model
+    def __init__(self, model: str | None = None, reasoning_effort: str | None = None) -> None:
+        # A falsy model (None or "") falls back to the provider's own default
+        # so the LiteLLM id assembled by ``litellm_model`` is always well-formed
+        # (``<prefix><model>``) and never a dangling ``"<prefix>/"``. Each
+        # concrete provider sets ``_default_model`` to the same value its ctor
+        # documents as the default, so config-built and directly-built providers
+        # agree on the fallback model.
+        self._model = model or self._default_model
         self._reasoning_effort = reasoning_effort
 
     @property

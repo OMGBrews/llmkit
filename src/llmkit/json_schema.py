@@ -32,6 +32,24 @@ construct, rather than silently producing a wrong model:
 * nested objects, inline or via local ``$defs`` / ``$ref`` references
   (``#/$defs/Name`` or the legacy ``#/definitions/Name``)
 
+Per-field constraints
+----------------------
+A small, fixed set of per-field constraints is carried through to the
+generated Pydantic ``Field`` so the model validates *value bounds*, not just
+shape. The supported set is **exactly**:
+
+* numeric: ``minimum`` → ``ge``, ``maximum`` → ``le``,
+  ``exclusiveMinimum`` → ``gt``, ``exclusiveMaximum`` → ``lt``
+* string: ``minLength`` → ``min_length``, ``maxLength`` → ``max_length``
+* array: ``minItems`` → ``min_length``, ``maxItems`` → ``max_length``
+* ``description`` → ``Field(description=...)`` (instructor surfaces this as
+  per-field guidance to the model)
+
+Any other constraint keyword (``pattern``, ``format``, ``multipleOf``,
+``uniqueItems``, ``const``, …) is **silently dropped** — deliberately, to
+avoid partial enforcement that looks complete. Nothing outside the list above
+is enforced; if a schema relies on one of those, validate it elsewhere.
+
 Serialization contract
 -----------------------
 The generated model maps a **non-required** JSON-schema field to an
@@ -51,7 +69,7 @@ import keyword
 import re
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, create_model
 
@@ -71,6 +89,33 @@ _SCALAR_TYPES: dict[str, type] = {
     "number": float,
     "boolean": bool,
 }
+
+# The ONLY per-field constraint keywords carried into Pydantic ``Field``.
+# Each JSON-schema keyword maps to the ``Field`` keyword that enforces it.
+# Anything outside this set is silently dropped (no partial enforcement):
+#   numeric: minimum -> ge, maximum -> le, exclusiveMinimum -> gt,
+#            exclusiveMaximum -> lt
+#   string : minLength -> min_length, maxLength -> max_length
+#   array  : minItems -> min_length, maxItems -> max_length (on list fields)
+# ``pattern`` / ``format`` / ``multipleOf`` / ``uniqueItems`` / ``const`` /
+# etc. are intentionally NOT supported — see the module docstring.
+
+
+class _FieldConstraints(NamedTuple):
+    """Resolved Pydantic ``Field`` bounds for one property (``None`` = unset).
+
+    A precise carrier so the bounds reach ``Field`` as typed keyword arguments
+    rather than an untyped splat. ``min_length`` / ``max_length`` serve both
+    string length (``minLength`` / ``maxLength``) and array item count
+    (``minItems`` / ``maxItems``) — the keyword Pydantic uses is the same.
+    """
+
+    ge: float | None = None
+    le: float | None = None
+    gt: float | None = None
+    lt: float | None = None
+    min_length: int | None = None
+    max_length: int | None = None
 
 
 class _JsonSchemaModel(BaseModel):
@@ -253,6 +298,55 @@ class _Converter:
             return _SCALAR_TYPES[jtype], nullable
         raise ValueError(f"Unsupported JSON-schema type {jtype!r} at {field_path!r}.")
 
+    def _field_constraints(self, schema: JsonDict) -> _FieldConstraints:
+        """Pull the supported per-field bounds off one property schema.
+
+        Mirrors :meth:`_field_type`'s ``$ref`` / nullable unwrapping so a
+        bound declared on the inner schema (e.g. on the non-null branch of an
+        ``anyOf``, or inside a referenced ``$def``) is still found. Returns a
+        :class:`_FieldConstraints` carrying the resolved Pydantic ``Field``
+        bounds (``ge`` / ``le`` / ``gt`` / ``lt`` / ``min_length`` /
+        ``max_length``).
+
+        Constraints outside the supported set (see the module docstring and the
+        ``_FieldConstraints`` fields) are silently dropped — no partial
+        enforcement. ``minLength`` (strings) and ``minItems`` (arrays) never
+        co-occur on one field, so mapping both onto ``min_length`` is safe.
+        """
+        if "$ref" in schema:
+            _, schema = self._resolve_ref(cast("str", schema["$ref"]))
+        inner, _ = self._unwrap_nullable(schema)
+        if "$ref" in inner:
+            _, inner = self._resolve_ref(cast("str", inner["$ref"]))
+            inner, _ = self._unwrap_nullable(inner)
+
+        def _number(key: str) -> float | None:
+            value = inner.get(key)
+            # ``bool`` is an ``int`` subclass — exclude it. A non-numeric (or
+            # missing) bound silently drops, matching the drop-the-unsupported
+            # contract rather than erroring.
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
+            return None
+
+        def _length(key: str) -> int | None:
+            value = inner.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return None
+
+        return _FieldConstraints(
+            ge=_number("minimum"),
+            le=_number("maximum"),
+            gt=_number("exclusiveMinimum"),
+            lt=_number("exclusiveMaximum"),
+            # minLength (string) and minItems (array) both map to min_length;
+            # at most one is present for a given field, so the ``or`` picks the
+            # one that applies without conflict.
+            min_length=_length("minLength") if "minLength" in inner else _length("minItems"),
+            max_length=_length("maxLength") if "maxLength" in inner else _length("maxItems"),
+        )
+
     def _build_enum(self, schema: JsonDict, field_path: str) -> type[Enum]:
         values = schema.get("enum")
         if not isinstance(values, list) or not values:
@@ -344,16 +438,26 @@ class _Converter:
             annotation, is_nullable = self._field_type(prop, f"{field_path}.{prop_name}")
             description = prop.get("description")
             desc = description if isinstance(description, str) else None
+            # Per-field value bounds (ge/le/gt/lt/min_length/max_length). Only
+            # the supported keywords cross over; everything else is dropped.
+            c = self._field_constraints(prop)
             optional = prop_name not in required
             # Union with None when the field is nullable OR optional — the two
             # are independent: a REQUIRED nullable field must still accept the
             # provider's ``null``.
             if is_nullable or optional:
                 annotation = annotation | None
-            if optional:
-                field_info = Field(default=None, description=desc)
-            else:
-                field_info = Field(..., description=desc)
+            default = None if optional else ...
+            field_info = Field(
+                default,
+                description=desc,
+                ge=c.ge,
+                le=c.le,
+                gt=c.gt,
+                lt=c.lt,
+                min_length=c.min_length,
+                max_length=c.max_length,
+            )
             fields[prop_name] = (annotation, field_info)
 
         model_name = (
@@ -417,6 +521,17 @@ def model_from_json_schema(
     * ``array`` (``items``), including arrays of objects
     * ``enum`` (string or integer members)
     * nested objects, inline or via local ``$ref`` (``#/$defs/...``)
+
+    Per-field constraints (carried into ``Field``; everything else dropped):
+
+    * numeric ``minimum``/``maximum`` → ``ge``/``le``,
+      ``exclusiveMinimum``/``exclusiveMaximum`` → ``gt``/``lt``
+    * ``minLength``/``maxLength`` → ``min_length``/``max_length`` (strings)
+    * ``minItems``/``maxItems`` → ``min_length``/``max_length`` (arrays)
+    * ``description`` → per-field ``Field`` description (instructor guidance)
+
+    Any constraint outside that set (``pattern``, ``format``, ``multipleOf``,
+    …) is **silently dropped** — no partial enforcement.
 
     Serialization contract:
         A non-required field becomes an optional Pydantic field defaulting to
