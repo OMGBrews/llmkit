@@ -53,6 +53,11 @@ dated `## [0.1.3]` section when the release is cut.
 - The retry helpers (`with_retries`, `retry_progress_callback`,
   `RetryProgressCallback`) are now exported from the package root, so callers
   no longer reach into `llmkit.retry` directly.
+- `RetryPolicy` (plus `DEFAULT_RETRY_POLICY` and `NO_RETRY`) is exported from
+  the package root — the per-call knob for the now default-on transient-error
+  retry layer (see _Changed_ below). `RetryPolicy` is a frozen dataclass
+  (`max_attempts`, `backoff_base_seconds`, `retry_on`); pass `retry=NO_RETRY`
+  to opt a call out, or a custom instance to tune the budget.
 - Reasoning/thinking control via `LLMClientConfig.reasoning_effort` (and a
   per-call `reasoning_effort` override on `structured_llm_call` /
   `structured_llm_call_sync` / `text_llm_call`), forwarded to LiteLLM. Lets
@@ -66,6 +71,21 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Changed
 
+- **Transient-error retries are now on by default.** `structured_llm_call`,
+  `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
+  the curated `LLM_RECOVERABLE_ERRORS` set (429 / 503 / 5xx, timeouts, transient
+  provider errors) on their own — three attempts with full-jitter backoff — so
+  reliability no longer depends on every caller wrapping each call. Programming
+  errors (e.g. `TypeError`) still propagate immediately. The budget is the new
+  per-call `retry: RetryPolicy` argument: pass `retry=NO_RETRY` to opt out or a
+  custom `RetryPolicy` to tune it. This layer stays **separate** from
+  instructor's in-call schema-repair budget (`validation_retries`, default 1) —
+  no double-counting — and each attempt remains its own logged call (so
+  `capture_llm_log_paths` sees one path per attempt). Streaming retries only a
+  failure that occurs **before the first chunk** is yielded; a partially
+  consumed stream cannot be transparently restarted. `with_retries()` remains
+  exported as the explicit, composable path for wrapping any awaitable, and now
+  takes a `retry_on` filter.
 - The internal LiteLLM call layer now forwards a provider's **full**
   `completion_kwargs()` dict (splatting it into the call) instead of
   cherry-picking `api_key` / `api_base`. This lets a provider carry whatever
