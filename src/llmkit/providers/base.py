@@ -25,6 +25,7 @@ package's ``__init__.py``.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -35,6 +36,30 @@ from typing import Protocol, runtime_checkable
 import instructor
 
 logger = logging.getLogger(__name__)
+
+
+def require_anthropic_sdk(provider_name: str) -> None:
+    """Raise a clear, actionable error if the Anthropic SDK is not installed.
+
+    The Anthropic and Bedrock providers both pin instructor's
+    ``ANTHROPIC_JSON`` mode. instructor reaches the Anthropic SDK only at
+    *call time*, on its ANTHROPIC_* usage-accounting path (``from
+    anthropic.types import Usage`` inside ``instructor/core/retry.py``), so
+    plain ``import llmkit`` and a Google-only flow never touch it. The SDK
+    therefore ships in the opt-in ``omg-llmkit[anthropic]`` extra rather than
+    the core install. Call this at provider construction so the failure
+    surfaces *eagerly* with a fix, instead of as a cryptic ``ModuleNotFound``
+    deep on the first completion.
+    """
+    if importlib.util.find_spec("anthropic") is None:
+        raise ModuleNotFoundError(
+            f"The {provider_name} provider requires the Anthropic SDK, which is "
+            "not installed. It ships in an opt-in extra so non-Anthropic hosts "
+            "take on no Anthropic dependency. Install it with:\n\n"
+            "    pip install 'omg-llmkit[anthropic]'\n\n"
+            "(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' "
+            "pulls it in.)"
+        )
 
 
 class Provider(StrEnum):

@@ -3,7 +3,7 @@
 These tests never touch the network and never read a provider credential.
 They pin the behaviour the rate limiter promises:
 
-* limiting is **on by default** with a per-provider cap of 2 (zero config),
+* limiting is **on by default** with a per-provider cap of 8 (zero config),
 * each provider gets an **independent** budget (keyed by provider name),
 * reconfiguring the cap / disabling takes effect for subsequent acquires,
 * a :meth:`configure` swap never strands in-flight callers on the old
@@ -25,22 +25,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from llmkit import _litellm
-from llmkit.rate_limiting import GlobalRateLimiter, configure_rate_limit
+from llmkit.rate_limiting import (
+    GlobalRateLimiter,
+    configure_rate_limit,
+    get_rate_limit_config,
+)
 
 
 @pytest.fixture(autouse=True)
 def reset_rate_limiter() -> Iterator[None]:
     """Reset the process-global limiter to its shipped default around each test.
 
-    The default state is on-by-default with a per-provider cap of 2.
+    The default state is on-by-default with a per-provider cap of 8.
     ``configure`` also clears the semaphore registries, so no semaphore
     constructed in one test can leak into the next.
     """
-    GlobalRateLimiter.configure(max_concurrent=2, enabled=True)
+    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
     try:
         yield
     finally:
-        GlobalRateLimiter.configure(max_concurrent=2, enabled=True)
+        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
 
 
 class _ConcurrencyProbe:
@@ -64,35 +68,35 @@ class _ConcurrencyProbe:
                     self.current -= 1
 
 
-async def test_default_on_caps_at_two_with_zero_config() -> None:
-    """With no configuration at all, one key caps concurrency at 2."""
+async def test_default_on_caps_at_eight_with_zero_config() -> None:
+    """With no configuration at all, one key caps concurrency at 8."""
     probe = _ConcurrencyProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(5)]
+    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(11)]
 
-    # Let the scheduler run; exactly 2 should get in, the rest block.
+    # Let the scheduler run; exactly 8 should get in, the rest block.
     for _ in range(20):
         await asyncio.sleep(0)
-    assert probe.current == 2
-    assert probe.peak == 2
+    assert probe.current == 8
+    assert probe.peak == 8
 
     hold.set()
     await asyncio.gather(*tasks)
-    assert probe.peak == 2
+    assert probe.peak == 8
 
 
 async def test_providers_have_independent_budgets() -> None:
-    """Saturating one key does not block a different key; each caps at 2."""
+    """Saturating one key does not block a different key; each caps at 8."""
     probe = _ConcurrencyProbe()
     openai_hold = asyncio.Event()
     ollama_hold = asyncio.Event()
 
-    # Saturate openai with 2 holders + 1 waiter.
-    openai_tasks = [asyncio.create_task(probe.run("openai", openai_hold)) for _ in range(3)]
+    # Saturate openai with 8 holders + 1 waiter.
+    openai_tasks = [asyncio.create_task(probe.run("openai", openai_hold)) for _ in range(9)]
     for _ in range(20):
         await asyncio.sleep(0)
-    assert probe.current == 2  # openai is full
+    assert probe.current == 8  # openai is full
 
     # An ollama acquire must proceed immediately despite openai being full.
     ollama_proceeded = asyncio.Event()
@@ -107,8 +111,8 @@ async def test_providers_have_independent_budgets() -> None:
         await asyncio.sleep(0)
     assert ollama_proceeded.is_set(), "ollama was blocked by openai's full budget"
 
-    # Independent caps: openai still holds exactly 2 (its third is queued).
-    assert probe.current == 2
+    # Independent caps: openai still holds exactly 8 (its ninth is queued).
+    assert probe.current == 8
 
     openai_hold.set()
     ollama_hold.set()
@@ -219,3 +223,16 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
 
     assert text == "hi"
     assert recorded == ["ollama"]
+
+
+def test_get_rate_limit_config_reports_effective_values() -> None:
+    """``get_rate_limit_config`` reflects the default and any reconfiguration,
+    so a host can read its effective limits without touching ``_max_concurrent``."""
+    default = get_rate_limit_config()
+    assert default.enabled is True
+    assert default.max_concurrent == 8
+
+    configure_rate_limit(max_concurrent=3, enabled=False)
+    updated = get_rate_limit_config()
+    assert updated.enabled is False
+    assert updated.max_concurrent == 3

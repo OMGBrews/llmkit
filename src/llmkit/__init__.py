@@ -13,7 +13,12 @@ This package provides:
 - Per-call invocation logging via a pluggable sink (with approximate cost)
 """
 
-from llmkit.exceptions import LLM_RECOVERABLE_ERRORS
+from llmkit.exceptions import (
+    LLM_RECOVERABLE_ERRORS,
+    LLM_SCHEMA_ERRORS,
+    LLM_TRANSPORT_ERRORS,
+)
+from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
     LLMCallRecord,
     LocalYamlLogSink,
@@ -38,7 +43,9 @@ from llmkit.providers import (
 )
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
+    RateLimitConfig,
     configure_rate_limit,
+    get_rate_limit_config,
 )
 from llmkit.retry import (
     DEFAULT_RETRY_POLICY,
@@ -80,6 +87,8 @@ __all__ = [
     # Rate limiting
     "GlobalRateLimiter",
     "configure_rate_limit",
+    "get_rate_limit_config",
+    "RateLimitConfig",
     # Retries (transient-error recovery, on by default via RetryPolicy;
     # with_retries is the explicit composable path for any awaitable)
     "RetryPolicy",
@@ -94,6 +103,10 @@ __all__ = [
     "text_llm_call",
     "stream_text_with_log",
     "capture_llm_log_paths",
+    # JSON-schema-dict structured output (build-once-reuse helper)
+    "model_from_json_schema",
     # Exception handling
     "LLM_RECOVERABLE_ERRORS",
+    "LLM_TRANSPORT_ERRORS",
+    "LLM_SCHEMA_ERRORS",
 ]

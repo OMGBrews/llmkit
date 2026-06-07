@@ -28,6 +28,21 @@ import llmkit
 
 Requires Python ≥ 3.13.
 
+The core install routes OpenRouter, Google, OpenAI, DeepSeek, and Ollama with no
+extra dependencies. Two providers gate their dependencies behind opt-in extras so
+hosts pay only for what they call:
+
+```bash
+pip install "omg-llmkit[anthropic]"  # direct Anthropic (Claude) routing
+pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (pulls in [anthropic] too)
+```
+
+The Anthropic SDK is opt-in because `instructor` reaches it only at *call time*,
+on its `ANTHROPIC_JSON` usage-accounting path — plain `import llmkit` and a
+Google-only flow never touch it. Constructing the `AnthropicProvider` or
+`BedrockProvider` without the SDK raises a clear `install omg-llmkit[anthropic]`
+error at construction, not a cryptic failure on the first call.
+
 ## Quick start
 
 ```python
@@ -67,7 +82,45 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 
-Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a conservative cap of **2 concurrent calls per provider** — enough to keep a metered cloud account from a self-inflicted burst without throttling normal use. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off; `configure_llm_logging(sink)` swaps the log sink (below).
+### Contracts as JSON-schema dicts
+
+If your structured-output contract is a **JSON-schema dict** — typically because the same schema is shared with a Node backend or a frontend — `model_from_json_schema(schema)` converts it to a Pydantic model at runtime, so you don't hand-write the converter (and re-discover its footguns). Build the model **once and reuse it**; `structured_llm_call` stays Pydantic-model-only and takes the result as `output_schema`.
+
+```python
+from llmkit import model_from_json_schema, structured_llm_call
+
+INVOICE_SCHEMA = {                       # shared with Node / the frontend
+    "title": "Invoice",
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "total": {"type": "number"},
+        "status": {"enum": ["open", "closed", "void"]},
+        "note": {"type": ["string", "null"]},          # optional, nullable
+        "lines": {"type": "array", "items": {"$ref": "#/$defs/Line"}},
+    },
+    "required": ["id", "total", "status", "lines"],
+    "$defs": {
+        "Line": {
+            "type": "object",
+            "properties": {"sku": {"type": "string"}, "qty": {"type": "integer"}},
+            "required": ["sku"],
+        }
+    },
+}
+
+Invoice = model_from_json_schema(INVOICE_SCHEMA)   # build once, at import
+
+result = await structured_llm_call(
+    prompt="Extract the invoice.",
+    output_schema=Invoice,                         # reuse on every call
+    feature="billing",
+)
+```
+
+**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); and nested objects inline or via local `$ref` (`#/$defs/...`). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` default to **`exclude_none=True`** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). Pass `exclude_none=False` to keep the nulls. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly.
+
+Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a default cap of **8 concurrent calls per provider** — enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off, and `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
 
 ## Logging: agent-readable by default
 
@@ -162,7 +215,11 @@ Register the config with `configure_llm_client(source)`, where `source` is a zer
 
 Two retry layers, kept deliberately separate:
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`) on its own — you don't wrap anything. The default `RetryPolicy` is three attempts with bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
+  - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
+  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks.
+
+  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. Both budgets use bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
   Tune or opt out per call with the `retry=` argument:
 
@@ -190,20 +247,22 @@ Two retry layers, kept deliberately separate:
 
   **Streaming caveat:** `stream_text_with_log` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
 
-  **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+  **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**); the old `max_retries` keyword still works as a **deprecated alias** that warns. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
 
   ```python
-  from llmkit import with_retries, LLM_RECOVERABLE_ERRORS
+  from llmkit import with_retries, LLM_TRANSPORT_ERRORS
 
   result = await with_retries(
       lambda: do_some_work(),
-      max_retries=3,
+      max_attempts=3,
       backoff_base_seconds=0.5,
-      retry_on=LLM_RECOVERABLE_ERRORS,
+      retry_on=LLM_TRANSPORT_ERRORS,
   )
   ```
 
-- **instructor's own low `max_retries`** handles *schema-validation* repair (re-ask the model to fix malformed JSON). This stays **separate** from the transient-retry layer above — the two budgets are never conflated, so attempts aren't double-counted.
+  > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active inner llmkit retry loop and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`.
+
+- **instructor's own low `validation_retries`** (default 1) handles *in-call* schema-validation repair — re-asking the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ## Development
 

@@ -12,6 +12,38 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Added
 
+- `model_from_json_schema(schema, *, name=None)` — converts a **JSON-schema
+  dict** into a Pydantic model class at runtime, so consumers who declare their
+  structured-output contracts as JSON-schema dicts (shared across Node /
+  frontend / Python) no longer hand-write a converter before calling
+  `structured_llm_call`. The intended pattern is **build-once-reuse**
+  (`Invoice = model_from_json_schema(schema)` at import, then pass `Invoice` as
+  `output_schema` on every call); `structured_llm_call`'s signature is
+  unchanged (still `output_schema: type[T] -> T`, no `dict` overload). Built on
+  `pydantic.create_model` (no new third-party dependency). Supported subset:
+  `object` with `properties` and a `required` array; scalars (`string` /
+  `integer` / `number` / `boolean`, plus `null` / nullable via
+  `["string", "null"]` or an `anyOf` null branch); `array` with `items`
+  (including arrays of objects); `enum` (string or integer members); and nested
+  objects inline or via local `$ref` (`#/$defs/...` / `#/definitions/...`).
+  Anything outside the subset raises a clear `ValueError` naming the construct
+  and its path, rather than silently producing a wrong model. Two footguns the
+  CaCL dogfood hit are handled and tested: (1) a non-required field maps to an
+  *optional* Pydantic field defaulting to `None`, and the generated model's
+  `model_dump` / `model_dump_json` default to `exclude_none=True`, so an
+  omitted optional is **absent** rather than `"field": null` (which would fail
+  downstream re-validation against the same schema); pass `exclude_none=False`
+  to keep the nulls. (2) A title-less or empty-titled schema still yields a
+  validly-named class (default `JsonSchemaModel`), which `create_model` and
+  `instructor` both require. Exported from the package root.
+- A `py.typed` marker so consumers' type checkers honor llmkit's type hints
+  (the package is basedpyright-clean and already declares the `Typing :: Typed`
+  classifier, but without the PEP 561 marker downstream tools treated it as
+  untyped and required an `ignore_missing_imports` override).
+- `get_rate_limit_config()` (returning a frozen `RateLimitConfig`) — the
+  symmetric read for `configure_rate_limit`, so a host can log or assert its
+  effective `enabled` / `max_concurrent` at startup without reaching into
+  limiter internals. Both are exported from the package root.
 - **AWS Bedrock** provider (`Provider.BEDROCK` / `BedrockProvider`, `bedrock/`
   LiteLLM prefix), giving first-class access to Claude-on-Bedrock. Unlike every
   other provider, Bedrock authenticates through the standard **AWS credential
@@ -71,12 +103,32 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Changed
 
+- **The Anthropic SDK moved from a core dependency to the opt-in
+  `omg-llmkit[anthropic]` extra.** It was core through 0.1.2 on the belief that
+  `instructor` forced it at import; measured against `instructor>=1.15.1`, that
+  is false — `instructor` reaches the SDK only at *call time*, on its
+  `ANTHROPIC_*` usage-accounting path (`from anthropic.types import Usage` inside
+  `instructor/core/retry.py`, guarded by the mode), so plain `import llmkit` and
+  a Google-only flow never touch it. Non-Anthropic hosts now take on no Anthropic
+  dependency. The `AnthropicProvider` and `BedrockProvider` (both pin
+  `ANTHROPIC_JSON`, so both need the SDK at call time) raise a clear
+  `install omg-llmkit[anthropic]` error *at construction* when the SDK is absent,
+  rather than failing cryptically on the first completion. The `[bedrock]` extra
+  pulls in `[anthropic]` (it routes Claude), and a new convenience `[all]` extra
+  installs every provider's optional dependencies at once. **Migration:** hosts
+  that route Anthropic or Bedrock should install `omg-llmkit[anthropic]` (or
+  `omg-llmkit[bedrock]`, or `omg-llmkit[all]`); hosts on other providers need no
+  change.
 - **Transient-error retries are now on by default.** `structured_llm_call`,
   `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
-  the curated `LLM_RECOVERABLE_ERRORS` set (429 / 503 / 5xx, timeouts, transient
-  provider errors) on their own — three attempts with full-jitter backoff — so
-  reliability no longer depends on every caller wrapping each call. Programming
-  errors (e.g. `TypeError`) still propagate immediately. The budget is the new
+  the curated recoverable set (429 / 503 / 5xx, timeouts, transient
+  provider errors) on their own — with full-jitter backoff — so
+  reliability no longer depends on every caller wrapping each call. The transient
+  set names the specific transient `openai` subclasses (`RateLimitError` /
+  `InternalServerError` / `APIConnectionError`) rather than their broad
+  `openai.APIError` base, so **permanent 4xx errors — authentication (401),
+  bad-request (400), permission (403) — fail fast** instead of burning the retry
+  budget. Programming errors (e.g. `TypeError`) still propagate immediately. The budget is the new
   per-call `retry: RetryPolicy` argument: pass `retry=NO_RETRY` to opt out or a
   custom `RetryPolicy` to tune it. This layer stays **separate** from
   instructor's in-call schema-repair budget (`validation_retries`, default 1) —
@@ -86,6 +138,56 @@ dated `## [0.1.3]` section when the release is cut.
   consumed stream cannot be transparently restarted. `with_retries()` remains
   exported as the explicit, composable path for wrapping any awaitable, and now
   takes a `retry_on` filter.
+- **Transport and schema-validation retries now have separate budgets.** The
+  recoverable set is split into `LLM_TRANSPORT_ERRORS` (rate limits, transient
+  5xx, network/timeout) and `LLM_SCHEMA_ERRORS` (pydantic `ValidationError`,
+  instructor `InstructorRetryException`), and `RetryPolicy` counts each against
+  its own budget: transport keeps `max_attempts` (default **3**), while the new
+  `validation_max_attempts` (default **2** = one retry) governs schema failures.
+  A deterministically-wrong schema or impossible constraint can no longer burn
+  the full transport budget on doomed re-asks, while a *transiently*-malformed
+  JSON response still earns one cross-call retry. `LLM_RECOVERABLE_ERRORS`
+  remains the **union** of the two subsets, so its documented `except`-clause
+  catch-set contract is unchanged. `NO_RETRY` disables **both** budgets (a single
+  attempt). `RetryPolicy` gains `validation_max_attempts` and
+  `validation_retry_on` (defaulting to `LLM_SCHEMA_ERRORS`); this cross-call
+  layer remains separate from instructor's in-call `validation_retries`
+  (default 1, which repairs malformed JSON *within* one attempt before any
+  `ValidationError` reaches the retry layer). Flagged by the PIA Maker and FiW
+  dogfoods of the 0.1.3 RC.
+- **Unified the public retry attempt-count on `max_attempts`.** `RetryPolicy`
+  already used `max_attempts`; `with_retries(...)` now uses it too, with the same
+  semantics everywhere — *total attempts including the first* (`N`, not `1 + N`).
+  The old `with_retries(..., max_retries=...)` keyword keeps working as a
+  **deprecated alias** that emits a `DeprecationWarning` and maps to
+  `max_attempts` (`max_attempts` wins if both are given), so existing consumers
+  (e.g. pia-maker) don't break. The progress-callback keyword stays `max_retries`
+  for backward compatibility. `LLM_TRANSPORT_ERRORS` and `LLM_SCHEMA_ERRORS` are
+  exported from the package root alongside `LLM_RECOVERABLE_ERRORS`.
+- **`with_retries` now guards against nested retry-budget multiplication.**
+  Because the call functions retry internally by default, wrapping one in
+  `with_retries` previously multiplied the budgets silently (the `3 × 3 = 9`
+  trap the PIA Maker dogfood hit). `with_retries` now detects (via a context
+  variable) when it runs *inside* an already-active llmkit retry loop and
+  collapses that inner layer to a **single pass** — so the budgets no longer
+  multiply, and per-attempt logging is preserved. An *accidental* double-wrap
+  additionally emits a filterable `RuntimeWarning` (so consumers running under
+  `-W error` can filter it). The guard does not affect `with_retries` wrapping a
+  plain (non-llmkit) awaitable, which still retries normally. The clean way to
+  drive retries from an outer wrapper is to opt the inner call out with
+  `retry=NO_RETRY` — which collapses the inner pass **without** warning; this is
+  documented in `with_retries`' docstring.
+- **Concurrency rate limiting is now on by default, scoped per provider.**
+  Previously the limiter was off until a host opted in, and a single process-wide
+  budget fronted every provider. It is now active out of the box and bounds
+  concurrent calls **per provider** (keyed by the effective provider name, the
+  same value logging records), so fan-out to one provider can't overrun its rate
+  limits or eat another provider's budget. The default cap is **8 concurrent
+  calls per provider** — headroom for the fan-out workloads consumers actually
+  run, while still bounding a self-inflicted burst; a tightly-metered account can
+  lower it. `configure_rate_limit(max_concurrent=..., enabled=...)` changes the
+  cap or turns it off, and `get_rate_limit_config()` reads back the effective
+  values.
 - The internal LiteLLM call layer now forwards a provider's **full**
   `completion_kwargs()` dict (splatting it into the call) instead of
   cherry-picking `api_key` / `api_base`. This lets a provider carry whatever
@@ -116,6 +218,21 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Fixed
 
+- **Synchronous calls no longer leak a `coroutine 'Logging.async_success_handler'
+  was never awaited` `RuntimeWarning` to stderr.** LiteLLM logs successes
+  asynchronously without awaiting inline — it queues the
+  `async_success_handler` coroutine on a background worker — so the sync bridge
+  (`structured_llm_call_sync` and the sync text path, via `run_sync`) could
+  close its event loop with that coroutine still un-awaited, surfacing the
+  warning on an otherwise clean call (flagged by the FiW dogfood of the 0.1.3 RC
+  in both a CLI and a Lambda). `run_sync` now **drains** LiteLLM's pending async
+  logging before tearing the loop down: it flushes the logging worker's queue
+  (awaiting the queued handlers) and then cancels any remaining background tasks
+  — bounded by the same `timeout` budget so a hung callback can't wedge the
+  bridge, and applied to **both** `run_sync` branches (the `asyncio.run` path
+  and the worker-thread path used when a loop is already running). The drain is
+  best-effort and never converts a successful call into a failure; genuine call
+  errors still propagate.
 - `text_llm_call` now coerces provider **list-content** responses to a single
   string. Some providers return `message.content` as a list of content blocks
   rather than a string; the call previously returned that list verbatim,

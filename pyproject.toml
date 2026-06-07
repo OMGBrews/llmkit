@@ -24,27 +24,49 @@ dependencies = [
     "litellm>=1.87.1",
     "instructor>=1.15.1",
     "openai>=2.0.0",
-    # instructor imports the Anthropic SDK to account usage for its native
-    # ANTHROPIC_JSON mode (instructor/core/retry.py), so the Anthropic
-    # provider fails at call time without it. Required, not optional, because
-    # llmkit treats Anthropic as a first-class provider.
-    "anthropic>=0.69",
     "pydantic>=2.5.0",
     "pyyaml>=6.0.0",
     "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
+# Anthropic (Claude) routing, direct and via Bedrock. instructor imports the
+# Anthropic SDK *only at call time* — and only on its ANTHROPIC_* usage-
+# accounting path (`from anthropic.types import Usage` inside
+# instructor/core/retry.py, guarded by `mode in {ANTHROPIC_JSON, ...}`). Plain
+# `import instructor` / `from_litellm(..., ANTHROPIC_JSON)` construct fine
+# without it; the SDK is reached only when an Anthropic (or Bedrock, which pins
+# ANTHROPIC_JSON) completion actually runs. So it is opt-in: non-Anthropic
+# hosts (e.g. Google-only) take on no Anthropic dependency, and the Anthropic /
+# Bedrock providers raise a clear "install omg-llmkit[anthropic]" error at
+# construction when it is absent.
+anthropic = [
+    "anthropic>=0.69",
+]
+# AWS Bedrock routing. LiteLLM's bedrock/ path needs boto3 for SigV4 request
+# signing; it is opt-in so non-Bedrock installs take on no AWS dependency.
+# Bedrock routes Claude and pins instructor's ANTHROPIC_JSON mode, so it also
+# needs the Anthropic SDK at call time — hence it pulls in the `anthropic` extra.
+bedrock = [
+    "boto3>=1.34",
+    "omg-llmkit[anthropic]",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "ruff==0.15.0",
     "basedpyright>=1.39",
+    # The offline test suite imports the Anthropic and Bedrock providers and
+    # exercises their construction; keep the Anthropic SDK present for dev/CI so
+    # `uv sync --extra dev` yields a fully green suite.
+    "omg-llmkit[anthropic]",
 ]
-# AWS Bedrock routing. LiteLLM's bedrock/ path needs boto3 for SigV4 request
-# signing; it is opt-in so non-Bedrock installs take on no AWS dependency.
-bedrock = [
-    "boto3>=1.34",
+# Convenience: pull in every optional provider dependency at once, so a host
+# that wants the full provider surface can `pip install 'omg-llmkit[all]'`
+# instead of enumerating extras.
+all = [
+    "omg-llmkit[anthropic]",
+    "omg-llmkit[bedrock]",
 ]
 
 [project.urls]

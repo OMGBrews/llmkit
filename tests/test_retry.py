@@ -46,7 +46,7 @@ async def test_progress_callback_invoked_on_non_final_failure() -> None:
         return "ok"
 
     with retry_progress_callback(cb):
-        result = await with_retries(flaky, max_retries=2, label="x")
+        result = await with_retries(flaky, max_attempts=2, label="x")
 
     assert result == "ok"
     assert cb.calls == [("x", 1, 2, "first try fails")]
@@ -61,7 +61,7 @@ async def test_progress_callback_not_invoked_on_first_success() -> None:
         return 42
 
     with retry_progress_callback(cb):
-        result = await with_retries(succeed, max_retries=3, label="x")
+        result = await with_retries(succeed, max_attempts=3, label="x")
 
     assert result == 42
     assert cb.calls == []
@@ -79,7 +79,7 @@ async def test_progress_callback_not_invoked_for_final_failure() -> None:
         raise ValueError("nope")
 
     with retry_progress_callback(cb), pytest.raises(ValueError, match="nope"):
-        await with_retries(always_fails, max_retries=2, label="x")
+        await with_retries(always_fails, max_attempts=2, label="x")
 
     # Only one callback: attempt 1/2 (non-final). Attempt 2/2 is final → no callback.
     assert cb.calls == [("x", 1, 2, "nope")]
@@ -97,7 +97,7 @@ async def test_progress_callback_default_none_no_op() -> None:
         return "ok"
 
     # No retry_progress_callback context — relies on default ContextVar value (None).
-    result = await with_retries(flaky, max_retries=2, label="x")
+    result = await with_retries(flaky, max_attempts=2, label="x")
     assert result == "ok"
 
 
@@ -120,7 +120,7 @@ async def test_progress_callback_exception_does_not_break_retry(
         return "ok"
 
     with retry_progress_callback(bad_callback), caplog.at_level(logging.ERROR):
-        result = await with_retries(flaky, max_retries=2, label="x")
+        result = await with_retries(flaky, max_attempts=2, label="x")
 
     assert result == "ok"
     assert any("retry progress callback raised" in r.message for r in caplog.records)
@@ -144,7 +144,7 @@ async def test_no_backoff_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
             raise ValueError("fail")
         return "ok"
 
-    result = await with_retries(flaky, max_retries=3, label="x")
+    result = await with_retries(flaky, max_attempts=3, label="x")
     assert result == "ok"
     assert slept == []  # no backoff configured
 
@@ -169,7 +169,7 @@ async def test_backoff_sleeps_between_retries_with_jittered_ceiling(
         raise ValueError("nope")
 
     with pytest.raises(ValueError, match="nope"):
-        await with_retries(always_fails, max_retries=3, label="x", backoff_base_seconds=2.0)
+        await with_retries(always_fails, max_attempts=3, label="x", backoff_base_seconds=2.0)
 
     # Two non-final failures (attempts 1 and 2) → two sleeps; attempt 3 is
     # final (no sleep). Ceilings: 2*2**0=2.0, 2*2**1=4.0.
@@ -189,7 +189,7 @@ async def test_backoff_not_slept_on_success(monkeypatch: pytest.MonkeyPatch) -> 
     async def succeed() -> int:
         return 7
 
-    result = await with_retries(succeed, max_retries=3, backoff_base_seconds=5.0)
+    result = await with_retries(succeed, max_attempts=3, backoff_base_seconds=5.0)
     assert result == 7
     assert slept == []
 
@@ -206,10 +206,10 @@ async def test_retry_progress_callback_resets_on_exit() -> None:
 
     with retry_progress_callback(cb_outer):
         with retry_progress_callback(cb_inner), pytest.raises(ValueError):
-            await with_retries(flaky, max_retries=2, label="inner")
+            await with_retries(flaky, max_attempts=2, label="inner")
         # Outer scope's callback should be active again.
         with pytest.raises(ValueError):
-            await with_retries(flaky, max_retries=2, label="outer")
+            await with_retries(flaky, max_attempts=2, label="outer")
 
     assert cb_inner.calls == [("inner", 1, 2, "always")]
     assert cb_outer.calls == [("outer", 1, 2, "always")]
