@@ -25,11 +25,14 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+import openai
 import pytest
 from pydantic import BaseModel
 
 from llmkit import (
     DEFAULT_RETRY_POLICY,
+    LLM_RECOVERABLE_ERRORS,
     NO_RETRY,
     LocalYamlLogSink,
     RetryPolicy,
@@ -403,3 +406,69 @@ def test_max_attempts_zero_raises_value_error() -> None:
     """``RetryPolicy(max_attempts=0)`` is rejected at construction."""
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
         _ = RetryPolicy(max_attempts=0)
+
+
+# --- transient set excludes auth / non-429 4xx ---------------------------
+
+
+def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
+    """Build a minimal ``openai`` status error of *cls* for offline tests."""
+    request = httpx.Request("POST", "https://api.test/v1/chat/completions")
+    return cls("boom", response=httpx.Response(status, request=request), body=None)
+
+
+def test_recoverable_set_excludes_auth_and_other_4xx() -> None:
+    """Permanent 4xx errors are not in the transient set; 429 / 5xx / network are.
+
+    This is the core of the auth/4xx fix: the set names specific transient
+    ``openai`` subclasses rather than the broad ``openai.APIError`` base, so a
+    bad key or malformed request can't be mistaken for something worth retrying.
+    """
+    assert not isinstance(_status_error(openai.AuthenticationError, 401), LLM_RECOVERABLE_ERRORS)
+    assert not isinstance(_status_error(openai.BadRequestError, 400), LLM_RECOVERABLE_ERRORS)
+    assert not isinstance(_status_error(openai.PermissionDeniedError, 403), LLM_RECOVERABLE_ERRORS)
+
+    assert isinstance(_status_error(openai.RateLimitError, 429), LLM_RECOVERABLE_ERRORS)
+    assert isinstance(_status_error(openai.InternalServerError, 503), LLM_RECOVERABLE_ERRORS)
+    conn = openai.APIConnectionError(message="down", request=httpx.Request("POST", "https://x"))
+    assert isinstance(conn, LLM_RECOVERABLE_ERRORS)
+
+
+@pytest.mark.asyncio
+async def test_structured_auth_error_is_not_retried() -> None:
+    """A 401 ``AuthenticationError`` fails fast: a single attempt, no retry."""
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+        calls[0] += 1
+        raise _status_error(openai.AuthenticationError, 401)
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(openai.AuthenticationError),
+    ):
+        await structured_output.structured_llm_call(
+            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
+    """A 429 ``RateLimitError`` is transient: retried once, then succeeds."""
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise _status_error(openai.RateLimitError, 429)
+        return _Schema(ok=True), None
+
+    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+        result = await structured_output.structured_llm_call(
+            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert result.ok is True
+    assert calls[0] == 2

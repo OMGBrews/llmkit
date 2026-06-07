@@ -67,7 +67,7 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 
-Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a conservative cap of **2 concurrent calls per provider** — enough to keep a metered cloud account from a self-inflicted burst without throttling normal use. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off; `configure_llm_logging(sink)` swaps the log sink (below).
+Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a default cap of **8 concurrent calls per provider** — enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off, and `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
 
 ## Logging: agent-readable by default
 

@@ -12,6 +12,14 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Added
 
+- A `py.typed` marker so consumers' type checkers honor llmkit's type hints
+  (the package is basedpyright-clean and already declares the `Typing :: Typed`
+  classifier, but without the PEP 561 marker downstream tools treated it as
+  untyped and required an `ignore_missing_imports` override).
+- `get_rate_limit_config()` (returning a frozen `RateLimitConfig`) — the
+  symmetric read for `configure_rate_limit`, so a host can log or assert its
+  effective `enabled` / `max_concurrent` at startup without reaching into
+  limiter internals. Both are exported from the package root.
 - **AWS Bedrock** provider (`Provider.BEDROCK` / `BedrockProvider`, `bedrock/`
   LiteLLM prefix), giving first-class access to Claude-on-Bedrock. Unlike every
   other provider, Bedrock authenticates through the standard **AWS credential
@@ -75,8 +83,12 @@ dated `## [0.1.3]` section when the release is cut.
   `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
   the curated `LLM_RECOVERABLE_ERRORS` set (429 / 503 / 5xx, timeouts, transient
   provider errors) on their own — three attempts with full-jitter backoff — so
-  reliability no longer depends on every caller wrapping each call. Programming
-  errors (e.g. `TypeError`) still propagate immediately. The budget is the new
+  reliability no longer depends on every caller wrapping each call. The transient
+  set names the specific transient `openai` subclasses (`RateLimitError` /
+  `InternalServerError` / `APIConnectionError`) rather than their broad
+  `openai.APIError` base, so **permanent 4xx errors — authentication (401),
+  bad-request (400), permission (403) — fail fast** instead of burning the retry
+  budget. Programming errors (e.g. `TypeError`) still propagate immediately. The budget is the new
   per-call `retry: RetryPolicy` argument: pass `retry=NO_RETRY` to opt out or a
   custom `RetryPolicy` to tune it. This layer stays **separate** from
   instructor's in-call schema-repair budget (`validation_retries`, default 1) —
@@ -86,6 +98,17 @@ dated `## [0.1.3]` section when the release is cut.
   consumed stream cannot be transparently restarted. `with_retries()` remains
   exported as the explicit, composable path for wrapping any awaitable, and now
   takes a `retry_on` filter.
+- **Concurrency rate limiting is now on by default, scoped per provider.**
+  Previously the limiter was off until a host opted in, and a single process-wide
+  budget fronted every provider. It is now active out of the box and bounds
+  concurrent calls **per provider** (keyed by the effective provider name, the
+  same value logging records), so fan-out to one provider can't overrun its rate
+  limits or eat another provider's budget. The default cap is **8 concurrent
+  calls per provider** — headroom for the fan-out workloads consumers actually
+  run, while still bounding a self-inflicted burst; a tightly-metered account can
+  lower it. `configure_rate_limit(max_concurrent=..., enabled=...)` changes the
+  cap or turns it off, and `get_rate_limit_config()` reads back the effective
+  values.
 - The internal LiteLLM call layer now forwards a provider's **full**
   `completion_kwargs()` dict (splatting it into the call) instead of
   cherry-picking `api_key` / `api_base`. This lets a provider carry whatever

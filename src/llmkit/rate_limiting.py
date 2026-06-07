@@ -17,14 +17,14 @@ the *effective* provider (see
 :func:`llmkit.structured_output._resolve_model_and_provider`), so a held
 slot is always accounted to the provider that actually runs the call.
 
-The default cap is **2 concurrent calls per provider**. Two is a
-conservative default: it protects a metered cloud account from a
-self-inflicted concurrent burst (and the bill / 429s that follow) without
-throttling normal interactive use. A host that wants more headroom — e.g.
-a local Ollama server that is happy to fan out — raises it once via
-:func:`configure_rate_limit`. A single cap value applies to *all*
-providers; there is intentionally no per-provider cap map, to keep the
-public surface small (one number, one switch).
+The default cap is **8 concurrent calls per provider**. Eight favours the
+common access pattern — fan-out — out of the box: it still bounds a
+self-inflicted burst (and the bill / 429s that follow) but doesn't quietly
+serialise the multi-call workloads consumers actually run. A host on a
+tightly-metered plan can lower it once via :func:`configure_rate_limit`; a
+local Ollama server happy to fan out harder can raise it. A single cap value
+applies to *all* providers; there is intentionally no per-provider cap map, to
+keep the public surface small (one number, one switch).
 
 Deliberate non-goals
 --------------------
@@ -44,6 +44,7 @@ import contextlib
 import logging
 import threading
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class GlobalRateLimiter:
     in-flight callers on a different semaphore than the one they acquired
     from — they release back onto their own snapshot.
 
-    Enabled by default with a per-provider cap of 2; see the module
+    Enabled by default with a per-provider cap of 8; see the module
     docstring for the rationale and the deliberate non-goals (no
     per-credential scoping, no extra global ceiling).
     """
@@ -78,11 +79,11 @@ class GlobalRateLimiter:
     _lock: threading.Lock = threading.Lock()
     _async_semaphores: dict[str, asyncio.Semaphore] = {}
     _sync_semaphores: dict[str, threading.Semaphore] = {}
-    _max_concurrent: int = 2
+    _max_concurrent: int = 8
     _enabled: bool = True
 
     @classmethod
-    def configure(cls, max_concurrent: int = 2, enabled: bool = True) -> None:
+    def configure(cls, max_concurrent: int = 8, enabled: bool = True) -> None:
         """Configure the global per-provider rate limit.
 
         Intended to be called once at startup before any LLM calls run.
@@ -111,6 +112,12 @@ class GlobalRateLimiter:
     def is_enabled(cls) -> bool:
         """Whether rate limiting is currently enabled."""
         return cls._enabled
+
+    @classmethod
+    def max_concurrent(cls) -> int:
+        """The current per-provider concurrency cap (the symmetric read of the
+        value ``configure`` sets)."""
+        return cls._max_concurrent
 
     @classmethod
     def _get_async_semaphore(cls, key: str) -> asyncio.Semaphore:
@@ -171,10 +178,22 @@ class GlobalRateLimiter:
             sem.release()
 
 
-def configure_rate_limit(max_concurrent: int = 2, enabled: bool = True) -> None:
+@dataclass(frozen=True)
+class RateLimitConfig:
+    """A read-only snapshot of the effective rate-limit configuration.
+
+    Returned by :func:`get_rate_limit_config` so a host can log or assert its
+    effective limits at startup without reaching into limiter internals.
+    """
+
+    enabled: bool
+    max_concurrent: int
+
+
+def configure_rate_limit(max_concurrent: int = 8, enabled: bool = True) -> None:
     """Configure the global, per-provider LLM rate limit.
 
-    Rate limiting is on by default (cap 2 per provider); call this only to
+    Rate limiting is on by default (cap 8 per provider); call this only to
     change the cap or turn it off. Call once at startup before any LLM calls
     run. When enabled, every provider call routed through the LiteLLM call
     layer passes through that provider's semaphore.
@@ -184,3 +203,20 @@ def configure_rate_limit(max_concurrent: int = 2, enabled: bool = True) -> None:
         enabled: Whether rate limiting is active.
     """
     GlobalRateLimiter.configure(max_concurrent, enabled)
+
+
+def get_rate_limit_config() -> RateLimitConfig:
+    """Read the effective rate-limit configuration.
+
+    The symmetric read for :func:`configure_rate_limit`: lets a host log or
+    assert its effective limits at startup without touching limiter internals
+    (e.g. ``GlobalRateLimiter._max_concurrent``).
+
+    Returns:
+        A :class:`RateLimitConfig` snapshot of the current ``enabled`` flag and
+        per-provider ``max_concurrent`` cap.
+    """
+    return RateLimitConfig(
+        enabled=GlobalRateLimiter.is_enabled(),
+        max_concurrent=GlobalRateLimiter.max_concurrent(),
+    )

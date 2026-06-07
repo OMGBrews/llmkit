@@ -38,7 +38,9 @@ from llmkit.providers import (
 )
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
+    RateLimitConfig,
     configure_rate_limit,
+    get_rate_limit_config,
 )
 from llmkit.retry import (
     DEFAULT_RETRY_POLICY,
@@ -80,6 +82,8 @@ __all__ = [
     # Rate limiting
     "GlobalRateLimiter",
     "configure_rate_limit",
+    "get_rate_limit_config",
+    "RateLimitConfig",
     # Retries (transient-error recovery, on by default via RetryPolicy;
     # with_retries is the explicit composable path for any awaitable)
     "RetryPolicy",
