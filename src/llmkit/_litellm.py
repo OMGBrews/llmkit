@@ -21,6 +21,7 @@ provider SDK's exhaustive parameter surface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 
@@ -32,6 +33,40 @@ from llmkit.providers import LLMProviderInterface, get_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+async def drain_async_logging(*, timeout: float | None) -> None:
+    """Flush LiteLLM's pending async logging on the current event loop.
+
+    LiteLLM doesn't ``await`` its success logging inline. After a successful
+    async call it *eagerly constructs* the ``Logging.async_success_handler``
+    coroutine and hands it to a module-global ``LoggingWorker`` queue
+    (``GLOBAL_LOGGING_WORKER``) to be run as a background task. On the sync
+    bridge that coroutine can still be sitting in the queue — created but never
+    awaited — when :func:`llmkit.sync.run_sync` closes the loop, and Python then
+    emits ``RuntimeWarning: coroutine 'Logging.async_success_handler' was never
+    awaited`` to stderr. That is visible noise on an otherwise clean call.
+
+    Calling the worker's own ``flush`` *awaits* every queued coroutine to
+    completion, which both performs the logging and clears the queue so no
+    coroutine is destroyed unawaited. We bound it with ``timeout`` so a wedged
+    callback can't hang the bridge (``flush`` is an unbounded ``queue.join`` on
+    its own); past the deadline we give up draining rather than block.
+
+    Best-effort by contract: this reaches into a LiteLLM internal, so any
+    failure (the internal moving, no queue yet, the flush erroring) is swallowed
+    — draining logging must never turn a successful call into a failed one.
+    """
+    try:
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    except Exception:  # pragma: no cover - litellm internal moved
+        return
+    try:
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout)
+    except TimeoutError:
+        logger.debug("LiteLLM async-logging drain timed out after %ss", timeout)
+    except Exception:  # pragma: no cover - best-effort drain
+        logger.debug("LiteLLM async-logging drain failed", exc_info=True)
 
 
 def _messages(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:

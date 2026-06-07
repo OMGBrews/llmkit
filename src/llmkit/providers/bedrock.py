@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import instructor
 
-from llmkit.providers.base import BaseProvider, LLMClientConfig
+from llmkit.providers.base import BaseProvider, LLMClientConfig, require_anthropic_sdk
 
 
 class BedrockProvider(BaseProvider):
@@ -43,7 +43,11 @@ class BedrockProvider(BaseProvider):
 
     Bedrock pulls in ``boto3`` for request signing; it ships via the
     ``omg-llmkit[bedrock]`` extra rather than the core install, so non-Bedrock
-    users take on no extra dependency.
+    users take on no extra dependency. Because it routes Claude under
+    ``ANTHROPIC_JSON``, it also needs the Anthropic SDK at call time — the
+    ``[bedrock]`` extra therefore pulls in the ``[anthropic]`` extra, and
+    constructing this provider without the Anthropic SDK raises a clear
+    "install omg-llmkit[anthropic]" error.
     """
 
     _provider_name = "AWS Bedrock"
@@ -56,6 +60,7 @@ class BedrockProvider(BaseProvider):
         aws_region_name: str | None = None,
         reasoning_effort: str | None = None,
     ):
+        require_anthropic_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
         self._aws_region_name = aws_region_name
 

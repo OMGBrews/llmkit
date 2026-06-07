@@ -28,6 +28,21 @@ import llmkit
 
 Requires Python ≥ 3.13.
 
+The core install routes OpenRouter, Google, OpenAI, DeepSeek, and Ollama with no
+extra dependencies. Two providers gate their dependencies behind opt-in extras so
+hosts pay only for what they call:
+
+```bash
+pip install "omg-llmkit[anthropic]"  # direct Anthropic (Claude) routing
+pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (pulls in [anthropic] too)
+```
+
+The Anthropic SDK is opt-in because `instructor` reaches it only at *call time*,
+on its `ANTHROPIC_JSON` usage-accounting path — plain `import llmkit` and a
+Google-only flow never touch it. Constructing the `AnthropicProvider` or
+`BedrockProvider` without the SDK raises a clear `install omg-llmkit[anthropic]`
+error at construction, not a cryptic failure on the first call.
+
 ## Quick start
 
 ```python

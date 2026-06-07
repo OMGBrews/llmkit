@@ -79,6 +79,22 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Changed
 
+- **The Anthropic SDK moved from a core dependency to the opt-in
+  `omg-llmkit[anthropic]` extra.** It was core through 0.1.2 on the belief that
+  `instructor` forced it at import; measured against `instructor>=1.15.1`, that
+  is false — `instructor` reaches the SDK only at *call time*, on its
+  `ANTHROPIC_*` usage-accounting path (`from anthropic.types import Usage` inside
+  `instructor/core/retry.py`, guarded by the mode), so plain `import llmkit` and
+  a Google-only flow never touch it. Non-Anthropic hosts now take on no Anthropic
+  dependency. The `AnthropicProvider` and `BedrockProvider` (both pin
+  `ANTHROPIC_JSON`, so both need the SDK at call time) raise a clear
+  `install omg-llmkit[anthropic]` error *at construction* when the SDK is absent,
+  rather than failing cryptically on the first completion. The `[bedrock]` extra
+  pulls in `[anthropic]` (it routes Claude), and a new convenience `[all]` extra
+  installs every provider's optional dependencies at once. **Migration:** hosts
+  that route Anthropic or Bedrock should install `omg-llmkit[anthropic]` (or
+  `omg-llmkit[bedrock]`, or `omg-llmkit[all]`); hosts on other providers need no
+  change.
 - **Transient-error retries are now on by default.** `structured_llm_call`,
   `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
   the curated recoverable set (429 / 503 / 5xx, timeouts, transient
@@ -178,6 +194,21 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Fixed
 
+- **Synchronous calls no longer leak a `coroutine 'Logging.async_success_handler'
+  was never awaited` `RuntimeWarning` to stderr.** LiteLLM logs successes
+  asynchronously without awaiting inline — it queues the
+  `async_success_handler` coroutine on a background worker — so the sync bridge
+  (`structured_llm_call_sync` and the sync text path, via `run_sync`) could
+  close its event loop with that coroutine still un-awaited, surfacing the
+  warning on an otherwise clean call (flagged by the FiW dogfood of the 0.1.3 RC
+  in both a CLI and a Lambda). `run_sync` now **drains** LiteLLM's pending async
+  logging before tearing the loop down: it flushes the logging worker's queue
+  (awaiting the queued handlers) and then cancels any remaining background tasks
+  — bounded by the same `timeout` budget so a hung callback can't wedge the
+  bridge, and applied to **both** `run_sync` branches (the `asyncio.run` path
+  and the worker-thread path used when a loop is already running). The drain is
+  best-effort and never converts a successful call into a failure; genuine call
+  errors still propagate.
 - `text_llm_call` now coerces provider **list-content** responses to a single
   string. Some providers return `message.content` as a list of content blocks
   rather than a string; the call previously returned that list verbatim,
