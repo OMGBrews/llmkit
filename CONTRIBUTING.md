@@ -81,5 +81,6 @@ uv run pytest tests/integration --run-live -k bedrock
 ## See also
 
 - [`README.md`](README.md) — what `llmkit` is, how to use it, and its scope.
+- [`PRINCIPLES.md`](PRINCIPLES.md) — the design principles behind the library.
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability.
 - [`CHANGELOG.md`](CHANGELOG.md) — release history.
