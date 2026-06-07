@@ -139,7 +139,7 @@ async def acompletion_structured[T: BaseModel](
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
-    async with GlobalRateLimiter.acquire_async():
+    async with GlobalRateLimiter.acquire_async(provider.name):
         parsed, completion = await client.chat.completions.create_with_completion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
@@ -178,7 +178,7 @@ async def acompletion_text(
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
-    async with GlobalRateLimiter.acquire_async():
+    async with GlobalRateLimiter.acquire_async(provider.name):
         resp = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
             model=provider.litellm_model(model),
             messages=_messages(prompt),
@@ -215,7 +215,7 @@ async def astream_text(
     provider = provider if provider is not None else get_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
-    async with GlobalRateLimiter.acquire_async():
+    async with GlobalRateLimiter.acquire_async(provider.name):
         stream = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
             model=provider.litellm_model(model),
             messages=_messages(prompt),

@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a global async rate limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a per-provider async concurrency limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -67,7 +67,7 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 
-`configure_rate_limit(...)` sets the process-global concurrency cap; `configure_llm_logging(sink)` swaps the log sink (below).
+Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a conservative cap of **2 concurrent calls per provider** — enough to keep a metered cloud account from a self-inflicted burst without throttling normal use. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off; `configure_llm_logging(sink)` swaps the log sink (below).
 
 ## Logging: agent-readable by default
 

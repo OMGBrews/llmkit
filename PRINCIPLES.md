@@ -16,9 +16,9 @@ OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama s
 
 Every call takes an optional `model=` that overrides the configured default just for that call. llmkit imposes no "strong/small/current" role system — resolve your own roles to a model string and pass it. Changing the default model is a one-line config change.
 
-## Concurrency is bounded so fan-out can't hammer a provider
+## Concurrency is bounded per provider so fan-out can't hammer a provider
 
-llmkit ships a global concurrency limiter that caps how many calls run at once, so a burst of parallel requests doesn't overrun a provider's rate limits. Enable it and set the cap with `configure_rate_limit(...)`.
+llmkit caps how many calls run at once, so a burst of parallel requests doesn't overrun a provider's rate limits. It's **on by default** — no opt-in — and bounded **per provider** (keyed by the same effective provider name the logs record), so a burst to one provider never eats another's budget. The default cap is a conservative **2 concurrent calls per provider**; raise it, or turn the limiter off, with `configure_rate_limit(...)`.
 
 ## Logging is on by default
 
