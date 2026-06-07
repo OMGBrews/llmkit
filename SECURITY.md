@@ -1,4 +1,7 @@
-# Security Policy
+# Security policy
+
+How to report a security vulnerability in `llmkit` and which versions receive
+fixes. Read this before filing a security issue.
 
 ## Reporting a vulnerability
 

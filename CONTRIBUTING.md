@@ -56,13 +56,30 @@ of relying on which keys are set: `uv run pytest tests/integration --run-live -k
 
 Ollama needs no key — just a reachable server. Run `ollama serve` and pull the
 smoke model (`ollama pull llama3.2`). By default the test talks to
-`http://localhost:11434`; set `OLLAMA_HOST` to point elsewhere. In the maintainer
-devcontainer Ollama runs on your **host** and the container reaches it at
-`http://host.docker.internal:11434` (already wired as the container's default
-`OLLAMA_HOST`), so just run `ollama serve` on the host.
+`http://localhost:11434`; set `OLLAMA_HOST` to point at your server if it runs
+elsewhere (for example, when Ollama runs on the Docker host, point it at
+`http://host.docker.internal:11434`).
+
+AWS Bedrock is the one deliberate exception to "every live test must pass under
+`--run-live`". Unlike the others it has no API key: it authenticates through the
+ambient **AWS credential chain** and needs the `boto3`-bearing extra, so its live
+test is allowed to skip when that isn't set up. To run it, install the extra and
+provide AWS credentials plus a region:
+
+```bash
+uv sync --extra dev --extra bedrock
+export AWS_REGION_NAME=us-east-1   # plus credentials via the standard AWS chain
+uv run pytest tests/integration --run-live -k bedrock
+```
 
 ## Conventions
 
 - Keep the public surface small — `llmkit` owns the call ergonomics, not transport.
 - No `dict[str, Any]` / bare `Any`; use precise types (basedpyright enforces this).
 - Hard cuts over deprecation shims for internal changes.
+
+## See also
+
+- [`README.md`](README.md) — what `llmkit` is, how to use it, and its scope.
+- [`SECURITY.md`](SECURITY.md) — how to report a vulnerability.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history.
