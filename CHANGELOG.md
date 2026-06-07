@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The accumulated work below is the next release (planned `0.1.3`) and has not yet
+been published to PyPI — the last published version is `0.1.2`. It moves to a
+dated `## [0.1.3]` section when the release is cut.
+
 ### Added
 
 - **AWS Bedrock** provider (`Provider.BEDROCK` / `BedrockProvider`, `bedrock/`
@@ -49,6 +53,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The retry helpers (`with_retries`, `retry_progress_callback`,
   `RetryProgressCallback`) are now exported from the package root, so callers
   no longer reach into `llmkit.retry` directly.
+- Reasoning/thinking control via `LLMClientConfig.reasoning_effort` (and a
+  per-call `reasoning_effort` override on `structured_llm_call` /
+  `structured_llm_call_sync` / `text_llm_call`), forwarded to LiteLLM. Lets
+  callers disable Gemini thinking (`reasoning_effort="disable"`) so it
+  doesn't consume the `max_tokens` budget and truncate structured output.
+  Set once on the config and every call inherits it; the per-call value
+  overrides it. Backward-compatible; defaults to provider behaviour — when
+  unset (`None`) no `reasoning_effort` kwarg is sent, so the outbound
+  request is byte-identical to before. `LLMCallRecord` also records the
+  per-call setting for log completeness.
 
 ### Changed
 
@@ -65,13 +79,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dispatch is now an exhaustive `match` whose fall-through calls
   `typing.assert_never`, so an unwired member is caught statically by
   basedpyright, raises `AssertionError` at runtime, and fails a dedicated
-  exhaustiveness test. No behaviour change for the five existing providers.
+  exhaustiveness test. No behaviour change for the existing providers.
 - The provider layer is reorganized from a single `providers.py` module into a
-  `llmkit.providers` **package** with one module per provider (`openrouter`,
-  `ollama`, `google`, `anthropic`, `openai`) over a provider-agnostic
-  `base` module, so adding a provider is a self-contained new file plus one
-  wiring line. Purely internal: the public API is unchanged — every symbol
-  (`Provider`, `LLMClientConfig`, the `*Provider` classes, `get_provider`,
+  `llmkit.providers` **package** with one module per provider over a
+  provider-agnostic `base` module, so adding a provider is a self-contained new
+  file plus one wiring line. Purely internal: the public API is unchanged — every
+  symbol (`Provider`, `LLMClientConfig`, the `*Provider` classes, `get_provider`,
   `get_llm_config`, …) imports from `llmkit` and `llmkit.providers` exactly as
   before.
 - README now describes `with_retries()` as a composable helper the caller wraps
@@ -93,21 +106,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   'anthropic'` on the first call, because the SDK `instructor` requires for
   `ANTHROPIC_JSON` usage accounting was never declared as a dependency. A clean
   `pip install omg-llmkit` can now call the Anthropic provider out of the box.
-
-## [0.1.3] — 2026-06-06
-
-### Added
-
-- Reasoning/thinking control via `LLMClientConfig.reasoning_effort` (and a
-  per-call `reasoning_effort` override on `structured_llm_call` /
-  `structured_llm_call_sync` / `text_llm_call`), forwarded to LiteLLM. Lets
-  callers disable Gemini thinking (`reasoning_effort="disable"`) so it
-  doesn't consume the `max_tokens` budget and truncate structured output.
-  Set once on the config and every call inherits it; the per-call value
-  overrides it. Backward-compatible; defaults to provider behaviour — when
-  unset (`None`) no `reasoning_effort` kwarg is sent, so the outbound
-  request is byte-identical to before. `LLMCallRecord` also records the
-  per-call setting for log completeness.
 
 ## [0.1.2] — 2026-06-05
 
@@ -152,5 +150,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
-[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.2
+[0.1.1]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.1
 [0.1.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.0
