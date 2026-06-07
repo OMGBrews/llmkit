@@ -162,7 +162,11 @@ Register the config with `configure_llm_client(source)`, where `source` is a zer
 
 Two retry layers, kept deliberately separate:
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`) on its own — you don't wrap anything. The default `RetryPolicy` is three attempts with bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
+  - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
+  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks.
+
+  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. Both budgets use bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
   Tune or opt out per call with the `retry=` argument:
 
@@ -190,20 +194,22 @@ Two retry layers, kept deliberately separate:
 
   **Streaming caveat:** `stream_text_with_log` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
 
-  **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+  **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**); the old `max_retries` keyword still works as a **deprecated alias** that warns. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
 
   ```python
-  from llmkit import with_retries, LLM_RECOVERABLE_ERRORS
+  from llmkit import with_retries, LLM_TRANSPORT_ERRORS
 
   result = await with_retries(
       lambda: do_some_work(),
-      max_retries=3,
+      max_attempts=3,
       backoff_base_seconds=0.5,
-      retry_on=LLM_RECOVERABLE_ERRORS,
+      retry_on=LLM_TRANSPORT_ERRORS,
   )
   ```
 
-- **instructor's own low `max_retries`** handles *schema-validation* repair (re-ask the model to fix malformed JSON). This stays **separate** from the transient-retry layer above — the two budgets are never conflated, so attempts aren't double-counted.
+  > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active inner llmkit retry loop and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`.
+
+- **instructor's own low `validation_retries`** (default 1) handles *in-call* schema-validation repair — re-asking the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ## Development
 

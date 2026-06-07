@@ -13,7 +13,11 @@ This package provides:
 - Per-call invocation logging via a pluggable sink (with approximate cost)
 """
 
-from llmkit.exceptions import LLM_RECOVERABLE_ERRORS
+from llmkit.exceptions import (
+    LLM_RECOVERABLE_ERRORS,
+    LLM_SCHEMA_ERRORS,
+    LLM_TRANSPORT_ERRORS,
+)
 from llmkit.logging import (
     LLMCallRecord,
     LocalYamlLogSink,
@@ -100,4 +104,6 @@ __all__ = [
     "capture_llm_log_paths",
     # Exception handling
     "LLM_RECOVERABLE_ERRORS",
+    "LLM_TRANSPORT_ERRORS",
+    "LLM_SCHEMA_ERRORS",
 ]

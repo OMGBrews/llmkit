@@ -212,10 +212,12 @@ async def structured_llm_call[T](
 
     return await with_retries(
         _attempt,
-        max_retries=retry.max_attempts,
+        max_attempts=retry.max_attempts,
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
         retry_on=retry.retry_on,
+        validation_max_attempts=retry.validation_max_attempts,
+        validation_retry_on=retry.validation_retry_on,
     )
 
 
@@ -352,10 +354,12 @@ async def text_llm_call(
 
     return await with_retries(
         _attempt,
-        max_retries=retry.max_attempts,
+        max_attempts=retry.max_attempts,
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
         retry_on=retry.retry_on,
+        validation_max_attempts=retry.validation_max_attempts,
+        validation_retry_on=retry.validation_retry_on,
     )
 
 
@@ -420,7 +424,11 @@ async def stream_text_with_log(
             # A partially-consumed stream can't be restarted, and only the
             # curated transient set is retryable — so a non-transient error or
             # a mid-stream failure (chunks already delivered) propagates as-is.
-            if not isinstance(exc, retry.retry_on) or yielded_any:
+            # Streaming is plain text (no schema parsing), so it budgets on the
+            # transport ``max_attempts`` only; both transient sets are matched
+            # for completeness so a stray validation error is still treated as
+            # transient rather than escaping unretried.
+            if not isinstance(exc, (*retry.retry_on, *retry.validation_retry_on)) or yielded_any:
                 raise
             # Pre-first-chunk transient failure: retry until the budget is
             # spent. The final attempt logs an exhaustion ERROR before
@@ -432,7 +440,7 @@ async def stream_text_with_log(
             await handle_retry_failure(
                 tag=tag,
                 attempt=attempt,
-                max_retries=retry.max_attempts,
+                max_attempts=retry.max_attempts,
                 error=exc,
                 backoff_base_seconds=retry.backoff_base_seconds,
             )

@@ -81,8 +81,8 @@ dated `## [0.1.3]` section when the release is cut.
 
 - **Transient-error retries are now on by default.** `structured_llm_call`,
   `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
-  the curated `LLM_RECOVERABLE_ERRORS` set (429 / 503 / 5xx, timeouts, transient
-  provider errors) on their own — three attempts with full-jitter backoff — so
+  the curated recoverable set (429 / 503 / 5xx, timeouts, transient
+  provider errors) on their own — with full-jitter backoff — so
   reliability no longer depends on every caller wrapping each call. The transient
   set names the specific transient `openai` subclasses (`RateLimitError` /
   `InternalServerError` / `APIConnectionError`) rather than their broad
@@ -98,6 +98,45 @@ dated `## [0.1.3]` section when the release is cut.
   consumed stream cannot be transparently restarted. `with_retries()` remains
   exported as the explicit, composable path for wrapping any awaitable, and now
   takes a `retry_on` filter.
+- **Transport and schema-validation retries now have separate budgets.** The
+  recoverable set is split into `LLM_TRANSPORT_ERRORS` (rate limits, transient
+  5xx, network/timeout) and `LLM_SCHEMA_ERRORS` (pydantic `ValidationError`,
+  instructor `InstructorRetryException`), and `RetryPolicy` counts each against
+  its own budget: transport keeps `max_attempts` (default **3**), while the new
+  `validation_max_attempts` (default **2** = one retry) governs schema failures.
+  A deterministically-wrong schema or impossible constraint can no longer burn
+  the full transport budget on doomed re-asks, while a *transiently*-malformed
+  JSON response still earns one cross-call retry. `LLM_RECOVERABLE_ERRORS`
+  remains the **union** of the two subsets, so its documented `except`-clause
+  catch-set contract is unchanged. `NO_RETRY` disables **both** budgets (a single
+  attempt). `RetryPolicy` gains `validation_max_attempts` and
+  `validation_retry_on` (defaulting to `LLM_SCHEMA_ERRORS`); this cross-call
+  layer remains separate from instructor's in-call `validation_retries`
+  (default 1, which repairs malformed JSON *within* one attempt before any
+  `ValidationError` reaches the retry layer). Flagged by the PIA Maker and FiW
+  dogfoods of the 0.1.3 RC.
+- **Unified the public retry attempt-count on `max_attempts`.** `RetryPolicy`
+  already used `max_attempts`; `with_retries(...)` now uses it too, with the same
+  semantics everywhere — *total attempts including the first* (`N`, not `1 + N`).
+  The old `with_retries(..., max_retries=...)` keyword keeps working as a
+  **deprecated alias** that emits a `DeprecationWarning` and maps to
+  `max_attempts` (`max_attempts` wins if both are given), so existing consumers
+  (e.g. pia-maker) don't break. The progress-callback keyword stays `max_retries`
+  for backward compatibility. `LLM_TRANSPORT_ERRORS` and `LLM_SCHEMA_ERRORS` are
+  exported from the package root alongside `LLM_RECOVERABLE_ERRORS`.
+- **`with_retries` now guards against nested retry-budget multiplication.**
+  Because the call functions retry internally by default, wrapping one in
+  `with_retries` previously multiplied the budgets silently (the `3 × 3 = 9`
+  trap the PIA Maker dogfood hit). `with_retries` now detects (via a context
+  variable) when it runs *inside* an already-active llmkit retry loop and
+  collapses that inner layer to a **single pass** — so the budgets no longer
+  multiply, and per-attempt logging is preserved. An *accidental* double-wrap
+  additionally emits a filterable `RuntimeWarning` (so consumers running under
+  `-W error` can filter it). The guard does not affect `with_retries` wrapping a
+  plain (non-llmkit) awaitable, which still retries normally. The clean way to
+  drive retries from an outer wrapper is to opt the inner call out with
+  `retry=NO_RETRY` — which collapses the inner pass **without** warning; this is
+  documented in `with_retries`' docstring.
 - **Concurrency rate limiting is now on by default, scoped per provider.**
   Previously the limiter was off until a host opted in, and a single process-wide
   budget fronted every provider. It is now active out of the box and bounds
