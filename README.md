@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a global async rate limiter, and **agent-readable per-call logging** out of the box, plus a composable `with_retries()` helper you wrap calls in for transient-error recovery.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a global async rate limiter, **agent-readable per-call logging**, and **transient-error retries on by default** out of the box.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -162,26 +162,48 @@ Register the config with `configure_llm_client(source)`, where `source` is a zer
 
 Two retry layers, kept deliberately separate:
 
-- **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) handles *transient provider* errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`). It is a composable helper you wrap a call in — the call functions do **not** retry on their own:
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors (429 / 503 / 5xx; the recoverable set is `LLM_RECOVERABLE_ERRORS`) on its own — you don't wrap anything. The default `RetryPolicy` is three attempts with bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+
+  Tune or opt out per call with the `retry=` argument:
 
   ```python
-  from llmkit import structured_llm_call, with_retries
+  from llmkit import structured_llm_call, RetryPolicy, NO_RETRY
 
-  result = await with_retries(
-      lambda: structured_llm_call(
-          prompt="Summarize the attached report.",
-          output_schema=Summary,
-          feature="reports",
-          label="exec_summary",
-      ),
-      max_retries=3,
-      backoff_base_seconds=0.5,
+  # Opt this one call out of automatic retries (e.g. latency-sensitive):
+  result = await structured_llm_call(
+      prompt="Summarize the attached report.",
+      output_schema=Summary,
+      feature="reports",
+      label="exec_summary",
+      retry=NO_RETRY,
+  )
+
+  # Or tune the budget / backoff for this call:
+  result = await structured_llm_call(
+      prompt="Summarize the attached report.",
+      output_schema=Summary,
+      feature="reports",
+      label="exec_summary",
+      retry=RetryPolicy(max_attempts=5, backoff_base_seconds=1.0),
   )
   ```
 
-  Wrap a `retry_progress_callback(...)` scope around the call to observe per-attempt failures (e.g. for a progress UI).
+  **Streaming caveat:** `stream_text_with_log` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
 
-- **instructor's own low `max_retries`** handles *schema-validation* repair (re-ask the model to fix malformed JSON).
+  **`with_retries()`** (exported from `llmkit`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+
+  ```python
+  from llmkit import with_retries, LLM_RECOVERABLE_ERRORS
+
+  result = await with_retries(
+      lambda: do_some_work(),
+      max_retries=3,
+      backoff_base_seconds=0.5,
+      retry_on=LLM_RECOVERABLE_ERRORS,
+  )
+  ```
+
+- **instructor's own low `max_retries`** handles *schema-validation* repair (re-ask the model to fix malformed JSON). This stays **separate** from the transient-retry layer above — the two budgets are never conflated, so attempts aren't double-counted.
 
 ## Development
 

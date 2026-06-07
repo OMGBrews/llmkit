@@ -9,6 +9,7 @@ This package provides:
 - The structured / plain-text / streaming call functions
 - Provider switching based on a host-supplied config
 - A process-global async rate limiter shared across all calls
+- Default-on transient-error retries with full-jitter backoff (RetryPolicy)
 - Per-call invocation logging via a pluggable sink (with approximate cost)
 """
 
@@ -40,6 +41,9 @@ from llmkit.rate_limiting import (
     configure_rate_limit,
 )
 from llmkit.retry import (
+    DEFAULT_RETRY_POLICY,
+    NO_RETRY,
+    RetryPolicy,
     RetryProgressCallback,
     retry_progress_callback,
     with_retries,
@@ -76,7 +80,11 @@ __all__ = [
     # Rate limiting
     "GlobalRateLimiter",
     "configure_rate_limit",
-    # Retries (composable helper you wrap calls in — not automatic)
+    # Retries (transient-error recovery, on by default via RetryPolicy;
+    # with_retries is the explicit composable path for any awaitable)
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
+    "NO_RETRY",
     "with_retries",
     "retry_progress_callback",
     "RetryProgressCallback",

@@ -31,6 +31,12 @@ from typing import cast
 
 from llmkit.logging import LLMCallRecord, write_llm_log
 from llmkit.providers import LLMProviderInterface
+from llmkit.retry import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    handle_retry_failure,
+    with_retries,
+)
 from llmkit.sync import run_sync
 
 logger = logging.getLogger(__name__)
@@ -94,6 +100,7 @@ async def structured_llm_call[T](
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> T:
     """Call LLM with structured output parsing.
 
@@ -126,71 +133,90 @@ async def structured_llm_call[T](
             route a single call through a different provider family without
             touching the app-wide :func:`~llmkit.configure_llm_client`
             registration. The log records the provider that actually ran.
+        retry: Transient-error retry budget applied to this call. Defaults
+            to :data:`~llmkit.DEFAULT_RETRY_POLICY` (retry the curated
+            ``LLM_RECOVERABLE_ERRORS`` with full-jitter backoff). Pass
+            :data:`~llmkit.NO_RETRY` to opt out, or a custom
+            :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
+            its own logged call; this layer stays separate from instructor's
+            in-call schema-repair budget.
 
     Returns:
         An instance of *output_schema* populated by the LLM.
 
     Raises:
-        Any exception from the LLM provider or output parser — callers
-        are responsible for catching ``LLM_RECOVERABLE_ERRORS``. The log
-        is still written on exception with the error recorded.
+        Any exception from the LLM provider or output parser — transient
+        ones (``LLM_RECOVERABLE_ERRORS``) are retried per *retry* first,
+        then re-raised on exhaustion; non-transient ones propagate
+        immediately. The log is still written on every attempt with the
+        error recorded.
     """
-    # Deferred import so test patches on ``llmkit._litellm``
-    # call functions resolve at call time.
-    from llmkit import _litellm
 
-    started_at = datetime.now(UTC)
-    start_t = time.monotonic()
-    response: T | None = None
-    cost: float | None = None
-    error: str | None = None
-    try:
-        # The public ``T`` is unbounded (frozen call surface); the LiteLLM
-        # seam requires ``T: BaseModel``. Every caller passes a Pydantic
-        # schema, so this is sound at runtime — suppress the bound mismatch.
-        parsed, cost = await _litellm.acompletion_structured(
-            prompt,
-            output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
-            temperature=temperature,
-            model=model,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            provider=provider,
-        )
-        response = cast("T", parsed)
-        return response
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        duration_ms = (time.monotonic() - start_t) * 1000
-        resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
-        response_dump = (
-            response.model_dump()  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — Pydantic result dumped for the log
-            if response is not None and hasattr(response, "model_dump")
-            else None
-        )
-        path = write_llm_log(
-            LLMCallRecord(
-                started_at=started_at,
-                feature=feature,
-                label=label,
-                model=resolved_model,
-                provider=resolved_provider,
+    async def _attempt() -> T:
+        # Deferred import so test patches on ``llmkit._litellm``
+        # call functions resolve at call time.
+        from llmkit import _litellm
+
+        started_at = datetime.now(UTC)
+        start_t = time.monotonic()
+        response: T | None = None
+        cost: float | None = None
+        error: str | None = None
+        try:
+            # The public ``T`` is unbounded (frozen call surface); the LiteLLM
+            # seam requires ``T: BaseModel``. Every caller passes a Pydantic
+            # schema, so this is sound at runtime — suppress the bound mismatch.
+            parsed, cost = await _litellm.acompletion_structured(
+                prompt,
+                output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
                 temperature=temperature,
-                duration_ms=duration_ms,
-                schema=output_schema.__name__,
-                prompt=prompt,
-                response=response_dump,
-                error=error,
-                approximate_cost=cost,
+                model=model,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
+                provider=provider,
             )
-        )
-        captured = _captured_log_paths.get()
-        if captured is not None and path is not None:
-            captured.append(path)
+            response = cast("T", parsed)
+            return response
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            duration_ms = (time.monotonic() - start_t) * 1000
+            resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
+            response_dump = (
+                response.model_dump()  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — Pydantic result dumped for the log
+                if response is not None and hasattr(response, "model_dump")
+                else None
+            )
+            path = write_llm_log(
+                LLMCallRecord(
+                    started_at=started_at,
+                    feature=feature,
+                    label=label,
+                    model=resolved_model,
+                    provider=resolved_provider,
+                    temperature=temperature,
+                    duration_ms=duration_ms,
+                    schema=output_schema.__name__,
+                    prompt=prompt,
+                    response=response_dump,
+                    error=error,
+                    approximate_cost=cost,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                )
+            )
+            captured = _captured_log_paths.get()
+            if captured is not None and path is not None:
+                captured.append(path)
+
+    return await with_retries(
+        _attempt,
+        max_retries=retry.max_attempts,
+        label=label or feature,
+        backoff_base_seconds=retry.backoff_base_seconds,
+        retry_on=retry.retry_on,
+    )
 
 
 def structured_llm_call_sync[T](
@@ -204,6 +230,7 @@ def structured_llm_call_sync[T](
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
 
@@ -215,7 +242,9 @@ def structured_llm_call_sync[T](
     inherits it. ``max_tokens`` caps the completion length when set
     (parity with :func:`text_llm_call`); ``None`` leaves it uncapped.
     ``reasoning_effort`` is forwarded identically (``None`` defers to the
-    configured :class:`~llmkit.LLMClientConfig` value).
+    configured :class:`~llmkit.LLMClientConfig` value). ``retry`` is the
+    transient-error budget, inherited from the async path (default-on; pass
+    :data:`~llmkit.NO_RETRY` to opt out).
     """
     return run_sync(
         structured_llm_call(
@@ -228,6 +257,7 @@ def structured_llm_call_sync[T](
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             provider=provider,
+            retry=retry,
         )
     )
 
@@ -242,6 +272,7 @@ async def text_llm_call(
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
 
@@ -264,54 +295,68 @@ async def text_llm_call(
             :class:`~llmkit.LLMClientConfig` value.
         provider: Optional provider override for THIS call only (``None``
             uses the globally-configured provider).
+        retry: Transient-error retry budget (default-on; see
+            :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
+            opt out. Each attempt is its own logged call.
 
     Returns:
         The model's textual response.
 
     Raises:
-        Any exception from the LLM provider — callers catch
-        ``LLM_RECOVERABLE_ERRORS``. The log is still written on
-        exception with the error recorded.
+        Any exception from the LLM provider — transient ones
+        (``LLM_RECOVERABLE_ERRORS``) are retried per *retry*, others
+        propagate immediately. The log is still written on every attempt
+        with the error recorded.
     """
-    from llmkit import _litellm
 
-    started_at = datetime.now(UTC)
-    start_t = time.monotonic()
-    text = ""
-    cost: float | None = None
-    error: str | None = None
-    try:
-        text, cost = await _litellm.acompletion_text(
-            prompt,
-            temperature=temperature,
-            model=model,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            provider=provider,
-        )
-        return text
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        path = _log_text_call(
-            started_at=started_at,
-            feature=feature,
-            label=label,
-            prompt=prompt,
-            text=text,
-            start_t=start_t,
-            temperature=temperature,
-            model=model,
-            provider=provider,
-            error=error,
-            approximate_cost=cost,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-        )
-        captured = _captured_log_paths.get()
-        if captured is not None and path is not None:
-            captured.append(path)
+    async def _attempt() -> str:
+        from llmkit import _litellm
+
+        started_at = datetime.now(UTC)
+        start_t = time.monotonic()
+        text = ""
+        cost: float | None = None
+        error: str | None = None
+        try:
+            text, cost = await _litellm.acompletion_text(
+                prompt,
+                temperature=temperature,
+                model=model,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                provider=provider,
+            )
+            return text
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            path = _log_text_call(
+                started_at=started_at,
+                feature=feature,
+                label=label,
+                prompt=prompt,
+                text=text,
+                start_t=start_t,
+                temperature=temperature,
+                model=model,
+                provider=provider,
+                error=error,
+                approximate_cost=cost,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            )
+            captured = _captured_log_paths.get()
+            if captured is not None and path is not None:
+                captured.append(path)
+
+    return await with_retries(
+        _attempt,
+        max_retries=retry.max_attempts,
+        label=label or feature,
+        backoff_base_seconds=retry.backoff_base_seconds,
+        retry_on=retry.retry_on,
+    )
 
 
 async def stream_text_with_log(
@@ -324,6 +369,7 @@ async def stream_text_with_log(
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
 ) -> AsyncIterator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
@@ -345,6 +391,69 @@ async def stream_text_with_log(
     since there is no Pydantic schema applied here. Streamed responses
     carry no per-call cost (LiteLLM does not stamp ``response_cost`` on
     stream chunks), so ``approximate_cost`` is left ``None``.
+
+    ``retry`` is the transient-error budget (default-on; pass
+    :data:`~llmkit.NO_RETRY` to opt out). A partially-consumed stream
+    cannot be transparently restarted, so retry applies **only** to a
+    transient failure that occurs *before the first chunk is yielded*:
+    once any chunk has reached the caller, a mid-stream error propagates
+    unretried. Each attempt is its own logged call.
+    """
+    tag = label or feature
+    for attempt in range(1, retry.max_attempts + 1):
+        yielded_any = False
+        try:
+            async for chunk in _stream_once(
+                prompt,
+                feature=feature,
+                label=label,
+                temperature=temperature,
+                model=model,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                provider=provider,
+            ):
+                yielded_any = True
+                yield chunk
+            return
+        except Exception as exc:
+            # A partially-consumed stream can't be restarted, and only the
+            # curated transient set is retryable — so a non-transient error or
+            # a mid-stream failure (chunks already delivered) propagates as-is.
+            if not isinstance(exc, retry.retry_on) or yielded_any:
+                raise
+            # Pre-first-chunk transient failure: retry until the budget is
+            # spent. The final attempt logs an exhaustion ERROR before
+            # re-raising, mirroring ``with_retries`` so an operator greps the
+            # streaming and non-streaming surfaces the same way.
+            if attempt == retry.max_attempts:
+                logger.error("%s: all %d attempts failed: %s", tag, retry.max_attempts, exc)
+                raise
+            await handle_retry_failure(
+                tag=tag,
+                attempt=attempt,
+                max_retries=retry.max_attempts,
+                error=exc,
+                backoff_base_seconds=retry.backoff_base_seconds,
+            )
+
+
+async def _stream_once(
+    prompt: str | list[dict[str, str]],
+    *,
+    feature: str,
+    label: str | None,
+    temperature: float,
+    model: str | None,
+    max_tokens: int | None,
+    reasoning_effort: str | None,
+    provider: LLMProviderInterface | None,
+) -> AsyncIterator[str]:
+    """One streaming attempt: yield each chunk, log the transcript on close.
+
+    The single-attempt core of :func:`stream_text_with_log` — the retry
+    loop there wraps this so each attempt writes its own log record (the
+    one-attempt-one-log contract `capture_llm_log_paths` relies on).
     """
     from llmkit import _litellm
 

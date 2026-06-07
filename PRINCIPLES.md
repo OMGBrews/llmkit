@@ -34,7 +34,7 @@ The call surface is async-first, because LLM calls are I/O-bound and usually fan
 
 ## Built for reliable calls
 
-Reliability is the point, not an add-on. Structured output is validated before you ever see it; a curated `LLM_RECOVERABLE_ERRORS` set names exactly what's worth retrying; instructor repairs malformed JSON in-call; and `with_retries()` is a composable helper you wrap a call in to recover transient provider errors with backoff.
+Reliability is the point, not an add-on. Structured output is validated before you ever see it; instructor repairs malformed JSON in-call; and every call function retries *transient* provider errors on its own by default, with bounded full-jitter backoff over a curated `LLM_RECOVERABLE_ERRORS` set — so reliability doesn't depend on each caller remembering to wrap every call. Programming errors stay out of that set and propagate immediately. The default budget is tunable (or opt out) per call via `retry=`, and `with_retries()` remains the explicit advanced path for wrapping any awaitable. This layer is kept separate from instructor's schema-repair budget, so the two are never conflated.
 
 ## See also
 
