@@ -26,7 +26,7 @@ from llmkit.providers.base import (
     LLMInfo,
     LLMProviderInterface,
     Provider,
-    _active_config,
+    active_config,
     configure_llm_client,
 )
 from llmkit.providers.bedrock import BedrockProvider
@@ -58,7 +58,7 @@ def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
             here (an unwired enum member). See :func:`typing.assert_never`.
     """
     if config is None:
-        config = _active_config()
+        config = active_config()
 
     match config.provider:
         case Provider.OPENROUTER:
@@ -188,7 +188,7 @@ def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:
         :class:`LLMInfo` snapshot of the resolved provider + model.
     """
     if config is None:
-        config = _active_config()
+        config = active_config()
     provider = build_provider(config)
 
     return LLMInfo(

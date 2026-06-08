@@ -7,5 +7,12 @@
   "typeCheckingMode": "standard",
   "reportMissingTypeStubs": false,
   "reportMissingModuleSource": false,
-  "reportExplicitAny": "error"
+  "reportExplicitAny": "error",
+  "reportPrivateUsage": "error",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "reportPrivateUsage": "none"
+    }
+  ]
 }

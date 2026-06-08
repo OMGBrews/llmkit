@@ -144,7 +144,7 @@ def configure_llm_client(config_source: Callable[[], LLMClientConfig]) -> None:
     _config_source = config_source
 
 
-def _active_config() -> LLMClientConfig:
+def active_config() -> LLMClientConfig:
     """Return the configured :class:`LLMClientConfig`, or raise if unset."""
     if _config_source is None:
         raise RuntimeError(
