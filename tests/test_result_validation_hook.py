@@ -10,15 +10,14 @@ the call. These tests pin the contract over the patched transport seam:
   (the lower one), NOT the transport budget;
 * a result the hook accepts is returned with no re-roll;
 * ``retry=NO_RETRY`` makes a rejection propagate after a single attempt;
-* the hook works on ``text_llm_call`` (text) and ``structured_data_call``
-  (which hands the hook the validated *model*, pre-dump);
+* the hook works on ``text_llm_call`` (text);
 * a rejected attempt is still its own logged record.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any, cast
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -33,7 +32,6 @@ from llmkit import (
     configure_llm_logging,
 )
 from llmkit.structured_output import (
-    structured_data_call,
     structured_llm_call,
     text_llm_call,
 )
@@ -171,46 +169,6 @@ async def test_text_on_result_rejects_then_accepts() -> None:
 
     assert result == "ok"
     assert calls[0] == 2
-
-
-@pytest.mark.asyncio
-async def test_data_call_hook_receives_validated_model_and_re_rolls() -> None:
-    """``structured_data_call`` hands the hook the validated *model* (pre-dump),
-    re-rolls on rejection, and still returns a plain dict."""
-    schema: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # test-fixture JSON-schema dict
-        "title": "Box",
-        "type": "object",
-        "properties": {"n": {"type": "integer"}},
-        "required": ["n"],
-    }
-    calls = [0]
-    seen_types: list[str] = []
-
-    async def _transport(*args: object, **_k: object) -> tuple[BaseModel, float | None]:
-        calls[0] += 1
-        model = args[1]
-        assert isinstance(model, type) and issubclass(model, BaseModel)
-        return model(n=calls[0]), None
-
-    def _require_two(model: BaseModel) -> None:
-        # The hook receives the generated *model* (named from the schema title),
-        # not the dict — record its type to prove that, then read its ``n`` field
-        # (invisible to the type checker on the ``BaseModel`` annotation).
-        seen_types.append(type(model).__name__)
-        n = cast("int", getattr(model, "n"))
-        if n < 2:
-            raise ResultValidationError("need n>=2")
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_data_call(
-            "hi", schema, feature="t", retry=_NO_BACKOFF, on_result=_require_two
-        )
-
-    assert result == {"n": 2}
-    assert calls[0] == 2
-    # The hook saw the generated Pydantic model (class named from the schema
-    # title), not the returned dict.
-    assert seen_types == ["Box", "Box"]
 
 
 @pytest.mark.asyncio

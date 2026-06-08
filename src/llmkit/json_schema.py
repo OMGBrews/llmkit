@@ -130,6 +130,7 @@ class _DumpJsonKwargs(TypedDict, total=False):
     serialize_as_any: bool
     polymorphic_serialization: bool | None
 
+
 # A JSON-schema dict: string keys to arbitrary JSON values. Modelled with
 # pydantic's ``JsonValue`` so the schema data carries a precise type rather
 # than ``Any`` everywhere it is read.
@@ -464,8 +465,8 @@ class _Converter:
         # JSON-clean. The generated models also set ``use_enum_values=True``
         # (see ``_JsonSchemaModel``), so a validated instance stores the raw
         # scalar — ``model_dump()`` yields ``2``, not ``<Enum._2: 2>`` — which
-        # is what dict consumers (``structured_data_call``) and the provider
-        # JSON both expect.
+        # is what dict consumers (those who ``model_dump()`` the result) and
+        # the provider JSON both expect.
         base: type = int if all_int else str
         # The functional ``Enum(...)`` call returns a new enum *class* at runtime,
         # but the stubs type it as an ``Enum`` instance — hence the narrow ignore.

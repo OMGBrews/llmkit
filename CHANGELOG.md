@@ -12,6 +12,9 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Added
 
+- `text_llm_call_sync(...)` — a synchronous wrapper around `text_llm_call`,
+  matching the existing structured sync wrappers and removing the call-surface
+  asymmetry for non-streaming LLM calls.
 - `model_from_json_schema(schema, *, name=None)` — converts a **JSON-schema
   dict** into a Pydantic model class at runtime, so consumers who declare their
   structured-output contracts as JSON-schema dicts (shared across Node /
@@ -146,20 +149,12 @@ dated `## [0.1.3]` section when the release is cut.
 - `LLMCallOptions`, an opt-in **frozen** bundle of the per-call keyword
   arguments (`temperature` / `model` / `max_tokens` / `reasoning_effort` /
   `retry` / `provider`) accepted as `options=` on `structured_llm_call`,
-  `structured_llm_call_sync`, `text_llm_call`, `stream_text_with_log`, and
-  `structured_data_call`, to cut the repeated per-call keyword block; the
+  `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and
+  `stream_text_with_log`, to cut the repeated per-call keyword block; the
   flat-keyword path is unchanged. Precedence is config < `options` < explicit
   per-call keyword. `feature` is intentionally **not** part of `LLMCallOptions`
   — it stays a required per-call keyword as a deliberate telemetry forcing
   function. Exported from the package root.
-- `structured_data_call` and `structured_data_call_sync` — a dict-in /
-  data-out structured call (JSON-schema dict in, plain `dict` out) built on
-  `model_from_json_schema`, for consumers who never want the intermediate
-  Pydantic instance. Inherits the full `structured_llm_call` surface (logging,
-  default-on retries, per-call `provider=` override, `model` / `temperature` /
-  `max_tokens` / `reasoning_effort`, and `LLMCallOptions`). An omitted optional
-  field is absent from the result, not present-as-null. Exported from the
-  package root.
 - `rate_limit_acquire_async(provider_key)` and
   `rate_limit_acquire_sync(provider_key)` context managers in
   `llmkit.rate_limiting` — the public way to join the global per-provider rate
@@ -167,8 +162,8 @@ dated `## [0.1.3]` section when the release is cut.
   `GlobalRateLimiter`. Each yields a `RateLimitSlot` whose `record_tokens(...)`
   debits the TPM budget when configured.
 - An `on_result` semantic-validation **re-roll hook** on the call functions
-  (`structured_llm_call` / `_sync`, `text_llm_call`, `structured_data_call` /
-  `_sync`) plus a new exported `ResultValidationError`. The callback is invoked
+  (`structured_llm_call` / `_sync`, `text_llm_call` / `_sync`) plus a new
+  exported `ResultValidationError`. The callback is invoked
   with each attempt's result; raising `ResultValidationError` from it rejects a
   result that *parsed* but is *semantically* wrong (an empty register, an
   unresolved citation, a total that doesn't reconcile) and re-rolls the call.
@@ -178,8 +173,7 @@ dated `## [0.1.3]` section when the release is cut.
   budget; on exhaustion the last `ResultValidationError` propagates, and each
   attempt (rejected ones included) is its own logged call. Folds an
   LLM-then-validate-then-re-roll loop consumers hand-rolled into the call
-  itself. `text_llm_call`'s hook receives the response text; `structured_data_call`'s
-  receives the validated Pydantic model (before it's dumped to a dict). Like
+  itself. `text_llm_call`'s hook receives the response text. Like
   `feature`, `on_result` is a per-call keyword, not part of `LLMCallOptions`.
 - An `omg_llmkit` **import shim**: the distribution installs as `omg-llmkit` but
   imports as `llmkit`, and a mistaken `import omg_llmkit` (e.g. a post-install
@@ -205,7 +199,8 @@ dated `## [0.1.3]` section when the release is cut.
   `omg-llmkit[bedrock]`, or `omg-llmkit[all]`); hosts on other providers need no
   change.
 - **Transient-error retries are now on by default.** `structured_llm_call`,
-  `text_llm_call`, `stream_text_with_log`, and `structured_llm_call_sync` retry
+  `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and
+  `stream_text_with_log` retry
   the curated recoverable set (429 / 503 / 5xx, timeouts, transient
   provider errors) on their own — with full-jitter backoff — so
   reliability no longer depends on every caller wrapping each call. The transient
@@ -374,8 +369,8 @@ dated `## [0.1.3]` section when the release is cut.
   now letter-led and sign-preserving (`NEG_1`, `N_1`), so they can never form a
   reserved `_sunder_`/`__dunder__` name. Generated models also set
   `use_enum_values=True`, so a validated instance stores the raw scalar —
-  `model_dump()` yields `2`, not `<Enum._2: 2>` (this also makes
-  `structured_data_call` hand dict consumers raw values). Surfaced by the FiW
+  `model_dump()` yields `2`, not `<Enum._2: 2>` (so a dict consumer that
+  `model_dump()`s the result gets raw values). Surfaced by the FiW
   0.2.0 RC dogfood.
 - **Synchronous calls no longer leak a `coroutine 'Logging.async_success_handler'
   was never awaited` `RuntimeWarning` to stderr.** LiteLLM logs successes

@@ -25,18 +25,17 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Generator, Mapping
+from collections.abc import AsyncIterator, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
 from llmkit.exceptions import ResultValidationError
-from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import LLMCallRecord, write_llm_log
 from llmkit.providers import LLMProviderInterface
 from llmkit.retry import (
@@ -74,8 +73,8 @@ class LLMCallOptions:
 
     Opt-in ergonomics for the call functions
     (:func:`structured_llm_call`, :func:`structured_llm_call_sync`,
-    :func:`text_llm_call`, :func:`stream_text_with_log`, and
-    :func:`~llmkit.structured_data_call`): a feature module builds one
+    :func:`text_llm_call`, :func:`text_llm_call_sync`, and
+    :func:`stream_text_with_log`): a feature module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
     instead of repeating the same nine-keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.
@@ -123,8 +122,7 @@ class _ResolvedCallArgs:
 
     The single shape every call function forwards to the transport once the
     three-layer precedence (config < options < explicit keyword) has been
-    collapsed. Internal — stage 3's :func:`~llmkit.structured_data_call`
-    reuses :func:`_resolve_call_args` to obtain one of these.
+    collapsed. Internal to the call-function module.
     """
 
     temperature: float
@@ -147,8 +145,7 @@ def _resolve_call_args(
 ) -> _ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
-    The shared seam all four call functions (and stage 3's
-    :func:`~llmkit.structured_data_call`) funnel through, so the
+    The shared seam all the call functions funnel through, so the
     precedence is defined in exactly one place. The keyword arguments are
     the values the call function received with its *own* defaults already
     applied; for each field the rule is:
@@ -560,146 +557,6 @@ def structured_llm_call_sync[T](
     )
 
 
-async def structured_data_call(
-    prompt: str | list[dict[str, str]],
-    schema: Mapping[str, JsonValue],
-    *,
-    feature: str,
-    label: str | None = None,
-    temperature: float = _DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
-    on_result: Callable[[BaseModel], object] | None = None,
-    options: LLMCallOptions | None = None,
-) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
-    """Dict-in / data-out structured call for JSON-schema-dict consumers.
-
-    The dict→dict sibling of :func:`structured_llm_call`, for callers whose
-    contract is *literally* "JSON-schema dict in, plain data out" — they
-    declare their schema as a dict and never want the intermediate Pydantic
-    instance. Internally it builds a model from *schema* via
-    :func:`~llmkit.model_from_json_schema`, runs the exact same machinery as
-    :func:`structured_llm_call` (logging, default-on retries, the per-call
-    ``provider=`` override, ``model`` / ``temperature`` / ``max_tokens`` /
-    ``reasoning_effort``, and the :class:`LLMCallOptions` bundle), then
-    returns the validated instance's ``model_dump()`` — so there is *one*
-    call path, not a duplicated one.
-
-    :func:`~llmkit.model_from_json_schema` stays exported as the lower-level
-    primitive (build-once-reuse, when you want the model class itself); this
-    is the convenience surface for the dict-in/dict-out case.
-
-    Args:
-        prompt: Either a plain string or a list of message dicts
-            (``[{"role": "system", "content": "..."}, ...]``).
-        schema: The output contract as a JSON-schema dict. The root must be
-            an object (or a ``$ref`` to one); see
-            :func:`~llmkit.model_from_json_schema` for the supported subset.
-        feature: Caller feature name; embedded in the log filename/body.
-            Required as a telemetry forcing function (see
-            :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
-        label: Optional finer-grained identifier for the log filename.
-        temperature: Sampling temperature passed to the provider.
-        model: Optional model override (provider default when ``None``).
-            *Dual-homed* with :class:`~llmkit.LLMClientConfig`: per-call
-            overrides ``options`` overrides config.
-        max_tokens: Optional cap on the completion length (uncapped when
-            ``None``).
-        reasoning_effort: Optional per-call override of the provider's
-            reasoning/thinking effort; ``None`` defers to the configured
-            :class:`~llmkit.LLMClientConfig` value. *Dual-homed* like
-            ``model``.
-        provider: Optional provider override for THIS call only (``None``
-            uses the globally-configured provider).
-        retry: Transient-error retry budget (default-on; see
-            :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
-            opt out.
-        on_result: Optional semantic-validation re-roll hook (see
-            :func:`structured_llm_call`). Because the re-roll must happen
-            *before* the result is dumped to a dict, the callback receives the
-            validated **Pydantic model** (the instance built from *schema*),
-            not the returned dict; raise :class:`~llmkit.ResultValidationError`
-            from it to reject and re-roll on the validation budget.
-        options: Optional :class:`LLMCallOptions` bundle (see
-            :func:`structured_llm_call`); explicit keywords here override it,
-            it overrides config, and ``None`` leaves the flat path unchanged.
-
-    Returns:
-        The validated response as a plain ``dict`` (the generated model's
-        ``model_dump()``). Because the generated model dumps with
-        ``exclude_none=True``, an omitted optional field is *absent* from the
-        result, not present-as-``null``.
-
-    Raises:
-        ValueError: If *schema* is outside the supported subset (raised by
-            :func:`~llmkit.model_from_json_schema` before any LLM call).
-        Any exception from the LLM provider or output parser — transient ones
-        are retried per *retry*, others propagate; the log is written on
-        every attempt with the error recorded (see :func:`structured_llm_call`).
-    """
-    output_model = model_from_json_schema(schema)
-    result = await structured_llm_call(
-        prompt,
-        output_model,
-        feature=feature,
-        label=label,
-        temperature=temperature,
-        model=model,
-        max_tokens=max_tokens,
-        reasoning_effort=reasoning_effort,
-        provider=provider,
-        retry=retry,
-        on_result=on_result,
-        options=options,
-    )
-    return result.model_dump()
-
-
-def structured_data_call_sync(
-    prompt: str | list[dict[str, str]],
-    schema: Mapping[str, JsonValue],
-    *,
-    feature: str,
-    label: str | None = None,
-    temperature: float = _DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
-    on_result: Callable[[BaseModel], object] | None = None,
-    options: LLMCallOptions | None = None,
-) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
-    """Synchronous wrapper around :func:`structured_data_call`.
-
-    The dict-in/data-out counterpart to :func:`structured_llm_call_sync`,
-    for the synchronous call sites that cannot ``await`` (e.g. FiW). Same
-    arguments, same logging, same data-out result; the coroutine is driven to
-    completion via the same :func:`run_sync` bridge, so the rate-limit slot,
-    retries, the ``on_result`` re-roll hook, and ``options`` precedence are all
-    inherited from the async path unchanged.
-    """
-    return run_sync(
-        structured_data_call(
-            prompt,
-            schema,
-            feature=feature,
-            label=label,
-            temperature=temperature,
-            model=model,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            provider=provider,
-            retry=retry,
-            on_result=on_result,
-            options=options,
-        )
-    )
-
-
 async def text_llm_call(
     prompt: str | list[dict[str, str]],
     *,
@@ -827,6 +684,43 @@ async def text_llm_call(
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
         validation_retry_on=_result_validation_budget(retry),
+    )
+
+
+def text_llm_call_sync(
+    prompt: str | list[dict[str, str]],
+    *,
+    feature: str,
+    label: str | None = None,
+    temperature: float = _DEFAULT_TEMPERATURE,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    provider: LLMProviderInterface | None = None,
+    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[str], object] | None = None,
+    options: LLMCallOptions | None = None,
+) -> str:
+    """Synchronous wrapper around :func:`text_llm_call`.
+
+    Same arguments, same logging, same plain-text result as the async version;
+    the coroutine is driven to completion via :func:`run_sync`, matching the
+    structured sync wrappers.
+    """
+    return run_sync(
+        text_llm_call(
+            prompt,
+            feature=feature,
+            label=label,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            retry=retry,
+            on_result=on_result,
+            options=options,
+        )
     )
 
 

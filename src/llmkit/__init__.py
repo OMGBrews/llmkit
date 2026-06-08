@@ -72,11 +72,10 @@ from llmkit.structured_output import (
     capture_llm_log_paths,
     capture_llm_records,
     stream_text_with_log,
-    structured_data_call,
-    structured_data_call_sync,
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
+    text_llm_call_sync,
 )
 
 __all__ = [
@@ -108,9 +107,8 @@ __all__ = [
     # Structured + plain-text call functions (the public call surface)
     "structured_llm_call",
     "structured_llm_call_sync",
-    "structured_data_call",
-    "structured_data_call_sync",
     "text_llm_call",
+    "text_llm_call_sync",
     "stream_text_with_log",
     "capture_llm_log_paths",
     "capture_llm_records",

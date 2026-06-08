@@ -85,6 +85,7 @@ The public call surface:
 | `structured_llm_call(prompt, output_schema, feature, label, ...)` | Async, returns a validated Pydantic instance |
 | `structured_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
+| `text_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 
 > **Two defaults worth knowing up front.**
@@ -93,7 +94,7 @@ The public call surface:
 
 ### Reusing call options
 
-The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `stream_text_with_log`, and `structured_data_call`) take up to nine keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
+The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `stream_text_with_log`) take up to nine keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
 from llmkit import LLMCallOptions, structured_llm_call
@@ -164,6 +165,15 @@ result = await structured_llm_call(
 
 **Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); and nested objects inline or via local `$ref` (`#/$defs/...`). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` default to **`exclude_none=True`** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). Pass `exclude_none=False` to keep the nulls. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly.
 
+**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the `exclude_none=True` default above, so the dict matches the schema:
+
+```python
+Person = model_from_json_schema(person_schema)   # build once, at import
+
+result = await structured_llm_call(prompt, Person, feature="extraction")
+data = result.model_dump()                        # {"name": "Ada", "age": 36}
+```
+
 #### Schema constraints
 
 `model_from_json_schema` carries a small, fixed set of per-field JSON-schema
@@ -202,60 +212,6 @@ enforced (and `null` itself still passes for a nullable field).
 `multipleOf`, `uniqueItems`, `const`, and the rest are *not* enforced. This is
 deliberate: partial enforcement that looks complete is worse than none. If a
 schema relies on one of those, validate it elsewhere.
-
-### Dict-in / data-out structured calls
-
-`structured_llm_call` is, and stays, Pydantic-model-only. But some consumers
-declare their output contracts as **JSON-schema dicts** and never want the
-intermediate Pydantic instance — their flow is literally dict-in → validate →
-dict-out. For them, `structured_data_call` (and its sync sibling
-`structured_data_call_sync`) takes a JSON-schema dict and returns plain data:
-
-```python
-from llmkit import structured_data_call
-
-person_schema = {
-    "title": "Person",
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "age": {"type": "integer"},
-        "nickname": {"type": "string"},  # optional
-    },
-    "required": ["name", "age"],
-}
-
-data = await structured_data_call(prompt, person_schema, feature="extraction")
-# -> {"name": "Ada", "age": 36}   (a plain dict, not a Pydantic model)
-```
-
-Internally it builds a model from the schema via
-[`model_from_json_schema`](#contracts-as-json-schema-dicts) and runs the exact
-same machinery as `structured_llm_call`, then returns the validated instance's
-`model_dump()`. So it inherits the whole call surface unchanged — logging,
-default-on retries, the per-call `provider=` override,
-`model`/`temperature`/`max_tokens`/`reasoning_effort`, and the
-[`LLMCallOptions`](#reusing-call-options) bundle:
-
-```python
-data = structured_data_call_sync(
-    prompt,
-    person_schema,
-    feature="extraction",
-    options=shared_options,   # same precedence: config < options < explicit keyword
-)
-```
-
-An **omitted optional** field is *absent* from the returned dict, not
-present-as-`null` — the generated model dumps with `exclude_none=True`, so a
-field the model never set won't round-trip back out as `"nickname": null` (which
-would otherwise fail re-validation against a schema that lists it as a
-non-nullable optional).
-
-`model_from_json_schema` remains the exported lower-level primitive: reach for it
-directly when you want the model *class* itself (the build-once-reuse pattern, or
-to pass it straight to `structured_llm_call`); reach for `structured_data_call`
-when your contract is simply dict-in / dict-out.
 
 ### Rate limiting
 
@@ -354,7 +310,7 @@ prompt: ...
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `text_llm_call`, `stream_text_with_log`, and their sync wrappers) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `stream_text_with_log`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
 **`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
 
@@ -617,7 +573,7 @@ result = await structured_llm_call(
 
 The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
 
-`on_result` is available on `structured_llm_call` (and its sync wrapper), `text_llm_call` (the hook receives the response *text*), and `structured_data_call` / `_sync` (the hook receives the validated Pydantic *model*, before it's dumped to a dict). It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
+`on_result` is available on `structured_llm_call` (and its sync wrapper) and `text_llm_call` (the hook receives the response *text*). It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 
 ## Development
 
