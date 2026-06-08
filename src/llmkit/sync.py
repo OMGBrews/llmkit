@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 from collections.abc import Coroutine
 
 
@@ -144,8 +145,18 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
         def run_in_new_loop() -> T:
             return _run_and_drain(coro, timeout=timeout)
 
+        # Run the worker inside a *copy* of the caller's context so the
+        # context-scoped state the call layer relies on — ``capture_llm_records``
+        # / ``capture_llm_log_paths`` (both record into a list held in a
+        # ``ContextVar``) and the retry ``_progress_callback`` — crosses into the
+        # worker thread. A bare ``executor.submit`` does not propagate
+        # ``contextvars``, so without this a ``*_sync`` call made from inside a
+        # running loop would silently capture nothing (the lists live in the
+        # parent context the worker never sees). The captured lists are shared by
+        # reference, so the worker's appends are visible to the caller on return.
+        ctx = contextvars.copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_in_new_loop)
+            future = executor.submit(ctx.run, run_in_new_loop)
             return future.result(timeout=timeout)
     else:
         return _run_and_drain(coro, timeout=timeout)

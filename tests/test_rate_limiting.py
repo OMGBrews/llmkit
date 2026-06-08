@@ -197,6 +197,49 @@ async def test_inflight_caller_not_stranded_by_configure_swap() -> None:
         pass
 
 
+def test_async_semaphore_not_reused_across_event_loops() -> None:
+    """A saturated provider on one loop must not crash the next loop.
+
+    An ``asyncio.Semaphore`` binds to the event loop it first *blocks* on and
+    thereafter raises ``RuntimeError`` if awaited from another. The sync bridge
+    runs a fresh loop per ``run_sync`` call, so the process-global registry must
+    key the async semaphore per-loop; otherwise the second call reuses the
+    first loop's (now-closed) semaphore and raises "bound to a different event
+    loop" the moment it has to block. This is a plain ``def`` (not the auto
+    async fixture) precisely so it drives two *separate* loops via
+    ``asyncio.run``, and it deliberately does **not** ``configure`` between them
+    — that would clear the registry and mask the bug.
+    """
+    GlobalRateLimiter.configure(max_concurrent=1)
+
+    async def contend(key: str) -> None:
+        # Hold the only slot, then start a waiter that must block on acquire —
+        # blocking is what binds the semaphore to the running loop.
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def holder() -> None:
+            async with GlobalRateLimiter.acquire_async(key):
+                held.set()
+                _ = await release.wait()
+
+        async def waiter() -> None:
+            _ = await held.wait()
+            async with GlobalRateLimiter.acquire_async(key):  # blocks: cap=1, held
+                pass
+
+        h = asyncio.create_task(holder())
+        w = asyncio.create_task(waiter())
+        _ = await held.wait()
+        for _ in range(5):  # let the waiter reach its blocking acquire
+            await asyncio.sleep(0)
+        release.set()
+        _ = await asyncio.gather(h, w)
+
+    asyncio.run(contend("openai"))  # loop A binds the semaphore
+    asyncio.run(contend("openai"))  # loop B: must not raise "bound to a different loop"
+
+
 async def test_call_layer_accounts_under_effective_provider_name() -> None:
     """acompletion_text acquires under the running provider's ``.name``.
 

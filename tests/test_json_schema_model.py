@@ -554,6 +554,47 @@ def test_array_item_count_bounds_enforced() -> None:
         _ = model(tags=["a", "b", "c"])
 
 
+def test_constraint_keyword_on_mismatched_type_is_dropped_not_crashing() -> None:
+    """A bound that doesn't match the field's type is dropped, not applied.
+
+    Pydantic rejects a length bound on a numeric field (and a numeric bound on a
+    string field) with a ``TypeError`` at *validation* time, not build time — so
+    applying a stray keyword unconditionally would turn a plausible-but-sloppy
+    schema into an opaque crash on the first response. The converter promises to
+    silently drop unsupported constraints; a *mismatched* one is dropped the
+    same way. Build succeeds and the values validate with no bound enforced.
+    """
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            # maxLength/minItems are nonsense on an integer; minimum is nonsense
+            # on a string. None must reach pydantic's Field as a real constraint.
+            "count": {"type": "integer", "maxLength": 3, "minItems": 1},
+            "label": {"type": "string", "minimum": 0, "exclusiveMaximum": 10},
+        },
+        "required": ["count", "label"],
+    }
+    model = model_from_json_schema(schema)  # must not raise
+    inst = model(count=99999, label="anything-long")  # must not raise at validation
+    assert _attr(inst, "count") == 99999
+    assert _attr(inst, "label") == "anything-long"
+
+
+def test_mixed_string_and_integer_enum_is_rejected_clearly() -> None:
+    """A mixed string/int enum can't be faithfully represented (one base coerces
+    members), so it's rejected with a clear, path-naming error rather than
+    silently building a model that rejects its own schema-valid integer values."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"kind": {"enum": ["a", 1]}},
+        "required": ["kind"],
+    }
+    with pytest.raises(ValueError, match="mixed-type enum"):
+        _ = model_from_json_schema(schema)
+
+
 def test_bounds_on_optional_field_enforced_when_present() -> None:
     """A bound on an optional field still applies once the field is supplied,
     but the field may be omitted."""

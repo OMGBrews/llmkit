@@ -235,6 +235,18 @@ class GlobalRateLimiter:
     the registries) does not strand in-flight callers — they release back onto,
     and debit, their own snapshot.
 
+    The *async* concurrency semaphore is additionally keyed by the running event
+    loop, because an ``asyncio.Semaphore`` binds to the loop it first blocks on
+    and cannot be awaited from another. The sync bridge runs a fresh loop per
+    call, so a per-loop key is what keeps a saturated provider from raising
+    "bound to a different event loop" when the next sync call (or a mixed
+    async/sync app) reuses the registry; closed loops are pruned so they can't
+    accumulate. A consequence is that the concurrency cap is enforced per
+    (provider, loop): truly concurrent loops in different threads do not share
+    one async semaphore — which is unavoidable, since an asyncio primitive can't
+    span loops. Cross-thread *sync* callers share the loop-agnostic
+    ``threading.Semaphore`` and so do share one cap.
+
     Enabled by default with a per-provider concurrency cap of 8; RPM and TPM
     are opt-in and off by default. See the module docstring for the rationale,
     the token-bucket choice, and the deliberate non-goals (single-tenant by
@@ -242,7 +254,11 @@ class GlobalRateLimiter:
     """
 
     _lock: threading.Lock = threading.Lock()
-    _async_semaphores: dict[str, asyncio.Semaphore] = {}
+    # Async semaphores are additionally keyed by the running event loop: an
+    # ``asyncio.Semaphore`` binds to the loop it first blocks on and cannot be
+    # awaited from another (the sync bridge runs a fresh loop per call). See
+    # ``_get_async_semaphore``.
+    _async_semaphores: dict[tuple[str, asyncio.AbstractEventLoop], asyncio.Semaphore] = {}
     _sync_semaphores: dict[str, threading.Semaphore] = {}
     _rpm_buckets: dict[str, _RateBucket] = {}
     _tpm_buckets: dict[str, _RateBucket] = {}
@@ -326,11 +342,24 @@ class GlobalRateLimiter:
 
     @classmethod
     def _get_async_semaphore(cls, key: str) -> asyncio.Semaphore:
+        # An ``asyncio.Semaphore`` lazily binds to the event loop it first
+        # *blocks* on and thereafter raises ``RuntimeError`` ("bound to a
+        # different event loop") if awaited from another. The sync bridge spins
+        # up a fresh loop for every ``run_sync`` call, and an app may mix async
+        # and sync entry points, so a process-global registry keyed by provider
+        # name alone would hand a loop-A semaphore to loop B and crash under
+        # contention. Key it by (provider, running loop) instead, and prune
+        # entries whose loop has closed so the short-lived loops the sync bridge
+        # retires can't accumulate without bound.
+        loop = asyncio.get_running_loop()
         with cls._lock:
-            sem = cls._async_semaphores.get(key)
+            registry = cls._async_semaphores
+            for stale in [k for k in registry if k[1].is_closed()]:
+                del registry[stale]
+            sem = registry.get((key, loop))
             if sem is None:
                 sem = asyncio.Semaphore(cls._max_concurrent)
-                cls._async_semaphores[key] = sem
+                registry[(key, loop)] = sem
             return sem
 
     @classmethod

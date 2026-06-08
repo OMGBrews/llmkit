@@ -101,6 +101,39 @@ def test_capture_records_crosses_the_sync_bridge() -> None:
     assert records[0].feature == "classification"
 
 
+def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
+    """Capture survives a ``*_sync`` call made from *inside* a running loop.
+
+    On that path ``run_sync`` cannot drive the coroutine in-thread (a loop is
+    already running), so it offloads to a worker thread. A bare
+    ``executor.submit`` would not propagate the capture ``ContextVar``, so the
+    record would be silently lost — the buffer lives in the parent context the
+    worker never sees. Regression for that running-loop sync-bridge case (the
+    no-running-loop test above exercises the in-thread path, which keeps the
+    context for free).
+    """
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
+        patch("llmkit.providers.build_provider", return_value=_provider()),
+    ):
+
+        async def _run() -> tuple[list[LLMCallRecord], _Schema]:
+            with capture_llm_records() as records:
+                # Called directly (blocking) from inside the running loop, so
+                # run_sync detects it and offloads to a worker thread whose
+                # context must carry this capture buffer.
+                result = structured_output.structured_llm_call_sync(
+                    "hi", _Schema, feature="classification"
+                )
+            return records, result
+
+        captured, result = asyncio.run(_run())
+
+    assert result.ok is True
+    assert len(captured) == 1
+    assert captured[0].feature == "classification"
+
+
 def test_capture_records_captures_text_calls() -> None:
     """``text_llm_call`` records flow into the capture buffer too."""
 

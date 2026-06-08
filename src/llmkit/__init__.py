@@ -3,7 +3,7 @@
 Provides a thin, opinionated layer over **LiteLLM** (with ``instructor``
 for structured output) that gives the application a unified, provider-
 agnostic call surface across cloud providers (OpenRouter, Google,
-Anthropic, OpenAI) and local Ollama.
+Anthropic, OpenAI, DeepSeek, AWS Bedrock) and local Ollama.
 
 This package provides:
 - The structured / plain-text / streaming call functions

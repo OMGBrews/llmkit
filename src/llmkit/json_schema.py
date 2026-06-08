@@ -391,6 +391,15 @@ class _Converter:
         ``_FieldConstraints`` fields) are silently dropped — no partial
         enforcement. ``minLength`` (strings) and ``minItems`` (arrays) never
         co-occur on one field, so mapping both onto ``min_length`` is safe.
+
+        A bound is also dropped when it does **not match the field's resolved
+        JSON type** — a numeric bound (``minimum`` …) on a non-numeric field, or
+        a length bound (``minLength`` / ``minItems`` …) on a non-string/array
+        field. Pydantic rejects such a mismatched constraint with a ``TypeError``
+        at *validation* time (not build time), so applying it unconditionally
+        would turn a stray keyword in an otherwise-valid schema into an opaque
+        crash on the first response. Gating by type keeps the drop-the-
+        unsupported promise instead of crashing.
         """
         if "$ref" in schema:
             _, schema = self._resolve_ref(cast("str", schema["$ref"]))
@@ -398,6 +407,20 @@ class _Converter:
         if "$ref" in inner:
             _, inner = self._resolve_ref(cast("str", inner["$ref"]))
             inner, _ = self._unwrap_nullable(inner)
+
+        raw_type = inner.get("type")
+        types: set[str] = (
+            {raw_type}
+            if isinstance(raw_type, str)
+            else {t for t in raw_type if isinstance(t, str)}
+            if isinstance(raw_type, list)
+            else set()
+        )
+        # Numeric bounds (ge/le/gt/lt) apply only to integer/number; length
+        # bounds (min_length/max_length) only to string/array. A field whose
+        # type is absent or anything else gets no bounds — drop, never crash.
+        numeric_field = bool(types & {"integer", "number"})
+        sized_field = bool(types & {"string", "array"})
 
         def _number(key: str) -> float | None:
             value = inner.get(key)
@@ -415,15 +438,23 @@ class _Converter:
             return None
 
         return _FieldConstraints(
-            ge=_number("minimum"),
-            le=_number("maximum"),
-            gt=_number("exclusiveMinimum"),
-            lt=_number("exclusiveMaximum"),
+            ge=_number("minimum") if numeric_field else None,
+            le=_number("maximum") if numeric_field else None,
+            gt=_number("exclusiveMinimum") if numeric_field else None,
+            lt=_number("exclusiveMaximum") if numeric_field else None,
             # minLength (string) and minItems (array) both map to min_length;
             # at most one is present for a given field, so the ``or`` picks the
             # one that applies without conflict.
-            min_length=_length("minLength") if "minLength" in inner else _length("minItems"),
-            max_length=_length("maxLength") if "maxLength" in inner else _length("maxItems"),
+            min_length=(
+                (_length("minLength") if "minLength" in inner else _length("minItems"))
+                if sized_field
+                else None
+            ),
+            max_length=(
+                (_length("maxLength") if "maxLength" in inner else _length("maxItems"))
+                if sized_field
+                else None
+            ),
         )
 
     def _build_enum(self, schema: JsonDict, field_path: str) -> type[Enum]:
@@ -434,13 +465,16 @@ class _Converter:
             )
         members: dict[str, JsonValue] = {}
         all_int = True
+        any_int = False
         for value in cast("list[JsonValue]", values):
             if isinstance(value, bool) or not isinstance(value, (str, int)):
                 raise ValueError(
                     f"Unsupported enum value {value!r} at {field_path!r}: only string and "
                     + "integer enum members are supported."
                 )
-            if not isinstance(value, int):
+            if isinstance(value, int):
+                any_int = True
+            else:
                 all_int = False
             raw = str(value)
             key = re.sub(r"\W+", "_", raw).strip("_").upper() or "VALUE"
@@ -457,6 +491,17 @@ class _Converter:
             while key in members:
                 key = f"{key}_"
             members[key] = value
+        # A mixed string/integer enum has no faithful single base: with
+        # ``use_enum_values=True`` an ``int`` base + str member (or vice versa)
+        # coerces members to one type, so the generated model would reject its
+        # own schema-valid values (e.g. integer ``1`` stored as ``"1"``). The
+        # supported subset is a homogeneous string *or* integer enum; reject the
+        # mix loudly, naming the construct, rather than silently misbuilding.
+        if any_int and not all_int:
+            raise ValueError(
+                f"Unsupported mixed-type enum at {field_path!r}: enum members must be all "
+                + "strings or all integers, not a mix of both."
+            )
         title = schema.get("title")
         name = (
             _safe_model_name(title) if isinstance(title, str) and title else self._anon_name("Enum")

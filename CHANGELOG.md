@@ -6,9 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The accumulated work below is the next release (planned `0.1.3`) and has not yet
+The accumulated work below is the next release (`0.2.0`, a MINOR bump — it
+carries default-behavior changes and a small breaking surface) and has not yet
 been published to PyPI — the last published version is `0.1.2`. It moves to a
-dated `## [0.1.3]` section when the release is cut.
+dated `## [0.2.0]` section when the release is cut.
+
+**Migrating from 0.1.2.** Most code keeps working unchanged, but three changes
+flip a default or move a symbol — review these first:
+
+- **Transient-error retries are on by default.** Every call function now retries
+  the recoverable set on its own. If you already wrap calls in your own retry
+  loop, pass `retry=NO_RETRY` (or wrap with `with_retries`, which auto-collapses
+  the inner pass) to avoid multiplied budgets. Permanent 4xx (401/400/403) fail
+  fast and are never retried.
+- **Per-provider concurrency limiting is on by default** (cap **8** concurrent
+  calls per provider). Lower it with `configure_rate_limit(max_concurrent=...)`,
+  or `enabled=False` to turn it off. RPM/TPM remain opt-in (off unless set), so
+  an unset request is byte-identical to before — note a migrator's old
+  per-minute tuning stays inert until you set `rpm=`/`tpm=`.
+- **A few symbols moved or were removed** (all breaking — see _Removed_):
+  `get_provider`/`get_llm_config` → `build_provider`/`describe_llm`;
+  `with_retries(max_retries=...)` → `max_attempts=...`; the `*Provider` classes,
+  `with_retries`, and `GlobalRateLimiter` are no longer re-exported from the
+  package root (import them from `llmkit.providers` / `llmkit.retry` /
+  `llmkit.rate_limiting`). The Anthropic SDK is now the opt-in
+  `omg-llmkit[anthropic]` extra — install it (or `[bedrock]` / `[all]`) only if
+  you route Anthropic or Bedrock.
 
 ### Added
 
@@ -38,7 +61,13 @@ dated `## [0.1.3]` section when the release is cut.
   downstream re-validation against the same schema); pass `exclude_none=False`
   to keep the nulls. (2) A title-less or empty-titled schema still yields a
   validly-named class (default `JsonSchemaModel`), which `create_model` and
-  `instructor` both require. Exported from the package root.
+  `instructor` both require. Generated models set `extra="forbid"`, so a
+  response carrying a key not in the schema is rejected rather than silently
+  kept (a hallucinated extra field fails loudly — stricter than JSON Schema's
+  permissive `additionalProperties` default). Per-field bounds outside the
+  supported set are dropped, and a constraint that doesn't match the field's
+  type, or a mixed string/integer `enum`, is handled safely (see _Fixed_).
+  Exported from the package root.
 - A `py.typed` marker so consumers' type checkers honor llmkit's type hints
   (the package is basedpyright-clean and already declares the `Typing :: Typed`
   classifier, but without the PEP 561 marker downstream tools treated it as
@@ -234,7 +263,7 @@ dated `## [0.1.3]` section when the release is cut.
   layer remains separate from instructor's in-call `validation_retries`
   (default 1, which repairs malformed JSON *within* one attempt before any
   `ValidationError` reaches the retry layer). Flagged by the PIA Maker and FiW
-  dogfoods of the 0.1.3 RC.
+  dogfoods of the 0.2.0 RC.
 - **Unified the public retry attempt-count on `max_attempts`.** `RetryPolicy`
   already used `max_attempts`; `with_retries(...)` now uses it too, with the same
   semantics everywhere — *total attempts including the first* (`N`, not `1 + N`).
@@ -289,12 +318,6 @@ dated `## [0.1.3]` section when the release is cut.
   symbol (`Provider`, `LLMClientConfig`, the `*Provider` classes, `get_provider`,
   `get_llm_config`, …) imports from `llmkit` and `llmkit.providers` exactly as
   before.
-- README now describes `with_retries()` as a composable helper the caller wraps
-  a call in — the public call functions do not retry on their own — instead of
-  implying transient-error retries happen automatically "out of the box".
-- `anthropic` is now a required runtime dependency. `instructor` imports the
-  Anthropic SDK to account usage for its native `ANTHROPIC_JSON` mode, so the
-  Anthropic provider needs it present at call time.
 - `LLMClientConfig.model` is now optional (`str | None`, default `None`); a
   falsy model resolves to the selected provider's own default model instead of
   producing a broken `"<prefix>/"` LiteLLM id.
@@ -360,6 +383,36 @@ dated `## [0.1.3]` section when the release is cut.
 
 ### Fixed
 
+- **The on-by-default concurrency limiter no longer raises "bound to a different
+  event loop" across sync calls.** The per-provider async semaphore was cached
+  in a process-global registry keyed by provider name alone, but an
+  `asyncio.Semaphore` binds to the event loop it first *blocks* on. Because the
+  sync bridge (`*_llm_call_sync`) runs a fresh loop per call, a saturated
+  provider on one call's loop would hand its now-bound semaphore to the next
+  call's loop and raise `RuntimeError` the moment it had to block. The registry
+  is now keyed per `(provider, loop)` and prunes closed loops, so a contended
+  cap survives the loop change. (Only surfaced under genuine contention, which
+  is why it escaped the earlier per-group review.)
+- **`capture_llm_records()` / `capture_llm_log_paths()` now capture across a
+  `*_sync` call made from inside a running event loop.** On that path `run_sync`
+  offloads to a worker thread, and a bare `executor.submit` does not propagate
+  `contextvars`, so the capture buffer (held in a `ContextVar`) was invisible to
+  the worker and the call's record was silently dropped. The worker now runs
+  inside a copy of the caller's context, so capture (and the retry progress
+  callback) cross the boundary as documented.
+- **`model_from_json_schema` no longer crashes at validation time on a
+  constraint keyword that doesn't match the field's type.** A length bound on a
+  numeric field (or a numeric bound on a string field) was passed straight to
+  pydantic's `Field`, which accepts it at build time but raises `TypeError` on
+  the first validation — turning a stray keyword in an otherwise-valid schema
+  into an opaque crash on the first response. Such a mismatched constraint is
+  now dropped (gated by the field's resolved JSON type), honoring the
+  drop-the-unsupported contract instead of crashing.
+- **`model_from_json_schema` now rejects a mixed string/integer `enum` with a
+  clear error** naming the construct and its path, instead of silently building
+  a model that coerces members to one base and then rejects its own
+  schema-valid values (e.g. integer `1` stored — and required — as `"1"`). The
+  supported subset is a homogeneous string *or* integer enum.
 - **`model_from_json_schema` no longer crashes on signed / colliding integer
   enums, and enum fields now dump as raw scalars.** A non-contiguous integer
   enum such as `[-1, 1, 2, 3, 4, 5]` (FiW's eval-judge schema, where `-1` is an
@@ -378,7 +431,7 @@ dated `## [0.1.3]` section when the release is cut.
   `async_success_handler` coroutine on a background worker — so the sync bridge
   (`structured_llm_call_sync` and the sync text path, via `run_sync`) could
   close its event loop with that coroutine still un-awaited, surfacing the
-  warning on an otherwise clean call (flagged by the FiW dogfood of the 0.1.3 RC
+  warning on an otherwise clean call (flagged by the FiW dogfood of the 0.2.0 RC
   in both a CLI and a Lambda). `run_sync` now **drains** LiteLLM's pending async
   logging before tearing the loop down: it flushes the logging worker's queue
   (awaiting the queued handlers) and then cancels any remaining background tasks
