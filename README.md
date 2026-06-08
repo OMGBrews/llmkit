@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, a per-provider async concurrency limiter, **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -259,15 +259,31 @@ when your contract is simply dict-in / dict-out.
 
 ### Rate limiting
 
-Concurrency limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it) with a default cap of **8 concurrent calls per provider** — enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account. `configure_rate_limit(max_concurrent=..., enabled=...)` raises the per-provider cap (e.g. for a local Ollama server) or turns it off, and `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
+Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions:
+
+- **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server.
+- **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
+- **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
+
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
+
+```python
+from llmkit import configure_rate_limit
+
+# Stay under a metered account's published per-minute limits:
+configure_rate_limit(rpm=3_500, tpm=2_000_000)
+```
+
+RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a burst up to the configured ceiling and then smooths to the sustained rate. (A streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for streamed calls.)
 
 #### Joining the global rate limit directly
 
 llmkit's own call functions already pass every provider call through the
-global, per-provider concurrency limit (cap 8 by default). If your app issues
-provider calls **outside** those functions — for example a LangChain chat-model
-wrapper that calls the provider itself — you can join the same per-provider
-budget by hand with the module-level acquire functions:
+global, per-provider limit (concurrency on by default; RPM/TPM when
+configured). If your app issues provider calls **outside** those functions —
+for example a LangChain chat-model wrapper that calls the provider itself — you
+can join the same per-provider budget by hand with the module-level acquire
+functions:
 
 ```python
 from llmkit.rate_limiting import (
@@ -276,18 +292,23 @@ from llmkit.rate_limiting import (
 )
 
 # Async path (e.g. an async _agenerate):
-async with rate_limit_acquire_async("openai"):
-    ...  # one slot held against openai's budget
+async with rate_limit_acquire_async("openai") as slot:
+    response = ...  # one slot held against openai's budget
+    slot.record_tokens(response.usage.total_tokens)  # debits TPM (no-op when off)
 
 # Sync path (e.g. a synchronous _generate / _stream):
-with rate_limit_acquire_sync("openai"):
-    ...  # one slot held against openai's budget
+with rate_limit_acquire_sync("openai") as slot:
+    response = ...  # one slot held against openai's budget
+    slot.record_tokens(response.usage.total_tokens)
 ```
 
 The argument is the **provider name** (`provider.name`, e.g. `"openai"`,
-`"ollama"`); each provider has an independent budget. Both context managers are
-no-ops when rate limiting is disabled, and they share the exact throttle
-llmkit's own call paths use, so a hand-joined slot counts against the same cap.
+`"ollama"`); each provider has an independent budget on every dimension. Each
+context manager yields a `RateLimitSlot`; call its `record_tokens(...)` once you
+know the call's token usage to debit the TPM budget (a no-op when TPM is off).
+Both are no-ops when rate limiting is disabled, and they share the exact
+throttle llmkit's own call paths use, so a hand-joined slot counts against the
+same budgets.
 
 To check whether limiting is currently active, read the effective config rather
 than reaching into the limiter:

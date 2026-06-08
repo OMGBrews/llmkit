@@ -1,15 +1,23 @@
-"""Offline tests for the global, per-provider concurrency limiter.
+"""Offline tests for the global, per-provider rate limiter.
 
 These tests never touch the network and never read a provider credential.
 They pin the behaviour the rate limiter promises:
 
-* limiting is **on by default** with a per-provider cap of 8 (zero config),
+* concurrency limiting is **on by default** with a per-provider cap of 8
+  (zero config),
 * each provider gets an **independent** budget (keyed by provider name),
 * reconfiguring the cap / disabling takes effect for subsequent acquires,
 * a :meth:`configure` swap never strands in-flight callers on the old
-  semaphore (they release back onto their snapshot), and
+  semaphore (they release back onto their snapshot),
 * the call layer accounts a slot under the *effective* provider's name —
-  the same value logging records.
+  the same value logging records, and
+* the opt-in **RPM** (requests/min) and **TPM** (tokens/min) token buckets
+  are off by default, gate per provider when configured, and — for TPM —
+  debit the bucket by each call's measured ``usage.total_tokens``.
+
+The RPM/TPM tests freeze the monotonic clock (monkeypatching
+``rate_limiting._now``) so token-bucket refill is deterministic and nothing
+sleeps for real.
 
 The limiter is a process-global; the ``reset_rate_limiter`` autouse fixture
 restores a known default state around every test so nothing leaks.
@@ -25,9 +33,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llmkit import _litellm
+from llmkit import _litellm, rate_limiting
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
+    RateLimitSlot,
+    _RateBucket,
     configure_rate_limit,
     get_rate_limit_config,
     rate_limit_acquire_async,
@@ -197,9 +207,9 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
     recorded: list[str] = []
 
     @contextlib.asynccontextmanager
-    async def _record(provider_key: str) -> AsyncGenerator[None]:
+    async def _record(provider_key: str) -> AsyncGenerator[RateLimitSlot]:
         recorded.append(provider_key)
-        yield
+        yield RateLimitSlot()
 
     provider = MagicMock()
     provider.name = "ollama"
@@ -234,11 +244,15 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     default = get_rate_limit_config()
     assert default.enabled is True
     assert default.max_concurrent == 8
+    assert default.rpm is None  # opt-in dimensions off by default
+    assert default.tpm is None
 
-    configure_rate_limit(max_concurrent=3, enabled=False)
+    configure_rate_limit(max_concurrent=3, enabled=False, rpm=120, tpm=90_000)
     updated = get_rate_limit_config()
     assert updated.enabled is False
     assert updated.max_concurrent == 3
+    assert updated.rpm == 120
+    assert updated.tpm == 90_000
 
 
 class _AsyncFunctionProbe:
@@ -392,3 +406,178 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
     release.set()
     for thread in threads:
         thread.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Requests-per-minute (RPM) and tokens-per-minute (TPM): opt-in token buckets.
+#
+# These are pinned with a *frozen* monotonic clock (monkeypatching
+# ``rate_limiting._now``) so refill is deterministic and nothing sleeps for
+# real — the bucket arithmetic is exercised directly, and the limiter wiring is
+# checked through the public acquire path.
+# ---------------------------------------------------------------------------
+
+
+def test_rate_bucket_acquire_drains_and_refills(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token bucket drains on acquire, refills at its rate, and caps at capacity."""
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    bucket = _RateBucket(rate_per_sec=10.0, capacity=100.0)  # full at construction
+
+    # Full bucket: draining the whole capacity succeeds with no wait.
+    assert bucket._try_acquire(100.0) == 0.0
+    # Now empty: the next unit isn't deducted; the gate reports the refill wait.
+    assert bucket._try_acquire(1.0) == 1.0 / 10.0  # 1 token / 10 per sec
+
+    # Advance 5s → +50 tokens refilled; 50 is now acquirable.
+    clock["t"] += 5.0
+    assert bucket._try_acquire(50.0) == 0.0
+
+    # However long we wait, the level caps at capacity (no unbounded credit).
+    clock["t"] += 10_000.0
+    bucket._refill_locked()
+    assert bucket._level == 100.0
+
+
+def test_rate_bucket_record_drives_negative_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPM accounting: a record over budget goes negative, then refills back up."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    bucket = _RateBucket(rate_per_sec=100.0, capacity=6_000.0)  # tpm 6000
+
+    assert bucket._try_budget() == 0.0  # full → budget available
+    bucket.record(6_500.0)  # one over-budget call → 500 into deficit
+    assert bucket._level == -500.0
+    # Exhausted: the gate now reports the wait until it climbs back above zero.
+    assert bucket._try_budget() == (1.0 + 500.0) / 100.0
+
+    clock["t"] += 6.0  # +600 tokens → back above zero
+    assert bucket._try_budget() == 0.0
+
+
+def test_rate_limit_slot_record_tokens_is_noop_without_bucket() -> None:
+    """A slot with no TPM bucket (or no tokens) records nothing and never raises."""
+    RateLimitSlot().record_tokens(1_234)
+    RateLimitSlot().record_tokens(None)
+
+
+def test_configure_rejects_nonpositive_rpm_tpm() -> None:
+    """``rpm``/``tpm`` must be a positive int or None — zero/negative is a config error."""
+    with pytest.raises(ValueError, match="rpm must be a positive integer"):
+        configure_rate_limit(rpm=0)
+    with pytest.raises(ValueError, match="tpm must be a positive integer"):
+        configure_rate_limit(tpm=-5)
+
+
+async def test_rpm_off_by_default_creates_no_bucket() -> None:
+    """With no rpm/tpm configured, acquiring creates no rate buckets (byte-identical)."""
+    async with GlobalRateLimiter.acquire_async("openai"):
+        pass
+    assert GlobalRateLimiter._rpm_buckets == {}
+    assert GlobalRateLimiter._tpm_buckets == {}
+
+
+async def test_rpm_acquire_debits_the_request_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An RPM-configured acquire deducts one request token from the provider bucket."""
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    configure_rate_limit(rpm=120)  # capacity 120, 2 requests/sec
+
+    async with GlobalRateLimiter.acquire_async("openai"):
+        pass
+
+    assert GlobalRateLimiter._rpm_buckets["openai"]._level == 119.0
+
+
+async def test_tpm_slot_records_against_provider_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``slot.record_tokens`` debits the provider's TPM bucket by the usage."""
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze
+    configure_rate_limit(tpm=6_000)
+
+    async with GlobalRateLimiter.acquire_async("openai") as slot:
+        slot.record_tokens(2_000)
+
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 4_000.0
+
+
+async def test_tpm_over_budget_blocks_then_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spending past the minute budget drives the bucket negative so the gate waits."""
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    configure_rate_limit(tpm=6_000)  # 100 tokens/sec
+
+    async with GlobalRateLimiter.acquire_async("openai") as slot:
+        slot.record_tokens(9_000)  # 3000 over the per-minute budget
+
+    bucket = GlobalRateLimiter._tpm_buckets["openai"]
+    assert bucket._level == -3_000.0
+    assert bucket._try_budget() > 0.0  # the next caller would block
+
+    clock["t"] += 60.0  # a full minute refills 6000 tokens → back above zero
+    assert bucket._try_budget() == 0.0
+
+
+async def test_tpm_budgets_are_independent_per_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draining one provider's TPM budget leaves another provider's untouched."""
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    configure_rate_limit(tpm=6_000)
+
+    async with GlobalRateLimiter.acquire_async("openai") as slot:
+        slot.record_tokens(6_000)  # drain openai
+    async with GlobalRateLimiter.acquire_async("google") as slot:
+        slot.record_tokens(1_000)  # google has its own full budget
+
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 0.0
+    assert GlobalRateLimiter._tpm_buckets["google"]._level == 5_000.0
+
+
+async def test_disabled_skips_rpm_and_tpm_dimensions() -> None:
+    """When limiting is disabled, acquire creates no rate buckets and the slot is inert."""
+    configure_rate_limit(enabled=False, rpm=1, tpm=1)
+    async with GlobalRateLimiter.acquire_async("openai") as slot:
+        slot.record_tokens(10_000)  # no bucket → no-op
+    assert GlobalRateLimiter._rpm_buckets == {}
+    assert GlobalRateLimiter._tpm_buckets == {}
+
+
+async def test_call_layer_debits_tpm_from_response_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: the real call layer debits TPM by the response's ``usage.total_tokens``.
+
+    Fully offline — ``litellm.acompletion`` is faked to return a usage-bearing
+    response, and the clock is frozen so the only level change is the debit.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    configure_rate_limit(tpm=6_000)
+
+    provider = MagicMock()
+    provider.name = "openai"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k"})
+    provider.litellm_model = MagicMock(return_value="openai/fake")
+    provider.reasoning_effort = None
+
+    async def _fake_acompletion(**_kwargs: object) -> MagicMock:
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content="hi"))],
+            usage=MagicMock(total_tokens=2_000),
+            _hidden_params={},
+        )
+
+    with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
+        text, _cost = await _litellm.acompletion_text(
+            "hi",
+            temperature=0.0,
+            model=None,
+            provider=provider,
+        )
+
+    assert text == "hi"
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 4_000.0

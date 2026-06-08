@@ -54,6 +54,7 @@ from llmkit.providers import (
 )
 from llmkit.rate_limiting import (
     RateLimitConfig,
+    RateLimitSlot,
     configure_rate_limit,
     get_rate_limit_config,
     rate_limit_acquire_async,
@@ -95,6 +96,7 @@ __all__ = [
     "configure_rate_limit",
     "get_rate_limit_config",
     "RateLimitConfig",
+    "RateLimitSlot",
     "rate_limit_acquire_async",
     "rate_limit_acquire_sync",
     # Retries (transient-error recovery, on by default via RetryPolicy)

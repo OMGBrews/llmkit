@@ -40,10 +40,31 @@ dated `## [0.1.3]` section when the release is cut.
   (the package is basedpyright-clean and already declares the `Typing :: Typed`
   classifier, but without the PEP 561 marker downstream tools treated it as
   untyped and required an `ignore_missing_imports` override).
+- **Opt-in per-provider requests-per-minute (RPM) and tokens-per-minute (TPM)
+  rate limiting**, alongside the existing concurrency cap. `configure_rate_limit`
+  gains `rpm=` / `tpm=` arguments (both `None` / off by default), and
+  `RateLimitConfig` / `get_rate_limit_config()` now report them. RPM and TPM are
+  **opt-in** — unlike concurrency, there is no universally sane per-minute
+  default (it's your account's metered limit), so leaving them unset sends a
+  request **byte-identical** to the prior behaviour. Each is a per-provider
+  **token bucket**: it tolerates a burst up to the configured ceiling, then
+  smooths to the sustained rate; TPM is debited by each call's measured
+  `usage.total_tokens` (a streamed call usually reports no usage and so does not
+  debit TPM, consistent with cost being `None` for streams). This addresses the
+  CaCL dogfood gap where a migrator's old `rate_limit_rpm` went inert under the
+  concurrency-only model — the binding limit on a metered account is usually
+  RPM/TPM, not concurrency, and the concurrency cap does not stand in for an RPM
+  limit. The acquire context managers (`rate_limit_acquire_async` /
+  `rate_limit_acquire_sync`, and `GlobalRateLimiter.acquire_async` /
+  `acquire_sync`) now yield a `RateLimitSlot` whose `record_tokens(...)` debits
+  the TPM budget; a host joining the limit by hand calls it once it knows a
+  call's usage. `RateLimitSlot` is exported from the package root. Per-credential
+  scoping for multi-tenant hosts remains a deliberate non-goal (llmkit is
+  single-tenant by design; see `docs/planning/opinions.md` §6.4).
 - `get_rate_limit_config()` (returning a frozen `RateLimitConfig`) — the
   symmetric read for `configure_rate_limit`, so a host can log or assert its
-  effective `enabled` / `max_concurrent` at startup without reaching into
-  limiter internals. Both are exported from the package root.
+  effective `enabled` / `max_concurrent` / `rpm` / `tpm` at startup without
+  reaching into limiter internals. Both are exported from the package root.
 - **AWS Bedrock** provider (`Provider.BEDROCK` / `BedrockProvider`, `bedrock/`
   LiteLLM prefix), giving first-class access to Claude-on-Bedrock. Unlike every
   other provider, Bedrock authenticates through the standard **AWS credential
@@ -141,9 +162,10 @@ dated `## [0.1.3]` section when the release is cut.
   package root.
 - `rate_limit_acquire_async(provider_key)` and
   `rate_limit_acquire_sync(provider_key)` context managers in
-  `llmkit.rate_limiting` — the public way to join the global per-provider
-  concurrency limit by hand (e.g. from a LangChain chat-model wrapper) without
-  referencing `GlobalRateLimiter`.
+  `llmkit.rate_limiting` — the public way to join the global per-provider rate
+  limit by hand (e.g. from a LangChain chat-model wrapper) without referencing
+  `GlobalRateLimiter`. Each yields a `RateLimitSlot` whose `record_tokens(...)`
+  debits the TPM budget when configured.
 - An `on_result` semantic-validation **re-roll hook** on the call functions
   (`structured_llm_call` / `_sync`, `text_llm_call`, `structured_data_call` /
   `_sync`) plus a new exported `ResultValidationError`. The callback is invoked

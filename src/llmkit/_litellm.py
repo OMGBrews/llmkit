@@ -131,6 +131,20 @@ def _response_cost(
     return None
 
 
+def _total_tokens(raw: object) -> int | None:
+    """Best-effort total token count for a completion from its ``usage``.
+
+    LiteLLM stamps a ``usage`` object (``prompt_tokens`` / ``completion_tokens``
+    / ``total_tokens``) onto a non-streamed completion. This reads
+    ``usage.total_tokens`` for the tokens-per-minute limiter to debit. Returns
+    ``None`` for any missing/odd shape (e.g. a streamed response that reports no
+    usage) — TPM accounting is best-effort and never breaks the call.
+    """
+    usage = getattr(raw, "usage", None)
+    total = getattr(usage, "total_tokens", None)
+    return total if isinstance(total, int) else None
+
+
 def _coerce_text_content(content: object) -> str:
     """Coerce a completion's ``message.content`` to a single string.
 
@@ -219,7 +233,7 @@ async def acompletion_structured[T: BaseModel](
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     client = instructor.from_litellm(_acompletion, mode=provider.instructor_mode)
-    async with GlobalRateLimiter.acquire_async(provider.name):
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         result = await client.chat.completions.create_with_completion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
@@ -230,9 +244,10 @@ async def acompletion_structured[T: BaseModel](
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
-    # instructor types the raw completion half of the tuple as Any; it is a
-    # litellm ModelResponse. Narrow once so cost extraction reads a real type.
-    parsed, completion = cast("tuple[T, ModelResponse]", result)
+        # instructor types the raw completion half of the tuple as Any; it is a
+        # litellm ModelResponse. Narrow once so cost/usage read a real type.
+        parsed, completion = cast("tuple[T, ModelResponse]", result)
+        slot.record_tokens(_total_tokens(completion))
     return parsed, _response_cost(completion)
 
 
@@ -261,7 +276,7 @@ async def acompletion_text(
     provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
-    async with GlobalRateLimiter.acquire_async(provider.name):
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
@@ -270,10 +285,12 @@ async def acompletion_text(
             **creds,
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
-    # Non-streaming acompletion returns a ModelResponse (the stub's union also
-    # admits CustomStreamWrapper, only reachable with stream=True); narrow it so
-    # the typed .choices[0].message.content chain (str | None) is precise.
-    response = cast("ModelResponse", resp)
+        # Non-streaming acompletion returns a ModelResponse (the stub's union
+        # also admits CustomStreamWrapper, only reachable with stream=True);
+        # narrow it so the typed .choices[0].message.content chain (str | None)
+        # and .usage are precise.
+        response = cast("ModelResponse", resp)
+        slot.record_tokens(_total_tokens(response))
     content = response.choices[0].message.content
     return _coerce_text_content(content), _response_cost(response)
 
@@ -302,7 +319,7 @@ async def astream_text(
     provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
-    async with GlobalRateLimiter.acquire_async(provider.name):
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
@@ -319,3 +336,8 @@ async def astream_text(
             delta = _chunk_delta_text(chunk)
             if delta:
                 yield delta
+        # Best-effort TPM accounting: a stream usually reports no usage (we
+        # don't request stream_options=include_usage), so this is typically a
+        # no-op — consistent with cost being None for streamed calls. When the
+        # wrapper does expose a final usage, debit it before releasing the slot.
+        slot.record_tokens(_total_tokens(stream))
