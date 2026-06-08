@@ -182,8 +182,15 @@ class LLMProviderInterface(Protocol):
         """The provider-prefixed LiteLLM model string for ``model`` (or the default)."""
         ...
 
-    def completion_kwargs(self) -> dict[str, str]:
-        """Credential kwargs (api_key / api_base) forwarded to ``litellm`` calls."""
+    def completion_kwargs(self) -> dict[str, object]:
+        """Credential + routing kwargs forwarded to ``litellm`` calls.
+
+        Carries the credential kwargs (``api_key`` / ``api_base`` /
+        ``aws_region_name``) and any provider-specific routing preference (e.g.
+        OpenRouter's ``extra_body`` ``require_parameters``). The value type is
+        ``object`` rather than ``str`` because a routing preference is a nested
+        mapping, not a string.
+        """
         ...
 
 
@@ -252,8 +259,13 @@ class BaseProvider(ABC):
         return f"{self._model_prefix}{model or self._model}"
 
     @abstractmethod
-    def completion_kwargs(self) -> dict[str, str]:
-        """Return the credential kwargs forwarded to every ``litellm`` call."""
+    def completion_kwargs(self) -> dict[str, object]:
+        """Return the credential + routing kwargs forwarded to every ``litellm`` call.
+
+        Values are typed ``object`` (not ``str``) because a provider may add a
+        nested routing preference (e.g. OpenRouter's ``extra_body``) alongside
+        the string credential kwargs.
+        """
         ...
 
 

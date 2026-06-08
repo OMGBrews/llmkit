@@ -57,12 +57,18 @@ def test_make_provider_threads_optional_knobs() -> None:
 
 
 def test_make_provider_openrouter_endpoint_default() -> None:
-    """OpenRouter without a ``base_url`` falls back to its public endpoint."""
+    """OpenRouter without a ``base_url`` falls back to its public endpoint.
+
+    ``require_parameters`` routing is on by default, so the kwargs also carry the
+    ``extra_body`` schema-honoring routing preference (see
+    ``tests/test_openrouter_routing.py``).
+    """
     provider = make_provider(Provider.OPENROUTER, api_key="sk-test", model="x/y")
     assert isinstance(provider, OpenRouterProvider)
     assert provider.completion_kwargs() == {
         "api_key": "sk-test",
         "api_base": "https://openrouter.ai/api/v1",
+        "extra_body": {"provider": {"require_parameters": True}},
     }
 
 

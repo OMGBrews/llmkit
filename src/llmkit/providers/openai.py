@@ -47,8 +47,8 @@ class OpenAIProvider(BaseProvider):
         self._base_url: str | None = base_url
 
     @override
-    def completion_kwargs(self) -> dict[str, str]:
-        kwargs = {"api_key": self._api_key}
+    def completion_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {"api_key": self._api_key}
         if self._base_url:
             kwargs["api_base"] = self._base_url
         return kwargs

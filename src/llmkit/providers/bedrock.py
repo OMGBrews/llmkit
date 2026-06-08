@@ -68,7 +68,7 @@ class BedrockProvider(BaseProvider):
         self._aws_region_name: str | None = aws_region_name
 
     @override
-    def completion_kwargs(self) -> dict[str, str]:
+    def completion_kwargs(self) -> dict[str, object]:
         """Return Bedrock credential kwargs forwarded to ``litellm``.
 
         Only ``aws_region_name`` is sent, and only when set; the access

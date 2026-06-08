@@ -31,7 +31,7 @@ class OllamaProvider(BaseProvider):
         self._base_url: str = base_url
 
     @override
-    def completion_kwargs(self) -> dict[str, str]:
+    def completion_kwargs(self) -> dict[str, object]:
         return {"api_base": self._base_url}
 
     @classmethod

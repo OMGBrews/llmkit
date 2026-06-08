@@ -48,7 +48,7 @@ class DeepSeekProvider(BaseProvider):
         self._api_key: str = api_key
 
     @override
-    def completion_kwargs(self) -> dict[str, str]:
+    def completion_kwargs(self) -> dict[str, object]:
         return {"api_key": self._api_key}
 
     @classmethod

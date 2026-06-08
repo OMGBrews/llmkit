@@ -487,6 +487,36 @@ The accessor verbs are split by intent:
 `describe_llm` replaces the old `get_llm_config`, and `build_provider` replaces
 `get_provider`; both old names are gone from the public surface.
 
+### OpenRouter: schema-honoring routing
+
+OpenRouter is a *router* — it forwards your request to one of several **serving
+providers** behind each model. There's a sharp edge for structured output:
+`structured_outputs` is a **model-level** capability, but the strict
+`response_format` is actually enforced by the *serving* endpoint the request
+lands on. A model can advertise the capability while one of its endpoints quietly
+ignores the schema and returns free-form JSON — which then surfaces only as a
+confusing downstream validation failure, with nothing pointing at routing as the
+cause.
+
+`OpenRouterProvider` defends against this **by default**: it sets OpenRouter's
+[`provider.require_parameters`](https://openrouter.ai/docs/features/provider-routing#requiring-providers-to-support-all-parameters)
+routing preference, so a request only lands on a serving endpoint that honors
+*every* parameter sent — including the structured `response_format`. The trade-off
+is that restricting routing to capable endpoints can in principle reduce
+availability or shift cost. To opt out (and accept the silent-free-form-JSON
+risk), construct the provider directly:
+
+```python
+from llmkit import structured_llm_call
+from llmkit.providers import OpenRouterProvider
+
+provider = OpenRouterProvider(api_key="sk-or-...", require_parameters=False)
+result = await structured_llm_call(prompt, MySchema, feature="x", provider=provider)
+```
+
+Routing stays on for the config-driven path (`configure_llm_client` /
+`build_provider`); the direct constructor above is the way to turn it off.
+
 ## Retries
 
 Two retry layers, kept deliberately separate:
