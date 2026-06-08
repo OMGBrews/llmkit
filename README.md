@@ -26,6 +26,11 @@ taken on PyPI), but the import name is just `llmkit`:
 import llmkit
 ```
 
+You **install** `omg-llmkit` but **import** `llmkit` — that split trips a natural
+post-install smoke test. A mistaken `import omg_llmkit` (the install name) raises
+a clear one-line redirect to `import llmkit`, not a bare
+`ModuleNotFoundError` that leaves you guessing.
+
 Requires Python ≥ 3.13.
 
 The core install routes OpenRouter, Google, OpenAI, DeepSeek, and Ollama with no
@@ -81,6 +86,10 @@ The public call surface:
 | `structured_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
+
+> **Two defaults worth knowing up front.**
+> - **`temperature` defaults to `0.2`** — biased toward deterministic output. A *creative* caller must override it explicitly (e.g. `temperature=1.0`); it is otherwise quietly conservative.
+> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family or credential (the multi-tenant, per-request-key pattern) without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
 ### Reusing call options
 

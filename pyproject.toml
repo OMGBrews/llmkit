@@ -76,7 +76,11 @@ Issues = "https://github.com/OMGBrews/llmkit/issues"
 Changelog = "https://github.com/OMGBrews/llmkit/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/llmkit"]
+# ``omg_llmkit`` is a one-line import shim: the distribution installs as
+# ``omg-llmkit`` but is imported as ``llmkit``; the shim turns a mistaken
+# ``import omg_llmkit`` into an actionable redirect instead of a bare
+# ModuleNotFoundError (see src/omg_llmkit/__init__.py).
+packages = ["src/llmkit", "src/omg_llmkit"]
 
 # --- uv configuration ---------------------------------------------------
 
