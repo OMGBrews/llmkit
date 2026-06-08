@@ -28,10 +28,10 @@ class OpenAIProvider(BaseProvider):
     ``api_base`` is only forwarded when a ``base_url`` is given).
     """
 
-    _provider_name = "OpenAI"
-    _model_prefix = "openai/"
-    _mode = instructor.Mode.JSON_SCHEMA
-    _default_model = "gpt-4.1-mini"
+    _provider_name: str = "OpenAI"
+    _model_prefix: str = "openai/"
+    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
+    _default_model: str = "gpt-4.1-mini"
 
     def __init__(
         self,
@@ -41,8 +41,8 @@ class OpenAIProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
-        self._api_key = api_key
-        self._base_url = base_url
+        self._api_key: str = api_key
+        self._base_url: str | None = base_url
 
     def completion_kwargs(self) -> dict[str, str]:
         kwargs = {"api_key": self._api_key}

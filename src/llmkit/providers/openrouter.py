@@ -14,10 +14,10 @@ class OpenRouterProvider(BaseProvider):
     using its native structured-outputs mode for instructor.
     """
 
-    _provider_name = "OpenRouter"
-    _model_prefix = "openrouter/"
-    _mode = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
-    _default_model = "google/gemini-2.0-flash-001"
+    _provider_name: str = "OpenRouter"
+    _model_prefix: str = "openrouter/"
+    _mode: instructor.Mode = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
+    _default_model: str = "google/gemini-2.0-flash-001"
 
     def __init__(
         self,
@@ -27,8 +27,8 @@ class OpenRouterProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
-        self._api_key = api_key
-        self._base_url = base_url
+        self._api_key: str = api_key
+        self._base_url: str = base_url
 
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key, "api_base": self._base_url}

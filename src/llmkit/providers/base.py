@@ -215,8 +215,8 @@ class BaseProvider(ABC):
         # concrete provider sets ``_default_model`` to the same value its ctor
         # documents as the default, so config-built and directly-built providers
         # agree on the fallback model.
-        self._model = model or self._default_model
-        self._reasoning_effort = reasoning_effort
+        self._model: str = model or self._default_model
+        self._reasoning_effort: str | None = reasoning_effort
 
     @property
     def name(self) -> str:

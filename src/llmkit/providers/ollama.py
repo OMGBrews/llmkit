@@ -14,10 +14,10 @@ class OllamaProvider(BaseProvider):
     for fully local/private LLM access. No data leaves the host.
     """
 
-    _provider_name = "Ollama"
-    _model_prefix = "ollama_chat/"
-    _mode = instructor.Mode.JSON_SCHEMA
-    _default_model = "llama3.2"
+    _provider_name: str = "Ollama"
+    _model_prefix: str = "ollama_chat/"
+    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
+    _default_model: str = "llama3.2"
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class OllamaProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
-        self._base_url = base_url
+        self._base_url: str = base_url
 
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_base": self._base_url}

@@ -4,7 +4,7 @@
   "pythonVersion": "3.13",
   "venvPath": ".",
   "venv": ".venv",
-  "typeCheckingMode": "standard",
+  "typeCheckingMode": "recommended",
   "reportMissingTypeStubs": false,
   "reportMissingModuleSource": false,
   "reportExplicitAny": "error",

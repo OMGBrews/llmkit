@@ -20,10 +20,10 @@ class AnthropicProvider(BaseProvider):
     :func:`~llmkit.providers.base.require_anthropic_sdk`).
     """
 
-    _provider_name = "Anthropic"
-    _model_prefix = "anthropic/"
-    _mode = instructor.Mode.ANTHROPIC_JSON
-    _default_model = "claude-sonnet-4-6"
+    _provider_name: str = "Anthropic"
+    _model_prefix: str = "anthropic/"
+    _mode: instructor.Mode = instructor.Mode.ANTHROPIC_JSON
+    _default_model: str = "claude-sonnet-4-6"
 
     def __init__(
         self,
@@ -33,7 +33,7 @@ class AnthropicProvider(BaseProvider):
     ):
         require_anthropic_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
-        self._api_key = api_key
+        self._api_key: str = api_key
 
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key}

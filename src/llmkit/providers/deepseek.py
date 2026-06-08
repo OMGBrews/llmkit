@@ -31,10 +31,10 @@ class DeepSeekProvider(BaseProvider):
     seen with other providers' reasoning modes.
     """
 
-    _provider_name = "DeepSeek"
-    _model_prefix = "deepseek/"
-    _mode = instructor.Mode.JSON
-    _default_model = "deepseek-chat"
+    _provider_name: str = "DeepSeek"
+    _model_prefix: str = "deepseek/"
+    _mode: instructor.Mode = instructor.Mode.JSON
+    _default_model: str = "deepseek-chat"
 
     def __init__(
         self,
@@ -43,7 +43,7 @@ class DeepSeekProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
-        self._api_key = api_key
+        self._api_key: str = api_key
 
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key}

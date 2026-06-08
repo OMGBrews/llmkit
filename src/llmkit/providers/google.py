@@ -14,10 +14,10 @@ class GoogleProvider(BaseProvider):
     latency, pinned to Gemini's native JSON-schema mode for instructor.
     """
 
-    _provider_name = "Google AI Studio"
-    _model_prefix = "gemini/"
-    _mode = instructor.Mode.JSON_SCHEMA
-    _default_model = "gemini-2.5-flash-lite"
+    _provider_name: str = "Google AI Studio"
+    _model_prefix: str = "gemini/"
+    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
+    _default_model: str = "gemini-2.5-flash-lite"
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class GoogleProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
-        self._api_key = api_key
+        self._api_key: str = api_key
 
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key}

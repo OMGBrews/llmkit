@@ -50,10 +50,10 @@ class BedrockProvider(BaseProvider):
     "install omg-llmkit[anthropic]" error.
     """
 
-    _provider_name = "AWS Bedrock"
-    _model_prefix = "bedrock/"
-    _mode = instructor.Mode.ANTHROPIC_JSON
-    _default_model = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    _provider_name: str = "AWS Bedrock"
+    _model_prefix: str = "bedrock/"
+    _mode: instructor.Mode = instructor.Mode.ANTHROPIC_JSON
+    _default_model: str = "anthropic.claude-3-5-sonnet-20240620-v1:0"
 
     def __init__(
         self,
@@ -63,7 +63,7 @@ class BedrockProvider(BaseProvider):
     ):
         require_anthropic_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
-        self._aws_region_name = aws_region_name
+        self._aws_region_name: str | None = aws_region_name
 
     def completion_kwargs(self) -> dict[str, str]:
         """Return Bedrock credential kwargs forwarded to ``litellm``.

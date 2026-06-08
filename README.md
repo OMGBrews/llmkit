@@ -535,7 +535,7 @@ Two retry layers, kept deliberately separate:
 ```bash
 uv sync --extra dev
 uv run ruff check . && uv run ruff format --check .
-uv run basedpyright          # 0 errors, 0 warnings — no baseline
+uv run basedpyright          # recommended tier; clean against the checked-in baseline
 uv run pytest
 ```
 

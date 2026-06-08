@@ -14,14 +14,23 @@ uv sync --extra dev
 
 ## Checks must pass
 
-CI runs the same four gates on every push and pull request, with **no baseline**:
+CI runs the same four gates on every push and pull request:
 
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run basedpyright          # 0 errors, 0 warnings
+uv run basedpyright          # clean against the checked-in baseline
 uv run pytest
 ```
+
+basedpyright runs in its `recommended` tier (stricter than the `standard`
+default, and at least as strict as the editor extension's defaults). A checked-in
+baseline at `.basedpyright/baseline.json` grandfathers the pre-existing findings —
+overwhelmingly `Unknown`/`Any` at the untyped LiteLLM/instructor boundary — so the
+command above is clean today while **any new finding fails CI**. The baseline is a
+ratchet: it should only ever shrink. If you legitimately clear entries, regenerate
+it with `uv run basedpyright --writebaseline` and commit the smaller file; never
+grow it to silence a finding in new code.
 
 Please run them locally before opening a PR. New behavior needs a test.
 
