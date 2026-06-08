@@ -144,6 +144,25 @@ dated `## [0.1.3]` section when the release is cut.
   `llmkit.rate_limiting` — the public way to join the global per-provider
   concurrency limit by hand (e.g. from a LangChain chat-model wrapper) without
   referencing `GlobalRateLimiter`.
+- An `on_result` semantic-validation **re-roll hook** on the call functions
+  (`structured_llm_call` / `_sync`, `text_llm_call`, `structured_data_call` /
+  `_sync`) plus a new exported `ResultValidationError`. The callback is invoked
+  with each attempt's result; raising `ResultValidationError` from it rejects a
+  result that *parsed* but is *semantically* wrong (an empty register, an
+  unresolved citation, a total that doesn't reconcile) and re-rolls the call.
+  The re-roll is charged against the **validation budget**
+  (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema
+  failure uses, so a deterministically-bad result can't burn the full transport
+  budget; on exhaustion the last `ResultValidationError` propagates, and each
+  attempt (rejected ones included) is its own logged call. Folds an
+  LLM-then-validate-then-re-roll loop consumers hand-rolled into the call
+  itself. `text_llm_call`'s hook receives the response text; `structured_data_call`'s
+  receives the validated Pydantic model (before it's dumped to a dict). Like
+  `feature`, `on_result` is a per-call keyword, not part of `LLMCallOptions`.
+- An `omg_llmkit` **import shim**: the distribution installs as `omg-llmkit` but
+  imports as `llmkit`, and a mistaken `import omg_llmkit` (e.g. a post-install
+  smoke test using the install name) now raises a clear one-line redirect to
+  `import llmkit` instead of a bare `ModuleNotFoundError`.
 
 ### Changed
 
@@ -274,6 +293,24 @@ dated `## [0.1.3]` section when the release is cut.
   — config < `options` < explicit per-call keyword — across the call-function
   docstrings and README, and documented `feature` as a deliberate required
   telemetry forcing function (intentionally excluded from `LLMCallOptions`).
+- **OpenRouter now requests schema-honoring routing by default.**
+  `OpenRouterProvider` sets OpenRouter's `provider.require_parameters` routing
+  preference (via `extra_body`), so a structured-output request only lands on a
+  serving endpoint that honors the strict `response_format` — closing the sharp
+  edge where OpenRouter advertises `structured_outputs` at the *model* level but
+  a routed *serving* endpoint silently ignores the schema and returns free-form
+  JSON (a confusing downstream validation failure). It restricts routing to
+  capable endpoints, which can in principle reduce availability or shift cost;
+  construct `OpenRouterProvider(..., require_parameters=False)` to opt out. The
+  `LLMProviderInterface.completion_kwargs` return type widened from
+  `dict[str, str]` to `dict[str, object]` to carry the nested routing
+  preference alongside the string credential kwargs.
+- Documented that a **fully per-call host needs no global config source**: a
+  caller that passes `provider=` on every call can run without
+  `configure_llm_client(...)` — the call runs on the per-call provider alone and
+  logging records it as the effective provider. Also flagged the
+  `temperature=0.2` default and the per-call `provider=` override prominently in
+  the README (onboarding papercuts from the greenfield integration).
 
 ### Removed
 
