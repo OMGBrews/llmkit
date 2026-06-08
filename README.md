@@ -453,6 +453,15 @@ ignores the ones a given provider doesn't use (e.g. `base_url` for Anthropic,
 chain). Leave `model` unset to inherit the provider's own default; the assembled
 LiteLLM id is always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
 
+**A fully per-call host needs no global config at all.** If you pass `provider=`
+on *every* call, you don't have to call `configure_llm_client(...)` — there is no
+global source to register, the call runs on the per-call provider alone, and the
+log records that provider as the effective one. The "configure once globally" and
+"provide per call" models are independent: use either, or mix them (a global
+default with per-call overrides where needed). A call that passes *neither* a
+per-call `provider=` nor a registered global source raises a clear
+`RuntimeError` telling you to configure one.
+
 To build from a full config instead, use `build_provider(config)`:
 
 ```python
