@@ -192,7 +192,7 @@ def test_options_retry_applied_when_keyword_default() -> None:
 
 
 def test_options_threads_through_text_and_sync() -> None:
-    """``options`` is honored by ``text_llm_call`` and ``structured_llm_call_sync``."""
+    """``options`` is honored by text and structured sync wrappers."""
     text_recorder: list[dict[str, object]] = []
 
     async def _fake_text(*_args: object, **kwargs: object) -> tuple[str, float | None]:
@@ -211,12 +211,18 @@ def test_options_threads_through_text_and_sync() -> None:
             _ = await structured_output.text_llm_call("hi", feature="summary", options=options)
 
         asyncio.run(_run_text())
+        text_sync_result = structured_output.text_llm_call_sync(
+            "hi", feature="summary", options=options
+        )
         result = structured_output.structured_llm_call_sync(
             "hi", _Schema, feature="classification", options=options
         )
 
     assert result.ok is True
+    assert text_sync_result == "hello"
     assert text_recorder[0]["model"] == "shared-model"
     assert text_recorder[0]["max_tokens"] == 128
+    assert text_recorder[1]["model"] == "shared-model"
+    assert text_recorder[1]["max_tokens"] == 128
     assert struct_calls[0]["model"] == "shared-model"
     assert struct_calls[0]["max_tokens"] == 128
