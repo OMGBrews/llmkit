@@ -69,7 +69,7 @@ import keyword
 import re
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any, NamedTuple, cast
+from typing import Any, ClassVar, NamedTuple, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, create_model
 
@@ -129,8 +129,9 @@ class _JsonSchemaModel(BaseModel):
     to opt back in to the nulls.
     """
 
-    model_config = ConfigDict(extra="forbid", use_enum_values=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", use_enum_values=True)
 
+    @override
     def model_dump(
         self,
         *,
@@ -139,6 +140,7 @@ class _JsonSchemaModel(BaseModel):
     ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
         return super().model_dump(exclude_none=exclude_none, **kwargs)
 
+    @override
     def model_dump_json(
         self,
         *,
@@ -182,7 +184,7 @@ class _Converter:
     """
 
     def __init__(self, root: JsonDict) -> None:
-        self._root = root
+        self._root: JsonDict = root
         defs = root.get("$defs")
         if not isinstance(defs, dict):
             defs = root.get("definitions")
@@ -197,7 +199,7 @@ class _Converter:
         # recursive $ref) rather than blowing the Python stack with a
         # RecursionError.
         self._in_progress: set[str] = set()
-        self._counter = 0
+        self._counter: int = 0
 
     def _ref_name(self, ref: str) -> str:
         prefix_defs = "#/$defs/"
@@ -208,7 +210,7 @@ class _Converter:
             return ref[len(prefix_definitions) :]
         raise ValueError(
             f"Unsupported $ref {ref!r}: only local references into "
-            f"'#/$defs/' or '#/definitions/' are supported."
+            + "'#/$defs/' or '#/definitions/' are supported."
         )
 
     def _resolve_ref(self, ref: str) -> tuple[str, JsonDict]:
@@ -231,7 +233,7 @@ class _Converter:
             if len(non_null) != 1:
                 raise ValueError(
                     f"Unsupported union type {type_field!r}: only a single non-null "
-                    f"type (optionally with 'null') is supported."
+                    + "type (optionally with 'null') is supported."
                 )
             return {**schema, "type": non_null[0]}, nullable
 
@@ -243,8 +245,8 @@ class _Converter:
             if len(non_null) != 1:
                 raise ValueError(
                     f"Unsupported anyOf/oneOf with {len(non_null)} non-null branches: "
-                    f"only a single non-null branch (optionally with a 'null' branch) "
-                    f"is supported."
+                    + "only a single non-null branch (optionally with a 'null' branch) "
+                    + "is supported."
                 )
             merged = {k: v for k, v in schema.items() if k not in ("anyOf", "oneOf")}
             return {**merged, **non_null[0]}, nullable
@@ -278,7 +280,7 @@ class _Converter:
         if jtype is None:
             raise ValueError(
                 f"Unsupported schema at {field_path!r}: no 'type', 'enum', or '$ref' — "
-                f"got keys {sorted(inner)}."
+                + f"got keys {sorted(inner)}."
             )
 
         if jtype == "object":
@@ -288,7 +290,7 @@ class _Converter:
             if not isinstance(items, dict):
                 raise ValueError(
                     f"Unsupported array at {field_path!r}: 'items' must be a single "
-                    f"schema object (tuple/heterogeneous arrays are not supported)."
+                    + "schema object (tuple/heterogeneous arrays are not supported)."
                 )
             element, element_nullable = self._field_type(cast("JsonDict", items), f"{field_path}[]")
             if element_nullable:
@@ -359,7 +361,7 @@ class _Converter:
             if isinstance(value, bool) or not isinstance(value, (str, int)):
                 raise ValueError(
                     f"Unsupported enum value {value!r} at {field_path!r}: only string and "
-                    f"integer enum members are supported."
+                    + "integer enum members are supported."
                 )
             if not isinstance(value, int):
                 all_int = False
@@ -389,7 +391,9 @@ class _Converter:
         # is what dict consumers (``structured_data_call``) and the provider
         # JSON both expect.
         base: type = int if all_int else str
-        return Enum(name, members, type=base)  # type: ignore[return-value]  # runtime str/int-mixin enum
+        # The functional ``Enum(...)`` call returns a new enum *class* at runtime,
+        # but the stubs type it as an ``Enum`` instance — hence the narrow ignore.
+        return Enum(name, members, type=base)  # pyright: ignore[reportReturnType]  # runtime str/int-mixin enum class
 
     def _build_object(
         self, schema: JsonDict, field_path: str, *, ref_name: str | None = None
@@ -408,8 +412,8 @@ class _Converter:
             if ref_name in self._in_progress:
                 raise ValueError(
                     f"Unsupported recursive schema at {field_path!r}: $ref "
-                    f"'#/$defs/{ref_name}' refers back to an object still being "
-                    f"built (self-referential / cyclic schemas are not supported)."
+                    + f"'#/$defs/{ref_name}' refers back to an object still being "
+                    + "built (self-referential / cyclic schemas are not supported)."
                 )
             self._in_progress.add(ref_name)
         try:
@@ -444,7 +448,7 @@ class _Converter:
             if not isinstance(prop_schema, dict):
                 raise ValueError(
                     f"Unsupported property {prop_name!r} at {field_path!r}: "
-                    f"must be a schema object."
+                    + "must be a schema object."
                 )
             prop = cast("JsonDict", prop_schema)
             annotation, is_nullable = self._field_type(prop, f"{field_path}.{prop_name}")
@@ -567,8 +571,11 @@ def model_from_json_schema(
         ValueError: On any construct outside the supported subset, naming the
             offending construct and its path in the schema.
     """
-    if not isinstance(schema, Mapping):
-        raise ValueError(
+    # Deliberate runtime guard: the annotation says ``Mapping`` but this is the
+    # library's public boundary, so a mistyped (untyped) caller still gets a
+    # clear ValueError rather than an obscure failure deeper in conversion.
+    if not isinstance(schema, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard at public boundary
+        raise ValueError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
             f"model_from_json_schema expects a mapping schema, got {type(schema).__name__}."
         )
     return _Converter(cast("JsonDict", dict(schema))).convert(name)

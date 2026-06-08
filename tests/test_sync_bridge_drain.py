@@ -99,7 +99,7 @@ def test_sync_call_in_running_loop_drains_litellm_logging_queue() -> None:
 
     result = asyncio.run(_outer())
     assert result == 11
-    queue = GLOBAL_LOGGING_WORKER._queue  # pyright: ignore[reportPrivateUsage]
+    queue = GLOBAL_LOGGING_WORKER._queue
     assert queue is None or queue.qsize() == 0
 
 
@@ -141,7 +141,7 @@ def test_call_error_propagates_through_drain() -> None:
 
     raised = False
     try:
-        run_sync(_boom())
+        _ = run_sync(_boom())
     except ValueError as exc:
         raised = exc.args == ("boom",)
     assert raised

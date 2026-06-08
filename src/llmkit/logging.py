@@ -113,7 +113,7 @@ class LocalYamlLogSink:
     """
 
     def __init__(self, log_dir: Path = DEFAULT_LOG_DIR) -> None:
-        self.log_dir = log_dir
+        self.log_dir: Path = log_dir
 
     def write(self, record: LLMCallRecord) -> None:
         """Persist *record* as a YAML file (the :class:`LogSink` contract).
@@ -161,7 +161,7 @@ class LocalYamlLogSink:
             }
 
             with open(filepath, "w") as f:
-                f.write(self._summary_header(record))
+                _ = f.write(self._summary_header(record))
                 yaml.dump(
                     doc,
                     f,
@@ -222,7 +222,7 @@ class LocalYamlLogSink:
         }
         try:
             with open(self.log_dir / INDEX_FILENAME, "a", encoding="utf-8") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                _ = f.write(json.dumps(line, ensure_ascii=False) + "\n")
         except OSError:
             logger.warning(
                 "Failed to append LLM log index for %s/%s",

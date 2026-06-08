@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import override
+
 import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig, require_anthropic_sdk
@@ -65,6 +67,7 @@ class BedrockProvider(BaseProvider):
         super().__init__(model, reasoning_effort)
         self._aws_region_name: str | None = aws_region_name
 
+    @override
     def completion_kwargs(self) -> dict[str, str]:
         """Return Bedrock credential kwargs forwarded to ``litellm``.
 

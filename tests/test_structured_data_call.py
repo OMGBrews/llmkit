@@ -60,7 +60,7 @@ _PERSON_SCHEMA: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # test
 
 
 @pytest.fixture(autouse=True)
-def _quiet_logging() -> Iterator[None]:
+def _quiet_logging() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse pytest fixture, invoked by pytest's collection machinery
     """Point logging at a no-op sink so these tests don't touch the disk."""
     configure_llm_logging(None)
     try:

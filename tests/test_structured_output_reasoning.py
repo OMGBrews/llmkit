@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from pydantic import BaseModel
@@ -164,7 +163,7 @@ def test_text_transport_forwards_reasoning_effort() -> None:
     assert seen["reasoning_effort"] == "disable"
 
 
-def test_log_record_carries_reasoning_effort(tmp_path: Path) -> None:
+def test_log_record_carries_reasoning_effort() -> None:
     """The ``LLMCallRecord`` built for a structured call records the setting."""
     captured: list[LLMCallRecord] = []
 
@@ -179,7 +178,7 @@ def test_log_record_carries_reasoning_effort(tmp_path: Path) -> None:
     configure_llm_logging(sink)
     try:
         with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-            asyncio.run(
+            _ = asyncio.run(
                 structured_output.structured_llm_call(
                     "hi", _Schema, feature="test", reasoning_effort="disable"
                 )

@@ -182,8 +182,8 @@ async def acompletion_structured[T: BaseModel](
             temperature=temperature,
             max_retries=validation_retries,
             **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
-            **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional max_tokens
-            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor **kwargs passthrough for optional reasoning_effort
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+            **({"reasoning_effort": effort} if effort is not None else {}),
         )
     return parsed, _response_cost(completion)
 
@@ -214,13 +214,13 @@ async def acompletion_text(
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):
-        resp = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
+        resp = await litellm.acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
             max_tokens=max_tokens,
             **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
-            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
+            **({"reasoning_effort": effort} if effort is not None else {}),
         )
     content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
     return _coerce_text_content(content), _response_cost(resp)
@@ -251,16 +251,16 @@ async def astream_text(
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):
-        stream = await litellm.acompletion(  # pyright: ignore[reportArgumentType]  # raw-llm — litellm over-strict signature
+        stream = await litellm.acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
             stream=True,
             **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
-            **({"max_tokens": max_tokens} if max_tokens is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional max_tokens
-            **({"reasoning_effort": effort} if effort is not None else {}),  # pyright: ignore[reportArgumentType]  # raw-llm — litellm **kwargs passthrough for optional reasoning_effort
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+            **({"reasoning_effort": effort} if effort is not None else {}),
         )
         async for chunk in stream:  # pyright: ignore[reportGeneralTypeIssues]  # raw-llm — litellm stream wrapper is async-iterable
-            delta = chunk.choices[0].delta.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm stream chunk
+            delta = chunk.choices[0].delta.content
             if delta:
                 yield delta

@@ -27,7 +27,7 @@ import contextvars
 import logging
 import random
 import warnings
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -154,7 +154,7 @@ _progress_callback: contextvars.ContextVar[RetryProgressCallback | None] = conte
 
 
 @contextmanager
-def retry_progress_callback(callback: RetryProgressCallback | None) -> Iterator[None]:
+def retry_progress_callback(callback: RetryProgressCallback | None) -> Generator[None]:
     """Install a progress callback for retries within this dynamic scope.
 
     The callback is read by :func:`with_retries` from a context variable,
@@ -291,10 +291,10 @@ async def with_retries[T](
         if inner_would_retry:
             warnings.warn(
                 f"with_retries({tag!r}) is nested inside an already-retrying llmkit "
-                "retry loop; this inner layer will run a single pass to avoid "
-                "multiplying retry budgets (the outer loop owns the retries). To "
-                "drive retries from an outer wrapper around a call function, opt "
-                "the inner call out with retry=NO_RETRY.",
+                + "retry loop; this inner layer will run a single pass to avoid "
+                + "multiplying retry budgets (the outer loop owns the retries). To "
+                + "drive retries from an outer wrapper around a call function, opt "
+                + "the inner call out with retry=NO_RETRY.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -316,7 +316,7 @@ async def with_retries[T](
             except Exception as e:
                 is_validation = use_validation_budget and isinstance(
                     e,
-                    validation_retry_on,  # type: ignore[arg-type]  # guarded by use_validation_budget
+                    validation_retry_on,  # pyright: ignore[reportArgumentType]  # None excluded by use_validation_budget
                 )
                 if is_validation:
                     validation_attempt += 1

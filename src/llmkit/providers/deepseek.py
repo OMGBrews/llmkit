@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import override
+
 import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig
@@ -45,6 +47,7 @@ class DeepSeekProvider(BaseProvider):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key
 
+    @override
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key}
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import override
+
 import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig
@@ -30,6 +32,7 @@ class OpenRouterProvider(BaseProvider):
         self._api_key: str = api_key
         self._base_url: str = base_url
 
+    @override
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_key": self._api_key, "api_base": self._base_url}
 

@@ -106,7 +106,7 @@ def test_log_record_carries_kwargs() -> None:
     configure_llm_logging(sink)
     try:
         with patch("llmkit._litellm.astream_text", _fake_astream):
-            asyncio.run(
+            _ = asyncio.run(
                 _drain(
                     structured_output.stream_text_with_log(
                         "hi", feature="test", max_tokens=128, reasoning_effort="disable"

@@ -25,7 +25,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -262,7 +262,7 @@ def _resolve_model_and_provider(
 
 
 @contextmanager
-def capture_llm_records() -> Iterator[list[LLMCallRecord]]:
+def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     """Capture the :class:`~llmkit.logging.LLMCallRecord` for each call here.
 
     The records-oriented counterpart to :func:`capture_llm_log_paths`:
@@ -289,7 +289,7 @@ def capture_llm_records() -> Iterator[list[LLMCallRecord]]:
 
 
 @contextmanager
-def capture_llm_log_paths() -> Iterator[list[Path]]:
+def capture_llm_log_paths() -> Generator[list[Path]]:
     """Capture log paths written by the call functions in this scope.
 
     The returned list is appended to once per LLM call inside the

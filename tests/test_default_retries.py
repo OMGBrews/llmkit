@@ -21,6 +21,8 @@ backoff by patching ``asyncio.sleep`` and ``random.uniform``.
 
 from __future__ import annotations
 
+import asyncio
+import random
 import warnings
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -40,7 +42,6 @@ from llmkit import (
     configure_llm_logging,
     structured_output,
 )
-from llmkit import retry as retry_mod
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 from llmkit.retry import with_retries
 from llmkit.structured_output import capture_llm_log_paths
@@ -53,7 +54,7 @@ def _make_validation_error() -> ValidationError:
     payload raises the genuine article rather than a hand-rolled stand-in.
     """
     try:
-        _Schema.model_validate({"ok": "not-a-bool-or-coercible"})
+        _ = _Schema.model_validate({"ok": "not-a-bool-or-coercible"})
     except ValidationError as exc:
         return exc
     raise AssertionError("expected a ValidationError")  # pragma: no cover
@@ -110,7 +111,7 @@ async def test_structured_non_recoverable_error_is_not_retried() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TypeError, match="programming error"),
     ):
-        await structured_output.structured_llm_call(
+        _ = await structured_output.structured_llm_call(
             "hi", _Schema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -130,7 +131,9 @@ async def test_structured_no_retry_opt_out_runs_single_attempt() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="transient"),
     ):
-        await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=NO_RETRY)
+        _ = await structured_output.structured_llm_call(
+            "hi", _Schema, feature="test", retry=NO_RETRY
+        )
 
     assert calls[0] == 1
 
@@ -172,7 +175,7 @@ async def test_structured_custom_policy_exhaustion_re_raises() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=policy)
+        _ = await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=policy)
 
     assert calls[0] == 3
 
@@ -246,7 +249,7 @@ async def test_text_no_retry_opt_out_runs_single_attempt() -> None:
             patch("llmkit._litellm.acompletion_text", side_effect=_transport),
             pytest.raises(TimeoutError, match="transient"),
         ):
-            await structured_output.text_llm_call("hi", feature="test", retry=NO_RETRY)
+            _ = await structured_output.text_llm_call("hi", feature="test", retry=NO_RETRY)
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
@@ -266,7 +269,9 @@ async def test_stream_failure_before_first_chunk_is_retried() -> None:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-            yield  # pragma: no cover — unreachable, makes this an async generator
+            # Unreachable by design: the bare ``yield`` makes this an async
+            # generator; the ``raise`` above precedes it on the first attempt.
+            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
         for delta in ("he", "llo"):
             yield delta
 
@@ -295,7 +300,9 @@ async def test_stream_each_attempt_is_its_own_logged_call(tmp_path: Path) -> Non
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-            yield  # pragma: no cover — unreachable, makes this an async generator
+            # Unreachable by design: the bare ``yield`` makes this an async
+            # generator; the ``raise`` above precedes it on the first attempt.
+            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
         for delta in ("he", "llo"):
             yield delta
 
@@ -355,7 +362,9 @@ async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
     async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
         calls[0] += 1
         raise TimeoutError("transient")
-        yield  # pragma: no cover — unreachable, makes this an async generator
+        # Unreachable by design: the bare ``yield`` makes this an async
+        # generator; the ``raise`` above precedes it on every attempt.
+        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     configure_llm_logging(None)
     try:
@@ -363,7 +372,7 @@ async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
             patch("llmkit._litellm.astream_text", _transport),
             pytest.raises(TimeoutError, match="transient"),
         ):
-            await _drain(
+            _ = await _drain(
                 structured_output.stream_text_with_log("hi", feature="test", retry=NO_RETRY)
             )
     finally:
@@ -394,8 +403,8 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
     async def _fake_sleep(delay: float) -> None:
         slept.append(delay)
 
-    monkeypatch.setattr(retry_mod.asyncio, "sleep", _fake_sleep)
-    monkeypatch.setattr(retry_mod.random, "uniform", lambda _lo, hi: hi)
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(random, "uniform", lambda _lo, hi: hi)
 
     calls = [0]
 
@@ -463,7 +472,7 @@ async def test_structured_auth_error_is_not_retried() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(openai.AuthenticationError),
     ):
-        await structured_output.structured_llm_call(
+        _ = await structured_output.structured_llm_call(
             "hi", _Schema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -515,7 +524,7 @@ async def test_with_retries_max_attempts_runs_exactly_n_attempts() -> None:
         raise TimeoutError("always")
 
     with pytest.raises(TimeoutError, match="always"):
-        await with_retries(_fn, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(_fn, max_attempts=3, retry_on=(TimeoutError,))
 
     assert calls[0] == 3
 
@@ -531,7 +540,10 @@ async def test_with_retries_max_retries_kwarg_raises_type_error() -> None:
         raise TimeoutError("always")
 
     with pytest.raises(TypeError, match="max_retries"):
-        await with_retries(_fn, max_retries=3, retry_on=(TimeoutError,))  # type: ignore[call-arg]  # hard-cut alias
+        # Deliberately passing the hard-cut ``max_retries`` alias: it is no longer
+        # a parameter, so the type checker rightly flags it; the test pins the
+        # runtime ``TypeError``.
+        await with_retries(_fn, max_retries=3, retry_on=(TimeoutError,))  # pyright: ignore[reportCallIssue]
 
     # The callable was never invoked: the bad kwarg is rejected at the call.
     assert calls[0] == 0
@@ -571,7 +583,7 @@ async def test_nested_with_retries_around_call_function_does_not_multiply() -> N
         pytest.warns(RuntimeWarning, match="nested"),
         pytest.raises(TimeoutError, match="always"),
     ):
-        await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
 
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
     # NOT 9 (3 x 3). The guard prevented the multiplication.
@@ -603,7 +615,7 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
             patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
             pytest.raises(TimeoutError, match="always"),
         ):
-            await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
 
     assert calls[0] == 3
 
@@ -682,7 +694,7 @@ async def test_persistent_validation_error_uses_lower_validation_budget() -> Non
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(ValidationError),
     ):
-        await structured_output.structured_llm_call(
+        _ = await structured_output.structured_llm_call(
             "hi", _Schema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -704,7 +716,7 @@ async def test_transport_error_still_uses_full_transport_budget() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        await structured_output.structured_llm_call(
+        _ = await structured_output.structured_llm_call(
             "hi", _Schema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -758,7 +770,9 @@ async def test_no_retry_single_attempt_for_validation_error() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(ValidationError),
     ):
-        await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=NO_RETRY)
+        _ = await structured_output.structured_llm_call(
+            "hi", _Schema, feature="test", retry=NO_RETRY
+        )
 
     assert calls[0] == 1
 
@@ -777,7 +791,9 @@ async def test_no_retry_single_attempt_for_transport_error() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="transient"),
     ):
-        await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=NO_RETRY)
+        _ = await structured_output.structured_llm_call(
+            "hi", _Schema, feature="test", retry=NO_RETRY
+        )
 
     assert calls[0] == 1
 
@@ -800,7 +816,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
             capture_llm_log_paths() as paths,
             pytest.raises(ValidationError),
         ):
-            await structured_output.structured_llm_call(
+            _ = await structured_output.structured_llm_call(
                 "hi", _Schema, feature="test", retry=_NO_BACKOFF
             )
     finally:

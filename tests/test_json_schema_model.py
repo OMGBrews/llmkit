@@ -74,10 +74,10 @@ def test_validates_and_rejects_per_schema() -> None:
     assert dumped["lines"][0] == {"sku": "A", "qty": 2}
     # A missing required field raises.
     with pytest.raises(ValidationError):
-        model(total=1.0, status="open", customer={"name": "X"}, lines=[])
+        _ = model(total=1.0, status="open", customer={"name": "X"}, lines=[])
     # An out-of-enum value raises.
     with pytest.raises(ValidationError):
-        model(
+        _ = model(
             id="x",
             total=1.0,
             status="nonsense",
@@ -95,14 +95,14 @@ def test_forbids_unexpected_extra_field() -> None:
     )
     assert model(id="ok").model_dump() == {"id": "ok"}
     with pytest.raises(ValidationError):
-        model(id="ok", hallucinated="nope")
+        _ = model(id="ok", hallucinated="nope")
 
 
 def test_multi_branch_union_raises_clear_value_error() -> None:
     """A genuine multi-type union (not just ``<type>`` + null) is unsupported
     and fails loudly rather than mis-converting."""
     with pytest.raises(ValueError, match="Unsupported union type"):
-        model_from_json_schema(
+        _ = model_from_json_schema(
             {
                 "type": "object",
                 "properties": {"x": {"type": ["string", "integer"]}},
@@ -110,7 +110,7 @@ def test_multi_branch_union_raises_clear_value_error() -> None:
             }
         )
     with pytest.raises(ValueError, match="Unsupported anyOf/oneOf"):
-        model_from_json_schema(
+        _ = model_from_json_schema(
             {
                 "type": "object",
                 "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
@@ -122,7 +122,7 @@ def test_multi_branch_union_raises_clear_value_error() -> None:
 def test_non_mapping_schema_raises_clear_value_error() -> None:
     """A non-mapping argument fails loudly with a clear message."""
     with pytest.raises(ValueError, match="mapping schema"):
-        model_from_json_schema([{"type": "object"}])  # pyright: ignore[reportArgumentType]
+        _ = model_from_json_schema([{"type": "object"}])  # pyright: ignore[reportArgumentType]
 
 
 def test_ref_to_same_def_yields_one_class() -> None:
@@ -205,14 +205,14 @@ def test_explicit_name_overrides_title() -> None:
 
 def test_unsupported_type_raises_clear_value_error() -> None:
     with pytest.raises(ValueError, match="Unsupported JSON-schema type 'foobar'"):
-        model_from_json_schema(
+        _ = model_from_json_schema(
             {"title": "Bad", "type": "object", "properties": {"x": {"type": "foobar"}}}
         )
 
 
 def test_unresolvable_ref_raises_clear_value_error() -> None:
     with pytest.raises(ValueError, match="Unresolvable \\$ref"):
-        model_from_json_schema(
+        _ = model_from_json_schema(
             {
                 "title": "Bad",
                 "type": "object",
@@ -224,7 +224,7 @@ def test_unresolvable_ref_raises_clear_value_error() -> None:
 
 def test_non_object_root_raises_clear_value_error() -> None:
     with pytest.raises(ValueError, match="top level must be an object"):
-        model_from_json_schema({"type": "array", "items": {"type": "string"}})
+        _ = model_from_json_schema({"type": "array", "items": {"type": "string"}})
 
 
 # --- Required-but-nullable fields accept null ------------------------------
@@ -243,7 +243,7 @@ def test_required_nullable_list_form_accepts_null() -> None:
     # Required: must be present...
     assert model.model_fields["a"].is_required()
     with pytest.raises(ValidationError):
-        model()
+        _ = model()
     # ...but null is a valid value.
     assert model(a=None).a is None  # pyright: ignore[reportAttributeAccessIssue]
     assert model(a="x").a == "x"  # pyright: ignore[reportAttributeAccessIssue]
@@ -313,7 +313,7 @@ def test_integer_enum_accepts_rejects_and_dumps_raw_int() -> None:
     assert not isinstance(dumped["level"], Enum)
     # Out-of-enum value rejected.
     with pytest.raises(ValidationError):
-        model(level=9)
+        _ = model(level=9)
 
 
 def test_signed_integer_enum_builds_and_dumps_raw() -> None:
@@ -336,7 +336,7 @@ def test_signed_integer_enum_builds_and_dumps_raw() -> None:
         assert type(dumped["score"]) is int  # raw scalar, not an Enum member
     for bad in (0, -2, 6):
         with pytest.raises(ValidationError):
-            model(score=bad)
+            _ = model(score=bad)
 
 
 def test_enum_member_names_are_never_reserved() -> None:
@@ -350,7 +350,9 @@ def test_enum_member_names_are_never_reserved() -> None:
             "required": ["v"],
         }
     )
-    names = list(model.model_fields["v"].annotation.__members__)  # type: ignore[union-attr]
+    annotation = model.model_fields["v"].annotation
+    assert annotation is not None
+    names = list(annotation.__members__)
     assert len(names) == 5  # no collisions collapsed members
     for name in names:
         assert not (name.startswith("_") and name.endswith("_")), name  # not _sunder_/__dunder__
@@ -391,7 +393,7 @@ def test_distinct_defs_with_same_title_stay_distinct() -> None:
     assert inst.model_dump() == {"a": {"x": "hello"}, "b": {"y": 5}}
     # b validated against A's shape would have passed wrongly; assert it fails.
     with pytest.raises(ValidationError):
-        model(a={"x": "hello"}, b={"x": "wrong"})
+        _ = model(a={"x": "hello"}, b={"x": "wrong"})
 
 
 # --- Recursive / self-referential schema fails loud ------------------------
@@ -421,7 +423,7 @@ def test_self_referential_schema_raises_clear_value_error() -> None:
         },
     }
     with pytest.raises(ValueError, match="recursive"):
-        model_from_json_schema(schema)
+        _ = model_from_json_schema(schema)
 
 
 def test_mutually_recursive_schema_raises_clear_value_error() -> None:
@@ -446,7 +448,7 @@ def test_mutually_recursive_schema_raises_clear_value_error() -> None:
         },
     }
     with pytest.raises(ValueError, match="recursive"):
-        model_from_json_schema(schema)
+        _ = model_from_json_schema(schema)
 
 
 # --- Per-field constraints carry into Field --------------------------------
@@ -468,9 +470,9 @@ def test_numeric_inclusive_bounds_enforced() -> None:
     assert model(score=3).score == 3  # pyright: ignore[reportAttributeAccessIssue]
     # Out-of-bounds rejected on both ends.
     with pytest.raises(ValidationError):
-        model(score=0)
+        _ = model(score=0)
     with pytest.raises(ValidationError):
-        model(score=6)
+        _ = model(score=6)
 
 
 def test_numeric_exclusive_bounds_enforced() -> None:
@@ -486,11 +488,11 @@ def test_numeric_exclusive_bounds_enforced() -> None:
     assert model(ratio=0.5).ratio == 0.5  # pyright: ignore[reportAttributeAccessIssue]
     # Endpoints rejected (exclusive).
     with pytest.raises(ValidationError):
-        model(ratio=0)
+        _ = model(ratio=0)
     with pytest.raises(ValidationError):
-        model(ratio=1)
+        _ = model(ratio=1)
     with pytest.raises(ValidationError):
-        model(ratio=-0.1)
+        _ = model(ratio=-0.1)
 
 
 def test_string_length_bounds_enforced() -> None:
@@ -505,9 +507,9 @@ def test_string_length_bounds_enforced() -> None:
     assert model(code="ab").code == "ab"  # pyright: ignore[reportAttributeAccessIssue]
     assert model(code="abcd").code == "abcd"  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        model(code="a")
+        _ = model(code="a")
     with pytest.raises(ValidationError):
-        model(code="abcde")
+        _ = model(code="abcde")
 
 
 def test_array_item_count_bounds_enforced() -> None:
@@ -530,9 +532,9 @@ def test_array_item_count_bounds_enforced() -> None:
     assert model(tags=["a"]).tags == ["a"]  # pyright: ignore[reportAttributeAccessIssue]
     assert model(tags=["a", "b"]).tags == ["a", "b"]  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        model(tags=[])
+        _ = model(tags=[])
     with pytest.raises(ValidationError):
-        model(tags=["a", "b", "c"])
+        _ = model(tags=["a", "b", "c"])
 
 
 def test_bounds_on_optional_field_enforced_when_present() -> None:
@@ -547,7 +549,7 @@ def test_bounds_on_optional_field_enforced_when_present() -> None:
     assert model().model_dump() == {}  # omitted: fine
     assert model(score=0).score == 0  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        model(score=-1)
+        _ = model(score=-1)
 
 
 def test_description_passthrough_preserved() -> None:
@@ -572,7 +574,7 @@ def test_description_passthrough_preserved() -> None:
     assert model.model_fields["plain"].description is None
     # And the description coexists with the bound: bound still enforced.
     with pytest.raises(ValidationError):
-        model(amount=-1, plain="x")
+        _ = model(amount=-1, plain="x")
 
 
 def test_unsupported_constraint_dropped_without_error() -> None:
@@ -603,7 +605,7 @@ def test_bound_on_referenced_def_is_found() -> None:
     model = model_from_json_schema(schema)
     assert model(n=10).n == 10  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        model(n=9)
+        _ = model(n=9)
 
 
 def test_bound_on_nullable_branch_is_found() -> None:
@@ -619,7 +621,7 @@ def test_bound_on_nullable_branch_is_found() -> None:
     assert model(n=None).n is None  # pyright: ignore[reportAttributeAccessIssue]
     assert model(n=5).n == 5  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        model(n=-1)
+        _ = model(n=-1)
 
 
 # --- Round-trip through structured_llm_call against a faked transport -------
@@ -686,7 +688,7 @@ def test_build_once_model_reused_across_calls() -> None:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
         for _ in range(3):
-            asyncio.run(structured_output.structured_llm_call("go", model, feature="billing"))
+            _ = asyncio.run(structured_output.structured_llm_call("go", model, feature="billing"))
 
     assert len(seen) == 3
     assert all(s is model for s in seen)  # the very same object each time

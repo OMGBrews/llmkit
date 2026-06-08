@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,9 +54,9 @@ class _ConcurrencyProbe:
     """Instrumented coroutine that records observed peak concurrency per key."""
 
     def __init__(self) -> None:
-        self.current = 0
-        self.peak = 0
-        self._lock = asyncio.Lock()
+        self.current: int = 0
+        self.peak: int = 0
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def run(self, key: str, hold: asyncio.Event) -> None:
         """Acquire a slot for ``key``, record peak concurrency, hold until set."""
@@ -65,7 +65,7 @@ class _ConcurrencyProbe:
                 self.current += 1
                 self.peak = max(self.peak, self.current)
             try:
-                await hold.wait()
+                _ = await hold.wait()
             finally:
                 async with self._lock:
                     self.current -= 1
@@ -85,7 +85,7 @@ async def test_default_on_caps_at_eight_with_zero_config() -> None:
     assert probe.peak == 8
 
     hold.set()
-    await asyncio.gather(*tasks)
+    _ = await asyncio.gather(*tasks)
     assert probe.peak == 8
 
 
@@ -107,7 +107,7 @@ async def test_providers_have_independent_budgets() -> None:
     async def ollama_call() -> None:
         async with GlobalRateLimiter.acquire_async("ollama"):
             ollama_proceeded.set()
-            await ollama_hold.wait()
+            _ = await ollama_hold.wait()
 
     ollama_task = asyncio.create_task(ollama_call())
     for _ in range(20):
@@ -119,7 +119,7 @@ async def test_providers_have_independent_budgets() -> None:
 
     openai_hold.set()
     ollama_hold.set()
-    await asyncio.gather(*openai_tasks, ollama_task)
+    _ = await asyncio.gather(*openai_tasks, ollama_task)
 
 
 async def test_reconfigure_raises_cap_for_new_acquires() -> None:
@@ -135,7 +135,7 @@ async def test_reconfigure_raises_cap_for_new_acquires() -> None:
     assert probe.peak == 5
 
     hold.set()
-    await asyncio.gather(*tasks)
+    _ = await asyncio.gather(*tasks)
 
 
 async def test_disabled_is_unbounded_no_op() -> None:
@@ -152,7 +152,7 @@ async def test_disabled_is_unbounded_no_op() -> None:
     assert probe.peak == 7
 
     hold.set()
-    await asyncio.gather(*tasks)
+    _ = await asyncio.gather(*tasks)
 
 
 async def test_inflight_caller_not_stranded_by_configure_swap() -> None:
@@ -169,11 +169,11 @@ async def test_inflight_caller_not_stranded_by_configure_swap() -> None:
     async def holder() -> None:
         async with GlobalRateLimiter.acquire_async("openai"):
             entered.set()
-            await release.wait()
+            _ = await release.wait()
         finished.set()
 
     task = asyncio.create_task(holder())
-    await entered.wait()
+    _ = await entered.wait()
 
     # Swap/clear the registry while the slot is held.
     configure_rate_limit(max_concurrent=3)
@@ -197,7 +197,7 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
     recorded: list[str] = []
 
     @contextlib.asynccontextmanager
-    async def _record(provider_key: str) -> AsyncIterator[None]:
+    async def _record(provider_key: str) -> AsyncGenerator[None]:
         recorded.append(provider_key)
         yield
 
@@ -250,9 +250,9 @@ class _AsyncFunctionProbe:
     """
 
     def __init__(self) -> None:
-        self.current = 0
-        self.peak = 0
-        self._lock = asyncio.Lock()
+        self.current: int = 0
+        self.peak: int = 0
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def run(self, key: str, hold: asyncio.Event) -> None:
         """Join via the public async function, record peak, hold until set."""
@@ -261,7 +261,7 @@ class _AsyncFunctionProbe:
                 self.current += 1
                 self.peak = max(self.peak, self.current)
             try:
-                await hold.wait()
+                _ = await hold.wait()
             finally:
                 async with self._lock:
                     self.current -= 1
@@ -279,7 +279,7 @@ async def test_rate_limit_acquire_async_respects_configured_cap() -> None:
     assert probe.peak == 8
 
     hold.set()
-    await asyncio.gather(*tasks)
+    _ = await asyncio.gather(*tasks)
     assert probe.peak == 8
 
 
@@ -295,7 +295,7 @@ async def test_rate_limit_acquire_async_acquires_and_releases() -> None:
 
     async def first() -> None:
         async with rate_limit_acquire_async("openai"):
-            await release_first.wait()
+            _ = await release_first.wait()
 
     async def second() -> None:
         async with rate_limit_acquire_async("openai"):
@@ -310,7 +310,7 @@ async def test_rate_limit_acquire_async_acquires_and_releases() -> None:
     assert not entered_second.is_set()
 
     release_first.set()  # free the slot
-    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1.0)
+    _ = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1.0)
     assert entered_second.is_set()
 
 
@@ -327,7 +327,7 @@ async def test_rate_limit_acquire_async_disabled_bypass() -> None:
     assert probe.peak == 7
 
     hold.set()
-    await asyncio.gather(*tasks)
+    _ = await asyncio.gather(*tasks)
 
 
 def test_rate_limit_acquire_sync_respects_configured_cap() -> None:
@@ -344,7 +344,7 @@ def test_rate_limit_acquire_sync_respects_configured_cap() -> None:
     def first() -> None:
         with rate_limit_acquire_sync("openai"):
             first_holds.set()
-            release_first.wait(timeout=1.0)
+            _ = release_first.wait(timeout=1.0)
 
     def second() -> None:
         with rate_limit_acquire_sync("openai"):
@@ -380,9 +380,9 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
 
     def worker() -> None:
         with rate_limit_acquire_sync("openai"):
-            both_in.wait()  # both threads must be inside at once
+            _ = both_in.wait()  # both threads must be inside at once
             reached_barrier.set()
-            release.wait(timeout=1.0)
+            _ = release.wait(timeout=1.0)
 
     threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
     for thread in threads:

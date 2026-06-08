@@ -43,7 +43,7 @@ import asyncio
 import contextlib
 import logging
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class GlobalRateLimiter:
 
     @classmethod
     @contextlib.asynccontextmanager
-    async def acquire_async(cls, provider_key: str) -> AsyncIterator[None]:
+    async def acquire_async(cls, provider_key: str) -> AsyncGenerator[None]:
         """Hold an async slot for ``provider_key`` for the ``async with`` block.
 
         ``provider_key`` is the provider name (``provider.name``); each
@@ -153,7 +153,7 @@ class GlobalRateLimiter:
             yield
             return
         sem = cls._get_async_semaphore(provider_key)
-        await sem.acquire()
+        _ = await sem.acquire()
         try:
             yield
         finally:
@@ -161,7 +161,7 @@ class GlobalRateLimiter:
 
     @classmethod
     @contextlib.contextmanager
-    def acquire_sync(cls, provider_key: str) -> Iterator[None]:
+    def acquire_sync(cls, provider_key: str) -> Generator[None]:
         """Hold a sync slot for ``provider_key`` for the ``with`` block.
 
         ``provider_key`` is the provider name (``provider.name``); each
@@ -171,7 +171,7 @@ class GlobalRateLimiter:
             yield
             return
         sem = cls._get_sync_semaphore(provider_key)
-        sem.acquire()
+        _ = sem.acquire()
         try:
             yield
         finally:
@@ -224,7 +224,7 @@ def get_rate_limit_config() -> RateLimitConfig:
 
 
 @contextlib.asynccontextmanager
-async def rate_limit_acquire_async(provider_key: str) -> AsyncIterator[None]:
+async def rate_limit_acquire_async(provider_key: str) -> AsyncGenerator[None]:
     """Hold an async slot on the global per-provider limit for the block.
 
     The public way to join the process-global, per-provider concurrency limit
@@ -247,7 +247,7 @@ async def rate_limit_acquire_async(provider_key: str) -> AsyncIterator[None]:
 
 
 @contextlib.contextmanager
-def rate_limit_acquire_sync(provider_key: str) -> Iterator[None]:
+def rate_limit_acquire_sync(provider_key: str) -> Generator[None]:
     """Hold a sync slot on the global per-provider limit for the block.
 
     The synchronous counterpart to :func:`rate_limit_acquire_async`, for a host

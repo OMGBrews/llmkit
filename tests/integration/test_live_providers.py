@@ -162,9 +162,9 @@ async def _assert_structured_roundtrip(
         # An extraction with the answer fully specified, so the result is
         # deterministic and a dropped/empty field is unambiguously wrong.
         "Extract the following facts about France into the schema. "
-        "Country: France. Capital: Paris. Continent: Europe. "
-        "Member of the European Union: yes. Number of bordering countries: 8. "
-        "Three largest cities by population: Paris, Marseille, Lyon.",
+        + "Country: France. Capital: Paris. Continent: Europe. "
+        + "Member of the European Union: yes. Number of bordering countries: 8. "
+        + "Three largest cities by population: Paris, Marseille, Lyon.",
         CountryProfile,
         feature="integration-smoke",
         label=provider.name,

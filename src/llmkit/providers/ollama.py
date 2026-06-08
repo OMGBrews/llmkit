@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import override
+
 import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig
@@ -28,6 +30,7 @@ class OllamaProvider(BaseProvider):
         super().__init__(model, reasoning_effort)
         self._base_url: str = base_url
 
+    @override
     def completion_kwargs(self) -> dict[str, str]:
         return {"api_base": self._base_url}
 

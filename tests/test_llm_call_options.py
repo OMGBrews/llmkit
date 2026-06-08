@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterator
-from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
 
 from llmkit import (
+    DEFAULT_RETRY_POLICY,
     NO_RETRY,
     LocalYamlLogSink,
     configure_llm_logging,
@@ -36,7 +36,7 @@ class _Schema(BaseModel):
 
 
 @pytest.fixture(autouse=True)
-def _quiet_logging() -> Iterator[None]:
+def _quiet_logging() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse pytest fixture, invoked by pytest's collection machinery
     """Point logging at a no-op sink so these tests don't touch the disk."""
     configure_llm_logging(None)
     try:
@@ -184,7 +184,7 @@ def test_options_retry_applied_when_keyword_default() -> None:
         model=None,
         max_tokens=None,
         reasoning_effort=None,
-        retry=structured_output.DEFAULT_RETRY_POLICY,
+        retry=DEFAULT_RETRY_POLICY,
         provider=None,
     )
 
@@ -215,7 +215,7 @@ def test_options_threads_through_text_and_sync() -> None:
             "hi", _Schema, feature="classification", options=options
         )
 
-    assert cast("_Schema", result).ok is True
+    assert result.ok is True
     assert text_recorder[0]["model"] == "shared-model"
     assert text_recorder[0]["max_tokens"] == 128
     assert struct_calls[0]["model"] == "shared-model"

@@ -86,10 +86,10 @@ def _drain_pending(loop: asyncio.AbstractEventLoop, *, timeout: float | None) ->
     if not pending:
         return
     for task in pending:
-        task.cancel()
+        _ = task.cancel()
     drain = asyncio.gather(*pending, return_exceptions=True)
     with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-        loop.run_until_complete(asyncio.wait_for(drain, timeout=timeout))
+        _ = loop.run_until_complete(asyncio.wait_for(drain, timeout=timeout))
 
 
 def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 600) -> T:

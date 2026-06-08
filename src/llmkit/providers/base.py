@@ -54,11 +54,11 @@ def require_anthropic_sdk(provider_name: str) -> None:
     if importlib.util.find_spec("anthropic") is None:
         raise ModuleNotFoundError(
             f"The {provider_name} provider requires the Anthropic SDK, which is "
-            "not installed. It ships in an opt-in extra so non-Anthropic hosts "
-            "take on no Anthropic dependency. Install it with:\n\n"
-            "    pip install 'omg-llmkit[anthropic]'\n\n"
-            "(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' "
-            "pulls it in.)"
+            + "not installed. It ships in an opt-in extra so non-Anthropic hosts "
+            + "take on no Anthropic dependency. Install it with:\n\n"
+            + "    pip install 'omg-llmkit[anthropic]'\n\n"
+            + "(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' "
+            + "pulls it in.)"
         )
 
 
@@ -149,7 +149,7 @@ def active_config() -> LLMClientConfig:
     if _config_source is None:
         raise RuntimeError(
             "LLM client not configured: call configure_llm_client(...) at "
-            "application startup before constructing a provider."
+            + "application startup before constructing a provider."
         )
     return _config_source()
 

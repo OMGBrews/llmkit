@@ -8,11 +8,12 @@ pin the callback contract specifically.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 
 import pytest
 
-from llmkit import retry as retry_mod
 from llmkit.retry import retry_progress_callback, with_retries
 
 
@@ -109,7 +110,7 @@ async def test_progress_callback_not_invoked_for_final_failure() -> None:
         raise ValueError("nope")
 
     with retry_progress_callback(cb), pytest.raises(ValueError, match="nope"):
-        await with_retries(always_fails, max_attempts=2, label="x")
+        _ = await with_retries(always_fails, max_attempts=2, label="x")
 
     # Only one callback: attempt 1/2 (non-final). Attempt 2/2 is final → no callback.
     assert cb.calls == [("x", 1, 2, "nope")]
@@ -165,7 +166,7 @@ async def test_no_backoff_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_sleep(delay: float) -> None:
         slept.append(delay)
 
-    monkeypatch.setattr(retry_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     attempts = [0]
 
     async def flaky() -> str:
@@ -192,14 +193,14 @@ async def test_backoff_sleeps_between_retries_with_jittered_ceiling(
         slept.append(delay)
 
     # random.uniform(0, ceiling) -> ceiling, so we assert the exact ceiling.
-    monkeypatch.setattr(retry_mod.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(retry_mod.random, "uniform", lambda _lo, hi: hi)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", lambda _lo, hi: hi)
 
     async def always_fails() -> str:
         raise ValueError("nope")
 
     with pytest.raises(ValueError, match="nope"):
-        await with_retries(always_fails, max_attempts=3, label="x", backoff_base_seconds=2.0)
+        _ = await with_retries(always_fails, max_attempts=3, label="x", backoff_base_seconds=2.0)
 
     # Two non-final failures (attempts 1 and 2) → two sleeps; attempt 3 is
     # final (no sleep). Ceilings: 2*2**0=2.0, 2*2**1=4.0.
@@ -214,7 +215,7 @@ async def test_backoff_not_slept_on_success(monkeypatch: pytest.MonkeyPatch) -> 
     async def fake_sleep(delay: float) -> None:
         slept.append(delay)
 
-    monkeypatch.setattr(retry_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     async def succeed() -> int:
         return 7
@@ -236,10 +237,10 @@ async def test_retry_progress_callback_resets_on_exit() -> None:
 
     with retry_progress_callback(cb_outer):
         with retry_progress_callback(cb_inner), pytest.raises(ValueError):
-            await with_retries(flaky, max_attempts=2, label="inner")
+            _ = await with_retries(flaky, max_attempts=2, label="inner")
         # Outer scope's callback should be active again.
         with pytest.raises(ValueError):
-            await with_retries(flaky, max_attempts=2, label="outer")
+            _ = await with_retries(flaky, max_attempts=2, label="outer")
 
     assert cb_inner.calls == [("inner", 1, 2, "always")]
     assert cb_outer.calls == [("outer", 1, 2, "always")]
