@@ -35,6 +35,7 @@ from llmkit.exceptions import (
     LLM_RECOVERABLE_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
+    ResultValidationError,
 )
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
@@ -118,4 +119,5 @@ __all__ = [
     "LLM_RECOVERABLE_ERRORS",
     "LLM_TRANSPORT_ERRORS",
     "LLM_SCHEMA_ERRORS",
+    "ResultValidationError",
 ]

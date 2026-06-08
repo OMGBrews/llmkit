@@ -25,7 +25,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
-from collections.abc import AsyncIterator, Generator, Mapping
+from collections.abc import AsyncIterator, Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +35,7 @@ from typing import Any, cast
 
 from pydantic import BaseModel, JsonValue
 
+from llmkit.exceptions import ResultValidationError
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import LLMCallRecord, write_llm_log
 from llmkit.providers import LLMProviderInterface
@@ -205,6 +206,19 @@ def _pick[V](keyword: V, default: V, option: V | _Unset) -> V:
 _DEFAULT_TEMPERATURE = 0.2
 
 
+def _result_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], ...]:
+    """The validation retry-set augmented with :class:`ResultValidationError`.
+
+    The ``on_result`` re-roll hook charges a rejected-result against the same
+    budget as a schema-validation failure (semantically the content is wrong,
+    not the transport), so :class:`ResultValidationError` is folded into the
+    policy's ``validation_retry_on`` for the call's :func:`with_retries` pass.
+    Including it unconditionally is harmless when no ``on_result`` is supplied —
+    nothing raises it — and keeps the call functions from branching on the hook.
+    """
+    return (*retry.validation_retry_on, ResultValidationError)
+
+
 _captured_log_paths: contextvars.ContextVar[list[Path] | None] = contextvars.ContextVar(
     "_llm_captured_log_paths", default=None
 )
@@ -320,6 +334,7 @@ async def structured_llm_call[T](
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
@@ -367,6 +382,19 @@ async def structured_llm_call[T](
             :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
             its own logged call; this layer stays separate from instructor's
             in-call schema-repair budget.
+        on_result: Optional semantic-validation hook. Called with the parsed
+            result of each attempt; raise
+            :class:`~llmkit.ResultValidationError` from it to **reject** a
+            result that parsed cleanly but is semantically wrong (an empty
+            register, an unresolved citation, a total that doesn't reconcile)
+            and re-roll the call. The re-roll is charged against the *validation*
+            budget (``retry.validation_max_attempts``), exactly like a schema
+            failure, so a deterministically-bad result can't burn the full
+            transport budget; on exhaustion the last
+            :class:`~llmkit.ResultValidationError` propagates. ``None`` (the
+            default) leaves the call unchanged. Folds an
+            LLM-then-validate-then-re-roll loop the caller would otherwise
+            hand-roll into the call itself.
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
             ``retry``/``provider`` once for reuse across many calls.
@@ -430,6 +458,11 @@ async def structured_llm_call[T](
                 ),
             )
             response = parsed
+            if on_result is not None:
+                # A raise (ResultValidationError) rejects this result and
+                # re-rolls within the validation budget; the attempt is still
+                # logged below with both the rejected response and the error.
+                _ = on_result(response)
             return response
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -470,7 +503,7 @@ async def structured_llm_call[T](
         backoff_base_seconds=retry.backoff_base_seconds,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
-        validation_retry_on=retry.validation_retry_on,
+        validation_retry_on=_result_validation_budget(retry),
     )
 
 
@@ -486,6 +519,7 @@ def structured_llm_call_sync[T](
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
@@ -500,10 +534,13 @@ def structured_llm_call_sync[T](
     ``reasoning_effort`` is forwarded identically (``None`` defers to the
     configured :class:`~llmkit.LLMClientConfig` value). ``retry`` is the
     transient-error budget, inherited from the async path (default-on; pass
-    :data:`~llmkit.NO_RETRY` to opt out). ``options`` is the same opt-in
-    :class:`LLMCallOptions` bundle the async call takes, with the same
-    **config < options < explicit keyword** precedence; it is forwarded
-    untouched so the merge happens once, in :func:`structured_llm_call`.
+    :data:`~llmkit.NO_RETRY` to opt out). ``on_result`` is the same
+    semantic-validation re-roll hook the async call takes (raise
+    :class:`~llmkit.ResultValidationError` to reject a result and re-roll on the
+    validation budget). ``options`` is the same opt-in :class:`LLMCallOptions`
+    bundle the async call takes, with the same **config < options < explicit
+    keyword** precedence; it is forwarded untouched so the merge happens once,
+    in :func:`structured_llm_call`.
     """
     return run_sync(
         structured_llm_call(
@@ -517,6 +554,7 @@ def structured_llm_call_sync[T](
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,
+            on_result=on_result,
             options=options,
         )
     )
@@ -534,6 +572,7 @@ async def structured_data_call(
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[BaseModel], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
     """Dict-in / data-out structured call for JSON-schema-dict consumers.
@@ -578,6 +617,12 @@ async def structured_data_call(
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
             opt out.
+        on_result: Optional semantic-validation re-roll hook (see
+            :func:`structured_llm_call`). Because the re-roll must happen
+            *before* the result is dumped to a dict, the callback receives the
+            validated **Pydantic model** (the instance built from *schema*),
+            not the returned dict; raise :class:`~llmkit.ResultValidationError`
+            from it to reject and re-roll on the validation budget.
         options: Optional :class:`LLMCallOptions` bundle (see
             :func:`structured_llm_call`); explicit keywords here override it,
             it overrides config, and ``None`` leaves the flat path unchanged.
@@ -607,6 +652,7 @@ async def structured_data_call(
         reasoning_effort=reasoning_effort,
         provider=provider,
         retry=retry,
+        on_result=on_result,
         options=options,
     )
     return result.model_dump()
@@ -624,6 +670,7 @@ def structured_data_call_sync(
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[BaseModel], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
     """Synchronous wrapper around :func:`structured_data_call`.
@@ -632,8 +679,8 @@ def structured_data_call_sync(
     for the synchronous call sites that cannot ``await`` (e.g. FiW). Same
     arguments, same logging, same data-out result; the coroutine is driven to
     completion via the same :func:`run_sync` bridge, so the rate-limit slot,
-    retries, and ``options`` precedence are all inherited from the async path
-    unchanged.
+    retries, the ``on_result`` re-roll hook, and ``options`` precedence are all
+    inherited from the async path unchanged.
     """
     return run_sync(
         structured_data_call(
@@ -647,6 +694,7 @@ def structured_data_call_sync(
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,
+            on_result=on_result,
             options=options,
         )
     )
@@ -663,6 +711,7 @@ async def text_llm_call(
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    on_result: Callable[[str], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
@@ -694,6 +743,11 @@ async def text_llm_call(
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
             opt out. Each attempt is its own logged call.
+        on_result: Optional semantic-validation re-roll hook (see
+            :func:`structured_llm_call`). Called with the response *text*; raise
+            :class:`~llmkit.ResultValidationError` from it to reject a
+            structurally-fine-but-wrong answer (e.g. text that fails to parse as
+            the JSON you asked for) and re-roll on the validation budget.
         options: Optional :class:`LLMCallOptions` bundle (see
             :func:`structured_llm_call`); explicit keywords here override it,
             it overrides config, and ``None`` leaves the flat path unchanged.
@@ -740,6 +794,10 @@ async def text_llm_call(
                 reasoning_effort=reasoning_effort,
                 provider=provider,
             )
+            if on_result is not None:
+                # A raise (ResultValidationError) rejects this text and re-rolls
+                # within the validation budget; the attempt is still logged below.
+                _ = on_result(text)
             return text
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -768,7 +826,7 @@ async def text_llm_call(
         backoff_base_seconds=retry.backoff_base_seconds,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
-        validation_retry_on=retry.validation_retry_on,
+        validation_retry_on=_result_validation_budget(retry),
     )
 
 

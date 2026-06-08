@@ -73,3 +73,22 @@ LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
 )
+
+
+class ResultValidationError(Exception):
+    """Raised by a call function's ``on_result`` hook to reject a result.
+
+    The signal a host uses to fold an LLM-then-validate-then-re-roll loop into
+    the call functions themselves. When a structured/text call's ``on_result``
+    callback raises this (a result that *parsed* but is *semantically* wrong —
+    an empty risk register, a citation that doesn't resolve, a total that
+    doesn't reconcile), the call re-rolls **within the same validation budget**
+    that governs schema-validation retries (``RetryPolicy.validation_max_attempts``),
+    so a deterministically-bad result can't burn the full transport budget.
+
+    It is in spirit a *schema-validation* failure (the content is wrong, not the
+    transport), so it is charged against the validation budget rather than the
+    transport one. On budget exhaustion the last ``ResultValidationError``
+    propagates to the caller, carrying the rejecting message (and, if the host
+    raised it ``from`` another error, that ``__cause__``).
+    """

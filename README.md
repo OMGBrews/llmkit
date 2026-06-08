@@ -530,6 +530,26 @@ Two retry layers, kept deliberately separate:
 
 - **instructor's own low `validation_retries`** (default 1) handles *in-call* schema-validation repair — re-asking the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
+### Re-rolling on a semantically-bad result
+
+A response can pass the schema and still be *wrong* — an empty register, a citation that doesn't resolve, a total that doesn't reconcile. Rather than hand-rolling an LLM-then-validate-then-re-roll loop around the call, pass an `on_result` hook: it's called with each attempt's result, and raising `ResultValidationError` from it **rejects** that result and re-rolls the call.
+
+```python
+from llmkit import structured_llm_call, ResultValidationError
+
+def _must_have_findings(report: Report) -> None:
+    if not report.findings:
+        raise ResultValidationError("empty report — re-roll")
+
+result = await structured_llm_call(
+    prompt, Report, feature="reports", on_result=_must_have_findings,
+)
+```
+
+The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
+
+`on_result` is available on `structured_llm_call` (and its sync wrapper), `text_llm_call` (the hook receives the response *text*), and `structured_data_call` / `_sync` (the hook receives the validated Pydantic *model*, before it's dumped to a dict). It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
+
 ## Development
 
 ```bash
