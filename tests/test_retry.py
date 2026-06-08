@@ -193,8 +193,11 @@ async def test_backoff_sleeps_between_retries_with_jittered_ceiling(
         slept.append(delay)
 
     # random.uniform(0, ceiling) -> ceiling, so we assert the exact ceiling.
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(random, "uniform", lambda _lo, hi: hi)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
 
     async def always_fails() -> str:
         raise ValueError("nope")

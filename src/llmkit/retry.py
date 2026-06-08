@@ -30,7 +30,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, cast
 
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 
@@ -199,7 +199,10 @@ async def handle_retry_failure(
         except Exception:
             logger.exception("%s: retry progress callback raised", tag)
     if backoff_base_seconds > 0:
-        ceiling = backoff_base_seconds * (2 ** (attempt - 1))
+        # int ** int widens to Any in the stubs (negative exponents yield
+        # float); attempt >= 1 keeps the exponent non-negative, so cast the
+        # power back to the int it really is before scaling to a float ceiling.
+        ceiling = backoff_base_seconds * cast("int", 2 ** (attempt - 1))
         await asyncio.sleep(random.uniform(0, ceiling))
 
 

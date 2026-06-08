@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 from llmkit import (
@@ -118,7 +119,7 @@ def test_local_yaml_sink_records_model_and_provider(tmp_path: Path) -> None:
 
     path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert path is not None
-    doc = yaml.safe_load(path.read_text())
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
     assert doc["model"] == "gemini-2.5-flash-lite"
     assert doc["provider"] == "Google AI Studio"
 
@@ -174,13 +175,13 @@ def test_local_yaml_sink_includes_approximate_cost_field(tmp_path: Path) -> None
 
     default_path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert default_path is not None
-    doc = yaml.safe_load(default_path.read_text())
+    doc = cast("dict[str, object]", yaml.safe_load(default_path.read_text()))
     assert "approximate_cost" in doc
     assert doc["approximate_cost"] is None
 
     priced_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(approximate_cost=0.0123))
     assert priced_path is not None
-    priced = yaml.safe_load(priced_path.read_text())
+    priced = cast("dict[str, object]", yaml.safe_load(priced_path.read_text()))
     assert priced["approximate_cost"] == 0.0123
 
 
@@ -234,7 +235,7 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
     lines = index.read_text().strip().splitlines()
     assert len(lines) == 2
 
-    first = json.loads(lines[0])
+    first = cast("dict[str, object]", json.loads(lines[0]))
     assert first["file"] == p1.name
     assert first["feature"] == "extraction"
     assert first["label"] == "first"
@@ -244,6 +245,6 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
     # The big prompt/response blobs are deliberately NOT in the index.
     assert "prompt" not in first and "response" not in first
 
-    second = json.loads(lines[1])
+    second = cast("dict[str, object]", json.loads(lines[1]))
     assert second["label"] == "second"
     assert second["error"] == "Timeout: slow"

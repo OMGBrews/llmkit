@@ -403,8 +403,11 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
     async def _fake_sleep(delay: float) -> None:
         slept.append(delay)
 
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
-    monkeypatch.setattr(random, "uniform", lambda _lo, hi: hi)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
 
     calls = [0]
 

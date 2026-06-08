@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import os
 import socket
-from typing import NoReturn
+from typing import NoReturn, Protocol, cast
 
 import pytest
 from pydantic import BaseModel
@@ -86,6 +86,22 @@ from llmkit.providers import (
 # skipped at collection (deterministically, regardless of any credentials in the
 # environment); with it, they all run and must pass.
 pytestmark = pytest.mark.live
+
+
+class _Boto3Session(Protocol):
+    """The slice of ``boto3.Session`` the Bedrock credential probe touches."""
+
+    def get_credentials(self) -> object | None: ...
+
+
+class _Boto3Module(Protocol):
+    """Typed view of the dynamically-imported ``boto3`` module.
+
+    ``pytest.importorskip`` returns ``Any``; narrowing it to this Protocol keeps
+    the credential check below precisely typed instead of leaking ``reportAny``.
+    """
+
+    def Session(self) -> _Boto3Session: ...
 
 
 class CountryProfile(BaseModel):
@@ -258,7 +274,10 @@ async def test_bedrock_live() -> None:
     # needs both that extra and an AWS account, which plain `--run-live` cannot
     # assume. Once the extra IS installed, the usual hard-fail rule applies:
     # a missing region/credential fails the test rather than skipping it.
-    boto3 = pytest.importorskip("boto3", reason="install omg-llmkit[bedrock] for live Bedrock")
+    boto3 = cast(
+        "_Boto3Module",
+        pytest.importorskip("boto3", reason="install omg-llmkit[bedrock] for live Bedrock"),
+    )
     region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION")
     if not region:
         _missing("AWS_REGION_NAME (or AWS_REGION) not set")

@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import yaml
 
@@ -156,7 +156,7 @@ class LocalYamlLogSink:
                 "duration_ms": round(record.duration_ms, 1),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
-                "response": record.response,
+                "response": cast("object", record.response),
                 "prompt": record.prompt,
             }
 

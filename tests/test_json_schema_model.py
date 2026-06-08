@@ -11,11 +11,25 @@ from __future__ import annotations
 
 import asyncio
 from enum import Enum
+from typing import cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 from llmkit import model_from_json_schema, structured_output
+
+
+def _attr(instance: BaseModel, name: str) -> object:
+    """Read a dynamically-built model field as a statically-known ``object``.
+
+    ``model_from_json_schema`` returns ``type[BaseModel]``, so an instance's
+    runtime fields (``.score``, ``.tags``, …) are not statically known and a
+    bare ``inst.score`` is an unknown-member access. Routing each assertion's
+    read through here gives it a real ``object`` type — which still supports the
+    ``==`` / ``is`` checks below — without weakening the assertion.
+    """
+    return cast("object", getattr(instance, name))
+
 
 # A representative schema: nested objects (inline + via $defs/$ref), an array
 # of objects, an enum, and a mix of required and optional fields.
@@ -245,8 +259,8 @@ def test_required_nullable_list_form_accepts_null() -> None:
     with pytest.raises(ValidationError):
         _ = model()
     # ...but null is a valid value.
-    assert model(a=None).a is None  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(a="x").a == "x"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(a=None), "a") is None
+    assert _attr(model(a="x"), "a") == "x"
 
 
 def test_required_nullable_anyof_form_accepts_null() -> None:
@@ -259,8 +273,8 @@ def test_required_nullable_anyof_form_accepts_null() -> None:
     }
     model = model_from_json_schema(schema)
     assert model.model_fields["a"].is_required()
-    assert model(a=None).a is None  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(a="x").a == "x"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(a=None), "a") is None
+    assert _attr(model(a="x"), "a") == "x"
 
 
 # --- anyOf/oneOf nullable shape (optional) ---------------------------------
@@ -275,9 +289,9 @@ def test_optional_nullable_anyof_excluded_when_unset() -> None:
     model = model_from_json_schema(schema)
     assert not model.model_fields["a"].is_required()
     inst = model()
-    assert inst.a is None  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(inst, "a") is None
     assert inst.model_dump() == {}
-    assert model(a=5).a == 5  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(a=5), "a") == 5
 
 
 def test_optional_nullable_oneof_excluded_when_unset() -> None:
@@ -289,7 +303,7 @@ def test_optional_nullable_oneof_excluded_when_unset() -> None:
     model = model_from_json_schema(schema)
     assert not model.model_fields["a"].is_required()
     assert model().model_dump() == {}
-    assert model(a="hi").a == "hi"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(a="hi"), "a") == "hi"
 
 
 # --- Integer enums ---------------------------------------------------------
@@ -331,7 +345,7 @@ def test_signed_integer_enum_builds_and_dumps_raw() -> None:
     model = model_from_json_schema(schema)  # must not raise
     # Every member is accepted and the non-contiguous gaps are rejected.
     for value in (-1, 1, 2, 3, 4, 5):
-        dumped = model(score=value).model_dump()
+        dumped: dict[str, object] = model(score=value).model_dump()
         assert dumped == {"score": value}
         assert type(dumped["score"]) is int  # raw scalar, not an Enum member
     for bad in (0, -2, 6):
@@ -351,7 +365,10 @@ def test_enum_member_names_are_never_reserved() -> None:
         }
     )
     annotation = model.model_fields["v"].annotation
+    # The field is a required integer enum, so its annotation is the generated
+    # ``Enum`` subclass — narrow to it so ``__members__`` is statically known.
     assert annotation is not None
+    assert issubclass(annotation, Enum)
     names = list(annotation.__members__)
     assert len(names) == 5  # no collisions collapsed members
     for name in names:
@@ -465,9 +482,9 @@ def test_numeric_inclusive_bounds_enforced() -> None:
     }
     model = model_from_json_schema(schema)
     # In-bounds (including the endpoints) accepted.
-    assert model(score=1).score == 1  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(score=5).score == 5  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(score=3).score == 3  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(score=1), "score") == 1
+    assert _attr(model(score=5), "score") == 5
+    assert _attr(model(score=3), "score") == 3
     # Out-of-bounds rejected on both ends.
     with pytest.raises(ValidationError):
         _ = model(score=0)
@@ -485,7 +502,7 @@ def test_numeric_exclusive_bounds_enforced() -> None:
         "required": ["ratio"],
     }
     model = model_from_json_schema(schema)
-    assert model(ratio=0.5).ratio == 0.5  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(ratio=0.5), "ratio") == 0.5
     # Endpoints rejected (exclusive).
     with pytest.raises(ValidationError):
         _ = model(ratio=0)
@@ -504,8 +521,8 @@ def test_string_length_bounds_enforced() -> None:
         "required": ["code"],
     }
     model = model_from_json_schema(schema)
-    assert model(code="ab").code == "ab"  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(code="abcd").code == "abcd"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(code="ab"), "code") == "ab"
+    assert _attr(model(code="abcd"), "code") == "abcd"
     with pytest.raises(ValidationError):
         _ = model(code="a")
     with pytest.raises(ValidationError):
@@ -529,8 +546,8 @@ def test_array_item_count_bounds_enforced() -> None:
         "required": ["tags"],
     }
     model = model_from_json_schema(schema)
-    assert model(tags=["a"]).tags == ["a"]  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(tags=["a", "b"]).tags == ["a", "b"]  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(tags=["a"]), "tags") == ["a"]
+    assert _attr(model(tags=["a", "b"]), "tags") == ["a", "b"]
     with pytest.raises(ValidationError):
         _ = model(tags=[])
     with pytest.raises(ValidationError):
@@ -547,7 +564,7 @@ def test_bounds_on_optional_field_enforced_when_present() -> None:
     }
     model = model_from_json_schema(schema)
     assert model().model_dump() == {}  # omitted: fine
-    assert model(score=0).score == 0  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(score=0), "score") == 0
     with pytest.raises(ValidationError):
         _ = model(score=-1)
 
@@ -589,7 +606,7 @@ def test_unsupported_constraint_dropped_without_error() -> None:
     }
     model = model_from_json_schema(schema)
     # Builds without error and accepts a value the pattern would have rejected.
-    assert model(code="not-a-number").code == "not-a-number"  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(code="not-a-number"), "code") == "not-a-number"
 
 
 def test_bound_on_referenced_def_is_found() -> None:
@@ -603,7 +620,7 @@ def test_bound_on_referenced_def_is_found() -> None:
         "$defs": {"Bounded": {"type": "integer", "minimum": 10}},
     }
     model = model_from_json_schema(schema)
-    assert model(n=10).n == 10  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(n=10), "n") == 10
     with pytest.raises(ValidationError):
         _ = model(n=9)
 
@@ -618,8 +635,8 @@ def test_bound_on_nullable_branch_is_found() -> None:
         "required": ["n"],
     }
     model = model_from_json_schema(schema)
-    assert model(n=None).n is None  # pyright: ignore[reportAttributeAccessIssue]
-    assert model(n=5).n == 5  # pyright: ignore[reportAttributeAccessIssue]
+    assert _attr(model(n=None), "n") is None
+    assert _attr(model(n=5), "n") == 5
     with pytest.raises(ValidationError):
         _ = model(n=-1)
 
@@ -656,8 +673,8 @@ def test_round_trip_through_structured_call() -> None:
             structured_output.structured_llm_call("Extract the invoice.", model, feature="billing")
         )
 
-    assert result.id == "INV-9"  # pyright: ignore[reportAttributeAccessIssue]  # test — dynamic model
-    assert result.status == "closed"  # pyright: ignore[reportAttributeAccessIssue]  # test — dynamic model
+    assert _attr(result, "id") == "INV-9"
+    assert _attr(result, "status") == "closed"
     # Omitted optionals stay absent on the way back out.
     dumped = result.model_dump()
     assert "note" not in dumped

@@ -33,7 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, cast
 
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import LLMCallRecord, write_llm_log
@@ -415,16 +415,21 @@ async def structured_llm_call[T](
             # The public ``T`` is unbounded (frozen call surface); the LiteLLM
             # seam requires ``T: BaseModel``. Every caller passes a Pydantic
             # schema, so this is sound at runtime — suppress the bound mismatch.
-            parsed, cost = await _litellm.acompletion_structured(
-                prompt,
-                output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                provider=provider,
+            # The suppressed unbounded-T arg below leaves the parsed half of the
+            # returned tuple untyped; it is a T by construction, so narrow it.
+            parsed, cost = cast(
+                "tuple[T, float | None]",
+                await _litellm.acompletion_structured(
+                    prompt,
+                    output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
+                    temperature=temperature,
+                    model=model,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    provider=provider,
+                ),
             )
-            response = cast("T", parsed)
+            response = parsed
             return response
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -432,8 +437,10 @@ async def structured_llm_call[T](
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
             resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
-            response_dump = (
-                response.model_dump()  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — Pydantic result dumped for the log
+            # The public T is unbounded, but every parsed result is a Pydantic
+            # model; narrow to BaseModel to dump it for the log.
+            response_dump: dict[str, JsonValue] | None = (
+                cast("dict[str, JsonValue]", cast("BaseModel", response).model_dump())
                 if response is not None and hasattr(response, "model_dump")
                 else None
             )

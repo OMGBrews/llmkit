@@ -150,8 +150,8 @@ def test_text_transport_forwards_reasoning_effort() -> None:
         return resp
 
     provider = MagicMock()
-    provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
-    provider.litellm_model.return_value = "fake/model"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
+    provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = "disable"
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
@@ -210,12 +210,14 @@ def _capture_provider_kwargs(
         return _Schema(ok=True), MagicMock(_hidden_params={})
 
     fake_client = MagicMock()
-    fake_client.chat.completions.create_with_completion = _fake_create_with_completion
+    fake_client.chat = MagicMock(
+        completions=MagicMock(create_with_completion=_fake_create_with_completion)
+    )
 
     provider = MagicMock()
-    provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
     provider.instructor_mode = "json"
-    provider.litellm_model.return_value = "fake/model"
+    provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = provider_effort
 
     with patch("llmkit._litellm.instructor.from_litellm", return_value=fake_client):

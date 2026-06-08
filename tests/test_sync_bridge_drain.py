@@ -32,10 +32,28 @@ import asyncio
 import subprocess
 import sys
 import textwrap
+from collections.abc import Coroutine
+from typing import Protocol, cast
 
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 from llmkit.sync import run_sync
+
+
+class _LoggingWorker(Protocol):
+    """Typed view of the litellm logging worker's enqueue entry point.
+
+    The shipped worker types ``ensure_initialized_and_enqueue`` with an
+    ``Unknown``-parameterised coroutine, leaking ``reportUnknownMemberType`` at
+    each call site; pin the one method these tests touch.
+    """
+
+    def ensure_initialized_and_enqueue(
+        self, async_coroutine: Coroutine[object, object, None]
+    ) -> None: ...
+
+
+_worker = cast("_LoggingWorker", GLOBAL_LOGGING_WORKER)
 
 # A self-contained script: enqueue a logging coroutine onto LiteLLM's worker the
 # way its post-call hook does, then drive it through run_sync. Run as a
@@ -90,7 +108,7 @@ def test_sync_call_in_running_loop_drains_litellm_logging_queue() -> None:
         async def _async_success_handler() -> None:
             return None
 
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(_async_success_handler())
+        _worker.ensure_initialized_and_enqueue(_async_success_handler())
         return value
 
     async def _outer() -> int:
@@ -136,7 +154,7 @@ def test_call_error_propagates_through_drain() -> None:
         async def _async_success_handler() -> None:
             return None
 
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(_async_success_handler())
+        _worker.ensure_initialized_and_enqueue(_async_success_handler())
         raise ValueError("boom")
 
     raised = False

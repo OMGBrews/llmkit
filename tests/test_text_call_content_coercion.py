@@ -65,17 +65,23 @@ def test_acompletion_text_joins_provider_list_content() -> None:
     """End-to-end at the transport seam: a provider returning list-shaped
     content makes ``acompletion_text`` return the joined string (not a list)."""
     fake_resp = MagicMock(_hidden_params={})
-    fake_resp.choices[0].message.content = [
-        {"type": "text", "text": "Joined "},
-        {"type": "text", "text": "across blocks."},
+    fake_resp.choices = [
+        MagicMock(
+            message=MagicMock(
+                content=[
+                    {"type": "text", "text": "Joined "},
+                    {"type": "text", "text": "across blocks."},
+                ]
+            )
+        )
     ]
 
     async def _fake_acompletion(**_kwargs: object) -> MagicMock:
         return fake_resp
 
     provider = MagicMock()
-    provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
-    provider.litellm_model.return_value = "fake/model"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
+    provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = None
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):

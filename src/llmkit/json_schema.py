@@ -67,13 +67,68 @@ from __future__ import annotations
 
 import keyword
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
-from typing import Any, ClassVar, NamedTuple, cast, override
+from typing import Any, ClassVar, Literal, NamedTuple, TypedDict, Unpack, cast, override
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, create_model
 
 __all__ = ["model_from_json_schema"]
+
+# pydantic's ``IncEx`` (the ``include`` / ``exclude`` selector type) is a
+# private alias; mirror its public shape here so the dump-kwargs TypedDict
+# below stays a real type rather than ``Any``.
+type _IncEx = set[int] | set[str] | Mapping[int, "_IncEx | bool"] | Mapping[str, "_IncEx | bool"]
+
+
+class _DumpKwargs(TypedDict, total=False):
+    """The exact keyword surface of ``BaseModel.model_dump`` minus
+    ``exclude_none`` (which the overrides below name explicitly).
+
+    Typing ``**kwargs`` with ``Unpack[_DumpKwargs]`` instead of ``Any`` lets the
+    overrides forward to pydantic's dump methods with real types, so no argument
+    arrives as ``Any``. Mirrors ``pydantic`` 2.13's signature — the *current*
+    pydantic, not the ``>=2.5`` floor: newer keys (e.g. ``fallback``,
+    ``polymorphic_serialization``) type-check here but would raise on an older
+    pydantic. Safe because these overrides are internal and only ever called
+    with ``exclude_none``, never the wider surface.
+    """
+
+    mode: Literal["json", "python"] | str
+    include: _IncEx | None
+    exclude: _IncEx | None
+    context: Any | None  # pyright: ignore[reportExplicitAny]  # raw-pydantic — pydantic types ``context`` as ``Any | None``
+    by_alias: bool | None
+    exclude_unset: bool
+    exclude_defaults: bool
+    exclude_computed_fields: bool
+    round_trip: bool
+    warnings: bool | Literal["none", "warn", "error"]
+    fallback: Callable[[Any], Any] | None  # pyright: ignore[reportExplicitAny]  # raw-pydantic — pydantic types ``fallback`` as ``Callable[[Any], Any]``
+    serialize_as_any: bool
+    polymorphic_serialization: bool | None
+
+
+class _DumpJsonKwargs(TypedDict, total=False):
+    """The keyword surface of ``BaseModel.model_dump_json`` minus
+    ``exclude_none`` — same as ``_DumpKwargs`` but with ``indent`` /
+    ``ensure_ascii`` in place of ``mode``. Mirrors ``pydantic`` 2.13.
+    """
+
+    indent: int | None
+    ensure_ascii: bool
+    include: _IncEx | None
+    exclude: _IncEx | None
+    context: Any | None  # pyright: ignore[reportExplicitAny]  # raw-pydantic — pydantic types ``context`` as ``Any | None``
+    by_alias: bool | None
+    exclude_unset: bool
+    exclude_defaults: bool
+    exclude_computed_fields: bool
+    round_trip: bool
+    warnings: bool | Literal["none", "warn", "error"]
+    fallback: Callable[[Any], Any] | None  # pyright: ignore[reportExplicitAny]  # raw-pydantic — pydantic types ``fallback`` as ``Callable[[Any], Any]``
+    serialize_as_any: bool
+    polymorphic_serialization: bool | None
 
 # A JSON-schema dict: string keys to arbitrary JSON values. Modelled with
 # pydantic's ``JsonValue`` so the schema data carries a precise type rather
@@ -136,7 +191,7 @@ class _JsonSchemaModel(BaseModel):
         self,
         *,
         exclude_none: bool = True,
-        **kwargs: Any,  # pyright: ignore[reportExplicitAny]  # raw-pydantic — forwards to model_dump's exhaustive keyword surface
+        **kwargs: Unpack[_DumpKwargs],
     ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
         return super().model_dump(exclude_none=exclude_none, **kwargs)
 
@@ -145,7 +200,7 @@ class _JsonSchemaModel(BaseModel):
         self,
         *,
         exclude_none: bool = True,
-        **kwargs: Any,  # pyright: ignore[reportExplicitAny]  # raw-pydantic — forwards to model_dump_json's exhaustive keyword surface
+        **kwargs: Unpack[_DumpJsonKwargs],
     ) -> str:
         return super().model_dump_json(exclude_none=exclude_none, **kwargs)
 
@@ -173,6 +228,27 @@ def _safe_model_name(raw: object) -> str:
 def _as_dict(value: JsonValue) -> JsonDict:
     """Narrow a JSON value to a schema dict (``object``)."""
     return cast("JsonDict", value)
+
+
+def _nullable(annotation: object) -> object:
+    """Union a runtime-built field annotation with ``None``.
+
+    The annotation is a runtime type-like object (a ``type``, a parametrised
+    generic such as ``list[str]``, or an existing ``X | None`` union), so the
+    ``|`` operator runs against an ``object`` whose concrete ``__or__`` only
+    exists at runtime. Confining the union here keeps the one unavoidable
+    type-level cast in a single named place rather than at every call site.
+    """
+    return cast("type", annotation) | None
+
+
+def _as_list(element: object) -> object:
+    """Build the ``list[...]`` annotation for an array field's element type.
+
+    Like :func:`_nullable`, the subscript targets a runtime-built element
+    annotation, so the type-level cast is confined here.
+    """
+    return list[cast("type", element)]
 
 
 class _Converter:
@@ -253,7 +329,7 @@ class _Converter:
 
         return schema, False
 
-    def _field_type(self, schema: JsonDict, field_path: str) -> tuple[Any, bool]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — returns a runtime-built model annotation (a type, a generic, or a `X | None` union)
+    def _field_type(self, schema: JsonDict, field_path: str) -> tuple[object, bool]:
         """Resolve (annotation, is_nullable) for one property schema.
 
         ``is_nullable`` is threaded back out so the caller can union the
@@ -294,8 +370,8 @@ class _Converter:
                 )
             element, element_nullable = self._field_type(cast("JsonDict", items), f"{field_path}[]")
             if element_nullable:
-                element = element | None
-            return list[element], nullable  # type: ignore[valid-type]  # runtime-built element type
+                element = _nullable(element)
+            return _as_list(element), nullable
         if isinstance(jtype, str) and jtype in _SCALAR_TYPES:
             return _SCALAR_TYPES[jtype], nullable
         raise ValueError(f"Unsupported JSON-schema type {jtype!r} at {field_path!r}.")
@@ -433,7 +509,7 @@ class _Converter:
             )
         props: JsonDict = cast("JsonDict", properties) if isinstance(properties, dict) else {}
         required_raw = schema.get("required")
-        required = (
+        required: set[str] = (
             {str(r) for r in cast("list[JsonValue]", required_raw)}
             if isinstance(required_raw, list)
             else set()
@@ -462,7 +538,7 @@ class _Converter:
             # are independent: a REQUIRED nullable field must still accept the
             # provider's ``null``.
             if is_nullable or optional:
-                annotation = annotation | None
+                annotation = _nullable(annotation)
             default = None if optional else ...
             field_info = Field(
                 default,
@@ -481,7 +557,12 @@ class _Converter:
             if isinstance(title, str) and title
             else self._anon_name("Object")
         )
-        model = create_model(model_name, __base__=_JsonSchemaModel, **fields)
+        # ``**fields`` is the one unavoidable ``Any`` boundary: pydantic's
+        # ``create_model`` is a dynamic factory whose ``**field_definitions`` is
+        # typed ``Any | tuple[Any, Any]`` in the stubs, so splatting the runtime
+        # field map lands every keyword argument on ``Any``. Confined and
+        # documented here rather than scattered.
+        model = create_model(model_name, __base__=_JsonSchemaModel, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
         if ref_name is not None:
             self._built[ref_name] = model
         return model

@@ -203,8 +203,8 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
 
     provider = MagicMock()
     provider.name = "ollama"
-    provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
-    provider.litellm_model.return_value = "ollama/fake"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
+    provider.litellm_model = MagicMock(return_value="ollama/fake")
     provider.reasoning_effort = None
 
     async def _fake_acompletion(**_kwargs: object) -> MagicMock:

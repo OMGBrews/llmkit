@@ -23,16 +23,42 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
+from typing import cast
 
 import instructor
 import litellm
+from litellm import CustomStreamWrapper
+from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 from pydantic import BaseModel
 
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
+    """Typed boundary over ``litellm.acompletion``.
+
+    LiteLLM's shipped stub types ``acompletion`` with ``Unknown`` in several
+    parameter slots (``messages``/``stop``/``model_list`` …) and exposes the
+    attribute itself with a partially-unknown type, which would otherwise leak
+    ``reportUnknownMemberType`` into every call site. Funnelling the call
+    through here narrows that member access (and the result) in one place to the
+    single fact callers rely on: it resolves to a ``ModelResponse`` (or, with
+    ``stream=True``, a ``CustomStreamWrapper``).
+
+    ``litellm.acompletion`` is resolved *inside* the call so unit tests can keep
+    patching ``llmkit._litellm.litellm.acompletion`` to stub the provider; the
+    per-call ``reportArgumentType`` suppressions at each caller cover the
+    over-strict argument shapes (credential splat, message-list typing).
+    """
+    acompletion = cast(
+        "Callable[..., Coroutine[object, object, ModelResponse | CustomStreamWrapper]]",
+        litellm.acompletion,
+    )
+    return await acompletion(**kwargs)
 
 
 async def drain_async_logging(*, timeout: float | None) -> None:
@@ -99,7 +125,7 @@ def _response_cost(
     """
     hidden = getattr(raw, "_hidden_params", None)
     if isinstance(hidden, dict):
-        cost = hidden.get("response_cost")  # pyright: ignore[reportUnknownMemberType]  # raw-llm — litellm hidden-params dict
+        cost: object = cast("dict[str, object]", hidden).get("response_cost")
         if isinstance(cost, (int, float)):
             return float(cost)
     return None
@@ -122,12 +148,31 @@ def _coerce_text_content(content: object) -> str:
         return content
     if isinstance(content, list):
         parts: list[str] = []
-        for block in content:
-            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+        for block in cast("list[object]", content):
+            text = (
+                cast("dict[str, object]", block).get("text")
+                if isinstance(block, dict)
+                else getattr(block, "text", None)
+            )
             if isinstance(text, str):
                 parts.append(text)
         return "".join(parts)
     return ""
+
+
+def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
+    """Extract the first choice's textual delta from a stream chunk.
+
+    LiteLLM assigns ``StreamingChoices.delta`` and ``Delta.content`` inside
+    ``__init__`` rather than as annotated class attributes, so the static type
+    of ``chunk.choices[0].delta.content`` is ``Unknown``. We narrow the two
+    dynamic hops to their real runtime types (``Delta``, then ``str | None``)
+    here so the streaming loop reads a precise ``str | None`` — the one place
+    that knows the litellm stream object's shape (raw-llm).
+    """
+    choice: StreamingChoices = chunk.choices[0]
+    delta: Delta = choice.delta
+    return cast("str | None", delta.content)
 
 
 async def acompletion_structured[T: BaseModel](
@@ -173,9 +218,9 @@ async def acompletion_structured[T: BaseModel](
     provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
-    client = instructor.from_litellm(litellm.acompletion, mode=provider.instructor_mode)
+    client = instructor.from_litellm(_acompletion, mode=provider.instructor_mode)
     async with GlobalRateLimiter.acquire_async(provider.name):
-        parsed, completion = await client.chat.completions.create_with_completion(
+        result = await client.chat.completions.create_with_completion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
             response_model=output_schema,
@@ -185,6 +230,9 @@ async def acompletion_structured[T: BaseModel](
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
+    # instructor types the raw completion half of the tuple as Any; it is a
+    # litellm ModelResponse. Narrow once so cost extraction reads a real type.
+    parsed, completion = cast("tuple[T, ModelResponse]", result)
     return parsed, _response_cost(completion)
 
 
@@ -214,16 +262,20 @@ async def acompletion_text(
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):
-        resp = await litellm.acompletion(
+        resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
             max_tokens=max_tokens,
-            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
+            **creds,
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
-    content = resp.choices[0].message.content  # pyright: ignore[reportAttributeAccessIssue]  # raw-llm — litellm ModelResponse
-    return _coerce_text_content(content), _response_cost(resp)
+    # Non-streaming acompletion returns a ModelResponse (the stub's union also
+    # admits CustomStreamWrapper, only reachable with stream=True); narrow it so
+    # the typed .choices[0].message.content chain (str | None) is precise.
+    response = cast("ModelResponse", resp)
+    content = response.choices[0].message.content
+    return _coerce_text_content(content), _response_cost(response)
 
 
 async def astream_text(
@@ -251,16 +303,19 @@ async def astream_text(
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     async with GlobalRateLimiter.acquire_async(provider.name):
-        stream = await litellm.acompletion(
+        resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
             stream=True,
-            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
+            **creds,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
-        async for chunk in stream:  # pyright: ignore[reportGeneralTypeIssues]  # raw-llm — litellm stream wrapper is async-iterable
-            delta = chunk.choices[0].delta.content
+        # stream=True makes acompletion return a CustomStreamWrapper, whose
+        # async iteration yields typed ModelResponseStream chunks.
+        stream = cast("CustomStreamWrapper", resp)
+        async for chunk in stream:
+            delta = _chunk_delta_text(chunk)
             if delta:
                 yield delta

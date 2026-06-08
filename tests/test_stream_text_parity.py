@@ -147,8 +147,8 @@ def _capture_provider_kwargs(
         return _FakeStream()
 
     provider = MagicMock()
-    provider.completion_kwargs.return_value = {"api_key": "k", "api_base": None}
-    provider.litellm_model.return_value = "fake/model"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
+    provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = provider_effort
 
     async def _drive() -> list[str]:
