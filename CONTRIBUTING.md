@@ -19,18 +19,19 @@ CI runs the same four gates on every push and pull request:
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run basedpyright          # clean against the checked-in baseline
+uv run basedpyright          # recommended tier, clean with no baseline
 uv run pytest
 ```
 
 basedpyright runs in its `recommended` tier (stricter than the `standard`
-default, and at least as strict as the editor extension's defaults). A checked-in
-baseline at `.basedpyright/baseline.json` grandfathers the pre-existing findings —
-overwhelmingly `Unknown`/`Any` at the untyped LiteLLM/instructor boundary — so the
-command above is clean today while **any new finding fails CI**. The baseline is a
-ratchet: it should only ever shrink. If you legitimately clear entries, regenerate
-it with `uv run basedpyright --writebaseline` and commit the smaller file; never
-grow it to silence a finding in new code.
+default, and at least as strict as the editor extension's defaults) and is clean
+at **0 errors, 0 warnings with no baseline** — there is no `.basedpyright/baseline.json`,
+so **any new finding fails CI**. The untyped LiteLLM/instructor surface is given
+precise types at the boundary; the few genuinely-unavoidable suppressions are
+inline `# pyright: ignore[...]` (or, for the package's deferred-import test seam,
+a single file-level rule disable), each tagged with a `raw-*` reason. Prefer real
+types; reach for a tagged suppression only at the provider-SDK boundary where a
+precise type isn't reachable, and never to silence a finding in new code.
 
 Please run them locally before opening a PR. New behavior needs a test.
 

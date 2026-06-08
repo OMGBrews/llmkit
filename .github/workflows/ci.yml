@@ -26,7 +26,7 @@ jobs:
       - name: Ruff (format check)
         run: uv run ruff format --check .
 
-      - name: basedpyright (recommended tier, ratcheting baseline)
+      - name: basedpyright (recommended tier, no baseline)
         run: uv run basedpyright
 
       - name: Tests
