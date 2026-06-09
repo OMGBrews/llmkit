@@ -143,8 +143,12 @@ class _RateBucket:
         """Deduct ``cost`` if available; else return the seconds to wait first.
 
         Returns ``0.0`` on success (tokens deducted), otherwise the time until
-        enough tokens will have refilled for ``cost`` to succeed.
+        enough tokens will have refilled for ``cost`` to succeed. ``cost`` is
+        clamped to the bucket capacity, since the level can never exceed it.
         """
+        # Clamp to capacity: the level caps at capacity on refill, so a cost
+        # greater than capacity could otherwise never be satisfied (permanent wait).
+        cost = min(cost, self._capacity)
         with self._lock:
             self._refill_locked()
             if self._level >= cost:
@@ -424,11 +428,8 @@ class GlobalRateLimiter:
         if tpm_bucket is not None:
             await tpm_bucket.wait_for_budget_async()
         sem = cls._get_async_semaphore(provider_key)
-        _ = await sem.acquire()
-        try:
+        async with sem:
             yield RateLimitSlot(tpm_bucket)
-        finally:
-            sem.release()
 
     @classmethod
     @contextlib.contextmanager

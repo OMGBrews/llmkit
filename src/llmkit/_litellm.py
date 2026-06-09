@@ -136,13 +136,23 @@ def _total_tokens(raw: object) -> int | None:
 
     LiteLLM stamps a ``usage`` object (``prompt_tokens`` / ``completion_tokens``
     / ``total_tokens``) onto a non-streamed completion. This reads
-    ``usage.total_tokens`` for the tokens-per-minute limiter to debit. Returns
+    ``usage.total_tokens`` for the tokens-per-minute limiter to debit, falling
+    back to summing ``prompt_tokens`` + ``completion_tokens`` (treating a
+    missing one as 0) when ``total_tokens`` is absent or non-int. Returns
     ``None`` for any missing/odd shape (e.g. a streamed response that reports no
     usage) — TPM accounting is best-effort and never breaks the call.
     """
     usage = getattr(raw, "usage", None)
     total = getattr(usage, "total_tokens", None)
-    return total if isinstance(total, int) else None
+    if isinstance(total, int):
+        return total
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if isinstance(prompt, int) or isinstance(completion, int):
+        return (prompt if isinstance(prompt, int) else 0) + (
+            completion if isinstance(completion, int) else 0
+        )
+    return None
 
 
 def _coerce_text_content(content: object) -> str:
