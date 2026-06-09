@@ -206,6 +206,17 @@ class _JsonSchemaModel(BaseModel):
         return super().model_dump_json(exclude_none=exclude_none, **kwargs)
 
 
+class _JsonSchemaModelAllow(_JsonSchemaModel):
+    """Open-ended variant for objects whose schema sets ``additionalProperties: true``.
+
+    Subclasses the strict base so the child ``model_config`` merges with the
+    parent's: it keeps ``use_enum_values`` and the ``exclude_none`` dump
+    override while flipping ``extra`` from ``"forbid"`` to ``"allow"``.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
+
+
 def _safe_model_name(raw: object) -> str:
     """Turn a schema ``title`` into a valid, non-empty Python class name.
 
@@ -302,6 +313,16 @@ class _Converter:
 
         Handles the two shapes real consumers emit: ``type: ["string",
         "null"]`` and ``anyOf: [{...}, {"type": "null"}]``.
+
+        Nullable-merge precedence: for the ``anyOf``/``oneOf`` shape, the OUTER
+        field-level keys win on conflict — they are the field's declared intent,
+        while the union merely expresses nullability — and the non-null branch
+        supplies ``type`` plus any keys the outer does not define. Example: an
+        outer ``description`` beats a branch ``description``, while the branch
+        supplies the ``type``.
+
+        Multi-variant (discriminated) unions are unsupported: an ``anyOf`` or
+        ``oneOf`` with more than one non-null branch is rejected loudly.
         """
         type_field = schema.get("type")
         if isinstance(type_field, list):
@@ -314,6 +335,7 @@ class _Converter:
                 )
             return {**schema, "type": non_null[0]}, nullable
 
+        keyword = "anyOf" if schema.get("anyOf") else "oneOf" if schema.get("oneOf") else None
         any_of = schema.get("anyOf") or schema.get("oneOf")
         if isinstance(any_of, list):
             branches = [_as_dict(b) for b in cast("list[JsonValue]", any_of)]
@@ -321,12 +343,14 @@ class _Converter:
             nullable = any(b.get("type") == "null" for b in branches)
             if len(non_null) != 1:
                 raise ValueError(
-                    f"Unsupported anyOf/oneOf with {len(non_null)} non-null branches: "
+                    f"Unsupported {keyword} with {len(non_null)} non-null branches: "
                     + "only a single non-null branch (optionally with a 'null' branch) "
-                    + "is supported."
+                    + "is supported. Multi-variant (discriminated) unions are unsupported."
                 )
             merged = {k: v for k, v in schema.items() if k not in ("anyOf", "oneOf")}
-            return {**merged, **non_null[0]}, nullable
+            # Outer field-level keys win on conflict; the non-null branch
+            # supplies ``type`` and any keys the outer does not define.
+            return {**non_null[0], **merged}, nullable
 
         return schema, False
 
@@ -598,6 +622,20 @@ class _Converter:
             )
             fields[prop_name] = (annotation, field_info)
 
+        # ``additionalProperties`` picks the model's extra policy:
+        #   absent / false -> strict ``extra="forbid"`` (the good LLM default);
+        #   true           -> ``extra="allow"`` (author wants open-ended keys);
+        #   a typed dict    -> unsupported, raise.
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            raise ValueError(
+                f"Unsupported 'additionalProperties' at {field_path!r}: typed "
+                + "additionalProperties maps are not supported (only true/false or absent)."
+            )
+        base: type[_JsonSchemaModel] = (
+            _JsonSchemaModelAllow if additional is True else _JsonSchemaModel
+        )
+
         model_name = (
             _safe_model_name(title)
             if isinstance(title, str) and title
@@ -608,7 +646,7 @@ class _Converter:
         # typed ``Any | tuple[Any, Any]`` in the stubs, so splatting the runtime
         # field map lands every keyword argument on ``Any``. Confined and
         # documented here rather than scattered.
-        model = create_model(model_name, __base__=_JsonSchemaModel, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
+        model = create_model(model_name, __base__=base, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
         if ref_name is not None:
             self._built[ref_name] = model
         return model

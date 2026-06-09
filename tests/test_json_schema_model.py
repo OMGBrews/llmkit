@@ -123,11 +123,19 @@ def test_multi_branch_union_raises_clear_value_error() -> None:
                 "required": ["x"],
             }
         )
-    with pytest.raises(ValueError, match="Unsupported anyOf/oneOf"):
+    with pytest.raises(ValueError, match=r"Unsupported anyOf with \d+ non-null branches"):
         _ = model_from_json_schema(
             {
                 "type": "object",
                 "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+                "required": ["x"],
+            }
+        )
+    with pytest.raises(ValueError, match=r"Unsupported oneOf with \d+ non-null branches"):
+        _ = model_from_json_schema(
+            {
+                "type": "object",
+                "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
                 "required": ["x"],
             }
         )
@@ -680,6 +688,212 @@ def test_bound_on_nullable_branch_is_found() -> None:
     assert _attr(model(n=5), "n") == 5
     with pytest.raises(ValidationError):
         _ = model(n=-1)
+
+
+# --- Nullable-merge precedence: outer field-level keys win -----------------
+
+
+def test_nullable_anyof_merge_outer_keys_win() -> None:
+    """A ``{"description": "outer", "anyOf": [{...branch...}, {"type": "null"}]}``
+    field resolves to a nullable field whose ``description`` is the outer one
+    and whose ``type`` comes from the non-null branch.
+
+    This documents the field *shape*; ``description`` is always read from the
+    outer property level (independent of the nullable merge), so the genuine
+    merge-precedence guard — where outer-vs-branch order is observable — lives
+    in :func:`test_nullable_anyof_outer_constraint_wins` below.
+    """
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "f": {
+                "description": "outer",
+                "anyOf": [
+                    {"type": "string", "description": "inner"},
+                    {"type": "null"},
+                ],
+            }
+        },
+        "required": ["f"],
+    }
+    model = model_from_json_schema(schema)
+    # Outer description wins over the branch's competing one.
+    assert model.model_fields["f"].description == "outer"
+    # The branch still supplied the type: a nullable str that accepts str AND None.
+    assert model.model_fields["f"].is_required()  # listed in required
+    assert _attr(model(f="hi"), "f") == "hi"
+    assert _attr(model(f=None), "f") is None
+    with pytest.raises(ValidationError):
+        _ = model(f=123)  # not a string and not null
+
+
+def test_nullable_anyof_branch_supplies_type_when_outer_omits() -> None:
+    """When the outer omits ``type``, the non-null branch supplies it — the
+    field resolves to the branch's type (here ``integer``), nullable, and the
+    outer ``description`` (with no branch competition) is preserved."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "f": {
+                "description": "outer-only",
+                "anyOf": [
+                    {"type": "integer"},
+                    {"type": "null"},
+                ],
+            }
+        },
+        "required": ["f"],
+    }
+    model = model_from_json_schema(schema)
+    # Outer description survives (no branch key competes for it).
+    assert model.model_fields["f"].description == "outer-only"
+    # Branch supplied the type: integers and null accepted, a string rejected.
+    assert _attr(model(f=5), "f") == 5
+    assert _attr(model(f=None), "f") is None
+    with pytest.raises(ValidationError):
+        _ = model(f="not-an-int")
+
+
+def test_nullable_anyof_outer_constraint_wins() -> None:
+    """The genuine merge-precedence guard: a constraint on the OUTER field wins
+    over a competing one on the non-null branch.
+
+    Constraints (here ``maxLength``) are the only place the nullable-merge order
+    is observable — ``description``/``type`` are not affected by it. With an
+    outer ``maxLength`` of 5 competing against a branch ``maxLength`` of 10, the
+    outer bound must win: a 5-char value validates, a 6-char value is rejected.
+    This FAILS against the pre-fix ``{**merged, **non_null[0]}`` (branch wins, so
+    the looser 10 leaks through and the 6-char value is wrongly accepted).
+    """
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "f": {
+                "maxLength": 5,
+                "anyOf": [
+                    {"type": "string", "maxLength": 10},
+                    {"type": "null"},
+                ],
+            }
+        },
+        "required": ["f"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(f="12345"), "f") == "12345"  # 5 chars: outer bound allows
+    with pytest.raises(ValidationError):
+        _ = model(f="123456")  # 6 chars: outer maxLength=5 wins, branch's 10 does not
+
+
+# --- additionalProperties: open vs strict vs typed-map ---------------------
+
+
+def test_additional_properties_true_accepts_unknown_key() -> None:
+    """``additionalProperties: true`` -> ``extra="allow"``: an unknown extra key
+    is accepted and retained (round-trips through ``model_dump``).
+
+    Regression: pre-fix every object was ``extra="forbid"``, so the extra key
+    raised ``ValidationError``.
+    """
+    schema: dict[str, object] = {
+        "title": "Open",
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+        "additionalProperties": True,
+    }
+    model = model_from_json_schema(schema)
+    inst = model(id="ok", extra_thing="kept")  # must not raise
+    dumped = inst.model_dump()
+    assert dumped["id"] == "ok"
+    assert dumped["extra_thing"] == "kept"  # unknown key retained
+    # The open base still keeps the exclude_none dump override behaviour.
+    assert isinstance(dumped, dict)
+
+
+def test_additional_properties_false_forbids_unknown_key() -> None:
+    """``additionalProperties: false`` keeps the strict ``extra="forbid"``
+    default — an unknown extra key is rejected."""
+    schema: dict[str, object] = {
+        "title": "Closed",
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+        "additionalProperties": False,
+    }
+    model = model_from_json_schema(schema)
+    assert model(id="ok").model_dump() == {"id": "ok"}
+    with pytest.raises(ValidationError):
+        _ = model(id="ok", hallucinated="nope")
+
+
+def test_additional_properties_absent_forbids_unknown_key() -> None:
+    """No ``additionalProperties`` keyword -> strict ``extra="forbid"`` (the
+    safe LLM default), same as ``false``."""
+    schema: dict[str, object] = {
+        "title": "Default",
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+    }
+    model = model_from_json_schema(schema)
+    with pytest.raises(ValidationError):
+        _ = model(id="ok", hallucinated="nope")
+
+
+def test_additional_properties_typed_map_raises_clear_value_error() -> None:
+    """A typed ``additionalProperties`` map (e.g. ``{"type": "string"}``) is
+    unsupported and raises a ``ValueError`` naming ``additionalProperties`` and
+    the field path."""
+    schema: dict[str, object] = {
+        "title": "Typed",
+        "type": "object",
+        "properties": {"id": {"type": "string"}},
+        "required": ["id"],
+        "additionalProperties": {"type": "string"},
+    }
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Unsupported 'additionalProperties' at .*: typed additionalProperties "
+            r"maps are not supported"
+        ),
+    ):
+        _ = model_from_json_schema(schema)
+
+
+# --- oneOf/anyOf multi-variant wording names the keyword present -----------
+
+
+def test_oneof_multi_variant_error_names_oneof() -> None:
+    """A ``oneOf`` with two real (non-null) branches stays unsupported and the
+    error names ``oneOf`` specifically (no Union support added)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
+        "required": ["x"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported oneOf with \d+ non-null branches"):
+        _ = model_from_json_schema(schema)
+    with pytest.raises(ValueError, match=r"Multi-variant \(discriminated\) unions are unsupported"):
+        _ = model_from_json_schema(schema)
+
+
+def test_common_nullable_anyof_still_builds() -> None:
+    """The common nullable case (``anyOf`` with one real branch + ``null``)
+    still builds fine — only genuine multi-variant unions are rejected."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"a": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+        "required": ["a"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(a="x"), "a") == "x"
+    assert _attr(model(a=None), "a") is None
 
 
 # --- Round-trip through structured_llm_call against a faked transport -------
