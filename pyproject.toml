@@ -57,9 +57,11 @@ dev = [
     "ruff==0.15.0",
     "basedpyright>=1.39",
     # The offline test suite imports the Anthropic and Bedrock providers and
-    # exercises their construction; keep the Anthropic SDK present for dev/CI so
+    # exercises their construction, which eagerly check for the Anthropic SDK
+    # and (for Bedrock) boto3. Pull in the `bedrock` extra — which itself
+    # includes `anthropic` — so both deps are present for dev/CI and
     # `uv sync --extra dev` yields a fully green suite.
-    "omg-llmkit[anthropic]",
+    "omg-llmkit[bedrock]",
 ]
 # Convenience: pull in every optional provider dependency at once, so a host
 # that wants the full provider surface can `pip install 'omg-llmkit[all]'`

@@ -6,7 +6,12 @@ from typing import override
 
 import instructor
 
-from llmkit.providers.base import BaseProvider, LLMClientConfig, require_anthropic_sdk
+from llmkit.providers.base import (
+    BaseProvider,
+    LLMClientConfig,
+    require_anthropic_sdk,
+    require_boto3_sdk,
+)
 
 
 class BedrockProvider(BaseProvider):
@@ -43,13 +48,16 @@ class BedrockProvider(BaseProvider):
     ``reasoning_effort`` is forwarded to LiteLLM for Bedrock models that
     support thinking (e.g. Claude) and is harmless on those that don't.
 
-    Bedrock pulls in ``boto3`` for request signing; it ships via the
-    ``omg-llmkit[bedrock]`` extra rather than the core install, so non-Bedrock
-    users take on no extra dependency. Because it routes Claude under
-    ``ANTHROPIC_JSON``, it also needs the Anthropic SDK at call time — the
-    ``[bedrock]`` extra therefore pulls in the ``[anthropic]`` extra, and
-    constructing this provider without the Anthropic SDK raises a clear
-    "install omg-llmkit[anthropic]" error.
+    Bedrock pulls in ``boto3`` for request signing (AWS SigV4); it ships via
+    the ``omg-llmkit[bedrock]`` extra rather than the core install, so
+    non-Bedrock users take on no extra dependency. Because it routes Claude
+    under ``ANTHROPIC_JSON``, it also needs the Anthropic SDK at call time —
+    the ``[bedrock]`` extra therefore pulls in the ``[anthropic]`` extra. Both
+    deps are checked *eagerly* at construction (Anthropic SDK first, then
+    ``boto3``): constructing this provider without the Anthropic SDK raises a
+    clear "install omg-llmkit[anthropic]" error, and without ``boto3`` an
+    "install omg-llmkit[bedrock]" error — instead of a cryptic
+    ``ModuleNotFound`` deep on the first completion.
     """
 
     _provider_name: str = "AWS Bedrock"
@@ -64,6 +72,7 @@ class BedrockProvider(BaseProvider):
         reasoning_effort: str | None = None,
     ):
         require_anthropic_sdk(self._provider_name)
+        require_boto3_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
         self._aws_region_name: str | None = aws_region_name
 

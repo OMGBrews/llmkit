@@ -38,6 +38,34 @@ import instructor
 logger = logging.getLogger(__name__)
 
 
+def _require_sdk(
+    import_name: str, *, provider_name: str, extra: str, label: str | None = None, note: str = ""
+) -> None:
+    """Raise a clear, actionable error if ``import_name`` is not importable.
+
+    Generic backing for the per-dependency ``require_*_sdk`` wrappers below.
+    Optional provider dependencies ship in opt-in pip extras (so hosts that
+    never touch a given provider take on no extra dependency) and are checked
+    *eagerly* at provider construction, so a missing dep fails with a fix
+    instead of as a cryptic ``ModuleNotFound`` deep on the first completion.
+
+    ``label`` is the human-readable dependency name used in the message (e.g.
+    ``"the Anthropic SDK"``); it defaults to ``import_name``. ``note`` is an
+    optional trailing sentence appended to the message (e.g. to cross-reference
+    a related extra).
+    """
+    if importlib.util.find_spec(import_name) is None:
+        message = (
+            f"The {provider_name} provider requires {label or import_name}, which is "
+            "not installed. It ships in an opt-in extra so hosts that don't use "
+            "this provider take on no extra dependency. Install it with:\n\n"
+            f"    pip install 'omg-llmkit[{extra}]'"
+        )
+        if note:
+            message += f"\n\n{note}"
+        raise ModuleNotFoundError(message)
+
+
 def require_anthropic_sdk(provider_name: str) -> None:
     """Raise a clear, actionable error if the Anthropic SDK is not installed.
 
@@ -51,15 +79,30 @@ def require_anthropic_sdk(provider_name: str) -> None:
     surfaces *eagerly* with a fix, instead of as a cryptic ``ModuleNotFound``
     deep on the first completion.
     """
-    if importlib.util.find_spec("anthropic") is None:
-        raise ModuleNotFoundError(
-            f"The {provider_name} provider requires the Anthropic SDK, which is "
-            + "not installed. It ships in an opt-in extra so non-Anthropic hosts "
-            + "take on no Anthropic dependency. Install it with:\n\n"
-            + "    pip install 'omg-llmkit[anthropic]'\n\n"
-            + "(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' "
-            + "pulls it in.)"
-        )
+    _require_sdk(
+        "anthropic",
+        provider_name=provider_name,
+        extra="anthropic",
+        label="the Anthropic SDK",
+        note=("(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' pulls it in.)"),
+    )
+
+
+def require_boto3_sdk(provider_name: str) -> None:
+    """Raise a clear, actionable error if ``boto3`` is not installed.
+
+    LiteLLM's Bedrock path uses ``boto3`` to sign requests (AWS SigV4), so the
+    Bedrock provider needs it at call time. It ships in the opt-in
+    ``omg-llmkit[bedrock]`` extra rather than the core install. Call this at
+    provider construction so a missing ``boto3`` fails *eagerly* with a fix,
+    instead of as a cryptic ``ModuleNotFound`` deep on the first completion.
+    """
+    _require_sdk(
+        "boto3",
+        provider_name=provider_name,
+        extra="bedrock",
+        note="(boto3 signs Bedrock requests with AWS SigV4.)",
+    )
 
 
 class Provider(StrEnum):
