@@ -127,54 +127,21 @@ def make_provider(
         AssertionError: If ``provider`` is not wired here (an unwired enum
             member). See :func:`typing.assert_never`.
     """
-    match provider:
-        case Provider.OPENROUTER:
-            return OpenRouterProvider(
-                api_key=api_key or "",
-                model=model,
-                base_url=base_url or "https://openrouter.ai/api/v1",
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.OLLAMA:
-            return OllamaProvider(
-                base_url=base_url or "http://localhost:11434",
-                model=model,
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.GOOGLE:
-            return GoogleProvider(
-                api_key=api_key or "",
-                model=model,
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.ANTHROPIC:
-            return AnthropicProvider(
-                api_key=api_key or "",
-                model=model,
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.OPENAI:
-            return OpenAIProvider(
-                api_key=api_key or "",
-                model=model,
-                base_url=base_url,
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.DEEPSEEK:
-            return DeepSeekProvider(
-                api_key=api_key or "",
-                model=model,
-                reasoning_effort=reasoning_effort,
-            )
-        case Provider.BEDROCK:
-            return BedrockProvider(
-                model=model,
-                aws_region_name=aws_region_name,
-                reasoning_effort=reasoning_effort,
-            )
-    # See build_provider: every member is handled, so this narrows to Never and
-    # assert_never makes a missing case a static + runtime + test failure.
-    assert_never(provider)
+    # This function's keyword params *are* the fields of LLMClientConfig, and
+    # each provider's build() already applies the same per-arm normalization
+    # (api_key or "", base_url or "<endpoint default>") this dispatch used to
+    # repeat. So synthesize a config and delegate to the single dispatch switch
+    # in build_provider — there is no second, parallel match to keep in sync,
+    # and the endpoint-default literals live only in each provider.
+    config = LLMClientConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        reasoning_effort=reasoning_effort,
+        aws_region_name=aws_region_name,
+    )
+    return build_provider(config)
 
 
 def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:

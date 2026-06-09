@@ -79,6 +79,24 @@ def test_make_provider_ollama_local_endpoint_default() -> None:
     assert provider.completion_kwargs() == {"api_base": "http://localhost:11434"}
 
 
+def test_make_provider_openai_no_base_url_stays_none() -> None:
+    """OpenAI without a ``base_url`` injects no ``api_base`` literal.
+
+    The endpoint-default normalization moved from ``make_provider``'s old per-arm
+    switch into ``build()``. OpenRouter/Ollama substitute a concrete endpoint
+    literal when ``base_url`` is omitted, but OpenAI must *not*: it leaves the
+    endpoint unset so LiteLLM uses OpenAI's real default. This pins that
+    distinction — ``completion_kwargs()`` carries only ``api_key`` (no
+    ``api_base`` key at all), and the underlying ``base_url`` stays ``None``.
+    """
+    provider = make_provider(Provider.OPENAI, api_key="sk-test", model="gpt-4.1")
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._base_url is None
+    kwargs = provider.completion_kwargs()
+    assert "api_base" not in kwargs
+    assert kwargs == {"api_key": "sk-test"}
+
+
 def test_make_provider_bedrock_region_only() -> None:
     """Bedrock takes a region, never an ``api_key`` (ambient AWS chain signs)."""
     provider = make_provider(
@@ -86,6 +104,19 @@ def test_make_provider_bedrock_region_only() -> None:
         model="anthropic.claude-3-5-sonnet-20240620-v1:0",
         aws_region_name="us-east-1",
     )
+    assert isinstance(provider, BedrockProvider)
+    assert provider.completion_kwargs() == {"aws_region_name": "us-east-1"}
+
+
+def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
+    """Bedrock's eager anthropic+boto3 checks succeed in the dev env.
+
+    ``BedrockProvider.__init__`` calls ``require_anthropic_sdk`` then
+    ``require_boto3_sdk`` *eagerly* at construction. Reaching a constructed
+    provider via ``make_provider`` at all proves both SDKs are importable here;
+    this asserts the region still threads through after those checks pass.
+    """
+    provider = make_provider(Provider.BEDROCK, aws_region_name="us-east-1")
     assert isinstance(provider, BedrockProvider)
     assert provider.completion_kwargs() == {"aws_region_name": "us-east-1"}
 

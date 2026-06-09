@@ -27,7 +27,12 @@ class OpenRouterProvider(BaseProvider):
     an endpoint that honors every parameter sent — including the structured
     ``response_format``. It restricts routing to capable endpoints, which can in
     principle reduce availability or shift cost; pass ``require_parameters=False``
-    to opt out (you then accept the silent-free-form-JSON risk above).
+    to opt out (you then accept the silent-free-form-JSON risk above). That opt-out
+    is a **direct-construction-only escape hatch**: it is deliberately not exposed
+    through the :func:`~llmkit.providers.build_provider` /
+    :func:`~llmkit.providers.make_provider` factories, since
+    :class:`~llmkit.LLMClientConfig` is provider-agnostic and does not carry an
+    OpenRouter-specific flag.
     """
 
     _provider_name: str = "OpenRouter"
