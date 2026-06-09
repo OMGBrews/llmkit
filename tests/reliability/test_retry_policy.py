@@ -1,22 +1,20 @@
-"""Tests for default-on transient-error retries in the call functions.
+"""Tests for the ``RetryPolicy`` value object and the recoverable-error set.
 
-The call functions (:func:`structured_llm_call`, :func:`text_llm_call`,
-:func:`stream_text_with_log`) now retry *transient* provider errors on
-their own, without the caller wrapping every call. These tests pin that
-contract end-to-end over the patched transport seam:
+These pin the *policy* side of retries, complementing the call-surface
+behaviour in ``test_default_retries.py``:
 
-* a transient error is retried then succeeds, with no caller wrapping;
-* a non-recoverable (programming) error is never retried;
-* ``retry=NO_RETRY`` opts a call out (a single attempt);
-* a custom :class:`~llmkit.RetryPolicy` budget is honoured;
-* each attempt is its own logged call (one log path per attempt);
-* streaming retries only a failure *before* the first chunk is yielded.
+* the shipped default budget (3 transport attempts / 2 validation, 0.5s base
+  backoff) and the jittered exponential-ceiling backoff;
+* ``LLM_RECOVERABLE_ERRORS`` membership — 429 / 5xx / network are transient,
+  auth and other 4xx are not — and that it's the union of the transport and
+  schema subsets;
+* the ``with_retries`` primitive's ``max_attempts`` naming and the nested-retry
+  guard that stops an outer wrapper from multiplying the inner budget;
+* the validation/transport budget split (a deterministic schema failure can't
+  burn the full transport budget).
 
-A canonical transient error is :class:`TimeoutError` (in
-``LLM_RECOVERABLE_ERRORS``); a canonical non-recoverable one is
-:class:`TypeError` (outside the set). Backoff is set to ``0.0`` so tests
-run without real sleeps, except the one test that pins the default
-backoff by patching ``asyncio.sleep`` and ``random.uniform``.
+A canonical transient error is :class:`TimeoutError`; a canonical
+non-recoverable one is an ``openai`` auth/4xx status error.
 """
 
 from __future__ import annotations
@@ -24,14 +22,13 @@ from __future__ import annotations
 import asyncio
 import random
 import warnings
-from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import openai
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from llmkit import (
     DEFAULT_RETRY_POLICY,
@@ -45,340 +42,22 @@ from llmkit import (
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 from llmkit.retry import with_retries
 from llmkit.structured_output import capture_llm_log_paths
+from tests._support import OkSchema
+
+_NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
 
 
 def _make_validation_error() -> ValidationError:
     """Build a real pydantic ``ValidationError`` for offline tests.
 
-    ``_Schema.ok`` is a required bool; constructing it from a non-bool
+    ``OkSchema.ok`` is a required bool; constructing it from a non-bool
     payload raises the genuine article rather than a hand-rolled stand-in.
     """
     try:
-        _ = _Schema.model_validate({"ok": "not-a-bool-or-coercible"})
+        _ = OkSchema.model_validate({"ok": "not-a-bool-or-coercible"})
     except ValidationError as exc:
         return exc
     raise AssertionError("expected a ValidationError")  # pragma: no cover
-
-
-class _Schema(BaseModel):
-    """Minimal structured-output schema for the call functions."""
-
-    ok: bool
-
-
-_NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
-
-
-async def _drain(stream: AsyncIterator[str]) -> list[str]:
-    """Consume an async text stream into a list of chunks."""
-    return [chunk async for chunk in stream]
-
-
-# --- structured_llm_call -------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_structured_transient_error_is_retried_then_succeeds() -> None:
-    """A transient ``TimeoutError`` raised once then success is retried and
-    succeeds with no caller wrapping; the transport is invoked twice."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return _Schema(ok=True), None
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
-        )
-
-    assert result.ok is True
-    assert calls[0] == 2
-
-
-@pytest.mark.asyncio
-async def test_structured_non_recoverable_error_is_not_retried() -> None:
-    """A non-recoverable ``TypeError`` propagates after a single attempt."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        raise TypeError("programming error")
-
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(TypeError, match="programming error"),
-    ):
-        _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
-        )
-
-    assert calls[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_structured_no_retry_opt_out_runs_single_attempt() -> None:
-    """``retry=NO_RETRY`` makes a transient error propagate after one attempt."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("transient")
-
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(TimeoutError, match="transient"),
-    ):
-        _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=NO_RETRY
-        )
-
-    assert calls[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_structured_custom_policy_succeeds_on_last_attempt() -> None:
-    """A custom ``RetryPolicy(max_attempts=N)`` retries N-1 transient
-    failures before a success on the final attempt."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        if calls[0] < 4:
-            raise TimeoutError("transient")
-        return _Schema(ok=True), None
-
-    policy = RetryPolicy(max_attempts=4, backoff_base_seconds=0.0)
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=policy
-        )
-
-    assert result.ok is True
-    assert calls[0] == 4
-
-
-@pytest.mark.asyncio
-async def test_structured_custom_policy_exhaustion_re_raises() -> None:
-    """A custom budget that never succeeds exhausts and re-raises the last
-    transient error, having attempted exactly ``max_attempts`` times."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("always")
-
-    policy = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(TimeoutError, match="always"),
-    ):
-        _ = await structured_output.structured_llm_call("hi", _Schema, feature="test", retry=policy)
-
-    assert calls[0] == 3
-
-
-@pytest.mark.asyncio
-async def test_each_attempt_is_its_own_logged_call(tmp_path: Path) -> None:
-    """A transient-then-success run writes one log per attempt: under
-    ``capture_llm_log_paths`` the two attempts yield two captured paths."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return _Schema(ok=True), None
-
-    configure_llm_logging(LocalYamlLogSink(tmp_path))
-    try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            capture_llm_log_paths() as paths,
-        ):
-            result = await structured_output.structured_llm_call(
-                "hi", _Schema, feature="test", retry=_NO_BACKOFF
-            )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert result.ok is True
-    assert len(paths) == 2
-    assert all(p.exists() for p in paths)
-
-
-# --- text_llm_call -------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_text_transient_error_is_retried_then_succeeds() -> None:
-    """``text_llm_call`` retries a transient error then returns the text."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return "hello", None
-
-    configure_llm_logging(None)
-    try:
-        with patch("llmkit._litellm.acompletion_text", side_effect=_transport):
-            result = await structured_output.text_llm_call("hi", feature="test", retry=_NO_BACKOFF)
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert result == "hello"
-    assert calls[0] == 2
-
-
-@pytest.mark.asyncio
-async def test_text_no_retry_opt_out_runs_single_attempt() -> None:
-    """``retry=NO_RETRY`` on ``text_llm_call`` runs a single attempt."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        calls[0] += 1
-        raise TimeoutError("transient")
-
-    configure_llm_logging(None)
-    try:
-        with (
-            patch("llmkit._litellm.acompletion_text", side_effect=_transport),
-            pytest.raises(TimeoutError, match="transient"),
-        ):
-            _ = await structured_output.text_llm_call("hi", feature="test", retry=NO_RETRY)
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert calls[0] == 1
-
-
-# --- stream_text_with_log ------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_stream_failure_before_first_chunk_is_retried() -> None:
-    """A transient failure *before* the first chunk is retried; the second
-    attempt yields the full output and the transport runs twice."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-            # Unreachable by design: the bare ``yield`` makes this an async
-            # generator; the ``raise`` above precedes it on the first attempt.
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-        for delta in ("he", "llo"):
-            yield delta
-
-    configure_llm_logging(None)
-    try:
-        with patch("llmkit._litellm.astream_text", _transport):
-            chunks = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
-            )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert chunks == ["he", "llo"]
-    assert calls[0] == 2
-
-
-@pytest.mark.asyncio
-async def test_stream_each_attempt_is_its_own_logged_call(tmp_path: Path) -> None:
-    """A retried stream writes one log per attempt: the pre-first-chunk
-    failure and the successful retry each produce a captured path, so
-    ``capture_llm_log_paths`` sees one record per attempt (parity with the
-    structured path)."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-            # Unreachable by design: the bare ``yield`` makes this an async
-            # generator; the ``raise`` above precedes it on the first attempt.
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-        for delta in ("he", "llo"):
-            yield delta
-
-    configure_llm_logging(LocalYamlLogSink(tmp_path))
-    try:
-        with (
-            patch("llmkit._litellm.astream_text", _transport),
-            capture_llm_log_paths() as paths,
-        ):
-            chunks = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
-            )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert chunks == ["he", "llo"]
-    assert len(paths) == 2
-    assert all(p.exists() for p in paths)
-
-
-@pytest.mark.asyncio
-async def test_stream_failure_after_first_chunk_is_not_retried() -> None:
-    """A mid-stream failure (after a chunk reached the caller) is NOT
-    retried: the already-yielded chunk is delivered, then the error
-    propagates, and the transport is invoked exactly once."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        yield "he"
-        raise TimeoutError("mid-stream")
-
-    delivered: list[str] = []
-    configure_llm_logging(None)
-    try:
-        with (
-            patch("llmkit._litellm.astream_text", _transport),
-            pytest.raises(TimeoutError, match="mid-stream"),
-        ):
-            async for chunk in structured_output.stream_text_with_log(
-                "hi", feature="test", retry=_NO_BACKOFF
-            ):
-                delivered.append(chunk)
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert delivered == ["he"]
-    assert calls[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
-    """``retry=NO_RETRY`` for streaming runs a single attempt even when the
-    failure occurs before the first chunk."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        raise TimeoutError("transient")
-        # Unreachable by design: the bare ``yield`` makes this an async
-        # generator; the ``raise`` above precedes it on every attempt.
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-
-    configure_llm_logging(None)
-    try:
-        with (
-            patch("llmkit._litellm.astream_text", _transport),
-            pytest.raises(TimeoutError, match="transient"),
-        ):
-            _ = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=NO_RETRY)
-            )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-    assert calls[0] == 1
 
 
 # --- RetryPolicy defaults & validation -----------------------------------
@@ -411,17 +90,17 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
 
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
     configure_llm_logging(None)
     try:
         with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
             result = await structured_output.structured_llm_call(
-                "hi", _Schema, feature="test", retry=DEFAULT_RETRY_POLICY
+                "hi", OkSchema, feature="test", retry=DEFAULT_RETRY_POLICY
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -467,7 +146,7 @@ async def test_structured_auth_error_is_not_retried() -> None:
     """A 401 ``AuthenticationError`` fails fast: a single attempt, no retry."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise _status_error(openai.AuthenticationError, 401)
 
@@ -476,7 +155,7 @@ async def test_structured_auth_error_is_not_retried() -> None:
         pytest.raises(openai.AuthenticationError),
     ):
         _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert calls[0] == 1
@@ -487,15 +166,15 @@ async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
     """A 429 ``RateLimitError`` is transient: retried once, then succeeds."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         if calls[0] == 1:
             raise _status_error(openai.RateLimitError, 429)
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
@@ -572,13 +251,13 @@ async def test_nested_with_retries_around_call_function_does_not_multiply() -> N
     a persistent transient error costs the *outer* budget, not the product."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise TimeoutError("always")
 
-    async def _wrapped() -> _Schema:
+    async def _wrapped() -> OkSchema:
         return await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     with (
@@ -602,13 +281,13 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
     silent: no ``RuntimeWarning`` fires on the user-intended path."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise TimeoutError("always")
 
-    async def _wrapped() -> _Schema:
+    async def _wrapped() -> OkSchema:
         return await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=NO_RETRY
+            "hi", OkSchema, feature="test", retry=NO_RETRY
         )
 
     with warnings.catch_warnings():
@@ -630,15 +309,15 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
     function writes one log per real attempt (here: 2)."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
-    async def _wrapped() -> _Schema:
+    async def _wrapped() -> OkSchema:
         return await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
@@ -689,7 +368,7 @@ async def test_persistent_validation_error_uses_lower_validation_budget() -> Non
     A deterministic schema failure can't burn the full transport budget."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise _make_validation_error()
 
@@ -698,7 +377,7 @@ async def test_persistent_validation_error_uses_lower_validation_budget() -> Non
         pytest.raises(ValidationError),
     ):
         _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     # validation_max_attempts default is 2 -> two attempts, not three.
@@ -711,7 +390,7 @@ async def test_transport_error_still_uses_full_transport_budget() -> None:
     under the same default policy — the split lowered *only* validation."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise TimeoutError("always")
 
@@ -720,7 +399,7 @@ async def test_transport_error_still_uses_full_transport_budget() -> None:
         pytest.raises(TimeoutError, match="always"),
     ):
         _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert calls[0] == 3
@@ -732,15 +411,15 @@ async def test_transiently_malformed_json_gets_one_cross_call_validation_retry()
     is still recovered: the one validation retry yields a clean parse."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         if calls[0] == 1:
             raise _make_validation_error()
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=_NO_BACKOFF
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
@@ -765,7 +444,7 @@ async def test_no_retry_single_attempt_for_validation_error() -> None:
     attempt (the validation budget is disabled too)."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise _make_validation_error()
 
@@ -774,7 +453,7 @@ async def test_no_retry_single_attempt_for_validation_error() -> None:
         pytest.raises(ValidationError),
     ):
         _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=NO_RETRY
+            "hi", OkSchema, feature="test", retry=NO_RETRY
         )
 
     assert calls[0] == 1
@@ -786,7 +465,7 @@ async def test_no_retry_single_attempt_for_transport_error() -> None:
     attempt (mirrors the validation case for the other budget)."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise TimeoutError("transient")
 
@@ -795,7 +474,7 @@ async def test_no_retry_single_attempt_for_transport_error() -> None:
         pytest.raises(TimeoutError, match="transient"),
     ):
         _ = await structured_output.structured_llm_call(
-            "hi", _Schema, feature="test", retry=NO_RETRY
+            "hi", OkSchema, feature="test", retry=NO_RETRY
         )
 
     assert calls[0] == 1
@@ -808,7 +487,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
     log records (one per attempt), so per-attempt logging survives the split."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
         calls[0] += 1
         raise _make_validation_error()
 
@@ -820,7 +499,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
             pytest.raises(ValidationError),
         ):
             _ = await structured_output.structured_llm_call(
-                "hi", _Schema, feature="test", retry=_NO_BACKOFF
+                "hi", OkSchema, feature="test", retry=_NO_BACKOFF
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())

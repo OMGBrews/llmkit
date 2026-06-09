@@ -16,7 +16,6 @@ the call. These tests pin the contract over the patched transport seam:
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import cast
 from unittest.mock import patch
 
@@ -25,11 +24,9 @@ from pydantic import BaseModel
 
 from llmkit import (
     NO_RETRY,
-    LocalYamlLogSink,
     ResultValidationError,
     RetryPolicy,
     capture_llm_records,
-    configure_llm_logging,
 )
 from llmkit.structured_output import (
     structured_llm_call,
@@ -41,16 +38,6 @@ class _Schema(BaseModel):
     """Minimal structured-output schema carrying a single int."""
 
     n: int
-
-
-@pytest.fixture(autouse=True)
-def _quiet_logging() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse pytest fixture
-    """Point logging at a no-op sink so these tests don't touch the disk."""
-    configure_llm_logging(None)
-    try:
-        yield
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
 
 
 # Keep the default attempt budgets (transport 3 / validation 2) but drop the

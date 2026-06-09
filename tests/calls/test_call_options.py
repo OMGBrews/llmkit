@@ -12,48 +12,22 @@ and an unset options field falling through (``model=None``) to the config.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterator
-from unittest.mock import MagicMock, patch
-
-import pytest
-from pydantic import BaseModel
+from collections.abc import Awaitable, Callable
+from unittest.mock import patch
 
 from llmkit import (
     DEFAULT_RETRY_POLICY,
     NO_RETRY,
-    LocalYamlLogSink,
-    configure_llm_logging,
     structured_output,
 )
 
 # Imported from the submodule rather than the package root: the integration
 # phase owns adding ``LLMCallOptions`` to ``llmkit.__all__``.
 from llmkit.structured_output import LLMCallOptions
-
-
-class _Schema(BaseModel):
-    ok: bool
-
-
-@pytest.fixture(autouse=True)
-def _quiet_logging() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse pytest fixture, invoked by pytest's collection machinery
-    """Point logging at a no-op sink so these tests don't touch the disk."""
-    configure_llm_logging(None)
-    try:
-        yield
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
-
-
-def _provider() -> MagicMock:
-    provider = MagicMock()
-    provider.model = "gemini-2.5-flash-lite"
-    provider.name = "Google AI Studio"
-    return provider
-
+from tests._support import OkSchema, provider_mock
 
 type _CallKwargs = dict[str, object]
-type _StructuredFake = Callable[..., Awaitable[tuple[_Schema, float | None]]]
+type _StructuredFake = Callable[..., Awaitable[tuple[OkSchema, float | None]]]
 
 
 def _structured_recorder() -> tuple[_StructuredFake, list[_CallKwargs]]:
@@ -65,9 +39,9 @@ def _structured_recorder() -> tuple[_StructuredFake, list[_CallKwargs]]:
     """
     calls: list[_CallKwargs] = []
 
-    async def _fake(*_args: object, **kwargs: object) -> tuple[_Schema, float | None]:
+    async def _fake(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
         calls.append(dict(kwargs))
-        return _Schema(ok=True), 0.0
+        return OkSchema(ok=True), 0.0
 
     return _fake, calls
 
@@ -84,13 +58,13 @@ def test_options_reused_across_calls_supplies_each_call() -> None:
     )
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
-        patch("llmkit.providers.build_provider", return_value=_provider()),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
 
         async def _run() -> None:
             for _ in range(3):
                 _ = await structured_output.structured_llm_call(
-                    "hi", _Schema, feature="extraction", options=options
+                    "hi", OkSchema, feature="extraction", options=options
                 )
 
         asyncio.run(_run())
@@ -109,13 +83,13 @@ def test_explicit_keyword_overrides_options_field() -> None:
     options = LLMCallOptions(model="options-model", temperature=0.9)
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
-        patch("llmkit.providers.build_provider", return_value=_provider()),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
 
         async def _run() -> None:
             _ = await structured_output.structured_llm_call(
                 "hi",
-                _Schema,
+                OkSchema,
                 feature="extraction",
                 model="explicit-model",
                 options=options,
@@ -136,12 +110,12 @@ def test_unset_options_field_falls_through_to_config() -> None:
     options = LLMCallOptions(temperature=0.7)
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
-        patch("llmkit.providers.build_provider", return_value=_provider()),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
 
         async def _run() -> None:
             _ = await structured_output.structured_llm_call(
-                "hi", _Schema, feature="extraction", options=options
+                "hi", OkSchema, feature="extraction", options=options
             )
 
         asyncio.run(_run())
@@ -158,12 +132,12 @@ def test_no_options_leaves_flat_kwargs_unchanged() -> None:
     fake, calls = _structured_recorder()
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
-        patch("llmkit.providers.build_provider", return_value=_provider()),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
 
         async def _run() -> None:
             _ = await structured_output.structured_llm_call(
-                "hi", _Schema, feature="extraction", model="flat-model", temperature=0.4
+                "hi", OkSchema, feature="extraction", model="flat-model", temperature=0.4
             )
 
         asyncio.run(_run())
@@ -204,7 +178,7 @@ def test_options_threads_through_text_and_sync() -> None:
     with (
         patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
         patch("llmkit._litellm.acompletion_structured", side_effect=struct_fake),
-        patch("llmkit.providers.build_provider", return_value=_provider()),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
 
         async def _run_text() -> None:
@@ -215,7 +189,7 @@ def test_options_threads_through_text_and_sync() -> None:
             "hi", feature="summary", options=options
         )
         result = structured_output.structured_llm_call_sync(
-            "hi", _Schema, feature="classification", options=options
+            "hi", OkSchema, feature="classification", options=options
         )
 
     assert result.ok is True

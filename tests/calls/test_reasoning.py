@@ -17,25 +17,21 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from unittest.mock import MagicMock, patch
-
-from pydantic import BaseModel
+from unittest.mock import patch
 
 from llmkit import (
-    LLMCallRecord,
     LLMClientConfig,
-    LocalYamlLogSink,
     Provider,
     build_provider,
-    configure_llm_logging,
     structured_output,
 )
-from llmkit.logging import LogSink
 from llmkit.providers import GoogleProvider, OllamaProvider
-
-
-class _Schema(BaseModel):
-    ok: bool
+from tests._support import (
+    OkSchema,
+    capture_structured_provider_kwargs,
+    capture_text_provider_kwargs,
+    capturing_sink,
+)
 
 
 def test_signatures_expose_reasoning_effort() -> None:
@@ -79,17 +75,17 @@ def test_sync_call_threads_reasoning_effort_to_transport() -> None:
     """``structured_llm_call_sync(..., reasoning_effort="disable")`` forwards it."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[_Schema, float | None]:
+    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
         seen.update(kwargs)
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = structured_output.structured_llm_call_sync(
-            "hi", _Schema, feature="test", reasoning_effort="disable"
+            "hi", OkSchema, feature="test", reasoning_effort="disable"
         )
 
     assert seen["reasoning_effort"] == "disable"
-    assert isinstance(result, _Schema)
+    assert isinstance(result, OkSchema)
     assert result.ok is True
 
 
@@ -97,14 +93,14 @@ def test_async_call_threads_reasoning_effort_to_transport() -> None:
     """The async ``structured_llm_call(..., reasoning_effort=...)`` does the same."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[_Schema, float | None]:
+    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
         seen.update(kwargs)
-        return _Schema(ok=True), None
+        return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
             structured_output.structured_llm_call(
-                "hi", _Schema, feature="test", reasoning_effort="low"
+                "hi", OkSchema, feature="test", reasoning_effort="low"
             )
         )
 
@@ -115,121 +111,49 @@ def test_async_call_threads_reasoning_effort_to_transport() -> None:
 def test_transport_omits_reasoning_effort_when_unset() -> None:
     """No per-call value and a provider configured with ``None`` → no kwarg,
     byte-identical to the pre-feature request."""
-    seen = _capture_provider_kwargs(reasoning_effort=None, provider_effort=None)
+    seen = capture_structured_provider_kwargs(reasoning_effort=None, provider_effort=None)
     assert "reasoning_effort" not in seen
 
 
 def test_transport_includes_per_call_reasoning_effort() -> None:
     """A per-call value reaches the provider call kwargs unchanged."""
-    seen = _capture_provider_kwargs(reasoning_effort="disable", provider_effort=None)
+    seen = capture_structured_provider_kwargs(reasoning_effort="disable", provider_effort=None)
     assert seen["reasoning_effort"] == "disable"
 
 
 def test_transport_falls_back_to_provider_reasoning_effort() -> None:
     """With no per-call value, the provider's configured value is forwarded."""
-    seen = _capture_provider_kwargs(reasoning_effort=None, provider_effort="disable")
+    seen = capture_structured_provider_kwargs(reasoning_effort=None, provider_effort="disable")
     assert seen["reasoning_effort"] == "disable"
 
 
 def test_per_call_reasoning_effort_overrides_provider() -> None:
     """An explicit per-call value wins over the provider's configured one."""
-    seen = _capture_provider_kwargs(reasoning_effort="high", provider_effort="disable")
+    seen = capture_structured_provider_kwargs(reasoning_effort="high", provider_effort="disable")
     assert seen["reasoning_effort"] == "high"
 
 
 def test_text_transport_forwards_reasoning_effort() -> None:
     """``acompletion_text`` forwards a resolved reasoning effort to LiteLLM."""
-    from llmkit import _litellm
-
-    seen: dict[str, object] = {}
-
-    async def _fake_acompletion(**kwargs: object) -> MagicMock:
-        seen.update(kwargs)
-        resp = MagicMock(_hidden_params={})
-        resp.choices = [MagicMock(message=MagicMock(content="hello"))]
-        return resp
-
-    provider = MagicMock()
-    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
-    provider.litellm_model = MagicMock(return_value="fake/model")
-    provider.reasoning_effort = "disable"
-
-    with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
-        text, _cost = asyncio.run(
-            _litellm.acompletion_text("hi", temperature=0.0, model=None, provider=provider)
-        )
-
-    assert text == "hello"
+    seen = capture_text_provider_kwargs(provider_effort="disable")
     assert seen["reasoning_effort"] == "disable"
 
 
 def test_log_record_carries_reasoning_effort() -> None:
     """The ``LLMCallRecord`` built for a structured call records the setting."""
-    captured: list[LLMCallRecord] = []
 
-    class _CapturingSink:
-        def write(self, record: LLMCallRecord) -> None:
-            captured.append(record)
+    async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        return OkSchema(ok=True), None
 
-    async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[_Schema, float | None]:
-        return _Schema(ok=True), None
-
-    sink: LogSink = _CapturingSink()
-    configure_llm_logging(sink)
-    try:
-        with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-            _ = asyncio.run(
-                structured_output.structured_llm_call(
-                    "hi", _Schema, feature="test", reasoning_effort="disable"
-                )
+    with (
+        capturing_sink() as captured,
+        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
+    ):
+        _ = asyncio.run(
+            structured_output.structured_llm_call(
+                "hi", OkSchema, feature="test", reasoning_effort="disable"
             )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
+        )
 
     assert len(captured) == 1
     assert captured[0].reasoning_effort == "disable"
-
-
-def _capture_provider_kwargs(
-    *, reasoning_effort: str | None, provider_effort: str | None
-) -> dict[str, object]:
-    """Drive ``acompletion_structured`` over a faked instructor client and
-    return the kwargs the provider call (``create_with_completion``) saw.
-
-    ``provider_effort`` is the provider's configured value; ``reasoning_effort``
-    is the per-call override.
-    """
-    from llmkit import _litellm
-
-    seen: dict[str, object] = {}
-
-    async def _fake_create_with_completion(
-        **kwargs: object,
-    ) -> tuple[_Schema, MagicMock]:
-        seen.update(kwargs)
-        return _Schema(ok=True), MagicMock(_hidden_params={})
-
-    fake_client = MagicMock()
-    fake_client.chat = MagicMock(
-        completions=MagicMock(create_with_completion=_fake_create_with_completion)
-    )
-
-    provider = MagicMock()
-    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
-    provider.instructor_mode = "json"
-    provider.litellm_model = MagicMock(return_value="fake/model")
-    provider.reasoning_effort = provider_effort
-
-    with patch("llmkit._litellm.instructor.from_litellm", return_value=fake_client):
-        parsed, _cost = asyncio.run(
-            _litellm.acompletion_structured(
-                "hi",
-                _Schema,
-                temperature=0.0,
-                model=None,
-                reasoning_effort=reasoning_effort,
-                provider=provider,
-            )
-        )
-    assert parsed.ok is True
-    return seen

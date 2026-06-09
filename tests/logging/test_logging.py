@@ -27,25 +27,7 @@ from llmkit import (
     configure_llm_logging,
 )
 from llmkit.logging import write_llm_log
-
-
-def _record(**overrides: object) -> LLMCallRecord:
-    base: dict[str, object] = {
-        "started_at": datetime(2026, 5, 31, 12, 0, 0, tzinfo=UTC),
-        "feature": "extraction",
-        "label": "summary",
-        "model": "gemini-2.5-flash-lite",
-        "provider": "Google AI Studio",
-        "temperature": 0.0,
-        "duration_ms": 12.3,
-        "schema": "Schema",
-        "prompt": "hi",
-        "response": None,
-        "error": None,
-    }
-    base.update(overrides)
-    return LLMCallRecord(**base)  # pyright: ignore[reportArgumentType]  # test-helper — kwargs splat
-
+from tests._support import make_record as _record
 
 # 1. Verdict-first header + metadata-before-blobs body.
 

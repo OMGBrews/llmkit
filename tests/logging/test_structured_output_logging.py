@@ -9,7 +9,6 @@ a ``grep`` away.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -20,6 +19,7 @@ from llmkit import (
     configure_llm_logging,
     structured_output,
 )
+from tests._support import make_record as _record
 
 
 def test_resolve_substitutes_provider_default_when_model_none() -> None:
@@ -93,24 +93,6 @@ def test_resolve_degrades_gracefully_when_provider_unavailable() -> None:
         resolved, provider = structured_output._resolve_model_and_provider("explicit-model")
     assert resolved == "explicit-model"
     assert provider is None
-
-
-def _record(**overrides: object) -> LLMCallRecord:
-    base: dict[str, object] = {
-        "started_at": datetime(2026, 5, 31, tzinfo=UTC),
-        "feature": "extraction",
-        "label": "summary",
-        "model": "gemini-2.5-flash-lite",
-        "provider": "Google AI Studio",
-        "temperature": 0.0,
-        "duration_ms": 12.3,
-        "schema": "Schema",
-        "prompt": "hi",
-        "response": None,
-        "error": None,
-    }
-    base.update(overrides)
-    return LLMCallRecord(**base)  # pyright: ignore[reportArgumentType]  # test-helper — kwargs splat
 
 
 def test_local_yaml_sink_records_model_and_provider(tmp_path: Path) -> None:
