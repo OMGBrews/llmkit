@@ -214,6 +214,26 @@ def test_bound_on_referenced_def_is_found() -> None:
         _ = model(n=9)
 
 
+def test_description_on_referenced_def_is_found() -> None:
+    """A ``description`` declared on a ``$ref`` target surfaces on the field,
+    mirroring how a bound on the target is unwrapped — so a ``$ref``-ed field
+    still carries its per-field guidance to the model. An inline ``description``
+    on the property still wins (outer-wins precedence)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "n": {"$ref": "#/$defs/Bounded"},
+            "m": {"$ref": "#/$defs/Bounded", "description": "Outer wins."},
+        },
+        "required": ["n", "m"],
+        "$defs": {"Bounded": {"type": "integer", "minimum": 0, "description": "From the def."}},
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["n"].description == "From the def."
+    assert model.model_fields["m"].description == "Outer wins."
+
+
 def test_bound_on_nullable_branch_is_found() -> None:
     """A bound on the non-null branch of a nullable field is applied; ``null``
     still passes (the bound only gates non-null values)."""

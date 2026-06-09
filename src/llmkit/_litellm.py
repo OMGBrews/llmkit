@@ -208,15 +208,15 @@ async def acompletion_structured[T: BaseModel](
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider: LLMProviderInterface | None = None,
-    validation_retries: int = 1,
 ) -> tuple[T, float | None]:
     """Structured completion via instructor pinned to the provider's mode.
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
-    completion (for cost) are both in hand. ``validation_retries`` is
-    instructor's in-call schema-repair budget — deliberately low and kept
-    separate from the transient-error retry layer (``with_retries`` in
-    :mod:`llmkit.retry`), which handles 429/503/5xx.
+    completion (for cost) are both in hand. instructor's in-call schema-repair
+    budget is pinned to ``max_retries=1`` (a single repair, deliberately low)
+    and kept separate from the transient-error retry layer (``with_retries`` in
+    :mod:`llmkit.retry`), which owns the cross-call 429/503/5xx and
+    schema-validation budgets.
 
     ``max_tokens`` caps the completion length when set; it is only included
     in the underlying call when not ``None``, so the default produces a
@@ -249,7 +249,9 @@ async def acompletion_structured[T: BaseModel](
             messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
             response_model=output_schema,
             temperature=temperature,
-            max_retries=validation_retries,
+            # instructor's in-call schema-repair budget: one repair, no more.
+            # The cross-call transient/validation budgets live in llmkit.retry.
+            max_retries=1,
             **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **({"reasoning_effort": effort} if effort is not None else {}),
@@ -291,11 +293,12 @@ async def acompletion_text(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
+            **creds,
             # Gate max_tokens like the structured/stream paths: an unset cap
             # sends no ``max_tokens`` key at all (not an explicit ``None``), so
-            # the request stays byte-identical to prior behaviour.
+            # the request stays byte-identical to prior behaviour. Creds are
+            # splatted first to match the structured/stream helpers exactly.
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-            **creds,
             **({"reasoning_effort": effort} if effort is not None else {}),
         )
         # Non-streaming acompletion returns a ModelResponse (the stub's union

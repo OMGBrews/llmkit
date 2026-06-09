@@ -406,6 +406,57 @@ async def test_transport_error_still_uses_full_transport_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_instructor_wrapped_transport_error_uses_full_transport_budget() -> None:
+    """instructor wraps an exhausted *transport* attempt in
+    ``InstructorRetryException`` (which lives in ``LLM_SCHEMA_ERRORS``). The
+    retry layer must unwrap it and charge the transport budget (3), not the
+    lower validation budget (2) — otherwise a structured call is less resilient
+    to a 429/network blip than the identical plain-text call."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        root = openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
+        raise InstructorRetryException(root, n_attempts=1, total_usage=0)
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(InstructorRetryException),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_instructor_wrapped_schema_error_uses_validation_budget() -> None:
+    """An ``InstructorRetryException`` wrapping a genuine ``ValidationError``
+    still uses the lower validation budget (2) — unwrapping must not push a real
+    schema failure onto the transport budget."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        raise InstructorRetryException(_make_validation_error(), n_attempts=1, total_usage=0)
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(InstructorRetryException),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 2
+
+
+@pytest.mark.asyncio
 async def test_transiently_malformed_json_gets_one_cross_call_validation_retry() -> None:
     """A transiently-malformed response (one ``ValidationError`` then success)
     is still recovered: the one validation retry yields a clean parse."""

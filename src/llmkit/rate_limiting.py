@@ -20,7 +20,7 @@ On by default, scoped per provider
 Rate limiting is **enabled out of the box** (``_enabled`` defaults to
 ``True``) — zero configuration needed. Every dimension is accounted **per
 provider**, where the key is the provider *name* string (``provider.name`` /
-:pyattr:`BaseProvider._provider_name`, e.g. ``"openai"``, ``"ollama"``). That
+:pyattr:`BaseProvider._provider_name`, e.g. ``"OpenAI"``, ``"Ollama"``). That
 is exactly the value logging records as the *effective* provider (see
 :func:`llmkit.structured_output._resolve_model_and_provider`), so a held slot —
 and any token debit — is always accounted to the provider that actually runs

@@ -8,6 +8,10 @@ import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
+#: Default local Ollama endpoint — the fallback when no ``base_url`` is
+#: configured. Defined once so the ctor default and :meth:`build` agree.
+_DEFAULT_BASE_URL = "http://localhost:11434"
+
 
 class OllamaProvider(BaseProvider):
     """Ollama LLM provider.
@@ -20,10 +24,11 @@ class OllamaProvider(BaseProvider):
     _model_prefix: str = "ollama_chat/"
     _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
     _default_model: str = "llama3.2"
+    is_local: bool = True
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
+        base_url: str = _DEFAULT_BASE_URL,
         model: str | None = None,
         reasoning_effort: str | None = None,
     ):
@@ -38,7 +43,7 @@ class OllamaProvider(BaseProvider):
     def build(cls, config: LLMClientConfig) -> OllamaProvider:
         """Construct from an :class:`LLMClientConfig` (local endpoint default)."""
         return cls(
-            base_url=config.base_url or "http://localhost:11434",
+            base_url=config.base_url or _DEFAULT_BASE_URL,
             model=config.model,
             reasoning_effort=config.reasoning_effort,
         )

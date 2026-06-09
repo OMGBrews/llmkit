@@ -32,7 +32,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
+from llmkit.exceptions import (
+    LLM_SCHEMA_ERRORS,
+    LLM_TRANSPORT_ERRORS,
+    underlying_provider_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +73,11 @@ class RetryPolicy:
     :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS` — so a persistent schema
     failure triggers a *fresh outer attempt* on the lower validation budget
     (each attempt runs its own low in-call repair budget). That is layering,
-    not summation: the inner budget stays 1 per attempt.
+    not summation: the inner budget stays 1 per attempt. Because instructor
+    wraps *transport* failures in the same exception, the loop first unwraps it
+    (:func:`~llmkit.exceptions.underlying_provider_error`) and routes a wrapped
+    transport cause to ``max_attempts`` — so a 429/5xx/network blip inside a
+    structured call gets the full transport budget, exactly like the text path.
 
     Attributes:
         max_attempts: Total *transport* attempts, including the first
@@ -317,16 +325,29 @@ async def with_retries[T](
             try:
                 return await fn()
             except Exception as e:
-                is_validation = use_validation_budget and isinstance(
-                    e,
-                    validation_retry_on,  # pyright: ignore[reportArgumentType]  # None excluded by use_validation_budget
+                # instructor re-raises *any* exhausted attempt — transport
+                # failures included — as InstructorRetryException, which is in
+                # the schema set. Unwrap to the underlying provider error so a
+                # wrapped transport failure (429/5xx/network) claims the
+                # transport budget first, matching the plain-text path; a
+                # wrapped schema failure (or an inner error in neither set)
+                # still falls through to the validation budget below.
+                cause = underlying_provider_error(e)
+                is_transport_cause = retry_on is not None and isinstance(cause, retry_on)
+                is_validation = (
+                    use_validation_budget
+                    and not is_transport_cause
+                    and isinstance(
+                        e,
+                        validation_retry_on,  # pyright: ignore[reportArgumentType]  # None excluded by use_validation_budget
+                    )
                 )
                 if is_validation:
                     validation_attempt += 1
                     attempt = validation_attempt
                     budget = validation_max_attempts
                     assert budget is not None  # guaranteed by use_validation_budget
-                elif retry_on is None or isinstance(e, retry_on):
+                elif retry_on is None or isinstance(e, retry_on) or is_transport_cause:
                     transport_attempt += 1
                     attempt = transport_attempt
                     budget = max_attempts

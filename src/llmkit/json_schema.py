@@ -39,7 +39,10 @@ generated Pydantic ``Field`` so the model validates *value bounds*, not just
 shape. The supported set is **exactly**:
 
 * numeric: ``minimum`` → ``ge``, ``maximum`` → ``le``,
-  ``exclusiveMinimum`` → ``gt``, ``exclusiveMaximum`` → ``lt``
+  ``exclusiveMinimum`` → ``gt``, ``exclusiveMaximum`` → ``lt`` — the **numeric**
+  (Draft 2020-12) form only. The Draft-4 *boolean* form
+  (``"exclusiveMinimum": true`` qualifying a sibling ``minimum``) is not
+  recognised and is dropped, so such a bound is treated as inclusive.
 * string: ``minLength`` → ``min_length``, ``maxLength`` → ``max_length``
 * array: ``minItems`` → ``min_length``, ``maxItems`` → ``max_length``
 * ``description`` → ``Field(description=...)`` (instructor surfaces this as
@@ -49,6 +52,11 @@ Any other constraint keyword (``pattern``, ``format``, ``multipleOf``,
 ``uniqueItems``, ``const``, …) is **silently dropped** — deliberately, to
 avoid partial enforcement that looks complete. Nothing outside the list above
 is enforced; if a schema relies on one of those, validate it elsewhere.
+
+A schema-level ``default`` on a non-required field is likewise **not** carried
+into the model: the field becomes optional with a ``None`` default and, via the
+``exclude_none`` dump contract below, is simply omitted when unset. Supply
+defaults after parsing if you need them.
 
 Serialization contract
 -----------------------
@@ -335,6 +343,11 @@ class _Converter:
                 )
             return {**schema, "type": non_null[0]}, nullable
 
+        if schema.get("anyOf") and schema.get("oneOf"):
+            raise ValueError(
+                "A field declares both 'anyOf' and 'oneOf'; only one is supported "
+                + "at a time. Combine them into a single union or drop one."
+            )
         keyword = "anyOf" if schema.get("anyOf") else "oneOf" if schema.get("oneOf") else None
         any_of = schema.get("anyOf") or schema.get("oneOf")
         if isinstance(any_of, list):
@@ -599,6 +612,15 @@ class _Converter:
             prop = cast("JsonDict", prop_schema)
             annotation, is_nullable = self._field_type(prop, f"{field_path}.{prop_name}")
             description = prop.get("description")
+            if description is None and "$ref" in prop:
+                # A bare ``$ref`` property carries its ``description`` on the
+                # referenced target, not inline. Fall back to it so a
+                # ``$ref``-ed field still surfaces its guidance to the model —
+                # mirroring how :meth:`_field_constraints` unwraps the ref for
+                # bounds. The outer property still wins when it sets its own
+                # ``description`` (the documented outer-wins precedence).
+                _, target = self._resolve_ref(cast("str", prop["$ref"]))
+                description = target.get("description")
             desc = description if isinstance(description, str) else None
             # Per-field value bounds (ge/le/gt/lt/min_length/max_length). Only
             # the supported keywords cross over; everything else is dropped.

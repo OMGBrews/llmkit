@@ -90,9 +90,10 @@ class LLMCallRecord:
     ``model`` is the *resolved effective* model (the provider default
     substituted when the caller passed ``None``) and ``provider`` names
     the active provider, so cost attribution is a ``grep`` over the logs
-    rather than a code trace. ``schema`` is the output schema name, or the
-    literal ``"stream"`` for streamed plain-text calls. ``response`` is the
-    Pydantic-dumped result, the accumulated stream text, or ``None``.
+    rather than a code trace. ``schema`` is the output schema name for a
+    structured call, or the literal ``"text"`` / ``"stream"`` for a buffered
+    or streamed plain-text call. ``response`` is the Pydantic-dumped result,
+    the accumulated text, or ``None``.
 
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
@@ -140,8 +141,11 @@ class _PathReturningLogSink(Protocol):
     :class:`LocalYamlLogSink`) advertises ``write_returning_path`` so
     :func:`write_llm_log` can hand the path to the path-capture primitive
     without that file detail leaking into the public :class:`LogSink`
-    contract. Third-party sinks implement only :class:`LogSink` and never
-    match this check.
+    contract. Being ``@runtime_checkable``, the :func:`isinstance` test matches
+    structurally — any sink exposing a ``write_returning_path`` method counts,
+    so a third-party sink opts into path-capture purely by defining one (it
+    *must* then return ``Path | None``). A sink that implements only
+    :meth:`LogSink.write` does not match and is path-capture-invisible.
     """
 
     def write_returning_path(self, record: LLMCallRecord) -> Path | None: ...
@@ -244,6 +248,14 @@ class LocalYamlLogSink:
                 except FileExistsError:
                     # Suffix collision — regenerate and retry; never overwrite.
                     continue
+                except (OSError, yaml.YAMLError):
+                    # A mid-write failure (disk full, encode error) leaves a
+                    # truncated file behind under the exclusive-create name.
+                    # Remove the orphan before degrading so the log dir never
+                    # accumulates empty/partial YAML, then re-raise to the
+                    # best-effort handler below.
+                    candidate.unlink(missing_ok=True)
+                    raise
                 filepath = candidate
                 break
             if filepath is None:

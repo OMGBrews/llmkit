@@ -18,6 +18,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check release tag matches pyproject version
+        # Only the release trigger carries a tag; workflow_dispatch has none.
+        if: github.event_name == 'release'
+        run: |
+          project_version="$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$project_version" != "$tag_version" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match pyproject version ${project_version}"
+            exit 1
+          fi
+          echo "Tag and pyproject version agree: ${project_version}"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 

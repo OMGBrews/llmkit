@@ -4,12 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-06-09
 
-The accumulated work below is the next release (`0.2.0`, a MINOR bump — it
-carries default-behavior changes and a small breaking surface) and has not yet
-been published to PyPI — the last published version is `0.1.2`. It moves to a
-dated `## [0.2.0]` section when the release is cut.
+This release is a MINOR bump — it carries default-behavior changes and a small
+breaking surface (the last published version was `0.1.2`).
 
 **Migrating from 0.1.2.** Most code keeps working unchanged, but three changes
 flip a default or move a symbol — review these first:
@@ -267,12 +265,11 @@ flip a default or move a symbol — review these first:
 - **Unified the public retry attempt-count on `max_attempts`.** `RetryPolicy`
   already used `max_attempts`; `with_retries(...)` now uses it too, with the same
   semantics everywhere — *total attempts including the first* (`N`, not `1 + N`).
-  The old `with_retries(..., max_retries=...)` keyword keeps working as a
-  **deprecated alias** that emits a `DeprecationWarning` and maps to
-  `max_attempts` (`max_attempts` wins if both are given), so existing consumers
-  (e.g. pia-maker) don't break. The progress-callback keyword stays `max_retries`
-  for backward compatibility. `LLM_TRANSPORT_ERRORS` and `LLM_SCHEMA_ERRORS` are
-  exported from the package root alongside `LLM_RECOVERABLE_ERRORS`.
+  The old `with_retries(..., max_retries=...)` keyword and the progress-callback
+  `max_retries` keyword were **removed outright** (hard cut, no shim — see
+  _Removed_ below); both now use `max_attempts`. `LLM_TRANSPORT_ERRORS` and
+  `LLM_SCHEMA_ERRORS` are exported from the package root alongside
+  `LLM_RECOVERABLE_ERRORS`.
 - **`with_retries` now guards against nested retry-budget multiplication.**
   Because the call functions retry internally by default, wrapping one in
   `with_retries` previously multiplied the budgets silently (the `3 × 3 = 9`
@@ -383,6 +380,15 @@ flip a default or move a symbol — review these first:
 
 ### Fixed
 
+- **Transient transport failures in a *structured* call now get the full
+  transport retry budget.** instructor wraps every exhausted attempt —
+  including a 429/503/network failure — in `InstructorRetryException`, which is
+  in `LLM_SCHEMA_ERRORS`, so a wrapped transport error was charged the lower
+  `validation_max_attempts` budget (2) instead of `max_attempts` (3) — strictly
+  fewer retries than the identical error gets on the plain-text path. The retry
+  layer now unwraps `InstructorRetryException` to its underlying provider error
+  (`underlying_provider_error`) and routes a transport cause to the transport
+  budget; a genuine schema failure still uses the validation budget.
 - **The on-by-default concurrency limiter no longer raises "bound to a different
   event loop" across sync calls.** The per-provider async semaphore was cached
   in a process-global registry keyed by provider name alone, but an
@@ -494,7 +500,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
-[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.1.2...HEAD
+[0.2.0]: https://github.com/OMGBrews/llmkit/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.2
 [0.1.1]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.1
 [0.1.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.0

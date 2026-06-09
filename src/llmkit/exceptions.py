@@ -20,6 +20,14 @@ The recoverable set is split into two subsets the retry layer budgets
   retry, but a deterministically-wrong schema can't burn the full transport
   budget on doomed re-asks.
 
+  Caveat — ``InstructorRetryException`` is a *wrapper*: instructor re-raises
+  **every** exhausted attempt this way, including transport failures (a 429
+  or network blip caught inside its create call), not only schema ones. The
+  retry layer therefore unwraps it via :func:`underlying_provider_error` and
+  charges a wrapped transport cause to the transport budget — so membership
+  here is the default-but-not-final classification, not a promise the failure
+  is genuinely schema-shaped.
+
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the two, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
 catching exactly what they did before.
@@ -58,8 +66,11 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 # full transport budget on doomed re-asks while a transiently-malformed JSON
 # response still earns one cross-call retry.
 #   - ``ValidationError``           — pydantic could not parse the response
-#   - ``InstructorRetryException``  — instructor exhausted its in-call
-#     ``validation_retries`` repair budget (default 1) for this attempt
+#   - ``InstructorRetryException``  — instructor exhausted its in-call repair
+#     budget (``max_retries=1``) for this attempt. NOTE: instructor wraps *any*
+#     exhausted attempt this way, transport failures included — the retry layer
+#     unwraps it (``underlying_provider_error``) so a wrapped transport cause is
+#     charged the transport budget rather than this lower one.
 LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     ValidationError,
     InstructorRetryException,
@@ -73,6 +84,32 @@ LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
 )
+
+
+def underlying_provider_error(exc: BaseException) -> BaseException:
+    """Dig the original provider error out of an ``InstructorRetryException``.
+
+    instructor re-raises *every* exhausted attempt — transport failures (rate
+    limits, 5xx, network) just as much as schema-validation failures — wrapped
+    in a single ``InstructorRetryException``. The wrapper alone can't tell the
+    retry layer which budget the failure belongs to, so this returns the
+    wrapped root error: instructor stores it as the first positional ``arg``,
+    with the tenacity ``RetryError.__cause__``'s recorded last attempt as a
+    fallback. Any other exception (a bare ``ValidationError``, a transport
+    error that never went through instructor) is returned unchanged, so callers
+    can classify ``underlying_provider_error(exc)`` uniformly.
+    """
+    if isinstance(exc, InstructorRetryException):
+        inner = exc.args[0] if exc.args else None
+        if isinstance(inner, BaseException):
+            return inner
+        # Fallback: instructor raises ``from`` a tenacity RetryError whose
+        # ``last_attempt`` Future holds the root exception.
+        last_attempt = getattr(exc.__cause__, "last_attempt", None)
+        recorded = getattr(last_attempt, "_exception", None)
+        if isinstance(recorded, BaseException):
+            return recorded
+    return exc
 
 
 class ResultValidationError(Exception):

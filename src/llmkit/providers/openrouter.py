@@ -8,6 +8,10 @@ import instructor
 
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
+#: OpenRouter's public API endpoint — the fallback when no ``base_url`` is
+#: configured. Defined once so the ctor default and :meth:`build` agree.
+_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
 
 class OpenRouterProvider(BaseProvider):
     """OpenRouter LLM provider.
@@ -44,7 +48,7 @@ class OpenRouterProvider(BaseProvider):
         self,
         api_key: str,
         model: str | None = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str = _DEFAULT_BASE_URL,
         reasoning_effort: str | None = None,
         require_parameters: bool = True,
     ):
@@ -74,6 +78,6 @@ class OpenRouterProvider(BaseProvider):
         return cls(
             api_key=config.api_key or "",
             model=config.model,
-            base_url=config.base_url or "https://openrouter.ai/api/v1",
+            base_url=config.base_url or _DEFAULT_BASE_URL,
             reasoning_effort=config.reasoning_effort,
         )

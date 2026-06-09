@@ -672,6 +672,7 @@ async def text_llm_call(
                 provider=provider,
                 error=error,
                 approximate_cost=cost,
+                schema="text",
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
             )
@@ -880,6 +881,7 @@ async def _stream_once(
             provider=provider,
             error=error,
             approximate_cost=None,
+            schema="stream",
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
         )
@@ -898,14 +900,17 @@ def _log_text_call(
     provider: LLMProviderInterface | None,
     error: str | None,
     approximate_cost: float | None,
+    schema: str = "text",
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
 ) -> None:
     """Build and record an ``LLMCallRecord`` for a plain-text/stream call.
 
     Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
-    ``schema`` is the literal ``"stream"`` and ``response`` is the
-    accumulated text rather than a Pydantic dump. ``model`` is resolved to
+    ``schema`` distinguishes the two surfaces in the log — ``"text"`` for a
+    buffered plain-text call, ``"stream"`` for a streamed one — and
+    ``response`` is the accumulated text rather than a Pydantic dump. ``model``
+    is resolved to
     the effective model (provider default substituted when the caller
     passed ``None``); ``provider`` is the per-call override (``None`` uses
     the globally-configured one) and names the provider the log records.
@@ -926,7 +931,7 @@ def _log_text_call(
             provider=resolved_provider,
             temperature=temperature,
             duration_ms=duration_ms,
-            schema="stream",
+            schema=schema,
             prompt=prompt,
             response=text,
             error=error,

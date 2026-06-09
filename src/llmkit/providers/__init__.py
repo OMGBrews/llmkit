@@ -94,12 +94,17 @@ def make_provider(
     """Construct a provider directly from raw credentials.
 
     The one-liner for the per-call ``provider=`` override: build a provider
-    from a tenant's key (and optional model) without standing up an
-    :class:`LLMClientConfig` or touching the module-level config source.
-    Multi-tenant hosts that hold a per-request key reach for exactly this::
+    from a raw key (and optional model) without standing up an
+    :class:`LLMClientConfig` or touching the module-level config source. Reach
+    for it to route a single call through a different provider family, model, or
+    credential than the globally-configured one::
 
-        provider = make_provider(Provider.ANTHROPIC, api_key=tenant_key)
+        provider = make_provider(Provider.ANTHROPIC, api_key=key)
         result = structured_llm_call_sync(..., provider=provider)
+
+    Note this does not isolate rate-limit budgets: the limiter is keyed by
+    provider *name*, so calls sharing a provider share its budget (llmkit is
+    single-tenant by design — see :mod:`llmkit.rate_limiting`).
 
     The accepted knobs mirror the fields each concrete provider reads;
     irrelevant ones are simply ignored (e.g. ``base_url`` for Anthropic,
@@ -162,7 +167,7 @@ def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:
         provider=config.provider,
         provider_name=provider.name,
         model=provider.model,
-        is_local=config.provider == Provider.OLLAMA,
+        is_local=provider.is_local,
     )
 
 

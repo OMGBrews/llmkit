@@ -18,12 +18,9 @@ from unittest.mock import patch
 from llmkit import (
     DEFAULT_RETRY_POLICY,
     NO_RETRY,
+    LLMCallOptions,
     structured_output,
 )
-
-# Imported from the submodule rather than the package root: the integration
-# phase owns adding ``LLMCallOptions`` to ``llmkit.__all__``.
-from llmkit.structured_output import LLMCallOptions
 from tests._support import OkSchema, provider_mock
 
 type _CallKwargs = dict[str, object]
@@ -100,6 +97,34 @@ def test_explicit_keyword_overrides_options_field() -> None:
     assert calls[0]["model"] == "explicit-model"
     # The untouched field still comes from options.
     assert calls[0]["temperature"] == 0.9
+
+
+def test_explicit_keyword_equal_to_default_defers_to_options() -> None:
+    """The documented merge edge: a per-call keyword left *at its default* is
+    indistinguishable from "not passed", so a set options field still wins.
+
+    Passing ``max_tokens=None`` (the keyword default) does NOT override an
+    options value — it defers to it. This is the footgun the precedence rule
+    accepts on purpose so a shared ``LLMCallOptions`` can supply the value."""
+    fake, calls = _structured_recorder()
+    options = LLMCallOptions(max_tokens=512)
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=fake),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> None:
+            _ = await structured_output.structured_llm_call(
+                "hi",
+                OkSchema,
+                feature="extraction",
+                max_tokens=None,  # equals the default -> yields to options
+                options=options,
+            )
+
+        asyncio.run(_run())
+
+    assert calls[0]["max_tokens"] == 512
 
 
 def test_unset_options_field_falls_through_to_config() -> None:

@@ -17,13 +17,10 @@ import pytest
 
 from llmkit import (
     LLMCallRecord,
+    capture_llm_records,
     configure_llm_logging,
     structured_output,
 )
-
-# Imported from the submodule rather than the package root: the integration
-# phase owns adding ``capture_llm_records`` to ``llmkit.__all__``.
-from llmkit.structured_output import capture_llm_records
 from tests._support import OkSchema, provider_mock
 
 
@@ -129,7 +126,9 @@ def test_capture_records_captures_text_calls() -> None:
 
     assert len(captured) == 1
     assert captured[0].approximate_cost == 0.001
-    assert captured[0].schema == "stream"
+    # A buffered plain-text call logs schema="text", distinct from a real
+    # stream (which logs "stream") — they were previously indistinguishable.
+    assert captured[0].schema == "text"
 
 
 def test_capture_records_records_error_on_failure() -> None:

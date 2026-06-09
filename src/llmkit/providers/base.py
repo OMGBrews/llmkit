@@ -257,6 +257,11 @@ class BaseProvider(ABC):
     _model_prefix: str = ""
     _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
     _default_model: str = ""
+    #: Whether this provider runs against a local endpoint (no data leaves the
+    #: host). A provider trait rather than a dispatch special-case, so locality
+    #: stays defined alongside the provider it describes (see
+    #: :func:`~llmkit.providers.describe_llm`). Cloud providers leave this False.
+    is_local: bool = False
 
     def __init__(self, model: str | None = None, reasoning_effort: str | None = None) -> None:
         # A falsy model (None or "") falls back to the provider's own default

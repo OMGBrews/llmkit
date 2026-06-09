@@ -90,7 +90,7 @@ The public call surface:
 
 > **Two defaults worth knowing up front.**
 > - **`temperature` defaults to `0.2`** — biased toward deterministic output. A *creative* caller must override it explicitly (e.g. `temperature=1.0`); it is otherwise quietly conservative.
-> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family or credential (the multi-tenant, per-request-key pattern) without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
+> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
 ### Reusing call options
 
@@ -405,16 +405,16 @@ Register the config with `configure_llm_client(source)`, where `source` is a zer
 ### Constructing a provider for a per-call override
 
 Most callers configure one provider once via `configure_llm_client(...)` and let
-every call pick it up. A multi-tenant host instead holds a *different* credential
-per request, so it builds a provider on the fly and passes it as the per-call
-`provider=` override. `make_provider` is the one-liner for that — it builds
-straight from raw credentials, with no `LLMClientConfig` and no module-level
-config source:
+every call pick it up. To send a *single* call through a different provider
+family, model, or credential, build a provider on the fly and pass it as the
+per-call `provider=` override. `make_provider` is the one-liner for that — it
+builds straight from raw credentials, with no `LLMClientConfig` and no
+module-level config source:
 
 ```python
 from llmkit import make_provider, structured_llm_call_sync, Provider
 
-provider = make_provider(Provider.ANTHROPIC, api_key=tenant_key)
+provider = make_provider(Provider.ANTHROPIC, api_key=anthropic_key)
 result = structured_llm_call_sync(
     prompt,
     output_schema=MyModel,
@@ -500,7 +500,7 @@ Two retry layers, kept deliberately separate:
 
 - **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
-  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks.
+  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one.)
 
   `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. Both budgets use bounded **full-jitter** backoff. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 

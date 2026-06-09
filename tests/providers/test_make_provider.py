@@ -2,8 +2,8 @@
 
 ``make_provider`` builds a provider straight from raw credentials for the
 per-call ``provider=`` override — no :class:`LLMClientConfig`, no module-level
-config source — so a multi-tenant host can construct a provider from a
-per-request key in one line. Separately, a falsy ``model`` (``None`` or ``""``)
+config source — so a single call can run through a different provider, model,
+or key in one line. Separately, a falsy ``model`` (``None`` or ``""``)
 must resolve to the provider's *own* default model rather than emitting a
 broken ``"<prefix>/"`` LiteLLM id; these tests pin both the ``make_provider``
 path and the ``build_provider`` / config path against that footgun.
@@ -61,7 +61,7 @@ def test_make_provider_openrouter_endpoint_default() -> None:
 
     ``require_parameters`` routing is on by default, so the kwargs also carry the
     ``extra_body`` schema-honoring routing preference (see
-    ``tests/test_openrouter_routing.py``).
+    ``tests/providers/test_openrouter_routing.py``).
     """
     provider = make_provider(Provider.OPENROUTER, api_key="sk-test", model="x/y")
     assert isinstance(provider, OpenRouterProvider)
