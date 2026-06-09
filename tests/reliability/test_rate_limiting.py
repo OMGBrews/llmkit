@@ -501,6 +501,62 @@ def test_rate_bucket_record_drives_negative_then_recovers(
     assert bucket._try_budget() == 0.0
 
 
+async def test_rpm_burst_is_capped_at_concurrency_not_a_full_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cold/idle RPM burst is the concurrency width, not a whole minute's quota.
+
+    Worked example for the ~2x-per-minute regression. The old bucket started at
+    ``rpm`` (600), so a fan-out could emit 600 instantly *plus* 600 more refilled
+    across the next 60s — ~2x the published per-minute limit inside one
+    provider-side fixed window. Capacity is now ``min(max_concurrent, rpm)``, so
+    the worst case over any 60s window is ``max_concurrent + rpm`` (8 + 600 =
+    608, ~1.3% over), not ``2 * rpm``.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    configure_rate_limit(max_concurrent=8, rpm=600)
+
+    bucket = GlobalRateLimiter._get_rpm_bucket("openai")
+    assert bucket is not None
+    assert bucket._level == 8.0  # full at the concurrency-width capacity, not 600
+
+    # Drain the burst: exactly ``max_concurrent`` requests go straight through...
+    for _ in range(8):
+        assert bucket._try_acquire(1.0) == 0.0
+    # ...and the 9th must wait for refill — the bucket cannot bank a full minute.
+    assert bucket._try_acquire(1.0) > 0.0
+
+    # Even after an arbitrarily long idle stretch the level caps at capacity (8),
+    # never back to 600 — so the post-idle burst stays bounded at 8, not rpm.
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 100_000.0)
+    bucket._refill_locked()
+    assert bucket._level == 8.0
+
+
+async def test_tpm_burst_reservoir_is_one_second_not_a_full_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idle TPM reservoir is ~1 second of tokens, not a whole minute.
+
+    The token-dimension half of the same regression: the bucket no longer starts
+    at ``tpm`` (a full minute, spendable in a burst before throttling) but at
+    ``tpm * _TPM_BURST_SECONDS / 60`` — a one-second reservoir — so an idle bucket
+    can bank at most ~1.7% of ``tpm`` above the sustained rate.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    configure_rate_limit(tpm=6_000)
+
+    bucket = GlobalRateLimiter._get_tpm_bucket("openai")
+    assert bucket is not None
+    assert bucket._level == 100.0  # tpm/60, the 1s reservoir — not 6000
+
+    # The cap also bounds refill: after a long idle the reservoir tops out at the
+    # 1s capacity, never back at a full minute's tokens.
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 100_000.0)
+    bucket._refill_locked()
+    assert bucket._level == 100.0
+
+
 def test_rate_limit_slot_record_tokens_is_noop_without_bucket() -> None:
     """A slot with no TPM bucket (or no tokens) records nothing and never raises."""
     RateLimitSlot().record_tokens(1_234)
@@ -537,12 +593,14 @@ async def test_rpm_acquire_debits_the_request_bucket(
 ) -> None:
     """An RPM-configured acquire deducts one request token from the provider bucket."""
     monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
-    configure_rate_limit(rpm=120)  # capacity 120, 2 requests/sec
+    # Burst capacity is the concurrency width min(max_concurrent=8, rpm=120) = 8,
+    # NOT a full minute's quota — so the bucket starts at 8, not 120.
+    configure_rate_limit(rpm=120)  # 2 requests/sec sustained; burst 8
 
     async with GlobalRateLimiter.acquire_async("openai"):
         pass
 
-    assert GlobalRateLimiter._rpm_buckets["openai"]._level == 119.0
+    assert GlobalRateLimiter._rpm_buckets["openai"]._level == 7.0  # 8 - 1
 
 
 async def test_tpm_slot_records_against_provider_bucket(
@@ -550,28 +608,32 @@ async def test_tpm_slot_records_against_provider_bucket(
 ) -> None:
     """``slot.record_tokens`` debits the provider's TPM bucket by the usage."""
     monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze
+    # Burst capacity is a 1s reservoir = tpm/60 = 100 tokens (not a full minute),
+    # so a 2000-token debit drives the level well negative — exactly the
+    # smoothing signal that makes the next caller wait. The debit *amount* (2000)
+    # is what this test pins; the start level is the small reservoir, not 6000.
     configure_rate_limit(tpm=6_000)
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(2_000)
 
-    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 4_000.0
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == -1_900.0  # 100 - 2000
 
 
 async def test_tpm_over_budget_blocks_then_clears(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spending past the minute budget drives the bucket negative so the gate waits."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    configure_rate_limit(tpm=6_000)  # 100 tokens/sec
+    configure_rate_limit(tpm=6_000)  # 100 tokens/sec sustained; burst 100 (1s)
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
-        slot.record_tokens(9_000)  # 3000 over the per-minute budget
+        slot.record_tokens(9_000)  # spends far past the small reservoir
 
     bucket = GlobalRateLimiter._tpm_buckets["openai"]
-    assert bucket._level == -3_000.0
+    assert bucket._level == -8_900.0  # 100 reservoir - 9000 spent
     assert bucket._try_budget() > 0.0  # the next caller would block
 
-    clock["t"] += 60.0  # a full minute refills 6000 tokens → back above zero
+    clock["t"] += 90.0  # +9000 tokens at 100/sec clears the 8900 deficit
     assert bucket._try_budget() == 0.0
 
 
@@ -580,15 +642,17 @@ async def test_tpm_budgets_are_independent_per_provider(
 ) -> None:
     """Draining one provider's TPM budget leaves another provider's untouched."""
     monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    configure_rate_limit(tpm=6_000)
+    configure_rate_limit(tpm=6_000)  # burst 100 (1s reservoir) per provider
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(6_000)  # drain openai
     async with GlobalRateLimiter.acquire_async("google") as slot:
-        slot.record_tokens(1_000)  # google has its own full budget
+        slot.record_tokens(1_000)  # google has its own full reservoir
 
-    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 0.0
-    assert GlobalRateLimiter._tpm_buckets["google"]._level == 5_000.0
+    # Each provider's debit lands only on its own bucket (independence is the
+    # point); both start from the same 100-token reservoir.
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == -5_900.0  # 100 - 6000
+    assert GlobalRateLimiter._tpm_buckets["google"]._level == -900.0  # 100 - 1000
 
 
 async def test_disabled_skips_rpm_and_tpm_dimensions() -> None:
@@ -633,7 +697,8 @@ async def test_call_layer_debits_tpm_from_response_usage(
         )
 
     assert text == "hi"
-    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 4_000.0
+    # 1s reservoir (tpm/60 = 100) minus the response's 2000-token usage.
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == -1_900.0
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +741,12 @@ async def test_tpm_budget_shared_across_key_casings(
 ) -> None:
     """Tokens recorded under "OPENAI" are visible to a "openai" acquirer's bucket."""
     monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    configure_rate_limit(tpm=6_000)
+    # tpm chosen so the 1s reservoir (tpm/60 = 4000) comfortably holds both
+    # debits: the first call must leave the *shared* bucket positive, or the
+    # second casing's TPM gate would (correctly) block waiting for refill — which
+    # under this frozen clock would never come. The sharing/casefold invariant,
+    # not the gate's blocking, is what this test pins.
+    configure_rate_limit(tpm=240_000)
 
     async with GlobalRateLimiter.acquire_async("OPENAI") as slot:
         slot.record_tokens(2_000)
@@ -684,7 +754,9 @@ async def test_tpm_budget_shared_across_key_casings(
         slot.record_tokens(1_000)
 
     assert set(GlobalRateLimiter._tpm_buckets) == {"openai"}
-    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 3_000.0
+    # Both debits land on the one shared (casefolded) bucket: 4000 reservoir
+    # minus 2000 minus 1000.
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 1_000.0
 
 
 async def test_concurrency_semaphore_shared_across_key_casings() -> None:

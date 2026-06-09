@@ -66,6 +66,23 @@ cost of unbounded per-provider history; for a thin, local-first limiter whose
 job is to *smooth* fan-out under a metered ceiling (not to bill), the bucket's
 constant-memory approximation is the right trade.
 
+The bucket's **capacity is the burst depth, deliberately decoupled from the
+per-minute number.** A bucket admits up to ``capacity + rate * T`` events in any
+window of length ``T``, so a capacity of a full minute's quota (``= rpm`` /
+``= tpm``) would let a cold or idle bucket emit ~2x the published per-minute
+limit inside one provider-side fixed-minute window — breaking the "set them to
+your account's published RPM/TPM" guidance for a bursty-after-idle workload.
+Instead the burst is sized small: RPM caps it at the concurrency width
+(``min(max_concurrent, rpm)``, since the RPM gate is passed before the
+concurrency semaphore) and TPM at a one-second reservoir
+(``_TPM_BURST_SECONDS``), so the worst-case overshoot is a small constant above
+the sustained rate, not 2x. Each bucket still starts *full* at that small
+capacity, so a quiet process's first call (and a cold fan-out up to
+``max_concurrent``) never waits — only the empty-start alternative would. A
+strict fixed-window provider therefore still sees a small burst above sustained,
+so a workload known to be bursty against such a provider wants a little
+headroom; the residual is documented in ``docs/planning/opinions.md`` §6.4.
+
 Single-tenant by design; deliberate non-goals
 ----------------------------------------------
 llmkit is designed for **single-tenant** applications: one credential per
@@ -106,6 +123,19 @@ def _now() -> float:
     without real sleeping.
     """
     return time.monotonic()
+
+
+#: Burst depth for a TPM bucket, expressed in seconds of the sustained rate:
+#: ``capacity = tpm * _TPM_BURST_SECONDS / 60``. A one-second reservoir keeps the
+#: worst-case per-window overshoot to ~1.7% of ``tpm`` instead of the 2x a
+#: full-minute capacity (``= tpm``) would allow after an idle stretch. TPM debits
+#: *after* the call and gates only while exhausted, so even this small reservoir
+#: never makes a quiet process's first call wait — capacity only bounds how much
+#: an idle bucket may bank. (RPM's burst is the concurrency width instead — see
+#: :meth:`GlobalRateLimiter._get_rpm_bucket` — because requests have a
+#: concurrency analog and tokens do not.) Decoupling capacity from the per-minute
+#: number is the burst-semantics decision recorded in opinions.md §6.4.
+_TPM_BURST_SECONDS: float = 1.0
 
 
 def _normalize_key(provider_key: str) -> str:
@@ -410,7 +440,18 @@ class GlobalRateLimiter:
                 return None
             bucket = cls._rpm_buckets.get(key)
             if bucket is None:
-                bucket = _RateBucket(rate_per_sec=rpm / 60.0, capacity=float(rpm))
+                # Burst = the concurrency width, not a full minute's quota. The
+                # RPM gate is passed *before* the concurrency semaphore, so
+                # capacity bounds how many requests race to the provider before
+                # the bucket throttles to the sustained rate; there is no point
+                # letting that exceed ``max_concurrent`` (the burst llmkit
+                # already tolerates). ``min`` with ``rpm`` keeps a mis-sized
+                # ``max_concurrent`` > ``rpm`` from reintroducing a >2x overshoot.
+                # Starting full at this smaller capacity lets a cold fan-out of up
+                # to ``max_concurrent`` go immediately while an idle bucket can
+                # never bank a whole minute (the ~2x-after-idle bug). See §6.4.
+                capacity = float(min(cls._max_concurrent, rpm))
+                bucket = _RateBucket(rate_per_sec=rpm / 60.0, capacity=capacity)
                 cls._rpm_buckets[key] = bucket
             return bucket
 
@@ -423,7 +464,16 @@ class GlobalRateLimiter:
                 return None
             bucket = cls._tpm_buckets.get(key)
             if bucket is None:
-                bucket = _RateBucket(rate_per_sec=tpm / 60.0, capacity=float(tpm))
+                # Burst = a one-second reservoir, not a full minute of tokens.
+                # TPM debits *after* the call and gates only while exhausted, so
+                # even this small reservoir lets the first call (and a concurrent
+                # first wave, bounded by ``max_concurrent``) through and then
+                # smooths to the sustained rate; capacity only caps how much an
+                # idle bucket banks, so a small one holds the per-window overshoot
+                # to ~1.7% of ``tpm`` instead of the 2x a full-minute capacity
+                # allowed after idle. See ``_TPM_BURST_SECONDS`` and §6.4.
+                capacity = tpm * _TPM_BURST_SECONDS / 60.0
+                bucket = _RateBucket(rate_per_sec=tpm / 60.0, capacity=capacity)
                 cls._tpm_buckets[key] = bucket
             return bucket
 
