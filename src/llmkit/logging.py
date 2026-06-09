@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +29,54 @@ import yaml
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOG_DIR = Path("data/llm-logs")
+
+# Bounded retry budget for the exclusive-create filename loop: a uuid4 suffix
+# collision is astronomically unlikely, so a handful of attempts is plenty
+# while still guaranteeing the loop terminates.
+_MAX_FILENAME_ATTEMPTS = 8
+
+# Matches a run of characters that are unsafe in a path component: path
+# separators, control characters (incl. CR/LF), and other filesystem-hostile
+# punctuation. Collapsed to a single "_" so names stay readable.
+_UNSAFE_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f/\\<>:\"|?*]+")
+# Strips the leading/trailing "_" and collapses any "." runs that remain so a
+# value can never resolve to "." / ".." or a hidden traversal segment.
+_DOT_RUN = re.compile(r"\.+")
+
+# Matches control characters (CR, LF, tabs, NUL, etc.) for one-lining values
+# interpolated into the "#" header comment, so a value can't forge a second
+# comment line.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _safe_path_component(value: str) -> str:
+    """Neutralize *value* so it is safe as a single filename component.
+
+    Path separators (``/``, ``\\``, :data:`os.sep`), control characters, and
+    other filesystem-hostile punctuation are replaced with ``_``; ``.`` runs
+    are collapsed to a single ``_`` so the result can never be ``.``/``..`` or
+    a hidden traversal segment. The output stays human-readable and is
+    guaranteed to contain no directory separators, so composing it into a path
+    cannot escape ``log_dir``. Empty/all-unsafe input degrades to ``"_"``.
+    """
+    cleaned = _UNSAFE_PATH_CHARS.sub("_", value)
+    cleaned = cleaned.replace(os.sep, "_")
+    if os.altsep:
+        cleaned = cleaned.replace(os.altsep, "_")
+    cleaned = _DOT_RUN.sub("_", cleaned)
+    cleaned = cleaned.strip("_")
+    return cleaned or "_"
+
+
+def _oneline(value: str) -> str:
+    """Collapse CR/LF and other control characters in *value* to single spaces.
+
+    Used on every caller-derived field interpolated into the ``#`` header
+    comment so a value containing a newline cannot forge a second
+    ``# ok | ...`` verdict line and corrupt the ``head -1`` triage.
+    """
+    return _CONTROL_CHARS.sub(" ", value).strip()
+
 
 # Compact append-only summary sibling to the per-call YAML files: one JSON
 # line per call, so cross-call scans don't have to glob + parse every YAML.
@@ -134,12 +185,20 @@ class LocalYamlLogSink:
         cross-reference it, without that file detail leaking into the shared
         :class:`LogSink` contract. ``None`` is returned when the write
         failed (best-effort: logging must never break the LLM call).
+
+        The filename is ``{timestamp}_{feature}_{label}_{uniquifier}.yaml``:
+        the microsecond ``started_at`` stamp keeps the directory naturally
+        sortable, ``feature``/``label`` are sanitized with
+        :func:`_safe_path_component` so neither can escape ``log_dir``, and a
+        short ``uuid4`` suffix plus exclusive-create (``mode="x"``) retry loop
+        guarantees two records can never share a path or silently overwrite
+        each other.
         """
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
             ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
-            safe_label = (record.label or "unlabeled").replace(".", "_").replace("/", "_")
-            filepath = self.log_dir / f"{ts}_{record.feature}_{safe_label}.yaml"
+            safe_feature = _safe_path_component(record.feature)
+            safe_label = _safe_path_component(record.label or "unlabeled")
 
             # Verdict-first order: cheap, high-signal metadata up top; the
             # large ``response``/``prompt`` blobs last (``response`` first —
@@ -159,16 +218,39 @@ class LocalYamlLogSink:
                 "response": cast("object", record.response),
                 "prompt": record.prompt,
             }
+            header = self._summary_header(record)
 
-            with open(filepath, "w") as f:
-                _ = f.write(self._summary_header(record))
-                yaml.dump(
-                    doc,
-                    f,
-                    default_flow_style=False,
-                    sort_keys=False,
-                    allow_unicode=True,
-                    width=120,
+            # Exclusive-create (``mode="x"``) so a path collision raises
+            # FileExistsError instead of truncating an existing log. The
+            # uuid4 suffix makes a collision astronomically unlikely; the
+            # bounded loop regenerates it on the off chance one happens, so
+            # even then no record is ever overwritten.
+            filepath: Path | None = None
+            for _attempt in range(_MAX_FILENAME_ATTEMPTS):
+                candidate = (
+                    self.log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
+                )
+                try:
+                    with open(candidate, "x") as f:
+                        _ = f.write(header)
+                        yaml.dump(
+                            doc,
+                            f,
+                            default_flow_style=False,
+                            sort_keys=False,
+                            allow_unicode=True,
+                            width=120,
+                        )
+                except FileExistsError:
+                    # Suffix collision — regenerate and retry; never overwrite.
+                    continue
+                filepath = candidate
+                break
+            if filepath is None:
+                # Exhausted the retry budget without a free name (should be
+                # unreachable in practice). Best-effort: skip the write.
+                raise OSError(
+                    f"could not allocate a unique log filename after {_MAX_FILENAME_ATTEMPTS} attempts"
                 )
         except (OSError, yaml.YAMLError):
             logger.warning(
@@ -191,12 +273,22 @@ class LocalYamlLogSink:
         The first line is a single-glance verdict — ``ok``/``ERROR``,
         feature/label, resolved model, schema, duration, approximate cost —
         so ``head -1`` across the directory triages a whole run.
+
+        Every caller-derived field (feature, label, model, schema) is passed
+        through :func:`_oneline` so a value containing a newline cannot forge
+        a second ``# ok | ...`` verdict line and corrupt that triage. The
+        second line is the ISO ``started_at`` stamp, which is machine-built
+        and contains no newlines.
         """
         status = "ERROR" if record.error else "ok"
         cost = f"${record.approximate_cost:.3g}" if record.approximate_cost is not None else "$?"
+        feature = _oneline(record.feature)
+        label = _oneline(record.label or "unlabeled")
+        model = _oneline(record.model or "?")
+        schema = _oneline(record.schema)
         return (
-            f"# {status} | {record.feature}/{record.label or 'unlabeled'} | "
-            f"{record.model or '?'} | {record.schema} | "
+            f"# {status} | {feature}/{label} | "
+            f"{model} | {schema} | "
             f"{round(record.duration_ms)}ms | {cost}\n"
             f"# {record.started_at.isoformat()}\n\n"
         )
