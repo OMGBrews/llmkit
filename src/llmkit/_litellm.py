@@ -291,7 +291,10 @@ async def acompletion_text(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             temperature=temperature,
-            max_tokens=max_tokens,
+            # Gate max_tokens like the structured/stream paths: an unset cap
+            # sends no ``max_tokens`` key at all (not an explicit ``None``), so
+            # the request stays byte-identical to prior behaviour.
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **creds,
             **({"reasoning_effort": effort} if effort is not None else {}),
         )

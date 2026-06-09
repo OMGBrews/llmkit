@@ -7,6 +7,9 @@
 * the transport (``acompletion_structured``) only puts ``max_tokens`` on the
   provider request when it is not ``None`` — so the default produces a
   request byte-identical to the prior behaviour (no ``max_tokens`` key).
+
+The plain-text transport (``acompletion_text``) gates ``max_tokens`` the same
+way, so all three call paths agree on the "unset cap sends no key" invariant.
 """
 
 from __future__ import annotations
@@ -146,4 +149,46 @@ def _capture_provider_kwargs(*, max_tokens: int | None) -> dict[str, object]:
             )
         )
     assert parsed.ok is True
+    return seen
+
+
+def test_text_transport_omits_max_tokens_when_none() -> None:
+    """Parity with the structured path: at the ``acompletion_text`` seam a
+    ``None`` cap sends **no** ``max_tokens`` kwarg (absent, not an explicit
+    ``None``) — byte-identical to the pre-feature request."""
+    seen = _capture_text_provider_kwargs(max_tokens=None)
+    assert "max_tokens" not in seen
+
+
+def test_text_transport_includes_max_tokens_when_set() -> None:
+    """A concrete cap reaches the plain-text provider call kwargs unchanged."""
+    seen = _capture_text_provider_kwargs(max_tokens=16)
+    assert seen["max_tokens"] == 16
+
+
+def _capture_text_provider_kwargs(*, max_tokens: int | None) -> dict[str, object]:
+    """Drive ``acompletion_text`` over a faked ``litellm.acompletion`` and
+    return the kwargs the provider request saw."""
+    from llmkit import _litellm
+
+    seen: dict[str, object] = {}
+    fake_resp = MagicMock(_hidden_params={})
+    fake_resp.choices = [MagicMock(message=MagicMock(content="ok"))]
+
+    async def _fake_acompletion(**kwargs: object) -> MagicMock:
+        seen.update(kwargs)
+        return fake_resp
+
+    provider = MagicMock()
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k", "api_base": None})
+    provider.litellm_model = MagicMock(return_value="fake/model")
+    provider.reasoning_effort = None
+
+    with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
+        text, _cost = asyncio.run(
+            _litellm.acompletion_text(
+                "hi", temperature=0.0, model=None, max_tokens=max_tokens, provider=provider
+            )
+        )
+    assert text == "ok"
     return seen
