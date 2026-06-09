@@ -32,9 +32,11 @@ import asyncio
 import subprocess
 import sys
 import textwrap
+import time
 from collections.abc import Coroutine
 from typing import Protocol, cast
 
+import pytest
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 from llmkit.sync import run_sync
@@ -163,3 +165,32 @@ def test_call_error_propagates_through_drain() -> None:
     except ValueError as exc:
         raised = exc.args == ("boom",)
     assert raised
+
+
+def test_running_loop_timeout_releases_caller_promptly() -> None:
+    """On the worker-thread path a timeout unblocks the caller at the deadline.
+
+    Regression: ``run_sync`` previously drove the worker through a
+    ``with ThreadPoolExecutor(...)`` block, whose ``__exit__`` calls
+    ``shutdown(wait=True)`` — so a ``TimeoutError`` could not leave the frame
+    until the (still-running) coroutine finished, silently defeating ``timeout``.
+    The executor is now torn down with ``wait=False`` so the error propagates at
+    the deadline while the abandoned worker drains in the background.
+    """
+
+    async def _slow(value: int) -> int:
+        await asyncio.sleep(1.5)  # comfortably past the timeout below
+        return value
+
+    async def _outer() -> None:
+        # Inside a running loop -> the ThreadPoolExecutor branch.
+        start = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _ = run_sync(_slow(99), timeout=0.2)
+        elapsed = time.monotonic() - start
+        # Must unblock near the 0.2s deadline, not after the ~1.5s call.
+        assert elapsed < 1.0, (
+            f"timeout took {elapsed:.2f}s — executor blocked on shutdown(wait=True)"
+        )
+
+    asyncio.run(_outer())

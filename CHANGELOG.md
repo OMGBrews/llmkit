@@ -458,6 +458,46 @@ flip a default or move a symbol — review these first:
   'anthropic'` on the first call, because the SDK `instructor` requires for
   `ANTHROPIC_JSON` usage accounting was never declared as a dependency. A clean
   `pip install omg-llmkit` can now call the Anthropic provider out of the box.
+- **A `*_sync` call made from inside a running event loop now honors its
+  `timeout`.** On that path `run_sync` drove the worker through a
+  `with ThreadPoolExecutor(...)` block whose `__exit__` calls
+  `shutdown(wait=True)`, so a timed-out `future.result(timeout=...)` could not
+  return until the in-flight provider request finished — the `timeout` argument
+  was effectively inert in the documented async-framework case, contradicting
+  the docstring. The executor is now torn down with `wait=False`, so a
+  `TimeoutError` reaches the caller at the deadline while the abandoned worker
+  drains in the background (one leaked non-daemon thread + request until they
+  finish on their own, as the docstring already warned).
+- **A streaming text call no longer dies with `IndexError` on an empty-`choices`
+  chunk.** `_chunk_delta_text` indexed `chunk.choices[0]` unconditionally, but
+  LiteLLM preserves an explicitly empty `choices=[]` — which the first-class
+  Gemini provider emits for metadata-only / keepalive frames. The error is not
+  in the retry set and, once any content has been yielded, was re-raised
+  unretried, killing the stream mid-flight and discarding partial output. Such a
+  frame is now skipped (treated as an empty delta).
+- **A non-streaming text completion no longer crashes with `IndexError` on an
+  empty-`choices` response.** `acompletion_text` read `response.choices[0]`
+  before the `None` → `""` coercion, so a degenerate `{"choices": []}` body
+  (e.g. from a malformed OpenAI-compatible proxy) raised instead of degrading to
+  an empty string. The index is now guarded.
+- **Per-call YAML logs are written as UTF-8.** The per-call log file was opened
+  with `open(candidate, "x")` (platform-default encoding) while the dump emits
+  raw non-ASCII (`allow_unicode=True`), so on a non-UTF-8 host any call
+  containing emoji/accents/CJK raised `UnicodeEncodeError` — which, subclassing
+  `ValueError`, escaped both the `OSError`/`YAMLError` handlers, bypassing
+  orphan cleanup and the index write. The file is now opened with
+  `encoding="utf-8"` (matching the index writer) and the handlers also catch
+  `UnicodeError` so any residual encode failure still cleans up and degrades.
+- **`model_from_json_schema`'s default dump no longer drops an explicitly-null
+  *required* field.** The generated model's `model_dump`/`model_dump_json`
+  excluded *every* `None` to keep an unset optional from round-tripping as
+  `"field": null` — but that also dropped a field in the schema's `required`
+  array that is legitimately nullable (`["string", "null"]` or an `anyOf` null
+  branch) and set to `None`, so `model(a=None).model_dump()` returned `{}` and
+  then failed re-validation with `'a' is a required property` — the exact
+  footgun the exclusion exists to prevent, inverted. The drop is now scoped to
+  optional fields; a required null is kept. `exclude_none=False` (keep every
+  null) and `exclude_none=True` (drop every null) remain available explicitly.
 
 ## [0.1.2] — 2026-06-05
 

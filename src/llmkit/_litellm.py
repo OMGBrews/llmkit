@@ -194,6 +194,13 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
     here so the streaming loop reads a precise ``str | None`` — the one place
     that knows the litellm stream object's shape (raw-llm).
     """
+    if not chunk.choices:
+        # Metadata-only / keepalive frames carry no choice to index — e.g. the
+        # Gemini provider emits ``ModelResponseStream(choices=[])`` for frames
+        # with no candidate. Return ``None`` so the streaming loop's ``if delta:``
+        # skips the frame, rather than raising ``IndexError`` and killing the
+        # stream mid-flight (the error is not retried once content has yielded).
+        return None
     choice: StreamingChoices = chunk.choices[0]
     delta: Delta = choice.delta
     return cast("str | None", delta.content)
@@ -307,7 +314,10 @@ async def acompletion_text(
         # and .usage are precise.
         response = cast("ModelResponse", resp)
         slot.record_tokens(_total_tokens(response))
-    content = response.choices[0].message.content
+    # Guard the index: a degenerate empty-``choices`` response (e.g. a malformed
+    # OpenAI-compatible proxy returning ``{"choices": []}``) would otherwise raise
+    # ``IndexError`` here, bypassing the ``None`` -> "" coercion below.
+    content = response.choices[0].message.content if response.choices else None
     return _coerce_text_content(content), _response_cost(response)
 
 

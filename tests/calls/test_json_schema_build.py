@@ -260,6 +260,14 @@ def test_required_nullable_list_form_accepts_null() -> None:
     assert _attr(model(a=None), "a") is None
     assert _attr(model(a="x"), "a") == "x"
 
+    # An explicitly-null REQUIRED field must SURVIVE the default dump: the
+    # exclude-none scoping drops only unset *optionals*, never a required null
+    # (dropping it would break the re-validation this module exists to protect).
+    assert model(a=None).model_dump() == {"a": None}
+    assert "null" in model(a=None).model_dump_json()
+    revalidated = model.model_validate(model(a=None).model_dump())
+    assert _attr(revalidated, "a") is None
+
 
 def test_required_nullable_anyof_form_accepts_null() -> None:
     """Same, via the ``anyOf`` + null-branch shape."""
@@ -273,6 +281,34 @@ def test_required_nullable_anyof_form_accepts_null() -> None:
     assert model.model_fields["a"].is_required()
     assert _attr(model(a=None), "a") is None
     assert _attr(model(a="x"), "a") == "x"
+
+    # Required null survives the default dump and re-validates cleanly.
+    assert model(a=None).model_dump() == {"a": None}
+    assert model.model_validate(model(a=None).model_dump()) is not None
+
+
+def test_required_null_and_unset_optional_dump_independently() -> None:
+    """A model mixing a required-nullable null with an unset optional drops only
+    the optional — the required null stays, so the payload re-validates."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "req": {"type": ["string", "null"]},
+            "opt": {"type": "string"},
+        },
+        "required": ["req"],
+    }
+    model = model_from_json_schema(schema)
+    inst = model(req=None)
+    # Required null kept; unset optional dropped.
+    assert inst.model_dump() == {"req": None}
+    # Escape hatch still surfaces every null.
+    assert inst.model_dump(exclude_none=False) == {"req": None, "opt": None}
+    # Native "drop all nulls" remains available when explicitly requested.
+    assert inst.model_dump(exclude_none=True) == {}
+    # The default payload re-validates against the same model.
+    assert model.model_validate(inst.model_dump()).model_dump() == {"req": None}
 
 
 # --- anyOf/oneOf nullable shape (optional) ---------------------------------

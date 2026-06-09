@@ -155,8 +155,24 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
         # parent context the worker never sees). The captured lists are shared by
         # reference, so the worker's appends are visible to the caller on return.
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(ctx.run, run_in_new_loop)
+        # Deliberately *not* a ``with`` block. The context manager's ``__exit__``
+        # calls ``executor.shutdown(wait=True)``, which blocks until the worker
+        # thread (still driving the in-flight provider request) finishes — so on
+        # the timeout path the ``TimeoutError`` could not leave this frame until
+        # the very call it was meant to abandon completed, silently defeating
+        # ``timeout``. Instead we shut down with ``wait=False`` so the error
+        # reaches the caller at the deadline while the abandoned worker drains on
+        # its own, matching the ``.. warning::`` contract in this docstring.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(ctx.run, run_in_new_loop)
+        try:
             return future.result(timeout=timeout)
+        finally:
+            # ``wait=False``: an already-running future cannot be cancelled, so
+            # never block teardown on it. On timeout this lets the ``TimeoutError``
+            # propagate immediately; on success the worker is already done and
+            # this is a no-op. The abandoned worker is a non-daemon thread and
+            # keeps the interpreter alive at exit until the call completes.
+            executor.shutdown(wait=False)
     else:
         return _run_and_drain(coro, timeout=timeout)

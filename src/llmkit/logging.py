@@ -235,7 +235,7 @@ class LocalYamlLogSink:
                     self.log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
                 )
                 try:
-                    with open(candidate, "x") as f:
+                    with open(candidate, "x", encoding="utf-8") as f:
                         _ = f.write(header)
                         yaml.dump(
                             doc,
@@ -248,11 +248,12 @@ class LocalYamlLogSink:
                 except FileExistsError:
                     # Suffix collision — regenerate and retry; never overwrite.
                     continue
-                except (OSError, yaml.YAMLError):
-                    # A mid-write failure (disk full, encode error) leaves a
-                    # truncated file behind under the exclusive-create name.
-                    # Remove the orphan before degrading so the log dir never
-                    # accumulates empty/partial YAML, then re-raise to the
+                except (OSError, yaml.YAMLError, UnicodeError):
+                    # A mid-write failure (disk full, or a residual encode error
+                    # such as un-encodable surrogates even on the utf-8 stream)
+                    # leaves a truncated file behind under the exclusive-create
+                    # name. Remove the orphan before degrading so the log dir
+                    # never accumulates empty/partial YAML, then re-raise to the
                     # best-effort handler below.
                     candidate.unlink(missing_ok=True)
                     raise
@@ -264,7 +265,7 @@ class LocalYamlLogSink:
                 raise OSError(
                     f"could not allocate a unique log filename after {_MAX_FILENAME_ATTEMPTS} attempts"
                 )
-        except (OSError, yaml.YAMLError):
+        except (OSError, yaml.YAMLError, UnicodeError):
             logger.warning(
                 "Failed to write LLM invocation log for %s/%s",
                 record.feature,

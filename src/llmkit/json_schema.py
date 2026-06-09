@@ -65,10 +65,16 @@ The generated model maps a **non-required** JSON-schema field to an
 optional from round-tripping back out as ``"field": null`` — which fails
 re-validation against a JSON schema that lists the field as a non-nullable
 optional — the generated model's :meth:`~pydantic.BaseModel.model_dump`
-and :meth:`~pydantic.BaseModel.model_dump_json` default to
-``exclude_none=True``. An optional the model never set is therefore
-*absent* from the dump, not present-and-null. Callers who genuinely want
-the nulls back can pass ``exclude_none=False`` explicitly.
+and :meth:`~pydantic.BaseModel.model_dump_json` drop such ``None`` values by
+default. An optional the model never set is therefore *absent* from the dump,
+not present-and-null.
+
+The drop is **scoped to optional fields**: a field that is in the schema's
+``required`` array but typed nullable (``["string", "null"]`` or an ``anyOf``
+null branch) and legitimately set to ``None`` is **kept**, because dropping a
+required field would itself break re-validation. Callers can pass
+``exclude_none=False`` to keep every null, or ``exclude_none=True`` for the
+native "drop all nulls" behaviour.
 """
 
 from __future__ import annotations
@@ -77,9 +83,17 @@ import keyword
 import re
 from collections.abc import Callable, Mapping
 from enum import Enum
-from typing import Any, ClassVar, Literal, NamedTuple, TypedDict, Unpack, cast, override
+from typing import Any, ClassVar, Literal, NamedTuple, Self, TypedDict, Unpack, cast, override
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, create_model
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializationInfo,
+    create_model,
+    model_serializer,
+)
 
 __all__ = ["model_from_json_schema"]
 
@@ -182,36 +196,117 @@ class _FieldConstraints(NamedTuple):
     max_length: int | None = None
 
 
+# Serialization-context key carrying the None-dropping directive from the dump
+# overrides down into the ``model_serializer`` — the one place that can drop a
+# field per-class across arbitrary nesting (pydantic drives nested models
+# through the core serializer, not the Python ``model_dump`` method, so a
+# top-level post-filter could never reach them). Values:
+#   "optional" — drop ``None`` only for fields *not* in the schema's ``required``
+#                array (the default; keeps an explicitly-null required field).
+#   "all"      — drop every ``None`` (native ``exclude_none=True`` semantics).
+#   "keep"     — drop nothing (the ``exclude_none=False`` escape hatch).
+_DROP_DIRECTIVE_KEY = "__llmkit_none_directive__"
+
+
+def _none_directive(exclude_none: bool | None) -> str:
+    """Map the ``exclude_none`` tri-state to a serializer directive."""
+    if exclude_none is None:
+        return "optional"
+    return "all" if exclude_none else "keep"
+
+
+def _with_directive(context: object, exclude_none: bool | None) -> object:
+    """Thread the None-dropping directive into the serialization ``context``.
+
+    Merges into a caller-supplied ``dict`` context (preserving their keys) or
+    starts a fresh one. A non-dict context is left untouched — our generated
+    models carry no field serializer that consumes a custom context, so the
+    serializer simply falls back to the default ``"optional"`` directive.
+    """
+    directive = _none_directive(exclude_none)
+    if context is None:
+        return {_DROP_DIRECTIVE_KEY: directive}
+    if isinstance(context, dict):
+        merged = dict(cast("dict[str, object]", context))
+        merged[_DROP_DIRECTIVE_KEY] = directive
+        return merged
+    return context
+
+
+def _read_directive(context: object) -> str:
+    """Recover the directive a dump override stowed in the context."""
+    if isinstance(context, dict):
+        value = cast("dict[str, object]", context).get(_DROP_DIRECTIVE_KEY)
+        if isinstance(value, str):
+            return value
+    return "optional"
+
+
 class _JsonSchemaModel(BaseModel):
-    """Base for every generated model: dumps exclude ``None`` by default.
+    """Base for every generated model: drops *optional* ``None`` on dump.
 
     A non-required JSON-schema field becomes an optional Pydantic field
-    defaulting to ``None``. Defaulting dumps to ``exclude_none=True`` keeps
-    an unset optional *absent* from the output rather than serialising as
-    ``"field": null`` (footgun #1 — that null then fails downstream
-    re-validation against the same JSON schema). Pass ``exclude_none=False``
-    to opt back in to the nulls.
+    defaulting to ``None``. Dumping drops such an unset optional rather than
+    serialising it as ``"field": null`` (footgun #1 — that null then fails
+    downstream re-validation against the same JSON schema).
+
+    Crucially the drop is *scoped to optional fields*: a field that is in the
+    schema's ``required`` array but typed nullable (``["string", "null"]`` / an
+    ``anyOf`` null branch) and legitimately set to ``None`` is **kept**, because
+    dropping it would itself break re-validation (``'field' is a required
+    property``) — the very failure this class exists to prevent. Pass
+    ``exclude_none=False`` to keep every null, or ``exclude_none=True`` for the
+    native "drop all nulls" behaviour.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", use_enum_values=True)
+
+    # Field names OPTIONAL in the source schema (absent from its ``required``
+    # array) — the only fields whose ``None`` is safe to drop. The builder
+    # stamps the real set onto each generated subclass; the empty default makes
+    # the base classes themselves drop nothing. A dunder name so pydantic skips
+    # it as a field and it is exempt from name mangling.
+    __llmkit_optional_fields__: ClassVar[frozenset[str]] = frozenset()
+
+    @model_serializer(mode="wrap")
+    def _drop_none(
+        self,
+        handler: Callable[[Self], dict[str, Any]],  # pyright: ignore[reportExplicitAny]  # raw-pydantic — wrap-serializer handler returns the dynamic dump dict
+        info: SerializationInfo,
+    ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
+        data = handler(self)
+        directive = _read_directive(info.context)
+        if directive == "keep":
+            return data
+        if directive == "all":
+            return {k: v for k, v in data.items() if v is not None}  # pyright: ignore[reportAny]  # raw-pydantic — dump values are dict[str, Any]
+        # "optional": keep an explicitly-null *required* field (dropping it
+        # would break re-validation); drop only unset optionals.
+        droppable = type(self).__llmkit_optional_fields__
+        return {k: v for k, v in data.items() if v is not None or k not in droppable}  # pyright: ignore[reportAny]  # raw-pydantic — dump values are dict[str, Any]
 
     @override
     def model_dump(
         self,
         *,
-        exclude_none: bool = True,
+        exclude_none: bool | None = None,
         **kwargs: Unpack[_DumpKwargs],
     ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_dump's dict[str, Any] return
-        return super().model_dump(exclude_none=exclude_none, **kwargs)
+        # Do not forward ``exclude_none`` to pydantic: the serializer above is
+        # the single source of truth for None-dropping (so nested models obey
+        # the same rule). Translate it into the context directive instead.
+        kwargs["context"] = _with_directive(kwargs.get("context"), exclude_none)
+        return super().model_dump(**kwargs)
 
     @override
     def model_dump_json(
         self,
         *,
-        exclude_none: bool = True,
+        exclude_none: bool | None = None,
         **kwargs: Unpack[_DumpJsonKwargs],
     ) -> str:
-        return super().model_dump_json(exclude_none=exclude_none, **kwargs)
+        kwargs["context"] = _with_directive(kwargs.get("context"), exclude_none)
+        return super().model_dump_json(**kwargs)
 
 
 class _JsonSchemaModelAllow(_JsonSchemaModel):
@@ -603,6 +698,10 @@ class _Converter:
         # is built at runtime and pydantic's factory is untyped here, so this
         # one dict carries ``Any`` deliberately.
         fields: dict[str, Any] = {}  # pyright: ignore[reportExplicitAny]  # raw-pydantic — create_model **field_definitions splat (runtime annotations)
+        # Optional field names (absent from ``required``) — stamped onto the
+        # generated class so its dump serializer drops only *these* fields'
+        # ``None``, never an explicitly-null required field.
+        optional_fields: set[str] = set()
         for prop_name, prop_schema in props.items():
             if not isinstance(prop_schema, dict):
                 raise ValueError(
@@ -626,6 +725,8 @@ class _Converter:
             # the supported keywords cross over; everything else is dropped.
             c = self._field_constraints(prop)
             optional = prop_name not in required
+            if optional:
+                optional_fields.add(prop_name)
             # Union with None when the field is nullable OR optional — the two
             # are independent: a REQUIRED nullable field must still accept the
             # provider's ``null``.
@@ -669,6 +770,7 @@ class _Converter:
         # field map lands every keyword argument on ``Any``. Confined and
         # documented here rather than scattered.
         model = create_model(model_name, __base__=base, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
+        model.__llmkit_optional_fields__ = frozenset(optional_fields)
         if ref_name is not None:
             self._built[ref_name] = model
         return model
