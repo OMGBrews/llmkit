@@ -167,6 +167,80 @@ def test_call_error_propagates_through_drain() -> None:
     assert raised
 
 
+def test_keyboard_interrupt_abandons_pending_call() -> None:
+    """Ctrl-C mid-call abandons the call; the teardown drain must not resume it.
+
+    A ``KeyboardInterrupt`` raised in a loop callback (how a signal lands in a
+    running loop) stops ``run_until_complete`` with the main task still
+    *pending*. Regression: the teardown drain then restarted the loop and
+    **resumed the interrupted call itself** — here the 0.3s remainder of the
+    call completes inside the 1s logging flush, setting the flag and leaving
+    its result unretrieved. Fixed, the bridge cancels-and-settles the main task
+    before any drain runs: the flag is never set, the original
+    ``KeyboardInterrupt`` propagates, and teardown stays far below the drain
+    timeout. The logging drain itself still runs (queue left empty).
+    """
+    completed: list[bool] = []
+
+    async def _interrupted_call() -> str:
+        loop = asyncio.get_running_loop()
+
+        def _interrupt() -> None:
+            raise KeyboardInterrupt
+
+        # The interrupt lands on the next loop iteration — i.e. while the call
+        # below is suspended in ``await``, exactly like SIGINT in a live loop.
+        _ = loop.call_soon(_interrupt)
+
+        async def _slow_handler() -> None:
+            await asyncio.sleep(1.0)
+
+        # Queued logging gives the teardown drain real work: the window in
+        # which the buggy bridge resumed the interrupted call.
+        _worker.ensure_initialized_and_enqueue(_slow_handler())
+        await asyncio.sleep(0.3)  # interrupted here; must never resume
+        completed.append(True)
+        return "should never complete"
+
+    start = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        _ = run_sync(_interrupted_call(), timeout=30)
+    elapsed = time.monotonic() - start
+
+    assert not completed, "interrupted call was resumed during teardown"
+    # Bounded by the ~1s logging flush, nowhere near the 30s drain budget.
+    assert elapsed < 5, f"teardown took {elapsed:.2f}s after interrupt"
+    queue = GLOBAL_LOGGING_WORKER._queue
+    assert queue is None or queue.qsize() == 0
+
+
+def test_settle_step_leaves_normal_paths_unchanged() -> None:
+    """The pre-drain settle is a no-op when the call finishes on its own.
+
+    Regression guard for the interrupt fix: a call that returns normally still
+    yields its result with the queued logging drained, and a call that raises
+    still propagates its own exception — the cancel-and-settle step only
+    engages when the loop was stopped with the main task pending.
+    """
+
+    async def _ok(value: int) -> int:
+        async def _async_success_handler() -> None:
+            return None
+
+        _worker.ensure_initialized_and_enqueue(_async_success_handler())
+        return value
+
+    assert run_sync(_ok(21)) == 21
+    queue = GLOBAL_LOGGING_WORKER._queue
+    assert queue is None or queue.qsize() == 0
+
+    async def _boom() -> int:
+        raise ValueError("still boom")
+
+    with pytest.raises(ValueError, match="still boom"):
+        _ = run_sync(_boom())
+
+
 def test_running_loop_timeout_releases_caller_promptly() -> None:
     """On the worker-thread path a timeout unblocks the caller at the deadline.
 

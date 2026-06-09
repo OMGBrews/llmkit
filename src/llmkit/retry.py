@@ -88,7 +88,15 @@ class RetryPolicy:
             including the first (``1`` = no retry). Defaults to ``2`` (one
             retry) — lower than ``max_attempts`` on purpose.
         backoff_base_seconds: Full-jitter backoff base; the sleep before
-            retry *n* is a random delay in ``[0, base * 2**(n-1)]``.
+            retry *n* is a random delay in
+            ``[0, min(base * 2**(n-1), max_backoff_seconds)]``.
+        max_backoff_seconds: Ceiling on any single backoff sleep. Caps the
+            exponential term so a large ``max_attempts`` can't grow the
+            worst-case sleep unboundedly (at the default base, attempt 15
+            would otherwise permit a multi-hour sleep). Defaults to 30
+            seconds — generous spacing for transient-error recovery while
+            bounding the worst case. Must be > 0; to disable backoff
+            entirely, set ``backoff_base_seconds=0`` instead.
         retry_on: The exception types treated as transient *transport*
             errors, retried against ``max_attempts``. Anything outside both
             sets (e.g. a programming error) propagates immediately. Defaults
@@ -101,6 +109,7 @@ class RetryPolicy:
     max_attempts: int = 3
     validation_max_attempts: int = 2
     backoff_base_seconds: float = 0.5
+    max_backoff_seconds: float = 30.0
     retry_on: tuple[type[BaseException], ...] = field(default=LLM_TRANSPORT_ERRORS)
     validation_retry_on: tuple[type[BaseException], ...] = field(default=LLM_SCHEMA_ERRORS)
 
@@ -111,6 +120,8 @@ class RetryPolicy:
             raise ValueError(
                 f"validation_max_attempts must be >= 1, got {self.validation_max_attempts}"
             )
+        if self.max_backoff_seconds <= 0:
+            raise ValueError(f"max_backoff_seconds must be > 0, got {self.max_backoff_seconds}")
 
 
 #: The budget applied when a call function's ``retry`` argument is left at
@@ -186,6 +197,7 @@ async def handle_retry_failure(
     max_attempts: int,
     error: BaseException,
     backoff_base_seconds: float,
+    max_backoff_seconds: float = 30.0,
 ) -> None:
     """Run the shared book-keeping for one *non-final* failed attempt.
 
@@ -199,6 +211,10 @@ async def handle_retry_failure(
     ``max_attempts`` is the budget the failing class is charged against
     (transport or validation), so the logged ``attempt/max_attempts`` pair
     reflects the actual ceiling for this error.
+
+    The full-jitter ceiling ``backoff_base_seconds * 2**(attempt-1)`` is
+    capped at ``max_backoff_seconds`` (default 30s), so a large attempt
+    budget can't grow the worst-case sleep unboundedly.
     """
     logger.warning("%s: attempt %d/%d failed: %s", tag, attempt, max_attempts, error)
     callback = _progress_callback.get()
@@ -211,7 +227,12 @@ async def handle_retry_failure(
         # int ** int widens to Any in the stubs (negative exponents yield
         # float); attempt >= 1 keeps the exponent non-negative, so cast the
         # power back to the int it really is before scaling to a float ceiling.
-        ceiling = backoff_base_seconds * cast("int", 2 ** (attempt - 1))
+        # The exponential ceiling is capped at max_backoff_seconds so late
+        # attempts under a large budget can't sleep for hours.
+        ceiling = min(
+            backoff_base_seconds * cast("int", 2 ** (attempt - 1)),
+            max_backoff_seconds,
+        )
         await asyncio.sleep(random.uniform(0, ceiling))
 
 
@@ -221,6 +242,7 @@ async def with_retries[T](
     max_attempts: int | None = None,
     label: str | None = None,
     backoff_base_seconds: float = 0.0,
+    max_backoff_seconds: float = 30.0,
     retry_on: tuple[type[BaseException], ...] | None = None,
     validation_max_attempts: int | None = None,
     validation_retry_on: tuple[type[BaseException], ...] | None = None,
@@ -252,17 +274,27 @@ async def with_retries[T](
         label: Optional identifier for log messages (e.g. an op_id).
         backoff_base_seconds: When > 0, sleep before each retry using
             exponential "full jitter" backoff — a random delay in
-            ``[0, backoff_base_seconds * 2**(attempt-1)]``. Defaults to
-            0.0 (retry immediately), which preserves prior behaviour for
-            callers that don't opt in. Jitter spreads concurrent retries
-            so a transient provider-saturation window (the dominant
-            failure mode for the eval fan-out) isn't re-hit by every
-            caller at once.
+            ``[0, min(backoff_base_seconds * 2**(attempt-1), max_backoff_seconds)]``.
+            Defaults to 0.0 (retry immediately), which preserves prior
+            behaviour for callers that don't opt in. Jitter spreads
+            concurrent retries so a transient provider-saturation window
+            (the dominant failure mode for the eval fan-out) isn't re-hit
+            by every caller at once.
+        max_backoff_seconds: Ceiling on any single backoff sleep (default
+            30s), capping the exponential term so a large ``max_attempts``
+            can't grow the worst-case sleep unboundedly.
         retry_on: When set, only exceptions matching this tuple are retried
             against ``max_attempts``; anything else propagates immediately
             on the first raise (so programming errors are never retried).
             ``None`` (the default) retries on any :class:`Exception`,
-            preserving prior behaviour for direct callers.
+            preserving prior behaviour for direct callers. Budget *routing*
+            still distinguishes the two classes when a validation budget is
+            configured: with ``retry_on=None`` the unwrapped cause is
+            classified against
+            :data:`~llmkit.exceptions.LLM_TRANSPORT_ERRORS`, so an
+            ``InstructorRetryException`` wrapping a 429/5xx/network blip is
+            charged the full ``max_attempts``, and only genuine validation
+            failures are charged the lower validation budget.
         validation_max_attempts: Total number of *schema-validation*
             attempts (1 = no retry). When set together with
             ``validation_retry_on``, failures matching that tuple are charged
@@ -334,7 +366,14 @@ async def with_retries[T](
                 # wrapped schema failure (or an inner error in neither set)
                 # still falls through to the validation budget below.
                 cause = underlying_provider_error(e)
-                is_transport_cause = retry_on is not None and isinstance(cause, retry_on)
+                # With retry_on=None ("retry on any Exception") the routing
+                # still needs a transport set to classify the unwrapped cause
+                # against — otherwise a wrapped 429/network blip would match
+                # ``validation_retry_on`` below and be charged the *lower*
+                # validation budget, the exact misclassification the unwrap
+                # exists to prevent. Fall back to the curated transport set.
+                transport_types = retry_on if retry_on is not None else LLM_TRANSPORT_ERRORS
+                is_transport_cause = isinstance(cause, transport_types)
                 is_validation = (
                     use_validation_budget
                     and not is_transport_cause
@@ -362,6 +401,7 @@ async def with_retries[T](
                         max_attempts=budget,
                         error=e,
                         backoff_base_seconds=backoff_base_seconds,
+                        max_backoff_seconds=max_backoff_seconds,
                     )
                 else:
                     logger.error("%s: all %d attempts failed: %s", tag, budget, e)

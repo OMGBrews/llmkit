@@ -211,6 +211,72 @@ async def test_backoff_sleeps_between_retries_with_jittered_ceiling(
 
 
 @pytest.mark.asyncio
+async def test_backoff_ceiling_is_capped_at_default_max_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under a large attempt budget, no sleep ever exceeds the default
+    ``max_backoff_seconds`` cap (30s). Uncapped, attempt 11 at base 2.0
+    would permit ``2 * 2**10 = 2048`` seconds; the cap bounds every sleep.
+    Jitter is pinned to its max so the asserted values are the ceilings."""
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    async def always_fails() -> str:
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        _ = await with_retries(always_fails, max_attempts=12, label="x", backoff_base_seconds=2.0)
+
+    # 11 non-final failures → 11 sleeps. Early attempts keep the pure
+    # exponential ceiling; once it crosses 30s the cap holds it flat.
+    assert len(slept) == 11
+    assert slept[:4] == [2.0, 4.0, 8.0, 16.0]
+    assert all(delay <= 30.0 for delay in slept)
+    assert slept[4:] == [30.0] * 7
+
+
+@pytest.mark.asyncio
+async def test_custom_max_backoff_seconds_is_honored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``max_backoff_seconds`` caps the jitter ceiling in place
+    of the 30s default."""
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    async def always_fails() -> str:
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        _ = await with_retries(
+            always_fails,
+            max_attempts=5,
+            label="x",
+            backoff_base_seconds=2.0,
+            max_backoff_seconds=5.0,
+        )
+
+    # Ceilings 2.0, 4.0 stay exponential; 8.0 and 16.0 are capped at 5.0.
+    assert slept == [2.0, 4.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
 async def test_backoff_not_slept_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """A first-attempt success never sleeps, even with backoff configured."""
     slept: list[float] = []

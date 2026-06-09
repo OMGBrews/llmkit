@@ -5,7 +5,8 @@ They pin the behaviour the rate limiter promises:
 
 * concurrency limiting is **on by default** with a per-provider cap of 8
   (zero config),
-* each provider gets an **independent** budget (keyed by provider name),
+* each provider gets an **independent** budget (keyed by provider name,
+  matched case-insensitively — ``"openai"`` and ``"OpenAI"`` are one budget),
 * reconfiguring the cap / disabling takes effect for subsequent acquires,
 * a :meth:`configure` swap never strands in-flight callers on the old
   semaphore (they release back onto their snapshot),
@@ -633,3 +634,112 @@ async def test_call_layer_debits_tpm_from_response_usage(
 
     assert text == "hi"
     assert GlobalRateLimiter._tpm_buckets["openai"]._level == 4_000.0
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive provider keys: llmkit's own call sites key by the display
+# name ("OpenAI"), while a host following the public-helper docs may pass any
+# casing. Keys are casefolded at the limiter boundary so every casing names
+# ONE budget — a differently-cased host can never silently fork onto a
+# separate budget it believes is shared.
+# ---------------------------------------------------------------------------
+
+
+async def test_rpm_budget_shared_across_key_casings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public-helper "openai" and internal-path "OpenAI" debit the SAME RPM bucket.
+
+    With a frozen clock and rpm=2 (capacity 2), one lowercase acquire via the
+    public helper plus one display-cased acquire via the internal path must
+    drain the single shared bucket to zero — and the registry must hold exactly
+    one (casefolded) entry, not one per casing.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    configure_rate_limit(rpm=2)
+
+    async with rate_limit_acquire_async("openai"):  # host casing, public helper
+        pass
+    async with GlobalRateLimiter.acquire_async("OpenAI"):  # llmkit's display name
+        pass
+
+    assert set(GlobalRateLimiter._rpm_buckets) == {"openai"}  # one bucket, casefolded key
+    assert GlobalRateLimiter._rpm_buckets["openai"]._level == 0.0  # 2 - 1 - 1
+
+    # The shared budget is now exhausted: a third acquire under ANY casing
+    # would have to wait for refill.
+    assert GlobalRateLimiter._rpm_buckets["openai"]._try_acquire(1.0) > 0.0
+
+
+async def test_tpm_budget_shared_across_key_casings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tokens recorded under "OPENAI" are visible to a "openai" acquirer's bucket."""
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    configure_rate_limit(tpm=6_000)
+
+    async with GlobalRateLimiter.acquire_async("OPENAI") as slot:
+        slot.record_tokens(2_000)
+    async with rate_limit_acquire_async("openai") as slot:
+        slot.record_tokens(1_000)
+
+    assert set(GlobalRateLimiter._tpm_buckets) == {"openai"}
+    assert GlobalRateLimiter._tpm_buckets["openai"]._level == 3_000.0
+
+
+async def test_concurrency_semaphore_shared_across_key_casings() -> None:
+    """A slot held under "OpenAI" blocks a "openai" acquire: one semaphore, cap 1."""
+    configure_rate_limit(max_concurrent=1)
+    entered_second = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def first() -> None:
+        async with GlobalRateLimiter.acquire_async("OpenAI"):  # internal casing
+            _ = await release_first.wait()
+
+    async def second() -> None:
+        async with rate_limit_acquire_async("openai"):  # host casing, public helper
+            entered_second.set()
+
+    first_task = asyncio.create_task(first())
+    second_task = asyncio.create_task(second())
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # If the casings forked into two semaphores, second() would be in already.
+    assert not entered_second.is_set(), "differently-cased keys got separate semaphores"
+
+    release_first.set()
+    _ = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1.0)
+    assert entered_second.is_set()
+
+
+def test_sync_semaphore_shared_across_key_casings() -> None:
+    """The sync path shares one threading.Semaphore across key casings too."""
+    configure_rate_limit(max_concurrent=1)
+    entered_second = threading.Event()
+    release_first = threading.Event()
+    first_holds = threading.Event()
+
+    def first() -> None:
+        with GlobalRateLimiter.acquire_sync("OpenAI"):  # internal casing
+            first_holds.set()
+            _ = release_first.wait(timeout=1.0)
+
+    def second() -> None:
+        with rate_limit_acquire_sync("openai"):  # host casing, public helper
+            entered_second.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    assert first_holds.wait(timeout=1.0)
+
+    second_thread.start()
+    # One shared slot, held under "OpenAI": the "openai" acquire must block.
+    assert not entered_second.wait(timeout=0.1)
+
+    release_first.set()
+    second_thread.join(timeout=1.0)
+    first_thread.join(timeout=1.0)
+    assert entered_second.is_set()

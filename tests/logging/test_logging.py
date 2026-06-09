@@ -2,11 +2,13 @@
 
 These pin the recent hardening of :class:`LocalYamlLogSink` /
 :func:`write_llm_log`: the verdict-first YAML layout and ``index.jsonl``
-summary, plus three robustness guards — filename collisions never
+summary, plus the robustness guards — filename collisions never
 overwrite, ``feature``/``label`` can't escape ``log_dir`` via path
-traversal, and a newline in a caller field can't forge a second verdict
-header line — and the best-effort swallowing that keeps a logging failure
-from ever breaking the LLM call. They also pin the serialization contract:
+traversal or blow the 255-byte filename component limit, and a newline in
+a caller field can't forge a second verdict header line — and the
+best-effort swallowing that keeps *any* logging failure (not just the
+common enumerated ones) from ever breaking the LLM call, with no orphaned
+partial file and no discarded YAML path when only the index append fails. They also pin the serialization contract:
 ``max_tokens``/``reasoning_effort`` land in the per-call YAML (but stay out
 of the compact index), and the body is always ``yaml.safe_load``-able even
 when the response carries arbitrary Python objects.
@@ -17,6 +19,7 @@ Records are built directly via :func:`_record`; no real LLM call is made.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
@@ -339,6 +342,62 @@ def test_index_append_failure_never_raises_and_keeps_percall_file(
     assert "feature:" in path.read_text()
 
 
+def test_cyclic_prompt_is_dumped_via_yaml_aliases_not_an_error(tmp_path: Path) -> None:
+    """A self-referential structure smuggled into ``prompt`` does not blow the
+    dump: PyYAML renders the cycle with anchors/aliases, so the write succeeds
+    (this is why the non-enumerated-failure test below needs a synthetic
+    trigger)."""
+    cyclic: dict[str, object] = {"role": "user"}
+    cyclic["self"] = cyclic
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(prompt=[cyclic]))
+    assert path is not None
+    assert path.exists()
+    assert "&id" in path.read_text()  # the cycle became an anchor, not a crash
+
+
+def test_non_enumerated_dump_failure_warns_and_leaves_no_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure *outside* the historically enumerated set (here a synthetic
+    ``RuntimeError`` from the dumper, standing in for RecursionError /
+    representer oddities) is still swallowed by the best-effort handler — no
+    exception, a warning with context — and the truncated exclusive-create
+    file is unlinked, so the log dir holds no orphan."""
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("exotic dumper failure")
+
+    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    with caplog.at_level(logging.WARNING, logger="llmkit.logging"):
+        result = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert result is None
+    assert any("Failed to write LLM invocation log" in r.message for r in caplog.records)
+    # The exclusive-create file opened before yaml.dump raised was cleaned up:
+    # nothing (YAML, index, or otherwise) is left in the log dir.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_index_serialization_failure_still_returns_yaml_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A record whose field violates the declared types (the dataclass doesn't
+    enforce them) makes ``json.dumps`` raise ``TypeError`` in the index append
+    — the YAML write itself survives (the dumper's fallback stringifies the
+    object), and the already-written per-call path is still returned instead
+    of being discarded."""
+    # ``provider`` is the one indexed field that is neither part of the
+    # filename nor the header, so only the index's json.dumps chokes on it.
+    record = _record(provider=object())
+    with caplog.at_level(logging.WARNING, logger="llmkit.logging"):
+        path = LocalYamlLogSink(tmp_path).write_returning_path(record)
+    assert path is not None
+    assert path.exists()
+    assert "feature:" in path.read_text()
+    assert any("Failed to append LLM log index" in r.message for r in caplog.records)
+    # The index line was the casualty, never the per-call file or the path.
+    assert not (tmp_path / "index.jsonl").exists()
+
+
 # 8. write_llm_log dispatch + swallowing.
 
 
@@ -376,3 +435,41 @@ def test_write_llm_log_returns_path_for_path_returning_sink(tmp_path: Path) -> N
     finally:
         configure_llm_logging(LocalYamlLogSink())
     assert path is not None and path.exists()
+
+
+# 9. Filename length clamp.
+
+
+def test_overlong_feature_is_clamped_and_still_written(tmp_path: Path) -> None:
+    """A 300-char feature no longer drives the filename past the 255-byte
+    component limit (which would make every write fail ENAMETOOLONG): the
+    component is clamped to 80 bytes and the file is written successfully."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(feature="f" * 300))
+    assert path is not None
+    assert path.exists()
+    assert len(path.name.encode("utf-8")) <= 255
+    # The sanitized component was clamped to exactly the 80-byte budget.
+    assert "f" * 80 in path.name
+    assert "f" * 81 not in path.name
+    # The full, unclamped feature still lives inside the YAML body.
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert doc["feature"] == "f" * 300
+
+
+def test_overlong_label_is_clamped_too(tmp_path: Path) -> None:
+    """The same clamp applies to ``label``."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(label="l" * 300))
+    assert path is not None
+    assert path.exists()
+    assert len(path.name.encode("utf-8")) <= 255
+
+
+def test_multibyte_feature_clamps_on_a_codepoint_boundary(tmp_path: Path) -> None:
+    """The clamp counts bytes (the filesystem limit is bytes, not chars) and
+    never cuts mid-codepoint: 300 two-byte chars become exactly 40 of them
+    (80 bytes), with no mojibake in the name."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(feature="é" * 300))
+    assert path is not None
+    assert path.exists()
+    assert "é" * 40 in path.name
+    assert "é" * 41 not in path.name

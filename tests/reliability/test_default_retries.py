@@ -21,6 +21,8 @@ split are pinned in ``test_retry_policy.py``.
 
 from __future__ import annotations
 
+import asyncio
+import random
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
@@ -354,3 +356,41 @@ async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
         configure_llm_logging(LocalYamlLogSink())
 
     assert calls[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_custom_max_backoff_propagates_through_call_functions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom ``RetryPolicy.max_backoff_seconds`` reaches the backoff sleeps
+    of a call function, not just direct ``with_retries`` users. Jitter is
+    pinned to its max so the asserted values are the exact ceilings: base 2.0
+    would permit 2.0 then 4.0; the 1.5s cap bounds both."""
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        raise TimeoutError("always")
+
+    policy = RetryPolicy(max_attempts=3, backoff_base_seconds=2.0, max_backoff_seconds=1.5)
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(TimeoutError, match="always"),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=policy
+        )
+
+    assert calls[0] == 3
+    assert slept == [1.5, 1.5]

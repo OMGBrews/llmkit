@@ -471,11 +471,25 @@ async def structured_llm_call[T](
             resolved_model, resolved_provider = _resolve_model_and_provider(model, provider)
             # The public T is unbounded, but every parsed result is a Pydantic
             # model; narrow to BaseModel to dump it for the log.
-            response_dump: dict[str, JsonValue] | None = (
-                cast("dict[str, JsonValue]", cast("BaseModel", response).model_dump())
-                if response is not None and hasattr(response, "model_dump")
-                else None
-            )
+            response_dump: dict[str, JsonValue] | None = None
+            if response is not None and hasattr(response, "model_dump"):
+                try:
+                    response_dump = cast(
+                        "dict[str, JsonValue]", cast("BaseModel", response).model_dump()
+                    )
+                except Exception:
+                    # A custom @field_serializer/@model_serializer on the
+                    # schema raised. The dump exists only for the log, so it
+                    # degrades to None — logging must never break the call
+                    # (success path) or mask the real provider error (error
+                    # path). Same warn pattern as the sink failures in
+                    # llmkit.logging.
+                    logger.warning(
+                        "Failed to serialize LLM response for log %s/%s; recording response as None",
+                        feature,
+                        label,
+                        exc_info=True,
+                    )
             _ = _record_call(
                 LLMCallRecord(
                     started_at=started_at,
@@ -500,6 +514,7 @@ async def structured_llm_call[T](
         max_attempts=retry.max_attempts,
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
+        max_backoff_seconds=retry.max_backoff_seconds,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
         validation_retry_on=_result_validation_budget(retry),
@@ -641,7 +656,11 @@ async def text_llm_call(
 
         started_at = datetime.now(UTC)
         start_t = time.monotonic()
-        text = ""
+        # None until the transport returns: a failed attempt logs
+        # ``response: None`` (per the LLMCallRecord contract), distinct from
+        # a successful empty completion's ``response: ""``. The streaming
+        # path differs on purpose — it logs the partial transcript.
+        text: str | None = None
         cost: float | None = None
         error: str | None = None
         try:
@@ -684,6 +703,7 @@ async def text_llm_call(
         max_attempts=retry.max_attempts,
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
+        max_backoff_seconds=retry.max_backoff_seconds,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
         validation_retry_on=_result_validation_budget(retry),
@@ -885,6 +905,7 @@ async def stream_text_with_log(
                     max_attempts=retry.max_attempts,
                     error=exc,
                     backoff_base_seconds=retry.backoff_base_seconds,
+                    max_backoff_seconds=retry.max_backoff_seconds,
                 )
     finally:
         _retry_active.reset(token)
@@ -954,7 +975,7 @@ def _log_text_call(
     feature: str,
     label: str | None,
     prompt: str | list[dict[str, str]],
-    text: str,
+    text: str | None,
     start_t: float,
     temperature: float,
     model: str | None,
@@ -970,7 +991,9 @@ def _log_text_call(
     Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
     ``schema`` distinguishes the two surfaces in the log — ``"text"`` for a
     buffered plain-text call, ``"stream"`` for a streamed one — and
-    ``response`` is the accumulated text rather than a Pydantic dump. ``model``
+    ``response`` is the accumulated text rather than a Pydantic dump
+    (``None`` when a buffered attempt failed before any content; the
+    streaming surface instead passes the partial transcript). ``model``
     is resolved to
     the effective model (provider default substituted when the caller
     passed ``None``); ``provider`` is the per-call override (``None`` uses

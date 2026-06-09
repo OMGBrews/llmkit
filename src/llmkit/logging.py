@@ -49,6 +49,13 @@ _DOT_RUN = re.compile(r"\.+")
 # comment line.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
+# Byte budget for a single sanitized filename component. Most filesystems cap
+# a path component at 255 *bytes*; the composed name carries a ~26-byte
+# timestamp, two sanitized components, an 8-char uuid suffix, separators, and
+# ".yaml", so 80 bytes per component keeps the whole filename comfortably
+# under the limit even for fully multi-byte input.
+_MAX_COMPONENT_BYTES = 80
+
 
 def _safe_path_component(value: str) -> str:
     """Neutralize *value* so it is safe as a single filename component.
@@ -56,7 +63,11 @@ def _safe_path_component(value: str) -> str:
     Path separators (``/``, ``\\``, :data:`os.sep`), control characters, and
     other filesystem-hostile punctuation are replaced with ``_``; ``.`` runs
     are collapsed to a single ``_`` so the result can never be ``.``/``..`` or
-    a hidden traversal segment. The output stays human-readable and is
+    a hidden traversal segment. The result is also clamped to
+    :data:`_MAX_COMPONENT_BYTES` UTF-8 bytes (cutting on a codepoint boundary,
+    never mid-character) so an oversized ``feature``/``label`` cannot push the
+    composed filename past the filesystem's 255-byte component limit and turn
+    every write into ``ENAMETOOLONG``. The output stays human-readable and is
     guaranteed to contain no directory separators, so composing it into a path
     cannot escape ``log_dir``. Empty/all-unsafe input degrades to ``"_"``.
     """
@@ -66,6 +77,13 @@ def _safe_path_component(value: str) -> str:
         cleaned = cleaned.replace(os.altsep, "_")
     cleaned = _DOT_RUN.sub("_", cleaned)
     cleaned = cleaned.strip("_")
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > _MAX_COMPONENT_BYTES:
+        # Hard byte clamp; errors="ignore" drops a trailing partial codepoint
+        # so the cut never lands mid-character. Safe to apply after the regex
+        # passes above because each of them substitutes a single "_" (no
+        # multi-char escape sequences exist to split).
+        cleaned = encoded[:_MAX_COMPONENT_BYTES].decode("utf-8", errors="ignore")
     return cleaned or "_"
 
 
@@ -241,11 +259,17 @@ class LocalYamlLogSink:
 
         The filename is ``{timestamp}_{feature}_{label}_{uniquifier}.yaml``:
         the microsecond ``started_at`` stamp keeps the directory naturally
-        sortable, ``feature``/``label`` are sanitized with
-        :func:`_safe_path_component` so neither can escape ``log_dir``, and a
-        short ``uuid4`` suffix plus exclusive-create (``mode="x"``) retry loop
+        sortable, ``feature``/``label`` are sanitized and length-clamped with
+        :func:`_safe_path_component` so neither can escape ``log_dir`` nor
+        push the name past the filesystem's component limit, and a short
+        ``uuid4`` suffix plus exclusive-create (``mode="x"``) retry loop
         guarantees two records can never share a path or silently overwrite
         each other.
+
+        Best-effort means *any* :class:`Exception` is swallowed (with a
+        warning); a failure after the file was exclusively created also
+        removes the truncated orphan, so the log dir never accumulates
+        partial YAML.
         """
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -304,15 +328,17 @@ class LocalYamlLogSink:
                 except FileExistsError:
                     # Suffix collision — regenerate and retry; never overwrite.
                     continue
-                except (OSError, yaml.YAMLError, UnicodeError):
-                    # A mid-write failure (disk full, or a residual encode error
-                    # such as un-encodable surrogates even on the utf-8 stream;
-                    # representer errors are designed out by _LogSafeDumper's
-                    # str() fallback, but YAMLError stays guarded for emitter
-                    # edge cases) leaves a truncated file behind under the
-                    # exclusive-create name. Remove the orphan before degrading so the log dir
-                    # never accumulates empty/partial YAML, then re-raise to the
-                    # best-effort handler below.
+                except Exception:
+                    # Any mid-write failure (disk full, un-encodable surrogates
+                    # even on the utf-8 stream, a RecursionError from a deeply
+                    # nested/cyclic payload, an exotic representer/emitter
+                    # error) leaves a truncated file behind under the
+                    # exclusive-create name. Remove the orphan before degrading
+                    # so the log dir never accumulates empty/partial YAML, then
+                    # re-raise to the best-effort handler below. Deliberately
+                    # broad — this sink is best-effort by contract — but never
+                    # BaseException, so KeyboardInterrupt/SystemExit still
+                    # propagate (the orphan cleanup is forfeited for those).
                     candidate.unlink(missing_ok=True)
                     raise
                 filepath = candidate
@@ -323,7 +349,11 @@ class LocalYamlLogSink:
                 raise OSError(
                     f"could not allocate a unique log filename after {_MAX_FILENAME_ATTEMPTS} attempts"
                 )
-        except (OSError, yaml.YAMLError, UnicodeError):
+        except Exception:
+            # Best-effort by contract: *any* failure (not just the common
+            # OSError/YAMLError/UnicodeError cases) degrades to a warning so
+            # logging can never break the LLM call. Never BaseException —
+            # KeyboardInterrupt/SystemExit must propagate.
             logger.warning(
                 "Failed to write LLM invocation log for %s/%s",
                 record.feature,
@@ -367,30 +397,38 @@ class LocalYamlLogSink:
     def _append_index(self, record: LLMCallRecord, filepath: Path) -> None:
         """Append one compact JSON line for *record* to ``index.jsonl``.
 
-        Best-effort and swallowed on failure (logging must never break the
-        call). A single ``write`` of a sub-4KB line under ``O_APPEND`` is
-        atomic on POSIX, so concurrent calls don't interleave lines.
+        Best-effort: *any* :class:`Exception` is swallowed with a warning
+        (logging must never break the call). The dataclass doesn't enforce
+        its field types, so a directly-constructed record can make
+        ``json.dumps`` raise ``TypeError``/``ValueError`` (or ``round`` raise
+        on a non-numeric ``duration_ms``) — those must not escape here, where
+        they would discard the per-call YAML path that was already written.
+        A single ``write`` of a sub-4KB line under ``O_APPEND`` is atomic on
+        POSIX, so concurrent calls don't interleave lines.
 
         The line carries only the cross-call triage fields; request-shaping
         knobs (temperature, max_tokens, reasoning_effort) are deliberately
         omitted to keep the index compact — they live in the per-call YAML.
         """
-        line: dict[str, str | float | None] = {
-            "file": filepath.name,
-            "timestamp": record.started_at.isoformat(),
-            "feature": record.feature,
-            "label": record.label,
-            "model": record.model,
-            "provider": record.provider,
-            "schema": record.schema,
-            "duration_ms": round(record.duration_ms, 1),
-            "approximate_cost": record.approximate_cost,
-            "error": record.error,
-        }
         try:
+            line: dict[str, str | float | None] = {
+                "file": filepath.name,
+                "timestamp": record.started_at.isoformat(),
+                "feature": record.feature,
+                "label": record.label,
+                "model": record.model,
+                "provider": record.provider,
+                "schema": record.schema,
+                "duration_ms": round(record.duration_ms, 1),
+                "approximate_cost": record.approximate_cost,
+                "error": record.error,
+            }
+            # Serialize before opening so a serialization failure can't even
+            # create/touch the index file.
+            payload = json.dumps(line, ensure_ascii=False) + "\n"
             with open(self.log_dir / INDEX_FILENAME, "a", encoding="utf-8") as f:
-                _ = f.write(json.dumps(line, ensure_ascii=False) + "\n")
-        except OSError:
+                _ = f.write(payload)
+        except Exception:
             logger.warning(
                 "Failed to append LLM log index for %s/%s",
                 record.feature,

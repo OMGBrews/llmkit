@@ -4,7 +4,10 @@ import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import logging
 from collections.abc import Coroutine
+
+logger = logging.getLogger(__name__)
 
 
 def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | None) -> T:
@@ -38,6 +41,12 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
     always propagates ahead of any straggler outcome. The drains run whether
     ``coro`` succeeded or raised — an error path leaves the same pending
     logging — and never hide the call's result or error.
+
+    One ordering subtlety: a :class:`KeyboardInterrupt` can stop the loop while
+    the call task is still *pending*, and the drains above restart the loop. So
+    before either drain runs, :func:`_settle_main` cancels and settles the
+    interrupted call — otherwise the drains would resume the very call Ctrl-C
+    was meant to abandon.
     """
     from llmkit import _litellm
 
@@ -50,6 +59,11 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
         try:
             return loop.run_until_complete(main)
         finally:
+            # If the loop was stopped out from under the call (KeyboardInterrupt
+            # raised by a signal landing in a callback), ``main`` is still
+            # pending — settle it *before* the drains below restart the loop,
+            # or they would resume the interrupted call itself during teardown.
+            _settle_main(loop, main, timeout=timeout)
             # Drain pending LiteLLM logging whether the call succeeded or
             # raised — an undrained coroutine/task is otherwise destroyed
             # (and warned about) at ``loop.close()``.
@@ -61,6 +75,53 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
         finally:
             asyncio.set_event_loop(None)
             loop.close()
+
+
+def _settle_main[T](
+    loop: asyncio.AbstractEventLoop, main: asyncio.Task[T], *, timeout: float | None
+) -> None:
+    """Cancel and settle a ``main`` task left pending by an interrupted loop.
+
+    Normally ``loop.run_until_complete(main)`` only returns once ``main`` is
+    done. But a :class:`KeyboardInterrupt` (or any ``BaseException`` raised by a
+    loop callback, e.g. a signal handler) stops the loop *out from under* the
+    call, leaving ``main`` pending. The teardown drains then restart the loop —
+    and, unfixed, would **resume the interrupted call itself**: it could run for
+    up to the full drain ``timeout``, complete, and have its result or exception
+    silently discarded ("Task exception was never retrieved" at GC). Ctrl-C is
+    supposed to abandon the call promptly, so before any drain runs we cancel
+    ``main`` and run the loop just long enough to settle the cancellation.
+
+    The settle preserves the drain contracts around it:
+
+    * The interrupting exception propagating out of ``run_until_complete`` must
+      reach the caller untouched, so nothing here is allowed to raise.
+      ``CancelledError`` is the expected outcome; gathering with
+      ``return_exceptions=True`` retrieves-and-discards anything else the task
+      raises while unwinding (so there is no "never retrieved" noise), and a
+      task that re-raises ``KeyboardInterrupt``/``SystemExit`` out of the loop
+      itself is swallowed with a warning rather than masking the original.
+    * The settle is bounded by ``timeout`` like the drains: a task that
+      swallows cancellation can't wedge teardown — past the deadline we move
+      on and :func:`_drain_pending` makes its own bounded attempt.
+
+    On the normal path ``main`` is already done and this is a near-no-op: we
+    only re-retrieve an un-cancelled task's exception (idempotent after
+    ``run_until_complete`` consumed it) to keep the GC quiet in the rare race
+    where the loop stopped between ``main`` finishing and its result being read.
+    """
+    if main.done():
+        if not main.cancelled():
+            _ = main.exception()  # retrieve-and-discard; idempotent if already read
+        return
+    _ = main.cancel()
+    settle = asyncio.gather(main, return_exceptions=True)
+    try:
+        _ = loop.run_until_complete(asyncio.wait_for(settle, timeout=timeout))
+    except (TimeoutError, asyncio.CancelledError):
+        pass
+    except BaseException:  # must not mask the caller's interrupt
+        logger.warning("interrupted call raised while being cancelled; discarding", exc_info=True)
 
 
 def _drain_pending(loop: asyncio.AbstractEventLoop, *, timeout: float | None) -> None:

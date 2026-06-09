@@ -5,21 +5,32 @@ The log used to record ``model: null`` whenever a caller passed
 reverse-engineered from code. These tests pin the fix: the log records
 the *resolved* effective model + the provider name, so a sweep's tier is
 a ``grep`` away.
+
+Also pins two response-fidelity contracts: a failed buffered text attempt
+logs ``response: None`` (not ``""``, which would be indistinguishable from
+a successful empty completion), and a schema whose custom serializer raises
+degrades the *logged* response to ``None`` without breaking the call.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import pytest
+from pydantic import BaseModel, model_serializer
+
 from llmkit import (
     LLMCallRecord,
     LocalYamlLogSink,
+    capture_llm_records,
     configure_llm_logging,
     structured_output,
 )
 from tests._support import make_record as _record
+from tests._support import provider_mock
 
 
 def test_resolve_substitutes_provider_default_when_model_none() -> None:
@@ -230,3 +241,140 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
     second = cast("dict[str, object]", json.loads(lines[1]))
     assert second["label"] == "second"
     assert second["error"] == "Timeout: slow"
+
+
+def test_failed_text_call_logs_response_none() -> None:
+    """A text attempt that raises before any content logs ``response: None``
+    (per the ``LLMCallRecord`` contract), not ``""`` — an empty string would
+    be indistinguishable from a successful empty completion."""
+
+    async def _boom(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+        raise RuntimeError("transport exploded")
+
+    with (
+        patch("llmkit._litellm.acompletion_text", side_effect=_boom),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> list[LLMCallRecord]:
+            with capture_llm_records() as records:
+                with pytest.raises(RuntimeError, match="transport exploded"):
+                    _ = await structured_output.text_llm_call("hi", feature="summary")
+            return records
+
+        captured = asyncio.run(_run())
+
+    assert len(captured) == 1
+    assert cast("object", captured[0].response) is None
+    assert captured[0].error is not None
+    assert "transport exploded" in captured[0].error
+
+
+def test_successful_text_call_still_logs_the_text() -> None:
+    """Regression for the ``None``-sentinel fix: a successful text call
+    records the actual completion text, exactly as before."""
+
+    async def _fake_text(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+        return "hello world", 0.001
+
+    with (
+        patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> list[LLMCallRecord]:
+            with capture_llm_records() as records:
+                result = await structured_output.text_llm_call("hi", feature="summary")
+                assert result == "hello world"
+            return records
+
+        captured = asyncio.run(_run())
+
+    assert len(captured) == 1
+    assert cast("object", captured[0].response) == "hello world"
+    assert captured[0].error is None
+
+
+def test_mid_stream_failure_still_logs_partial_transcript() -> None:
+    """The streaming surface is deliberately different from the buffered
+    one: a mid-stream error logs the partial transcript accumulated so far
+    (alongside the error), not ``None``."""
+    from collections.abc import AsyncIterator
+
+    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        async def _gen() -> AsyncIterator[str]:
+            yield "par"
+            yield "tial"
+            raise RuntimeError("stream died")
+
+        return _gen()
+
+    with (
+        patch("llmkit._litellm.astream_text", side_effect=_fake_stream),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> tuple[list[str], list[LLMCallRecord]]:
+            chunks: list[str] = []
+            with capture_llm_records() as records:
+                with pytest.raises(RuntimeError, match="stream died"):
+                    async for chunk in structured_output.stream_text_with_log(
+                        "hi", feature="summary"
+                    ):
+                        chunks.append(chunk)
+            return chunks, records
+
+        chunks, captured = asyncio.run(_run())
+
+    assert chunks == ["par", "tial"]
+    assert len(captured) == 1
+    assert cast("object", captured[0].response) == "partial"
+    assert captured[0].error is not None
+    assert "stream died" in captured[0].error
+
+
+class _ExplodingDumpSchema(BaseModel):
+    """A schema whose custom serializer raises — only ``model_dump`` breaks;
+    construction and field access stay fine."""
+
+    ok: bool
+
+    @model_serializer
+    def _boom(self) -> dict[str, object]:
+        raise ValueError("serializer exploded")
+
+
+def test_raising_model_serializer_degrades_logged_response_not_the_call(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A custom ``@model_serializer`` that raises must not replace a
+    successful return value (or mask a real provider error) — the dump
+    exists only for the log, so the logged response degrades to ``None``
+    with a warning, and the call still returns the parsed model."""
+
+    async def _fake_structured(
+        *_args: object, **_kwargs: object
+    ) -> tuple[_ExplodingDumpSchema, float | None]:
+        return _ExplodingDumpSchema(ok=True), 0.001
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+        caplog.at_level("WARNING", logger="llmkit.structured_output"),
+    ):
+
+        async def _run() -> tuple[_ExplodingDumpSchema, list[LLMCallRecord]]:
+            with capture_llm_records() as records:
+                result = await structured_output.structured_llm_call(
+                    "hi", _ExplodingDumpSchema, feature="extraction"
+                )
+            return result, records
+
+        result, captured = asyncio.run(_run())
+
+    # The call itself succeeds — the serializer failure stays in the log path.
+    assert result.ok is True
+    assert len(captured) == 1
+    assert cast("object", captured[0].response) is None
+    assert captured[0].error is None
+    assert any("Failed to serialize LLM response" in m for m in caplog.messages)

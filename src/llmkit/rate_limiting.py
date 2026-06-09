@@ -26,6 +26,13 @@ is exactly the value logging records as the *effective* provider (see
 and any token debit — is always accounted to the provider that actually runs
 the call.
 
+Provider keys are matched **case-insensitively**: every key is casefolded at
+the limiter boundary (see :func:`_normalize_key`), so ``"openai"``,
+``"OpenAI"``, and ``"OPENAI"`` all name one budget. A host joining the limit
+by hand via :func:`rate_limit_acquire_async` / :func:`rate_limit_acquire_sync`
+therefore cannot fork itself onto a separate budget by spelling the provider
+name differently from llmkit's own call sites.
+
 **Concurrency** defaults to a cap of **8 concurrent calls per provider**: eight
 favours the common access pattern — fan-out — out of the box, bounding a
 self-inflicted burst (and the bill / 429s that follow) without quietly
@@ -99,6 +106,19 @@ def _now() -> float:
     without real sleeping.
     """
     return time.monotonic()
+
+
+def _normalize_key(provider_key: str) -> str:
+    """Casefold a provider key so limiter budgets are shared case-insensitively.
+
+    The single choke point where a provider key enters the limiter:
+    :meth:`GlobalRateLimiter.acquire_async` / :meth:`acquire_sync` normalize
+    through this before touching any registry, so ``"openai"``, ``"OpenAI"``,
+    and ``"OPENAI"`` resolve to one semaphore and one RPM/TPM bucket. The
+    normalized form is an internal registry key only — display/logging keeps
+    the provider's original ``name``.
+    """
+    return provider_key.casefold()
 
 
 class _RateBucket:
@@ -221,9 +241,9 @@ class GlobalRateLimiter:
 
     All state is class-level — this is a typed namespace, not a class you
     instantiate. Use the :meth:`acquire_async` / :meth:`acquire_sync` context
-    managers, keyed by provider name, to bound concurrency *and* (when
-    configured) the request and token rate to each provider across the whole
-    process.
+    managers, keyed by provider name (matched case-insensitively), to bound
+    concurrency *and* (when configured) the request and token rate to each
+    provider across the whole process.
 
     The async path (:meth:`acquire_async`) is what the LiteLLM call layer
     uses; the sync path (:meth:`acquire_sync`) is retained for synchronous
@@ -412,7 +432,9 @@ class GlobalRateLimiter:
     async def acquire_async(cls, provider_key: str) -> AsyncGenerator[RateLimitSlot]:
         """Hold an async slot for ``provider_key`` for the ``async with`` block.
 
-        ``provider_key`` is the provider name (``provider.name``); each provider
+        ``provider_key`` is the provider name (``provider.name``, e.g.
+        ``"OpenAI"``), matched case-insensitively (casefolded via
+        :func:`_normalize_key` before touching any registry); each provider
         has an independent budget on every dimension. Passes the request-rate
         (RPM) and token-rate (TPM) gates first — so a caller doesn't hold a
         scarce concurrency slot while waiting on a rate gate — then acquires the
@@ -427,6 +449,7 @@ class GlobalRateLimiter:
         if not cls._enabled:
             yield RateLimitSlot()
             return
+        provider_key = _normalize_key(provider_key)
         rpm_bucket = cls._get_rpm_bucket(provider_key)
         if rpm_bucket is not None:
             await rpm_bucket.acquire_async(1.0)
@@ -444,11 +467,13 @@ class GlobalRateLimiter:
 
         The synchronous counterpart to :meth:`acquire_async`, with identical
         per-provider semantics across all three dimensions. ``provider_key`` is
-        the provider name (``provider.name``). A no-op when disabled.
+        the provider name (``provider.name``, e.g. ``"OpenAI"``), matched
+        case-insensitively. A no-op when disabled.
         """
         if not cls._enabled:
             yield RateLimitSlot()
             return
+        provider_key = _normalize_key(provider_key)
         rpm_bucket = cls._get_rpm_bucket(provider_key)
         if rpm_bucket is not None:
             rpm_bucket.acquire_sync(1.0)
@@ -543,16 +568,18 @@ async def rate_limit_acquire_async(provider_key: str) -> AsyncGenerator[RateLimi
     a host that issues provider calls outside llmkit's own call functions (e.g.
     a LangChain chat-model wrapper) and still wants them bounded by the same
     concurrency / RPM / TPM budgets. ``provider_key`` is the provider name
-    (``provider.name``, e.g. ``"openai"``); each provider has an independent
-    budget. Yields a :class:`RateLimitSlot`; call its
+    (``provider.name``, e.g. ``"OpenAI"``, ``"AWS Bedrock"``), matched
+    **case-insensitively** — ``"openai"`` and ``"OpenAI"`` share one budget, so
+    any casing joins the same budget llmkit's own calls debit. Each provider
+    has an independent budget. Yields a :class:`RateLimitSlot`; call its
     :meth:`~RateLimitSlot.record_tokens` once you know the call's token usage to
     debit the TPM budget (a no-op when TPM is off). A no-op when limiting is
     disabled.
 
     Usage::
 
-        async with rate_limit_acquire_async("openai") as slot:
-            response = ...  # one slot held against openai's budget
+        async with rate_limit_acquire_async("OpenAI") as slot:
+            response = ...  # one slot held against OpenAI's budget
             slot.record_tokens(response.usage.total_tokens)
 
     Behaviour is identical to the throttle llmkit's own async call path uses.
@@ -568,15 +595,17 @@ def rate_limit_acquire_sync(provider_key: str) -> Generator[RateLimitSlot]:
     The synchronous counterpart to :func:`rate_limit_acquire_async`, for a host
     joining the global per-provider limit from a sync code path (e.g. a
     synchronous LangChain ``_generate``/``_stream`` wrapper). ``provider_key``
-    is the provider name (``provider.name``); each provider has an independent
-    budget across all three dimensions. Yields a :class:`RateLimitSlot` whose
+    is the provider name (``provider.name``, e.g. ``"OpenAI"``), matched
+    **case-insensitively** — any casing joins the same budget llmkit's own
+    calls debit. Each provider has an independent budget across all three
+    dimensions. Yields a :class:`RateLimitSlot` whose
     :meth:`~RateLimitSlot.record_tokens` debits the TPM budget. A no-op when
     limiting is disabled.
 
     Usage::
 
-        with rate_limit_acquire_sync("openai") as slot:
-            response = ...  # one slot held against openai's budget
+        with rate_limit_acquire_sync("OpenAI") as slot:
+            response = ...  # one slot held against OpenAI's budget
             slot.record_tokens(response.usage.total_tokens)
     """
     with GlobalRateLimiter.acquire_sync(provider_key) as slot:

@@ -35,6 +35,10 @@ flip a default or move a symbol — review these first:
 
 ### Added
 
+- `RetryPolicy.max_backoff_seconds` (default `30.0`) — a ceiling on any single
+  backoff sleep. Previously the full-jitter ceiling `base * 2**(attempt-1)`
+  was uncapped, so a large `max_attempts` could sleep hours on late attempts.
+  The cap propagates through the call functions and `with_retries`.
 - `text_llm_call_sync(...)` — a synchronous wrapper around `text_llm_call`,
   matching the existing structured sync wrappers and removing the call-surface
   asymmetry for non-streaming LLM calls.
@@ -381,6 +385,46 @@ flip a default or move a symbol — review these first:
   `llmkit.rate_limiting`); only the top-level re-export is gone.
 
 ### Fixed
+
+- **Logging is now best-effort against *any* exception, not an enumerated
+  set.** The YAML sink's handlers caught only `(OSError, yaml.YAMLError,
+  UnicodeError)`, so an exotic failure (e.g. `RecursionError` from a cyclic
+  structure) escaped a sink documented as never breaking the call, and the
+  truncated exclusive-create file was left orphaned. The sink and the
+  `index.jsonl` append now swallow any `Exception` (warning with context), the
+  orphan is unlinked on any post-create failure, and an index-line failure no
+  longer discards the already-written YAML path. Sanitized `feature`/`label`
+  filename components are also clamped to 80 UTF-8 bytes, so a long label can
+  no longer make every log write fail with `ENAMETOOLONG`.
+- **A failed `text_llm_call` attempt logs `response: null`, not `""`.** The
+  empty-string initializer made a pre-content failure indistinguishable from a
+  successful empty completion; the record now matches the documented
+  "accumulated text, or None" contract (streaming keeps its intentional
+  partial-transcript-on-error behavior).
+- **A raising custom serializer can no longer mask a structured call's
+  result.** The `model_dump()` on the logging path ran unprotected in the
+  `finally`; a schema with a raising `@model_serializer` would replace the
+  successful return value (or the real provider error) with the serializer
+  exception. The dump now degrades the *logged* response to `None` with a
+  warning.
+- **Ctrl-C abandons an in-flight sync call instead of resuming it during
+  teardown.** After `KeyboardInterrupt` stopped the loop mid-call, the
+  logging-drain `finally` restarted the loop and resumed the interrupted call
+  for up to the full drain timeout, then discarded its result. The bridge now
+  cancels and settles the pending main task before draining, without masking
+  the caller's `KeyboardInterrupt`.
+- **`with_retries(retry_on=None)` routes wrapped transport causes to the
+  transport budget.** With the documented "retry on any Exception" default, an
+  `InstructorRetryException` wrapping a 429/503 was charged to the *lower*
+  validation budget — the exact misclassification `underlying_provider_error`
+  exists to prevent. The unwrapped cause is now classified against
+  `LLM_TRANSPORT_ERRORS` when `retry_on` is unset.
+- **Rate-limit provider keys are case-insensitive.** The limiter keyed budgets
+  by exact string, but llmkit's own calls use display names (`"OpenAI"`) while
+  the public helpers' examples said `"openai"` — a host following the docs
+  silently acquired against a separate budget. Keys are now casefolded at the
+  acquire boundary, so any casing joins the same rpm/tpm/concurrency budget;
+  examples updated to the canonical names.
 
 - **A real provider 503 is retried again.** LiteLLM maps HTTP 503 to its own
   `ServiceUnavailableError`, which subclasses `openai.APIStatusError` directly —

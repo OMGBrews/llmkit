@@ -131,7 +131,8 @@ class LLMClientConfig:
 
     Only the *active* provider's fields need be populated. ``api_key`` is
     unused by Ollama (which talks to a local endpoint) and ``base_url`` is
-    unused by Google/Anthropic (whose endpoints are fixed). Per-call
+    unused by Google/Anthropic/DeepSeek/Bedrock (whose endpoints are
+    fixed). Per-call
     ``model`` overrides (e.g. the strong/small roles the host resolves)
     are passed at call time and are not part of this config — this carries
     only the provider's *default* model.

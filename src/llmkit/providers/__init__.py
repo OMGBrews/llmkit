@@ -3,8 +3,9 @@
 Public facade for the provider layer. The provider-agnostic core lives in
 :mod:`llmkit.providers.base`; each concrete provider lives in its own
 sibling module (``openrouter``, ``ollama``, ``google``, ``anthropic``,
-``openai``). This package is the **single place** that imports every
-provider module and maps a :class:`Provider` to its implementation.
+``openai``, ``deepseek``, ``bedrock``). This package is the **single
+place** that imports every provider module and maps a :class:`Provider`
+to its implementation.
 
 Adding a provider: create a ``providers/<name>.py`` with a
 :class:`BaseProvider` subclass and a ``build(config)`` classmethod, then

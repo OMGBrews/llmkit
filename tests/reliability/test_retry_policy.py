@@ -4,7 +4,7 @@ These pin the *policy* side of retries, complementing the call-surface
 behaviour in ``test_default_retries.py``:
 
 * the shipped default budget (3 transport attempts / 2 validation, 0.5s base
-  backoff) and the jittered exponential-ceiling backoff;
+  backoff, 30s per-sleep cap) and the jittered exponential-ceiling backoff;
 * ``LLM_RECOVERABLE_ERRORS`` membership — 429 / 5xx / network are transient,
   auth and other 4xx are not — and that it's the union of the transport and
   schema subsets; including litellm's own ``ServiceUnavailableError`` (its
@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import random
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,9 +69,11 @@ def _make_validation_error() -> ValidationError:
 
 
 def test_default_retry_policy_values() -> None:
-    """The shipped default budget is three attempts with 0.5s base backoff."""
+    """The shipped default budget is three attempts with 0.5s base backoff
+    and a 30s cap on any single backoff sleep."""
     assert DEFAULT_RETRY_POLICY.max_attempts == 3
     assert DEFAULT_RETRY_POLICY.backoff_base_seconds == 0.5
+    assert DEFAULT_RETRY_POLICY.max_backoff_seconds == 30.0
 
 
 @pytest.mark.asyncio
@@ -117,6 +120,14 @@ def test_max_attempts_zero_raises_value_error() -> None:
     """``RetryPolicy(max_attempts=0)`` is rejected at construction."""
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
         _ = RetryPolicy(max_attempts=0)
+
+
+@pytest.mark.parametrize("bad_cap", [0.0, -1.0])
+def test_non_positive_max_backoff_seconds_raises_value_error(bad_cap: float) -> None:
+    """``RetryPolicy`` rejects a non-positive backoff cap at construction,
+    like its other numeric fields (disable backoff via ``backoff_base_seconds=0``)."""
+    with pytest.raises(ValueError, match="max_backoff_seconds must be > 0"):
+        _ = RetryPolicy(max_backoff_seconds=bad_cap)
 
 
 # --- transient set excludes auth / non-429 4xx ---------------------------
@@ -550,6 +561,70 @@ async def test_instructor_wrapped_schema_error_uses_validation_budget() -> None:
     ):
         _ = await structured_output.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_transport_cause",
+    [
+        pytest.param(lambda: _status_error(openai.RateLimitError, 429), id="429"),
+        pytest.param(_litellm_503, id="litellm-503"),
+    ],
+)
+async def test_retry_on_none_wrapped_transport_cause_uses_transport_budget(
+    make_transport_cause: Callable[[], Exception],
+) -> None:
+    """``retry_on=None`` ("retry on any Exception") must not break the budget
+    *routing*: an ``InstructorRetryException`` wrapping a transport cause
+    (429, litellm 503) is classified against ``LLM_TRANSPORT_ERRORS`` after
+    unwrapping and charged the full transport budget (4), not the lower
+    validation budget (2). Regression test: the cause check used to require
+    an explicit ``retry_on``, so direct ``with_retries`` callers using the
+    documented ``None`` default got the exact misclassification the unwrap
+    exists to prevent."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _fn() -> str:
+        calls[0] += 1
+        raise InstructorRetryException(make_transport_cause(), n_attempts=1, total_usage=0)
+
+    with pytest.raises(InstructorRetryException):
+        _ = await with_retries(
+            _fn,
+            max_attempts=4,
+            retry_on=None,
+            validation_max_attempts=2,
+            validation_retry_on=LLM_SCHEMA_ERRORS,
+        )
+
+    assert calls[0] == 4
+
+
+@pytest.mark.asyncio
+async def test_retry_on_none_wrapped_validation_cause_uses_validation_budget() -> None:
+    """Under the same ``retry_on=None`` setup, an ``InstructorRetryException``
+    wrapping a genuine ``ValidationError`` still lands on the lower validation
+    budget (2) — the transport fallback must not swallow real schema failures."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _fn() -> str:
+        calls[0] += 1
+        raise InstructorRetryException(_make_validation_error(), n_attempts=1, total_usage=0)
+
+    with pytest.raises(InstructorRetryException):
+        _ = await with_retries(
+            _fn,
+            max_attempts=4,
+            retry_on=None,
+            validation_max_attempts=2,
+            validation_retry_on=LLM_SCHEMA_ERRORS,
         )
 
     assert calls[0] == 2
