@@ -82,4 +82,4 @@ def test_bedrock_provider_builds_when_both_present() -> None:
     """With both anthropic and boto3 installed, construction succeeds (sanity)."""
     provider = BedrockProvider()
     assert provider.name == "AWS Bedrock"
-    assert provider.litellm_model() == "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
+    assert provider.litellm_model() == "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"

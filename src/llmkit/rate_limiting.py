@@ -298,8 +298,14 @@ class GlobalRateLimiter:
                 (the default) to leave the token-rate dimension off.
 
         Raises:
-            ValueError: if ``rpm`` or ``tpm`` is set to a non-positive value.
+            ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` /
+                ``tpm`` is set to a non-positive value. ``Semaphore(0)`` is a
+                legal, permanently-locked semaphore, so without this check a
+                ``max_concurrent=0`` would be accepted here and silently hang
+                every subsequent LLM call.
         """
+        if max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be a positive integer, got {max_concurrent!r}")
         if rpm is not None and rpm <= 0:
             raise ValueError(f"rpm must be a positive integer or None, got {rpm!r}")
         if tpm is not None and tpm <= 0:
@@ -502,7 +508,8 @@ def configure_rate_limit(
             the token-rate dimension off (the default).
 
     Raises:
-        ValueError: if ``rpm`` or ``tpm`` is set to a non-positive value.
+        ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` / ``tpm``
+            is set to a non-positive value.
     """
     GlobalRateLimiter.configure(max_concurrent, enabled, rpm, tpm)
 

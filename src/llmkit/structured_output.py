@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from llmkit.providers import LLMProviderInterface
 from llmkit.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
+    _retry_active,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
     handle_retry_failure,
     with_retries,
 )
@@ -787,7 +789,15 @@ async def stream_text_with_log(
     retry = resolved.retry
     provider = resolved.provider
     tag = label or feature
-    for attempt in range(1, retry.max_attempts + 1):
+
+    # Nested-retry guard, mirroring ``with_retries``: when an outer llmkit
+    # retry loop is already active (the documented composable path — a host
+    # wrapping stream consumption, since mid-stream errors propagate
+    # unretried), this loop collapses to a single pass so the budgets don't
+    # multiply (the 3 x 3 = 9 trap). The accidental double-wrap — a failure
+    # this policy *would* have retried — warns; an explicit NO_RETRY inner
+    # stays silent.
+    if _retry_active.get():
         yielded_any = False
         try:
             async for chunk in _stream_once(
@@ -804,29 +814,80 @@ async def stream_text_with_log(
                 yield chunk
             return
         except Exception as exc:
-            # A partially-consumed stream can't be restarted, and only the
-            # curated transient set is retryable — so a non-transient error or
-            # a mid-stream failure (chunks already delivered) propagates as-is.
-            # Streaming is plain text (no schema parsing), so it budgets on the
-            # transport ``max_attempts`` only; both transient sets are matched
-            # for completeness so a stray validation error is still treated as
-            # transient rather than escaping unretried.
-            if not isinstance(exc, (*retry.retry_on, *retry.validation_retry_on)) or yielded_any:
-                raise
-            # Pre-first-chunk transient failure: retry until the budget is
-            # spent. The final attempt logs an exhaustion ERROR before
-            # re-raising, mirroring ``with_retries`` so an operator greps the
-            # streaming and non-streaming surfaces the same way.
-            if attempt == retry.max_attempts:
-                logger.error("%s: all %d attempts failed: %s", tag, retry.max_attempts, exc)
-                raise
-            await handle_retry_failure(
-                tag=tag,
-                attempt=attempt,
-                max_attempts=retry.max_attempts,
-                error=exc,
-                backoff_base_seconds=retry.backoff_base_seconds,
+            would_have_retried = (
+                retry.max_attempts > 1
+                and not yielded_any
+                and isinstance(exc, (*retry.retry_on, *retry.validation_retry_on))
             )
+            if would_have_retried:
+                warnings.warn(
+                    f"stream_text_with_log({tag!r}) is nested inside an already-retrying "
+                    + "llmkit retry loop; this inner layer ran a single pass to avoid "
+                    + "multiplying retry budgets (the outer loop owns the retries). To "
+                    + "drive retries from an outer wrapper around a call function, opt "
+                    + "the inner call out with retry=NO_RETRY.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            raise
+
+    # Mark this loop active so a nested llmkit retry layer collapses to a
+    # single pass, exactly as ``with_retries`` does. An async generator body
+    # runs in its *consumer's* context, so the flag is released around each
+    # ``yield`` (and re-armed on resume): holding it across a suspension would
+    # leak it into the consumer's own llmkit calls between chunks — and, on an
+    # early break, leave it set in their context for good.
+    token = _retry_active.set(True)
+    try:
+        for attempt in range(1, retry.max_attempts + 1):
+            yielded_any = False
+            try:
+                async for chunk in _stream_once(
+                    prompt,
+                    feature=feature,
+                    label=label,
+                    temperature=temperature,
+                    model=model,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    provider=provider,
+                ):
+                    yielded_any = True
+                    _retry_active.reset(token)
+                    try:
+                        yield chunk
+                    finally:
+                        token = _retry_active.set(True)
+                return
+            except Exception as exc:
+                # A partially-consumed stream can't be restarted, and only the
+                # curated transient set is retryable — so a non-transient error or
+                # a mid-stream failure (chunks already delivered) propagates as-is.
+                # Streaming is plain text (no schema parsing), so it budgets on the
+                # transport ``max_attempts`` only; both transient sets are matched
+                # for completeness so a stray validation error is still treated as
+                # transient rather than escaping unretried.
+                if (
+                    not isinstance(exc, (*retry.retry_on, *retry.validation_retry_on))
+                    or yielded_any
+                ):
+                    raise
+                # Pre-first-chunk transient failure: retry until the budget is
+                # spent. The final attempt logs an exhaustion ERROR before
+                # re-raising, mirroring ``with_retries`` so an operator greps the
+                # streaming and non-streaming surfaces the same way.
+                if attempt == retry.max_attempts:
+                    logger.error("%s: all %d attempts failed: %s", tag, retry.max_attempts, exc)
+                    raise
+                await handle_retry_failure(
+                    tag=tag,
+                    attempt=attempt,
+                    max_attempts=retry.max_attempts,
+                    error=exc,
+                    backoff_base_seconds=retry.backoff_base_seconds,
+                )
+    finally:
+        _retry_active.reset(token)
 
 
 async def _stream_once(

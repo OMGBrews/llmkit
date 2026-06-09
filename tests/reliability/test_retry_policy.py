@@ -7,7 +7,10 @@ behaviour in ``test_default_retries.py``:
   backoff) and the jittered exponential-ceiling backoff;
 * ``LLM_RECOVERABLE_ERRORS`` membership — 429 / 5xx / network are transient,
   auth and other 4xx are not — and that it's the union of the transport and
-  schema subsets;
+  schema subsets; including litellm's own ``ServiceUnavailableError`` (its
+  503, which does not subclass ``openai.InternalServerError``);
+* instructor's in-call schema-repair budget (``max_retries=2`` = two attempts
+  total = one repair re-ask) as pinned by ``acompletion_structured``;
 * the ``with_retries`` primitive's ``max_attempts`` naming and the nested-retry
   guard that stops an outer wrapper from multiplying the inner budget;
 * the validation/transport budget split (a deterministic schema failure can't
@@ -26,6 +29,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import litellm
 import openai
 import pytest
 from pydantic import ValidationError
@@ -42,7 +46,7 @@ from llmkit import (
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 from llmkit.retry import with_retries
 from llmkit.structured_output import capture_llm_log_paths
-from tests._support import OkSchema
+from tests._support import OkSchema, capture_structured_provider_kwargs
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
 
@@ -124,6 +128,23 @@ def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APISt
     return cls("boom", response=httpx.Response(status, request=request), body=None)
 
 
+def _litellm_503() -> litellm.exceptions.ServiceUnavailableError:
+    """Build litellm's 503 the way litellm itself constructs it.
+
+    LiteLLM's exception mapping raises ``ServiceUnavailableError`` with
+    keyword ``message`` / ``llm_provider`` / ``model`` (and optionally the
+    underlying ``httpx.Response``) — not the ``openai`` SDK's
+    ``(message, response=, body=)`` shape.
+    """
+    request = httpx.Request("POST", "https://api.test/v1/chat/completions")
+    return litellm.exceptions.ServiceUnavailableError(
+        message="service unavailable",
+        llm_provider="openai",
+        model="gpt-4o-mini",
+        response=httpx.Response(503, request=request),
+    )
+
+
 def test_recoverable_set_excludes_auth_and_other_4xx() -> None:
     """Permanent 4xx errors are not in the transient set; 429 / 5xx / network are.
 
@@ -136,9 +157,25 @@ def test_recoverable_set_excludes_auth_and_other_4xx() -> None:
     assert not isinstance(_status_error(openai.PermissionDeniedError, 403), LLM_RECOVERABLE_ERRORS)
 
     assert isinstance(_status_error(openai.RateLimitError, 429), LLM_RECOVERABLE_ERRORS)
-    assert isinstance(_status_error(openai.InternalServerError, 503), LLM_RECOVERABLE_ERRORS)
+    assert isinstance(_status_error(openai.InternalServerError, 500), LLM_RECOVERABLE_ERRORS)
     conn = openai.APIConnectionError(message="down", request=httpx.Request("POST", "https://x"))
     assert isinstance(conn, LLM_RECOVERABLE_ERRORS)
+
+
+def test_litellm_service_unavailable_503_is_in_transport_set() -> None:
+    """litellm's real 503 class is transport-recoverable.
+
+    ``litellm.exceptions.ServiceUnavailableError`` does NOT subclass
+    ``openai.InternalServerError`` (its MRO goes straight to
+    ``openai.APIStatusError``), so the subclass-of-openai pattern the rest of
+    the transport set relies on never covered it — it must be (and is) listed
+    explicitly in ``LLM_TRANSPORT_ERRORS``.
+    """
+    err = _litellm_503()
+    # The premise that forces the explicit listing: no openai 5xx subclassing.
+    assert not isinstance(err, openai.InternalServerError)
+    assert isinstance(err, LLM_TRANSPORT_ERRORS)
+    assert isinstance(err, LLM_RECOVERABLE_ERRORS)
 
 
 @pytest.mark.asyncio
@@ -179,6 +216,68 @@ async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
 
     assert result.ok is True
     assert calls[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_structured_litellm_503_is_retried_on_transport_budget() -> None:
+    """A litellm-native 503 gets the full transport budget (3 attempts).
+
+    Regression test: litellm raises ``ServiceUnavailableError`` for HTTP 503
+    (never ``openai.InternalServerError``), so before the explicit listing in
+    ``LLM_TRANSPORT_ERRORS`` a real 503 matched neither retry budget and
+    propagated unretried after a single attempt.
+    """
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        raise _litellm_503()
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(litellm.exceptions.ServiceUnavailableError),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
+    """A transient litellm 503 is recovered: retried once, then succeeds."""
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise _litellm_503()
+        return OkSchema(ok=True), None
+
+    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+        result = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert result.ok is True
+    assert calls[0] == 2
+
+
+# --- instructor's in-call schema-repair budget -----------------------------
+
+
+def test_instructor_in_call_budget_is_two_attempts_one_repair() -> None:
+    """The structured call pins instructor's ``max_retries`` to 2.
+
+    instructor feeds the int to tenacity's ``stop_after_attempt``, so the
+    value counts *total attempts*: 2 = two attempts total = exactly one
+    schema-repair re-ask. Regression test: the previous ``max_retries=1``
+    meant one attempt total — zero in-call repairs ever happened, despite the
+    documented "single repair" intent.
+    """
+    seen = capture_structured_provider_kwargs()
+    assert seen["max_retries"] == 2
 
 
 # --- unified naming: max_attempts is the only name ------------------------

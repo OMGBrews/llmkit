@@ -53,8 +53,10 @@ def test_completion_kwargs_without_region() -> None:
 
 
 def test_default_model() -> None:
-    """A sane, structured-output-capable on-demand default when none is given."""
-    assert BedrockProvider().model == "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    """A current, structured-output-capable default when none is given: Haiku 4.5
+    (the model ``ANTHROPIC_JSON`` was measured against) via its cross-region
+    inference-profile id — newer Claude models on Bedrock aren't on-demand."""
+    assert BedrockProvider().model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 def test_build_provider_maps_bedrock() -> None:

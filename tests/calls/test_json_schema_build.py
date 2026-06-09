@@ -239,6 +239,52 @@ def test_non_object_root_raises_clear_value_error() -> None:
         _ = model_from_json_schema({"type": "array", "items": {"type": "string"}})
 
 
+def test_typeless_enum_root_raises_clear_value_error() -> None:
+    """A bare ``{"enum": [...]}`` root must fail loudly naming the construct —
+    pre-fix it silently built a zero-field ``extra='forbid'`` model that
+    rejected every real response (or validated ``{}``, losing the data)."""
+    with pytest.raises(ValueError, match="top level must be an object, got 'enum'"):
+        _ = model_from_json_schema({"enum": ["a", "b", "c"]})
+
+
+def test_typeless_anyof_root_raises_clear_value_error() -> None:
+    with pytest.raises(ValueError, match="top level must be an object, got 'anyOf'"):
+        _ = model_from_json_schema({"anyOf": [{"type": "string"}, {"type": "null"}]})
+
+
+def test_typeless_oneof_root_raises_clear_value_error() -> None:
+    with pytest.raises(ValueError, match="top level must be an object, got 'oneOf'"):
+        _ = model_from_json_schema({"oneOf": [{"type": "string"}, {"type": "integer"}]})
+
+
+def test_empty_root_raises_clear_value_error() -> None:
+    """A root with neither ``type`` nor ``properties`` is not recognisably an
+    object — fail clearly rather than build an empty everything-rejecting model."""
+    with pytest.raises(ValueError, match="top level must be an object"):
+        _ = model_from_json_schema({})
+    with pytest.raises(ValueError, match="top level must be an object"):
+        _ = model_from_json_schema({"title": "JustATitle"})
+
+
+def test_ref_root_to_enum_def_raises_clear_value_error() -> None:
+    """A root ``$ref`` resolving to an enum def is the same non-object root —
+    the typeless-root gate applies to the resolved target too."""
+    with pytest.raises(ValueError, match="top level must be an object, got 'enum'"):
+        _ = model_from_json_schema(
+            {"$ref": "#/$defs/Status", "$defs": {"Status": {"enum": ["open", "closed"]}}}
+        )
+
+
+def test_bare_properties_root_still_builds() -> None:
+    """Regression: a typeless root that carries ``properties`` is recognisably
+    an object and must keep building (the shape the typeless-root gate exists
+    to preserve)."""
+    model = model_from_json_schema({"properties": {"x": {"type": "string"}}, "required": ["x"]})
+    assert _attr(model(x="hi"), "x") == "hi"
+    with pytest.raises(ValidationError):
+        _ = model()
+
+
 # --- Required-but-nullable fields accept null ------------------------------
 
 

@@ -66,14 +66,15 @@ class RetryPolicy:
     budget is spent.
 
     This layer is kept deliberately separate from instructor's in-call
-    schema-repair budget (``validation_retries``, default 1) — the two are
-    never conflated, so attempts are not double-counted *within* one call.
+    schema-repair budget (``max_retries=2``: two attempts total, i.e. one
+    schema-repair re-ask per call) — the two are never conflated, so attempts
+    are not double-counted *within* one call.
     Note the layering at the seam: when instructor exhausts its own repair
     budget it raises ``InstructorRetryException``, which is in
     :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS` — so a persistent schema
     failure triggers a *fresh outer attempt* on the lower validation budget
     (each attempt runs its own low in-call repair budget). That is layering,
-    not summation: the inner budget stays 1 per attempt. Because instructor
+    not summation: the inner budget stays one re-ask per attempt. Because instructor
     wraps *transport* failures in the same exception, the loop first unwraps it
     (:func:`~llmkit.exceptions.underlying_provider_error`) and routes a wrapped
     transport cause to ``max_attempts`` — so a 429/5xx/network blip inside a

@@ -394,7 +394,7 @@ class LLMClientConfig:
 pip install "omg-llmkit[bedrock]"
 ```
 
-The first cut targets plain **on-demand** Claude-on-Bedrock models (default `anthropic.claude-3-5-sonnet-20240620-v1:0`). Newer Claude 4.x models on Bedrock are typically reached through a cross-region inference profile — pass the profile-prefixed id as `model` (e.g. `us.anthropic.claude-sonnet-4-...`).
+The default model is Claude Haiku 4.5 via its **cross-region inference profile** id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on Bedrock are typically reached through inference profiles rather than plain on-demand ids. Pass a different profile- or partition-prefixed id as `model` (e.g. `eu.anthropic.claude-...`) when your account routes elsewhere.
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 

@@ -102,6 +102,120 @@ def test_array_item_count_bounds_enforced() -> None:
         _ = model(tags=["a", "b", "c"])
 
 
+def test_array_item_string_min_length_enforced() -> None:
+    """A ``minLength`` on the array's ``items`` schema bounds each ELEMENT —
+    pre-fix the array branch recursed into ``items`` for the type only and
+    silently dropped the bound, so ``["a"]`` validated."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"tags": {"type": "array", "items": {"type": "string", "minLength": 3}}},
+        "required": ["tags"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(tags=["abc", "abcd"]), "tags") == ["abc", "abcd"]
+    with pytest.raises(ValidationError):
+        _ = model(tags=["ab"])
+    with pytest.raises(ValidationError):
+        _ = model(tags=["abc", "x"])  # every element is bounded, not just the first
+
+
+def test_array_item_integer_minimum_enforced() -> None:
+    """Numeric bounds on ``items`` apply per element too."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"counts": {"type": "array", "items": {"type": "integer", "minimum": 0}}},
+        "required": ["counts"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(counts=[0, 5]), "counts") == [0, 5]
+    with pytest.raises(ValidationError):
+        _ = model(counts=[-1])
+
+
+def test_array_item_bound_via_ref_enforced() -> None:
+    """A bound declared inside a ``$def`` used as the ``items`` schema is
+    enforced per element — item constraints compose with ``$ref`` resolution."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"ns": {"type": "array", "items": {"$ref": "#/$defs/Bounded"}}},
+        "required": ["ns"],
+        "$defs": {"Bounded": {"type": "integer", "minimum": 10}},
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(ns=[10, 11]), "ns") == [10, 11]
+    with pytest.raises(ValidationError):
+        _ = model(ns=[9])
+
+
+def test_array_item_bound_composes_with_item_count_bounds() -> None:
+    """Element bounds (``minLength`` on items) and container bounds
+    (``minItems`` on the array) are enforced independently and together."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "tags": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 2},
+                "minItems": 1,
+            }
+        },
+        "required": ["tags"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(tags=["ok"]), "tags") == ["ok"]
+    with pytest.raises(ValidationError):
+        _ = model(tags=[])  # container bound
+    with pytest.raises(ValidationError):
+        _ = model(tags=["x"])  # element bound
+
+
+def test_nullable_array_items_with_bound_accept_null() -> None:
+    """A bound on nullable items gates only the non-null elements — ``null``
+    elements still pass (the constraint wraps the non-null branch)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "vals": {"type": "array", "items": {"type": ["string", "null"], "minLength": 3}}
+        },
+        "required": ["vals"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(vals=[None, "abc"]), "vals") == [None, "abc"]
+    with pytest.raises(ValidationError):
+        _ = model(vals=["ab"])
+
+
+def test_array_of_objects_item_property_bounds_still_enforced() -> None:
+    """Regression: nested object items keep their per-property bounds (this
+    already worked pre-fix; pinned so the element-constraint wrap can't
+    regress it)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "lines": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"qty": {"type": "integer", "minimum": 1}},
+                    "required": ["qty"],
+                },
+            }
+        },
+        "required": ["lines"],
+    }
+    model = model_from_json_schema(schema)
+    inst = model(lines=[{"qty": 1}])
+    assert inst.model_dump() == {"lines": [{"qty": 1}]}
+    with pytest.raises(ValidationError):
+        _ = model(lines=[{"qty": 0}])
+
+
 def test_constraint_keyword_on_mismatched_type_is_dropped_not_crashing() -> None:
     """A bound that doesn't match the field's type is dropped, not applied.
 
@@ -212,6 +326,45 @@ def test_bound_on_referenced_def_is_found() -> None:
     assert _attr(model(n=10), "n") == 10
     with pytest.raises(ValidationError):
         _ = model(n=9)
+
+
+def test_ref_sibling_bound_is_applied() -> None:
+    """A bound sitting ALONGSIDE a ``$ref`` (Draft 2020-12 sibling keywords)
+    is enforced — pre-fix the ref resolution REPLACED the schema, so
+    ``{"$ref": ..., "minimum": 5}`` silently lost the bound."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/Count", "minimum": 5}},
+        "required": ["n"],
+        "$defs": {"Count": {"type": "integer"}},
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(n=5), "n") == 5
+    with pytest.raises(ValidationError):
+        _ = model(n=4)
+
+
+def test_ref_sibling_bound_outer_wins_over_target() -> None:
+    """When the outer property and the ``$ref`` target both declare the same
+    bound, the OUTER one wins (mirroring the nullable-merge and the
+    ``$ref``-sibling ``description`` precedence); target-only bounds the outer
+    does not redeclare still apply."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/Count", "minimum": 5}},
+        "required": ["n"],
+        "$defs": {"Count": {"type": "integer", "minimum": 1, "maximum": 10}},
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(n=5), "n") == 5
+    # Outer minimum=5 beats the target's looser minimum=1.
+    with pytest.raises(ValidationError):
+        _ = model(n=2)
+    # The target's maximum (no outer competitor) still applies alongside.
+    with pytest.raises(ValidationError):
+        _ = model(n=11)
 
 
 def test_description_on_referenced_def_is_found() -> None:

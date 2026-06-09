@@ -14,6 +14,7 @@ module-level pattern.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -76,6 +77,49 @@ def _oneline(value: str) -> str:
     ``# ok | ...`` verdict line and corrupt the ``head -1`` triage.
     """
     return _CONTROL_CHARS.sub(" ", value).strip()
+
+
+class _LogSafeDumper(yaml.SafeDumper):
+    """:class:`yaml.SafeDumper` that degrades unknown objects to plain scalars.
+
+    ``record.response`` is whatever the caller produced — typically a Pydantic
+    ``model_dump()`` in python mode, which can carry Enum members, ``Decimal``,
+    ``set``, datetime subclasses, and other arbitrary objects. The stock
+    (unsafe) ``Dumper`` serializes those as ``!!python/object`` tags, which
+    ``yaml.safe_load`` refuses to parse (breaking the documented
+    safe-load-able analysis-tooling contract) and which are an
+    arbitrary-code-execution hazard for anyone using full ``yaml.load``.
+
+    This dumper keeps the standard types (str/int/float/bool/None/dict/list,
+    dates, sets, …) exactly as ``SafeDumper`` renders them, and registers two
+    fallbacks for everything else: an :class:`enum.Enum` member is rendered as
+    its ``.value`` (the payload, not the Python identity), and any other
+    unrepresentable object is rendered as ``str(obj)``. The log therefore
+    always contains plain, safe-load-able YAML regardless of what the sink is
+    fed.
+    """
+
+
+def _represent_enum(dumper: yaml.SafeDumper, data: enum.Enum) -> yaml.Node:
+    """Render an Enum member as its underlying ``.value``."""
+    return dumper.represent_data(data.value)  # pyright: ignore[reportAny, reportUnknownMemberType]  # raw-llm — Enum payload is arbitrary; yaml stubs leave represent_data untyped
+
+
+def _represent_fallback(dumper: yaml.SafeDumper, data: object) -> yaml.Node:
+    """Render any otherwise-unrepresentable object as a plain string scalar."""
+    try:
+        text = str(data)
+    except Exception:
+        # A hostile/broken __str__ must not break logging; object.__repr__
+        # never raises.
+        text = object.__repr__(data)
+    return dumper.represent_str(text)
+
+
+# Enum first: multi-representers match in registration order, and an Enum
+# member is also an ``object``, so the generic fallback would shadow it.
+_LogSafeDumper.add_multi_representer(enum.Enum, _represent_enum)
+_LogSafeDumper.add_multi_representer(object, _represent_fallback)
 
 
 # Compact append-only summary sibling to the per-call YAML files: one JSON
@@ -157,14 +201,19 @@ class LocalYamlLogSink:
 
     The per-call YAML is laid out **verdict-first** — a one-line summary
     comment header (status / feature / model / schema / duration / cost),
-    then the small metadata fields, with the large ``response`` and
-    ``prompt`` blobs last — so a reader (a human, but in practice mostly a
-    coding agent) learns what happened from the head of the file without
-    paying to scan the whole prompt. ``index.jsonl`` carries one short
-    line per call (file, timestamp, feature, label, model, schema,
-    duration, cost, error) so cross-call questions — "which calls errored
-    / were slowest / most expensive / the last call for feature X" — are a
-    single small scan instead of globbing and parsing every YAML.
+    then the small metadata fields (including the request-shaping knobs:
+    temperature, max_tokens, reasoning_effort), with the large ``response``
+    and ``prompt`` blobs last — so a reader (a human, but in practice mostly
+    a coding agent) learns what happened from the head of the file without
+    paying to scan the whole prompt. The body is dumped with
+    :class:`_LogSafeDumper`, so the file is always ``yaml.safe_load``-able —
+    plain tags only, never ``!!python/object``. ``index.jsonl`` carries one
+    short line per call (file, timestamp, feature, label, model, provider,
+    schema, duration, cost, error) so cross-call questions — "which calls
+    errored / were slowest / most expensive / the last call for feature X" —
+    are a single small scan instead of globbing and parsing every YAML. The
+    index is deliberately compact: per-call request knobs (temperature,
+    max_tokens, reasoning_effort) live only in the per-call YAML.
     """
 
     def __init__(self, log_dir: Path = DEFAULT_LOG_DIR) -> None:
@@ -216,6 +265,8 @@ class LocalYamlLogSink:
                 "provider": record.provider,
                 "schema": record.schema,
                 "temperature": record.temperature,
+                "max_tokens": record.max_tokens,
+                "reasoning_effort": record.reasoning_effort,
                 "duration_ms": round(record.duration_ms, 1),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
@@ -237,9 +288,14 @@ class LocalYamlLogSink:
                 try:
                     with open(candidate, "x", encoding="utf-8") as f:
                         _ = f.write(header)
+                        # _LogSafeDumper keeps the file safe_load-able: only
+                        # plain YAML tags, never ``!!python/object`` (Enum
+                        # members become their .value, anything else SafeDumper
+                        # can't represent degrades to str(obj)).
                         yaml.dump(
                             doc,
                             f,
+                            Dumper=_LogSafeDumper,
                             default_flow_style=False,
                             sort_keys=False,
                             allow_unicode=True,
@@ -250,9 +306,11 @@ class LocalYamlLogSink:
                     continue
                 except (OSError, yaml.YAMLError, UnicodeError):
                     # A mid-write failure (disk full, or a residual encode error
-                    # such as un-encodable surrogates even on the utf-8 stream)
-                    # leaves a truncated file behind under the exclusive-create
-                    # name. Remove the orphan before degrading so the log dir
+                    # such as un-encodable surrogates even on the utf-8 stream;
+                    # representer errors are designed out by _LogSafeDumper's
+                    # str() fallback, but YAMLError stays guarded for emitter
+                    # edge cases) leaves a truncated file behind under the
+                    # exclusive-create name. Remove the orphan before degrading so the log dir
                     # never accumulates empty/partial YAML, then re-raise to the
                     # best-effort handler below.
                     candidate.unlink(missing_ok=True)
@@ -312,6 +370,10 @@ class LocalYamlLogSink:
         Best-effort and swallowed on failure (logging must never break the
         call). A single ``write`` of a sub-4KB line under ``O_APPEND`` is
         atomic on POSIX, so concurrent calls don't interleave lines.
+
+        The line carries only the cross-call triage fields; request-shaping
+        knobs (temperature, max_tokens, reasoning_effort) are deliberately
+        omitted to keep the index compact — they live in the per-call YAML.
         """
         line: dict[str, str | float | None] = {
             "file": filepath.name,

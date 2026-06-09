@@ -382,6 +382,65 @@ flip a default or move a symbol — review these first:
 
 ### Fixed
 
+- **A real provider 503 is retried again.** LiteLLM maps HTTP 503 to its own
+  `ServiceUnavailableError`, which subclasses `openai.APIStatusError` directly —
+  not `openai.InternalServerError` — so the canonical transient "model
+  overloaded" error matched neither retry budget and propagated unretried.
+  `litellm.exceptions.ServiceUnavailableError` is now listed explicitly in
+  `LLM_TRANSPORT_ERRORS`.
+- **`stream_text_with_log` now participates in the nested-retry guard.** Its
+  hand-rolled retry loop ignored the `_retry_active` flag that `with_retries`
+  documents (and the other call functions honor), so wrapping stream consumption
+  in `with_retries` could multiply pre-first-chunk attempts up to
+  `max_attempts × max_attempts` with no warning. The stream loop now collapses
+  to a single pass under an outer llmkit retry loop (with the same
+  `RuntimeWarning`) and arms the guard around its own attempts.
+- **Structured calls get the documented single in-call schema repair.**
+  instructor turns an integer `max_retries` into `stop_after_attempt(n)` — *n
+  attempts total* — so the previous `max_retries=1` meant zero repair re-asks
+  and every validation failure burned a full cross-call attempt (new request,
+  log record, rate-limit slot). Now `max_retries=2`: two in-call attempts, one
+  repair.
+- **`LocalYamlLogSink` no longer drops `max_tokens` and `reasoning_effort`.**
+  `LLMCallRecord` carried both fields but the YAML body never serialized them,
+  so file-sink users couldn't tell from a log whether a truncated response was
+  cap-limited or thinking was disabled. Both now appear in the per-call YAML
+  (the compact `index.jsonl` deliberately omits them).
+- **Per-call YAML logs are now always `yaml.safe_load`-able.** The sink dumped
+  with the default (unsafe) Dumper, so a response containing an `Enum`,
+  `Decimal`, or `set` was written as `!!python/object` tags — unparseable by
+  `safe_load` and an arbitrary-code-execution hazard under full `yaml.load`.
+  The sink now uses a `SafeDumper` subclass that renders enums as their values
+  and any other non-plain object as a string.
+- **`configure_rate_limit(max_concurrent=0)` now raises instead of hanging
+  every call forever.** `Semaphore(0)` is a legal, permanently-locked
+  semaphore, so a zero cap was accepted at configure time and every subsequent
+  call blocked with nothing pointing at the misconfiguration; negative values
+  raised only at the first call. `configure` now validates `max_concurrent < 1`
+  with a `ValueError`, symmetric with the rpm/tpm checks.
+- **`model_from_json_schema` rejects typeless non-object roots with a clear
+  error.** A root carrying `enum`/`anyOf`/`oneOf` (or nothing recognizable as
+  an object) without `"type": "object"` previously fell through to the object
+  builder and silently produced a zero-field, `extra="forbid"` model that
+  rejected every real response.
+- **`model_from_json_schema` enforces constraints on array items.** Bounds on
+  an array's `items` schema (`minLength`, `minimum`, …) — keywords in the
+  documented supported set — were silently dropped, so schema-violating
+  elements validated. Item constraints now wrap the element annotation,
+  composing with nullable, enum, and `$ref` items.
+- **`model_from_json_schema` honors constraint keywords that are siblings of a
+  `$ref`.** Resolution replaced the schema dict outright, so
+  `{"$ref": ..., "minimum": 5}` lost the bound (while a sibling `description`
+  was honored). Sibling keywords now merge over the resolved target with
+  outer-wins precedence, matching Draft 2020-12 and the module's existing
+  merge behavior.
+- **The default Bedrock model is current again.** The previous default,
+  `anthropic.claude-3-5-sonnet-20240620-v1:0`, was retired upstream in late
+  2025, so configuring `Provider.BEDROCK` without naming a model failed at call
+  time with an AWS error that never implicated the stale default. The default
+  is now Claude Haiku 4.5 via its cross-region inference profile
+  (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — the model the provider's
+  `ANTHROPIC_JSON` mode pin was measured against.
 - **Transient transport failures in a *structured* call now get the full
   transport retry budget.** instructor wraps every exhausted attempt —
   including a 429/503/network failure — in `InstructorRetryException`, which is

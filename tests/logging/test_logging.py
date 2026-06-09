@@ -6,7 +6,10 @@ summary, plus three robustness guards — filename collisions never
 overwrite, ``feature``/``label`` can't escape ``log_dir`` via path
 traversal, and a newline in a caller field can't forge a second verdict
 header line — and the best-effort swallowing that keeps a logging failure
-from ever breaking the LLM call.
+from ever breaking the LLM call. They also pin the serialization contract:
+``max_tokens``/``reasoning_effort`` land in the per-call YAML (but stay out
+of the compact index), and the body is always ``yaml.safe_load``-able even
+when the response carries arbitrary Python objects.
 
 Records are built directly via :func:`_record`; no real LLM call is made.
 """
@@ -15,6 +18,8 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 from typing import Any, cast
 
@@ -113,7 +118,94 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
     assert second["error"] == "Timeout: slow"
 
 
-# 3. Filename collision — the headline guard.
+# 3. max_tokens / reasoning_effort serialization + safe-load-able YAML.
+
+
+def test_max_tokens_and_reasoning_effort_round_trip_into_yaml(tmp_path: Path) -> None:
+    """``max_tokens`` and ``reasoning_effort`` land in the per-call YAML body
+    and round-trip through ``yaml.safe_load`` with their original values."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(
+        _record(max_tokens=512, reasoning_effort="high")
+    )
+    assert path is not None
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert doc["max_tokens"] == 512
+    assert doc["reasoning_effort"] == "high"
+
+
+def test_unset_max_tokens_and_reasoning_effort_serialize_as_null(tmp_path: Path) -> None:
+    """The defaults (both ``None``) still appear as explicit keys, so the log
+    shape is stable whether or not the caller set them."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert path is not None
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert "max_tokens" in doc and doc["max_tokens"] is None
+    assert "reasoning_effort" in doc and doc["reasoning_effort"] is None
+
+
+def test_max_tokens_and_reasoning_effort_stay_out_of_the_index(tmp_path: Path) -> None:
+    """The index is deliberately compact (cross-call triage fields only):
+    request-shaping knobs live in the per-call YAML, not ``index.jsonl``."""
+    sink = LocalYamlLogSink(tmp_path)
+    assert sink.write_returning_path(_record(max_tokens=512, reasoning_effort="high")) is not None
+    line = cast(
+        "dict[str, object]", json.loads((tmp_path / "index.jsonl").read_text().splitlines()[0])
+    )
+    assert "max_tokens" not in line
+    assert "reasoning_effort" not in line
+
+
+class _Color(Enum):
+    RED = "red"
+
+
+def test_response_with_python_objects_stays_safe_loadable(tmp_path: Path) -> None:
+    """A response carrying an Enum member, a Decimal, and a set (as a python-mode
+    ``model_dump()`` can produce) yields a file with no ``!!python`` tags that
+    ``yaml.safe_load`` parses into sensible plain values."""
+    response = {
+        "status": _Color.RED,
+        "price": Decimal("1.25"),
+        "tags": {"alpha", "beta"},
+        "plain": "text",
+        "count": 3,
+    }
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(response=response))
+    assert path is not None
+    text = path.read_text()
+    assert "!!python" not in text
+
+    doc = cast("dict[str, object]", yaml.safe_load(text))
+    parsed = cast("dict[str, object]", doc["response"])
+    # Enum member -> its payload value; Decimal -> its string form; set stays a set.
+    assert parsed["status"] == "red"
+    assert parsed["price"] == "1.25"
+    assert parsed["tags"] == {"alpha", "beta"}
+    # Standard types are untouched.
+    assert parsed["plain"] == "text"
+    assert parsed["count"] == 3
+
+
+def test_standard_record_round_trips_through_safe_load(tmp_path: Path) -> None:
+    """The safe dumper preserves the existing format for ordinary records: the
+    full document safe-loads with the standard scalar types intact."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(
+        _record(
+            prompt="line one\nline two",
+            response={"answer": 42, "ok": True, "ratio": 0.5, "items": ["a", "b"]},
+            approximate_cost=0.001,
+        )
+    )
+    assert path is not None
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert doc["feature"] == "extraction"
+    assert doc["temperature"] == 0.0
+    assert doc["approximate_cost"] == 0.001
+    assert doc["prompt"] == "line one\nline two"
+    assert doc["response"] == {"answer": 42, "ok": True, "ratio": 0.5, "items": ["a", "b"]}
+
+
+# 4. Filename collision — the headline guard.
 
 
 def test_identical_records_do_not_overwrite_each_other(tmp_path: Path) -> None:
@@ -138,7 +230,7 @@ def test_identical_records_do_not_overwrite_each_other(tmp_path: Path) -> None:
     assert "SECOND_RESPONSE" in p2.read_text()
 
 
-# 4. feature/label path-traversal guard.
+# 5. feature/label path-traversal guard.
 
 
 @pytest.mark.parametrize("hostile", ["a/b/../c", "../escape", "..", "/etc/passwd"])
@@ -167,7 +259,7 @@ def test_label_path_traversal_stays_inside_log_dir(tmp_path: Path) -> None:
     assert path.resolve().parent == log_dir.resolve()
 
 
-# 5. Header injection guard.
+# 6. Header injection guard.
 
 
 def test_feature_newline_cannot_forge_a_second_verdict_line(tmp_path: Path) -> None:
@@ -198,7 +290,7 @@ def test_label_newline_cannot_forge_a_second_verdict_line(tmp_path: Path) -> Non
     assert len(comment_lines) == 2
 
 
-# 6. Best-effort error swallow.
+# 7. Best-effort error swallow.
 
 
 def test_yaml_dump_failure_returns_none_and_does_not_raise(
@@ -247,7 +339,7 @@ def test_index_append_failure_never_raises_and_keeps_percall_file(
     assert "feature:" in path.read_text()
 
 
-# 7. write_llm_log dispatch + swallowing.
+# 8. write_llm_log dispatch + swallowing.
 
 
 def test_write_llm_log_swallows_a_raising_sink() -> None:

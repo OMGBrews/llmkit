@@ -38,6 +38,7 @@ separately.
 """
 
 import httpx
+import litellm
 import openai
 from instructor.core import InstructorRetryException
 from pydantic import ValidationError
@@ -51,11 +52,32 @@ from pydantic import ValidationError
 #   - ``RateLimitError``      — 429
 #   - ``InternalServerError`` — 5xx
 #   - ``APIConnectionError``  — network failures (``APITimeoutError`` subclasses it)
+#   - ``litellm ServiceUnavailableError`` — 503 (see below)
 #   - ``httpx.RequestError``  — lower-level network failures
 #   - ``TimeoutError``        — builtin timeout
+#
+# LiteLLM raises its *own* exception classes, which we catch via their
+# ``openai`` bases: ``litellm.RateLimitError`` subclasses
+# ``openai.RateLimitError``, ``litellm.InternalServerError`` subclasses
+# ``openai.InternalServerError``, ``litellm.Timeout``/``litellm.APIConnectionError``
+# subclass ``openai.APIConnectionError``. The one transient class that does
+# NOT follow that pattern is ``litellm.exceptions.ServiceUnavailableError``
+# (LiteLLM's mapping for HTTP 503): its MRO goes straight to
+# ``openai.APIStatusError``, skipping ``openai.InternalServerError`` — so it
+# must be listed explicitly or real 503s would propagate unretried.
+#
+# Deliberate scope: we do not retry generic ``openai.APIStatusError`` with
+# status >= 500. LiteLLM maps the 5xx family to the named classes above
+# (500 → ``InternalServerError``, 503 → ``ServiceUnavailableError``), and an
+# isinstance-tuple can't express a status-code predicate; a raw
+# ``APIStatusError`` outside those mappings is unexpected enough to surface
+# rather than retry.
 LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     openai.RateLimitError,
     openai.InternalServerError,
+    # litellm-native 503 — does not subclass ``openai.InternalServerError``
+    # (only ``openai.APIStatusError``), so it needs an explicit entry.
+    litellm.exceptions.ServiceUnavailableError,
     openai.APIConnectionError,
     httpx.RequestError,
     TimeoutError,
@@ -67,7 +89,8 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 # response still earns one cross-call retry.
 #   - ``ValidationError``           — pydantic could not parse the response
 #   - ``InstructorRetryException``  — instructor exhausted its in-call repair
-#     budget (``max_retries=1``) for this attempt. NOTE: instructor wraps *any*
+#     budget (``max_retries=2``: two attempts total, i.e. one schema-repair
+#     re-ask) for this attempt. NOTE: instructor wraps *any*
 #     exhausted attempt this way, transport failures included — the retry layer
 #     unwraps it (``underlying_provider_error``) so a wrapped transport cause is
 #     charged the transport budget rather than this lower one.

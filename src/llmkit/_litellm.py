@@ -220,8 +220,10 @@ async def acompletion_structured[T: BaseModel](
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
     completion (for cost) are both in hand. instructor's in-call schema-repair
-    budget is pinned to ``max_retries=1`` (a single repair, deliberately low)
-    and kept separate from the transient-error retry layer (``with_retries`` in
+    budget is pinned to ``max_retries=2`` — instructor counts *total attempts*
+    (it feeds the int to tenacity's ``stop_after_attempt``), so 2 means two
+    attempts total = one schema-repair re-ask, deliberately low — and kept
+    separate from the transient-error retry layer (``with_retries`` in
     :mod:`llmkit.retry`), which owns the cross-call 429/503/5xx and
     schema-validation budgets.
 
@@ -256,9 +258,12 @@ async def acompletion_structured[T: BaseModel](
             messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
             response_model=output_schema,
             temperature=temperature,
-            # instructor's in-call schema-repair budget: one repair, no more.
-            # The cross-call transient/validation budgets live in llmkit.retry.
-            max_retries=1,
+            # instructor's in-call schema-repair budget. instructor counts
+            # *total attempts* (the int becomes tenacity stop_after_attempt),
+            # so 2 = two attempts total = exactly one schema-repair re-ask;
+            # 1 would mean no repair ever happens. The cross-call
+            # transient/validation budgets live in llmkit.retry.
+            max_retries=2,
             **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
             **({"reasoning_effort": effort} if effort is not None else {}),

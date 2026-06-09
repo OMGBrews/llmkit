@@ -39,11 +39,14 @@ class BedrockProvider(BaseProvider):
     does not). Non-Claude Bedrock families (Llama, Titan) may need a different
     mode and are out of scope for this first cut.
 
-    The default model is a plain **on-demand** Claude-on-Bedrock id. Newer
-    Claude 4.x models on Bedrock are typically reachable only through a
-    cross-region inference profile — pass the profile-prefixed id as the
-    ``model`` (e.g. ``us.anthropic.claude-sonnet-4-...``); inference profiles
-    are otherwise out of scope here.
+    The default model is Haiku 4.5 — the model the ``ANTHROPIC_JSON`` mode
+    choice above was actually measured against — via its **cross-region
+    inference profile** id (``us.anthropic....``). Newer Claude models on
+    Bedrock are generally reachable only through such a profile, not a bare
+    on-demand id, so the default carries the ``us.`` prefix; callers in other
+    AWS partitions should pass their region group's profile id (e.g.
+    ``eu.anthropic....``) as the ``model``. Inference profiles are otherwise
+    out of scope here.
 
     ``reasoning_effort`` is forwarded to LiteLLM for Bedrock models that
     support thinking (e.g. Claude) and is harmless on those that don't.
@@ -63,7 +66,7 @@ class BedrockProvider(BaseProvider):
     _provider_name: str = "AWS Bedrock"
     _model_prefix: str = "bedrock/"
     _mode: instructor.Mode = instructor.Mode.ANTHROPIC_JSON
-    _default_model: str = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    _default_model: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def __init__(
         self,

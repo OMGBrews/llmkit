@@ -83,7 +83,18 @@ import keyword
 import re
 from collections.abc import Callable, Mapping
 from enum import Enum
-from typing import Any, ClassVar, Literal, NamedTuple, Self, TypedDict, Unpack, cast, override
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    Self,
+    TypedDict,
+    Unpack,
+    cast,
+    override,
+)
 
 from pydantic import (
     BaseModel,
@@ -366,6 +377,29 @@ def _as_list(element: object) -> object:
     return list[cast("type", element)]
 
 
+def _with_constraints(annotation: object, c: _FieldConstraints) -> object:
+    """Wrap a runtime-built annotation with resolved bounds via ``Annotated``.
+
+    Used where the bounds cannot ride on the property's own ``Field`` — array
+    *element* constraints (``minLength`` on the items schema, say) must attach
+    to the element annotation, not the list field. A no-op when every bound is
+    unset. Like :func:`_nullable`, the type-level cast is confined here.
+    """
+    if all(bound is None for bound in c):
+        return annotation
+    return Annotated[
+        cast("type", annotation),
+        Field(
+            ge=c.ge,
+            le=c.le,
+            gt=c.gt,
+            lt=c.lt,
+            min_length=c.min_length,
+            max_length=c.max_length,
+        ),
+    ]
+
+
 class _Converter:
     """One conversion pass over a single root schema and its ``$defs``.
 
@@ -501,7 +535,13 @@ class _Converter:
                     f"Unsupported array at {field_path!r}: 'items' must be a single "
                     + "schema object (tuple/heterogeneous arrays are not supported)."
                 )
-            element, element_nullable = self._field_type(cast("JsonDict", items), f"{field_path}[]")
+            items_schema = cast("JsonDict", items)
+            element, element_nullable = self._field_type(items_schema, f"{field_path}[]")
+            # Per-element bounds (e.g. ``minLength`` on the items schema) ride
+            # on the element annotation — the list field's own ``Field`` only
+            # carries ``minItems``/``maxItems``. Wrap BEFORE the nullable
+            # union so a ``null`` element still passes unbounded.
+            element = _with_constraints(element, self._field_constraints(items_schema))
             if element_nullable:
                 element = _nullable(element)
             return _as_list(element), nullable
@@ -533,12 +573,20 @@ class _Converter:
         crash on the first response. Gating by type keeps the drop-the-
         unsupported promise instead of crashing.
         """
+        # Draft 2020-12 applies keywords that sit ALONGSIDE a ``$ref`` together
+        # with the target's, so merge rather than replace — outer keys win on
+        # conflict, matching the nullable-merge precedence above. Without the
+        # merge, ``{"$ref": "#/$defs/Count", "minimum": 5}`` would silently
+        # drop the bound.
         if "$ref" in schema:
-            _, schema = self._resolve_ref(cast("str", schema["$ref"]))
+            _, target = self._resolve_ref(cast("str", schema["$ref"]))
+            siblings = {k: v for k, v in schema.items() if k != "$ref"}
+            schema = {**target, **siblings}
         inner, _ = self._unwrap_nullable(schema)
         if "$ref" in inner:
-            _, inner = self._resolve_ref(cast("str", inner["$ref"]))
-            inner, _ = self._unwrap_nullable(inner)
+            _, target = self._resolve_ref(cast("str", inner["$ref"]))
+            siblings = {k: v for k, v in inner.items() if k != "$ref"}
+            inner, _ = self._unwrap_nullable({**target, **siblings})
 
         raw_type = inner.get("type")
         types: set[str] = (
@@ -790,6 +838,23 @@ class _Converter:
             raise ValueError(
                 f"Unsupported root schema: top level must be an object, got type {jtype!r}."
             )
+        if jtype is None:
+            # A typeless root is accepted only when it is recognisably an
+            # object (bare ``properties``). An ``enum`` / ``anyOf`` / ``oneOf``
+            # root — or an empty schema — would otherwise fall through to a
+            # zero-field ``extra="forbid"`` model that rejects every real
+            # response (or silently validates ``{}``).
+            offender = next((k for k in ("enum", "anyOf", "oneOf") if k in root), None)
+            if offender is not None:
+                raise ValueError(
+                    f"Unsupported root schema: top level must be an object, got {offender!r} "
+                    + "with no 'type'. Wrap it in an object property instead."
+                )
+            if "properties" not in root:
+                raise ValueError(
+                    "Unsupported root schema: top level must be an object with 'properties' "
+                    + f'(or "type": "object") — got keys {sorted(root)}.'
+                )
         model = self._build_object(root, "$", ref_name=root_ref)
         chosen = name if name else root.get("title")
         # Rename so an explicit name / title wins, and a title-less root

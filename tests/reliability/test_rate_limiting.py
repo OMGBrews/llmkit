@@ -514,6 +514,15 @@ def test_configure_rejects_nonpositive_rpm_tpm() -> None:
         configure_rate_limit(tpm=-5)
 
 
+def test_configure_rejects_nonpositive_max_concurrent() -> None:
+    """``max_concurrent`` must be positive — ``Semaphore(0)`` is a legal,
+    permanently-locked semaphore, so accepting 0 would hang every LLM call."""
+    with pytest.raises(ValueError, match="max_concurrent must be a positive integer"):
+        configure_rate_limit(max_concurrent=0)
+    with pytest.raises(ValueError, match="max_concurrent must be a positive integer"):
+        configure_rate_limit(max_concurrent=-1)
+
+
 async def test_rpm_off_by_default_creates_no_bucket() -> None:
     """With no rpm/tpm configured, acquiring creates no rate buckets (byte-identical)."""
     async with GlobalRateLimiter.acquire_async("openai"):

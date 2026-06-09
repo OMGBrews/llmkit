@@ -130,7 +130,7 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
         (Provider.ANTHROPIC, "anthropic/", "claude-sonnet-4-6"),
         (Provider.OPENAI, "openai/", "gpt-4.1-mini"),
         (Provider.DEEPSEEK, "deepseek/", "deepseek-chat"),
-        (Provider.BEDROCK, "bedrock/", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
+        (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(
