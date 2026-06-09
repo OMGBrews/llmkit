@@ -455,6 +455,83 @@ def test_enum_member_names_are_never_reserved() -> None:
         assert not (name.startswith("_") and name.endswith("_")), name  # not _sunder_/__dunder__
 
 
+# --- Canonical nullable enum (null as an enum member) ----------------------
+
+
+def test_nullable_enum_list_form_accepts_members_and_null() -> None:
+    """The canonical nullable-enum spelling — ``type: ["string", "null"]`` with
+    ``null`` as an enum member — must build a nullable enum that accepts every
+    string member AND an actual ``null`` (JSON Schema requires ``null`` in the
+    ``enum`` list for it to validate)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"choice": {"type": ["string", "null"], "enum": ["a", "b", None]}},
+        "required": ["choice"],
+    }
+    model = model_from_json_schema(schema)
+    # Required field, but null is one of its valid values.
+    assert model.model_fields["choice"].is_required()
+    for value in ("a", "b"):
+        assert _attr(model(choice=value), "choice") == value
+    assert _attr(model(choice=None), "choice") is None
+    # An out-of-enum string is still rejected — null didn't widen the field.
+    with pytest.raises(ValidationError):
+        _ = model(choice="c")
+    # A real null round-trips: it survives the default dump and re-validates.
+    assert model(choice=None).model_dump() == {"choice": None}
+    revalidated = model.model_validate(model(choice=None).model_dump())
+    assert _attr(revalidated, "choice") is None
+    assert _attr(model.model_validate({"choice": "a"}), "choice") == "a"
+
+
+def test_nullable_enum_anyof_form_accepts_members_and_null() -> None:
+    """Same canonical spelling via the ``anyOf`` + null-branch shape: the
+    non-null branch carries a ``null``-bearing enum, handled consistently."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "choice": {"anyOf": [{"type": "string", "enum": ["a", "b", None]}, {"type": "null"}]}
+        },
+        "required": ["choice"],
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(choice="a"), "choice") == "a"
+    assert _attr(model(choice=None), "choice") is None
+    with pytest.raises(ValidationError):
+        _ = model(choice="c")
+    assert model(choice=None).model_dump() == {"choice": None}
+
+
+def test_non_nullable_enum_with_null_member_raises() -> None:
+    """A ``null`` enum member on a field whose type is NOT nullable is a
+    contradiction (an enum that permits ``null`` but a type that forbids it).
+    It must fail loud naming the field path — not silently drop the ``null``."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"choice": {"type": "string", "enum": ["a", None]}},
+        "required": ["choice"],
+    }
+    with pytest.raises(ValueError, match=r"choice"):
+        _ = model_from_json_schema(schema)
+
+
+def test_nullable_enum_with_only_null_member_raises() -> None:
+    """A nullable enum whose only member is ``null`` collapses to an empty value
+    list once ``null`` is dropped — it must fail loud (no empty ``Enum``), not
+    build a member-less enum."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"choice": {"type": ["string", "null"], "enum": [None]}},
+        "required": ["choice"],
+    }
+    with pytest.raises(ValueError, match=r"non-empty list"):
+        _ = model_from_json_schema(schema)
+
+
 # --- $defs sharing a title must NOT collapse to one class ------------------
 
 

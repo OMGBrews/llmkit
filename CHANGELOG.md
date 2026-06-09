@@ -601,6 +601,17 @@ flip a default or move a symbol — review these first:
   footgun the exclusion exists to prevent, inverted. The drop is now scoped to
   optional fields; a required null is kept. `exclude_none=False` (keep every
   null) and `exclude_none=True` (drop every null) remain available explicitly.
+- **`model_from_json_schema` accepts the canonical nullable-enum spelling.** A
+  nullable enum's standard JSON Schema form carries `null` as an enum member
+  (`{"type": ["string", "null"], "enum": ["a", null]}`) — JSON Schema requires
+  it there for an actual `null` to validate — but the enum builder rejected any
+  non-`str`/`int` member, so it failed with `Unsupported enum value None` while
+  accepting the looser null-free spelling. The `null` member is now dropped once
+  the field has resolved as nullable (its nullability rides the `X | None`
+  union), for both the `type`-list and `anyOf`/`oneOf` shapes. A `null` member
+  on a *non-nullable* field still fails loud (a type that forbids `null` but an
+  enum that permits it is contradictory), as does an enum whose only member is
+  `null`.
 
 ## [0.1.2] — 2026-06-05
 

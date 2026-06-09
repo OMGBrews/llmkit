@@ -517,6 +517,16 @@ class _Converter:
             nullable = nullable or inner_nullable
 
         if "enum" in inner:
+            # The canonical nullable-enum spelling carries ``null`` as an enum
+            # member (``{"type": ["string", "null"], "enum": ["a", null]}``) —
+            # JSON Schema requires it there for an actual ``null`` to validate.
+            # Nullability is already resolved into the ``X | None`` union, so
+            # drop the ``null`` member before building the Enum. A ``null``
+            # member on a NON-nullable field is left in place so ``_build_enum``
+            # still rejects the contradiction loudly.
+            if nullable and isinstance(inner["enum"], list):
+                non_null_members: list[JsonValue] = [v for v in inner["enum"] if v is not None]
+                inner = {**inner, "enum": cast("JsonValue", non_null_members)}
             return self._build_enum(inner, field_path), nullable
 
         jtype = inner.get("type")
