@@ -274,6 +274,35 @@ def _resolve_model_and_provider(
         return (model, None)
 
 
+def _build_call_provider(
+    provider: LLMProviderInterface | None,
+) -> LLMProviderInterface | None:
+    """Resolve the provider for a call exactly once, best-effort.
+
+    A per-call ``provider`` override is returned unchanged; otherwise the
+    globally-configured provider is built a single time so the transport and
+    the log record share one instance — the default path no longer calls
+    :func:`~llmkit.providers.build_provider` twice (once to run the call,
+    again only to read ``.model``/``.name`` for the log). A build failure
+    degrades to ``None`` rather than breaking the call: the transport then
+    re-resolves and surfaces the real configuration error, and the log path
+    degrades to ``(model, None)`` via :func:`_resolve_model_and_provider`.
+    Building is config + cached SDK checks (no I/O), so resolving it here
+    before the retry loop is safe and happens once per call, not per attempt.
+    """
+    if provider is not None:
+        return provider
+    try:
+        from llmkit.providers import build_provider
+
+        return build_provider()
+    except Exception:
+        # The call must not break here; let the transport raise the real
+        # error (logged + retried per attempt) and the log degrade to None.
+        logger.debug("Could not pre-resolve provider for LLM call", exc_info=True)
+        return None
+
+
 @contextmanager
 def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     """Capture the :class:`~llmkit.logging.LLMCallRecord` for each call here.
@@ -426,7 +455,10 @@ async def structured_llm_call[T](
     max_tokens = resolved.max_tokens
     reasoning_effort = resolved.reasoning_effort
     retry = resolved.retry
-    provider = resolved.provider
+    # Build the provider once for this call; the transport reuses this
+    # instance (no rebuild) and the per-attempt log reads its model/name
+    # from it rather than constructing a second one.
+    provider = _build_call_provider(resolved.provider)
 
     async def _attempt() -> T:
         # Deferred import so test patches on ``llmkit._litellm``
@@ -649,7 +681,10 @@ async def text_llm_call(
     max_tokens = resolved.max_tokens
     reasoning_effort = resolved.reasoning_effort
     retry = resolved.retry
-    provider = resolved.provider
+    # Build the provider once for this call; the transport reuses this
+    # instance (no rebuild) and the per-attempt log reads its model/name
+    # from it rather than constructing a second one.
+    provider = _build_call_provider(resolved.provider)
 
     async def _attempt() -> str:
         from llmkit import _litellm
@@ -807,7 +842,10 @@ async def stream_text_with_log(
     max_tokens = resolved.max_tokens
     reasoning_effort = resolved.reasoning_effort
     retry = resolved.retry
-    provider = resolved.provider
+    # Build the provider once for this call; every streaming attempt reuses
+    # this instance for both the transport and the per-attempt log record
+    # rather than constructing a second one.
+    provider = _build_call_provider(resolved.provider)
     tag = label or feature
 
     # Nested-retry guard, mirroring ``with_retries``: when an outer llmkit
