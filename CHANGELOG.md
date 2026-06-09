@@ -4,10 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — 2026-06-09
+## [Unreleased]
 
-This release is a MINOR bump — it carries default-behavior changes and a small
-breaking surface (the last published version was `0.1.2`).
+The accumulated work below is the next release (`0.2.0`, a MINOR bump — it
+carries default-behavior changes and a small breaking surface) and has not yet
+been published to PyPI — the last published version is `0.1.2`. It moves to a
+dated `## [0.2.0]` section when the release is cut.
 
 **Migrating from 0.1.2.** Most code keeps working unchanged, but three changes
 flip a default or move a symbol — review these first:
@@ -500,7 +502,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
-[0.2.0]: https://github.com/OMGBrews/llmkit/compare/v0.1.2...v0.2.0
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.1.2...HEAD
 [0.1.2]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.2
 [0.1.1]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.1
 [0.1.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.1.0
