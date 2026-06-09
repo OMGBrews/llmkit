@@ -21,6 +21,7 @@ from llmkit import (
     LLMCallOptions,
     structured_output,
 )
+from llmkit.options import resolve_call_args
 from tests._support import OkSchema, provider_mock
 
 type _CallKwargs = dict[str, object]
@@ -177,7 +178,7 @@ def test_options_retry_applied_when_keyword_default() -> None:
     """A ``retry`` set on options is honored when the keyword is left default;
     proves the budget field merges like the rest."""
     options = LLMCallOptions(retry=NO_RETRY)
-    resolved = structured_output._resolve_call_args(
+    resolved = resolve_call_args(
         options,
         temperature=0.2,
         model=None,

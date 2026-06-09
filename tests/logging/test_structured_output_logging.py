@@ -29,6 +29,7 @@ from llmkit import (
     configure_llm_logging,
     structured_output,
 )
+from llmkit.capture import resolve_model_and_provider
 from tests._support import make_record as _record
 from tests._support import provider_mock
 
@@ -38,7 +39,7 @@ def test_resolve_substitutes_provider_default_when_model_none() -> None:
     fake_provider.model = "gemini-2.5-flash-lite"
     fake_provider.name = "Google AI Studio"
     with patch("llmkit.providers.build_provider", return_value=fake_provider):
-        resolved, provider = structured_output._resolve_model_and_provider(None)
+        resolved, provider = resolve_model_and_provider(None)
     assert resolved == "gemini-2.5-flash-lite"
     assert provider == "Google AI Studio"
 
@@ -48,7 +49,7 @@ def test_resolve_keeps_explicit_model_and_records_provider() -> None:
     fake_provider.model = "gemini-2.5-flash-lite"
     fake_provider.name = "Google AI Studio"
     with patch("llmkit.providers.build_provider", return_value=fake_provider):
-        resolved, provider = structured_output._resolve_model_and_provider("gemini-2.5-flash")
+        resolved, provider = resolve_model_and_provider("gemini-2.5-flash")
     assert resolved == "gemini-2.5-flash"
     assert provider == "Google AI Studio"
 
@@ -63,7 +64,7 @@ def test_resolve_uses_explicit_provider_without_global_lookup() -> None:
         "llmkit.providers.build_provider",
         side_effect=AssertionError("global build_provider must not be called"),
     ):
-        resolved, provider = structured_output._resolve_model_and_provider(None, override)
+        resolved, provider = resolve_model_and_provider(None, override)
     assert resolved == "anthropic/claude-sonnet-4-6"
     assert provider == "OpenRouter"
 
@@ -101,7 +102,7 @@ def test_resolve_degrades_gracefully_when_provider_unavailable() -> None:
         "llmkit.providers.build_provider",
         side_effect=RuntimeError("no provider configured"),
     ):
-        resolved, provider = structured_output._resolve_model_and_provider("explicit-model")
+        resolved, provider = resolve_model_and_provider("explicit-model")
     assert resolved == "explicit-model"
     assert provider is None
 

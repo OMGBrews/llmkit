@@ -36,7 +36,7 @@ from llmkit import (
     configure_llm_logging,
     structured_output,
 )
-from llmkit.structured_output import capture_llm_log_paths
+from llmkit.capture import capture_llm_log_paths
 from tests._support import OkSchema
 
 # Backoff set to 0.0 so these tests retry without real sleeps (the default

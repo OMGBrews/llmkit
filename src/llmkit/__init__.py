@@ -31,6 +31,10 @@ the seven concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 # suppressed inline — disable the rule for this re-export module only.
 # pyright: reportImportCycles=false
 
+from llmkit.capture import (
+    capture_llm_log_paths,
+    capture_llm_records,
+)
 from llmkit.exceptions import (
     LLM_RECOVERABLE_ERRORS,
     LLM_SCHEMA_ERRORS,
@@ -44,6 +48,7 @@ from llmkit.logging import (
     LogSink,
     configure_llm_logging,
 )
+from llmkit.options import LLMCallOptions
 from llmkit.providers import (
     LLMClientConfig,
     LLMProviderInterface,
@@ -68,9 +73,6 @@ from llmkit.retry import (
     retry_progress_callback,
 )
 from llmkit.structured_output import (
-    LLMCallOptions,
-    capture_llm_log_paths,
-    capture_llm_records,
     stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,

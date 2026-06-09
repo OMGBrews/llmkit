@@ -44,9 +44,9 @@ from llmkit import (
     configure_llm_logging,
     structured_output,
 )
+from llmkit.capture import capture_llm_log_paths
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 from llmkit.retry import with_retries
-from llmkit.structured_output import capture_llm_log_paths
 from tests._support import OkSchema, capture_structured_provider_kwargs
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)

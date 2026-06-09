@@ -17,6 +17,7 @@ import pytest
 
 from llmkit import (
     LLMCallRecord,
+    capture_llm_log_paths,
     capture_llm_records,
     configure_llm_logging,
     structured_output,
@@ -168,7 +169,7 @@ def test_capture_records_independent_of_paths_capture() -> None:
 
         async def _run() -> tuple[list[LLMCallRecord], list[object]]:
             with capture_llm_records() as records:
-                with structured_output.capture_llm_log_paths() as paths:
+                with capture_llm_log_paths() as paths:
                     _ = await structured_output.structured_llm_call(
                         "hi", OkSchema, feature="extraction"
                     )

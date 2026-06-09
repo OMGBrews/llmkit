@@ -188,8 +188,8 @@ class LogSink(Protocol):
     third-party sink (a database, an in-memory buffer, a metrics pipe) is a
     one-method object. To capture per-call *records* (cost/metadata) or
     *file paths* without authoring a sink, use
-    :func:`~llmkit.structured_output.capture_llm_records` or
-    :func:`~llmkit.structured_output.capture_llm_log_paths`.
+    :func:`~llmkit.capture.capture_llm_records` or
+    :func:`~llmkit.capture.capture_llm_log_paths`.
     """
 
     def write(self, record: LLMCallRecord) -> None: ...
@@ -242,7 +242,7 @@ class LocalYamlLogSink:
 
         Returns nothing, per the shared sink contract. Callers that need
         the written path use :meth:`write_returning_path` (or the
-        :func:`~llmkit.structured_output.capture_llm_log_paths` context
+        :func:`~llmkit.capture.capture_llm_log_paths` context
         manager, which calls it for the configured file sink).
         """
         _ = self.write_returning_path(record)
@@ -252,7 +252,7 @@ class LocalYamlLogSink:
 
         The file-specific counterpart to :meth:`write`: the per-call YAML
         path is returned so the path-capture primitive
-        (:func:`~llmkit.structured_output.capture_llm_log_paths`) can
+        (:func:`~llmkit.capture.capture_llm_log_paths`) can
         cross-reference it, without that file detail leaking into the shared
         :class:`LogSink` contract. ``None`` is returned when the write
         failed (best-effort: logging must never break the LLM call).
@@ -461,12 +461,12 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
     Returns the written file path when the configured sink is a
     file sink that exposes one (it advertises a ``write_returning_path``
     method, as :class:`LocalYamlLogSink` does), so the
-    :func:`~llmkit.structured_output.capture_llm_log_paths` primitive can
+    :func:`~llmkit.capture.capture_llm_log_paths` primitive can
     cross-reference it. For a third-party sink that only implements the
     file-agnostic :class:`LogSink` contract (``write(record) -> None``),
     there is no path to return, so this returns ``None`` — path-capture is
     simply empty for such sinks, while
-    :func:`~llmkit.structured_output.capture_llm_records` still captures
+    :func:`~llmkit.capture.capture_llm_records` still captures
     the record itself.
     """
     if _sink is None:
