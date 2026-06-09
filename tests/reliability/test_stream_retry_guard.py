@@ -18,8 +18,7 @@ unretried) does not multiply the two budgets. These pin:
 from __future__ import annotations
 
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator
-from typing import cast
+from collections.abc import AsyncIterator
 from unittest.mock import patch
 
 import pytest
@@ -223,12 +222,9 @@ async def test_guard_flag_clear_after_early_break() -> None:
             yield delta
 
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
-        # The public annotation is AsyncIterator, but the runtime object is an
-        # async generator — aclose() is the early-abandonment path under test.
-        stream = cast(
-            "AsyncGenerator[str]",
-            structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF),
-        )
+        # The public annotation is AsyncGenerator, so aclose() — the
+        # early-abandonment path under test — is on the surface directly.
+        stream = structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
         async for _chunk in stream:
             break
         assert _retry_active.get() is False

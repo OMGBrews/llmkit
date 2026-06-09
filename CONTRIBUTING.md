@@ -27,11 +27,18 @@ basedpyright runs in its `recommended` tier (stricter than the `standard`
 default, and at least as strict as the editor extension's defaults) and is clean
 at **0 errors, 0 warnings with no baseline** — there is no `.basedpyright/baseline.json`,
 so **any new finding fails CI**. The untyped LiteLLM/instructor surface is given
-precise types at the boundary; the few genuinely-unavoidable suppressions are
-inline `# pyright: ignore[...]` (or, for the package's deferred-import test seam,
-a single file-level rule disable), each tagged with a `raw-*` reason. Prefer real
-types; reach for a tagged suppression only at the provider-SDK boundary where a
-precise type isn't reachable, and never to silence a finding in new code.
+precise types at the boundary; the suppressions that remain are inline
+`# pyright: ignore[<rule>]` comments (plus one file-level rule disable in
+`__init__.py` for the package's deferred-import test seam), each naming the
+specific rule it silences. Two conventions govern them: a suppression forced by
+an untyped or loosely-typed **third-party surface** carries a `raw-*` tag naming
+the culprit (`raw-llm` for LiteLLM/instructor/yaml, `raw-pydantic` for pydantic's
+`Any`-typed seams) — these cluster in `_litellm.py`, `logging.py`, and
+`json_schema.py`; the rest (pytest fixtures invoked by name, test helpers,
+runtime guards at a public boundary) carry a short trailing reason comment
+instead. Prefer real types; when you must suppress, name the rule and say why
+(with a `raw-*` tag when a third-party type forces it), and never suppress to
+quiet a finding in new code that could be typed precisely.
 
 Please run them locally before opening a PR. New behavior needs a test.
 
@@ -71,10 +78,14 @@ elsewhere (for example, when Ollama runs on the Docker host, point it at
 `http://host.docker.internal:11434`).
 
 AWS Bedrock is the one deliberate exception to "every live test must pass under
-`--run-live`". Unlike the others it has no API key: it authenticates through the
-ambient **AWS credential chain** and needs the `boto3`-bearing extra, so its live
-test is allowed to skip when that isn't set up. To run it, install the extra and
-provide AWS credentials plus a region:
+`--run-live`" — and the exception is narrow. Unlike the others it has no API
+key: it authenticates through the ambient **AWS credential chain** and needs the
+`boto3`-bearing extra. The *only* allowed skip is structural —
+`pytest.importorskip("boto3")` when the extra isn't installed. Once `boto3` is
+present, the usual hard-fail rule applies: a missing region
+(`AWS_REGION_NAME`/`AWS_REGION`) or an unresolvable credential chain **fails**
+the test under `--run-live`, exactly like a missing key for any other provider.
+To run it, install the extra and provide AWS credentials plus a region:
 
 ```bash
 uv sync --extra dev --extra bedrock

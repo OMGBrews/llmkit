@@ -21,10 +21,12 @@ the capture context managers live in :mod:`llmkit.capture`
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import aclosing, contextmanager
 from datetime import UTC, datetime
 from typing import cast
 
@@ -35,6 +37,7 @@ from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import DEFAULT_TEMPERATURE, LLMCallOptions, resolve_call_args
 from llmkit.providers import LLMProviderInterface
+from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
@@ -90,7 +93,36 @@ def _build_call_provider(
         return None
 
 
-async def structured_llm_call[T](
+#: The ``error`` recorded when a stream's consumer abandons it mid-flight
+#: (breaks out / closes the generator / cancels the task). The verdict header
+#: then reads ``# ERROR`` with this marker, so a truncated transcript is never
+#: mistaken for one the model finished (a plain ``# ok`` over partial text).
+STREAM_ABANDONED_ERROR = "Abandoned: stream closed by consumer before completion"
+
+
+@contextmanager
+def _sync_concurrency_slot(provider: LLMProviderInterface | None) -> Generator[None]:
+    """Hold the loop-agnostic per-provider concurrency slot for a sync call.
+
+    The sync wrappers drive the async call path over a *fresh event loop per
+    call* (:func:`run_sync`), so the per-(provider, loop) asyncio semaphore
+    acquired inside is always uncontended there and cannot bound sync fan-out
+    across threads. The cap is instead enforced here, in the calling thread,
+    via the limiter's loop-agnostic ``threading.Semaphore``
+    (:meth:`GlobalRateLimiter.concurrency_slot_sync`) — concurrency only;
+    the RPM/TPM buckets are loop-agnostic already and stay inside the async
+    path. With no resolvable ``provider`` (a build failure) the call proceeds
+    ungated, exactly like :func:`_build_call_provider` degrading: the
+    transport then surfaces the real configuration error.
+    """
+    if provider is None:
+        yield
+        return
+    with GlobalRateLimiter.concurrency_slot_sync(provider.name):
+        yield
+
+
+async def structured_llm_call[T: BaseModel](
     prompt: str | list[dict[str, str]],
     output_schema: type[T],
     *,
@@ -211,24 +243,15 @@ async def structured_llm_call[T](
         cost: float | None = None
         error: str | None = None
         try:
-            # The public ``T`` is unbounded (frozen call surface); the LiteLLM
-            # seam requires ``T: BaseModel``. Every caller passes a Pydantic
-            # schema, so this is sound at runtime — suppress the bound mismatch.
-            # The suppressed unbounded-T arg below leaves the parsed half of the
-            # returned tuple untyped; it is a T by construction, so narrow it.
-            parsed, cost = cast(
-                "tuple[T, float | None]",
-                await _litellm.acompletion_structured(
-                    prompt,
-                    output_schema,  # pyright: ignore[reportArgumentType]  # raw-model — unbounded public T vs BaseModel-bound seam
-                    temperature=temperature,
-                    model=model,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    provider=provider,
-                ),
+            response, cost = await _litellm.acompletion_structured(
+                prompt,
+                output_schema,
+                temperature=temperature,
+                model=model,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                provider=provider,
             )
-            response = parsed
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this result and
                 # re-rolls within the validation budget; the attempt is still
@@ -241,14 +264,12 @@ async def structured_llm_call[T](
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
             resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
-            # The public T is unbounded, but every parsed result is a Pydantic
-            # model; narrow to BaseModel to dump it for the log.
+            # ``T`` is bounded to ``BaseModel``, so every parsed result dumps;
+            # the cast only launders ``model_dump``'s ``dict[str, Any]``.
             response_dump: dict[str, JsonValue] | None = None
-            if response is not None and hasattr(response, "model_dump"):
+            if response is not None:
                 try:
-                    response_dump = cast(
-                        "dict[str, JsonValue]", cast("BaseModel", response).model_dump()
-                    )
+                    response_dump = cast("dict[str, JsonValue]", response.model_dump())
                 except Exception:
                     # A custom @field_serializer/@model_serializer on the
                     # schema raised. The dump exists only for the log, so it
@@ -293,7 +314,7 @@ async def structured_llm_call[T](
     )
 
 
-def structured_llm_call_sync[T](
+def structured_llm_call_sync[T: BaseModel](
     prompt: str | list[dict[str, str]],
     output_schema: type[T],
     *,
@@ -314,8 +335,12 @@ def structured_llm_call_sync[T](
     Same arguments, same logging, same
     output as the async version; the coroutine is driven to completion
     via :func:`run_sync`, which handles running-event-loop detection. The
-    rate-limit slot is acquired inside the async path, so the sync caller
-    inherits it. ``max_tokens`` caps the completion length when set
+    RPM/TPM rate gates are acquired inside the async path (their buckets are
+    shared across event loops), while the per-provider *concurrency* cap is
+    held in this calling thread around the whole call — ``run_sync`` drives a
+    fresh loop per call, so only the loop-agnostic sync semaphore can bound
+    fan-out across threads (see :func:`_sync_concurrency_slot`). ``max_tokens``
+    caps the completion length when set
     (parity with :func:`text_llm_call`); ``None`` leaves it uncapped.
     ``reasoning_effort`` is forwarded identically (``None`` defers to the
     configured :class:`~llmkit.LLMClientConfig` value). ``retry`` is the
@@ -325,25 +350,41 @@ def structured_llm_call_sync[T](
     :class:`~llmkit.ResultValidationError` to reject a result and re-roll on the
     validation budget). ``options`` is the same opt-in :class:`LLMCallOptions`
     bundle the async call takes, with the same **config < options < explicit
-    keyword** precedence; it is forwarded untouched so the merge happens once,
-    in :func:`structured_llm_call`.
+    keyword** precedence; it is forwarded untouched — only the *provider* is
+    pre-resolved here (to key the concurrency slot), and the built instance is
+    passed down so the async path reuses it under identical precedence.
     """
-    return run_sync(
-        structured_llm_call(
-            prompt,
-            output_schema,
-            feature=feature,
-            label=label,
+    # Resolve the provider here so the concurrency slot is keyed by the name
+    # the async path will account under; passing the built instance down means
+    # the async path reuses it (no double build, identical precedence).
+    call_provider = _build_call_provider(
+        resolve_call_args(
+            options,
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
-            provider=provider,
             retry=retry,
-            on_result=on_result,
-            options=options,
-        )
+            provider=provider,
+        ).provider
     )
+    with _sync_concurrency_slot(call_provider):
+        return run_sync(
+            structured_llm_call(
+                prompt,
+                output_schema,
+                feature=feature,
+                label=label,
+                temperature=temperature,
+                model=model,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                provider=call_provider,
+                retry=retry,
+                on_result=on_result,
+                options=options,
+            )
+        )
 
 
 async def text_llm_call(
@@ -503,23 +544,40 @@ def text_llm_call_sync(
 
     Same arguments, same logging, same plain-text result as the async version;
     the coroutine is driven to completion via :func:`run_sync`, matching the
-    structured sync wrappers.
+    structured sync wrapper — including holding the per-provider concurrency
+    slot in the calling thread around the call (see
+    :func:`structured_llm_call_sync` / :func:`_sync_concurrency_slot`).
     """
-    return run_sync(
-        text_llm_call(
-            prompt,
-            feature=feature,
-            label=label,
+    # Same provider pre-resolution as ``structured_llm_call_sync``: the
+    # concurrency slot is keyed by the provider name the async path accounts
+    # under, and the built instance is reused downstream (no double build).
+    call_provider = _build_call_provider(
+        resolve_call_args(
+            options,
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
-            provider=provider,
             retry=retry,
-            on_result=on_result,
-            options=options,
-        )
+            provider=provider,
+        ).provider
     )
+    with _sync_concurrency_slot(call_provider):
+        return run_sync(
+            text_llm_call(
+                prompt,
+                feature=feature,
+                label=label,
+                temperature=temperature,
+                model=model,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                provider=call_provider,
+                retry=retry,
+                on_result=on_result,
+                options=options,
+            )
+        )
 
 
 async def stream_text_with_log(
@@ -534,14 +592,17 @@ async def stream_text_with_log(
     provider: LLMProviderInterface | None = None,
     retry: RetryPolicy = DEFAULT_RETRY_POLICY,
     options: LLMCallOptions | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
     Yields each chunk's textual content as it arrives. Callers parse the
     accumulated text themselves — typically as in-progress JSON, when the
-    prompt instructs the model to return JSON. One YAML log per call is
-    written to ``data/llm-logs/`` after the stream finishes (or errors),
-    mirroring :func:`structured_llm_call`'s logging contract so the
+    prompt instructs the model to return JSON. One log record per call is
+    handed to the configured log sink (see
+    :func:`~llmkit.configure_llm_logging`) after the stream finishes, errors,
+    or is abandoned by its consumer — an abandoned stream records the partial
+    transcript with :data:`STREAM_ABANDONED_ERROR` as its error, never a clean
+    ``ok`` — mirroring :func:`structured_llm_call`'s logging contract so the
     invocation appears in the same per-feature analysis tooling.
 
     ``max_tokens`` caps the streamed completion length and
@@ -598,18 +659,25 @@ async def stream_text_with_log(
     if _retry_active.get():
         yielded_any = False
         try:
-            async for chunk in _stream_once(
-                prompt,
-                feature=feature,
-                label=label,
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                provider=provider,
-            ):
-                yielded_any = True
-                yield chunk
+            # ``aclosing`` so an abandoning consumer's close propagates to the
+            # attempt generator *here and now* — its finally then logs the
+            # abandoned record deterministically, not whenever GC finalizes
+            # the suspended generator.
+            async with aclosing(
+                _stream_once(
+                    prompt,
+                    feature=feature,
+                    label=label,
+                    temperature=temperature,
+                    model=model,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    provider=provider,
+                )
+            ) as attempt_stream:
+                async for chunk in attempt_stream:
+                    yielded_any = True
+                    yield chunk
             return
         except Exception as exc:
             would_have_retried = (
@@ -640,22 +708,29 @@ async def stream_text_with_log(
         for attempt in range(1, retry.max_attempts + 1):
             yielded_any = False
             try:
-                async for chunk in _stream_once(
-                    prompt,
-                    feature=feature,
-                    label=label,
-                    temperature=temperature,
-                    model=model,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    provider=provider,
-                ):
-                    yielded_any = True
-                    _retry_active.reset(token)
-                    try:
-                        yield chunk
-                    finally:
-                        token = _retry_active.set(True)
+                # ``aclosing`` for the same reason as the nested-retry branch
+                # above: an abandoning consumer's close must reach the attempt
+                # generator before this frame unwinds, so its abandoned-stream
+                # log is written deterministically rather than at GC time.
+                async with aclosing(
+                    _stream_once(
+                        prompt,
+                        feature=feature,
+                        label=label,
+                        temperature=temperature,
+                        model=model,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        provider=provider,
+                    )
+                ) as attempt_stream:
+                    async for chunk in attempt_stream:
+                        yielded_any = True
+                        _retry_active.reset(token)
+                        try:
+                            yield chunk
+                        finally:
+                            token = _retry_active.set(True)
                 return
             except Exception as exc:
                 # A partially-consumed stream can't be restarted, and only the
@@ -699,12 +774,16 @@ async def _stream_once(
     max_tokens: int | None,
     reasoning_effort: str | None,
     provider: LLMProviderInterface | None,
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str]:
     """One streaming attempt: yield each chunk, log the transcript on close.
 
     The single-attempt core of :func:`stream_text_with_log` — the retry
     loop there wraps this so each attempt writes its own log record (the
-    one-attempt-one-log contract `capture_llm_log_paths` relies on).
+    one-attempt-one-log contract `capture_llm_log_paths` relies on). The
+    record is honest about *how* the stream ended: a provider error logs
+    that error, and a consumer that abandons the stream mid-flight (close /
+    cancellation) logs :data:`STREAM_ABANDONED_ERROR` — never a clean ``ok``
+    over a truncated transcript.
     """
     from llmkit import _litellm
 
@@ -724,6 +803,17 @@ async def _stream_once(
             if chunk:
                 accumulated.append(chunk)
                 yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        # The *consumer* abandoned the stream (broke out / closed the
+        # generator / cancelled the task) — both are BaseExceptions, so
+        # without this clause they would bypass the except below and the
+        # finally would log the partial transcript with ``error=None``,
+        # indistinguishable from a stream the model finished. Mark it
+        # honestly and always re-raise: swallowing GeneratorExit is illegal
+        # (RuntimeError: generator ignored GeneratorExit) and swallowing
+        # cancellation would break task teardown.
+        error = STREAM_ABANDONED_ERROR
+        raise
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         raise

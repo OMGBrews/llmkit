@@ -163,9 +163,9 @@ result = await structured_llm_call(
 )
 ```
 
-**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); and nested objects inline or via local `$ref` (`#/$defs/...`). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` default to **`exclude_none=True`** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). Pass `exclude_none=False` to keep the nulls. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models set **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default).
+**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An explicit `"type": "object"` with **no `properties`** raises rather than silently building a zero-field model that rejects every real response — set `"additionalProperties": true` for an intentionally free-form object.
 
-**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the `exclude_none=True` default above, so the dict matches the schema:
+**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the optional-`None` drop above, so the dict matches the schema:
 
 ```python
 Person = model_from_json_schema(person_schema)   # build once, at import
@@ -204,9 +204,17 @@ Score(score=3)   # ok
 Score(score=6)   # raises pydantic.ValidationError
 ```
 
-Bounds are resolved through `$ref` and nullable wrappers, so a constraint
-declared inside a `$def` or on the non-null branch of a nullable field is still
-enforced (and `null` itself still passes for a nullable field).
+Bounds are resolved through `$ref` chains of any depth and through nullable
+wrappers, so a constraint declared inside a `$def` (even several `$ref` hops
+deep) or on the non-null branch of a nullable field is still enforced (and
+`null` itself still passes for a nullable field).
+
+One form caveat: `exclusiveMinimum` / `exclusiveMaximum` are recognised in
+their **numeric** (Draft 2020-12) form only. The Draft-4 / OpenAPI-3.0
+*boolean* form (`"exclusiveMinimum": true` qualifying a sibling `"minimum"`)
+is not recognised and is dropped — the bound is enforced as the sibling's
+*inclusive* `minimum`/`maximum`. If your schema comes from an OpenAPI 3.0
+document, rewrite exclusive bounds in the numeric form.
 
 **Anything outside the table above is silently dropped** — `pattern`, `format`,
 `multipleOf`, `uniqueItems`, `const`, and the rest are *not* enforced. This is
@@ -217,7 +225,7 @@ schema relies on one of those, validate it elsewhere.
 
 Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions:
 
-- **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server.
+- **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server. The cap binds async callers and the `*_sync` wrappers alike — a thread-pool fan-out of sync calls shares one per-provider cap. One caveat: async callers (on a shared event loop) and sync callers (in other threads) are capped on *independent* semaphores, so a workload mixing both populations can momentarily hold up to 2 × the cap per provider; RPM/TPM budgets are shared across both.
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
@@ -230,7 +238,7 @@ from llmkit import configure_rate_limit
 configure_rate_limit(rpm=3_500, tpm=2_000_000)
 ```
 
-RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — about the concurrency width for RPM, roughly a second of tokens for TPM — *not* a full minute's quota, so setting `rpm=`/`tpm=` to your account's published limits keeps you within a provider's per-minute window with only a few percent of overshoot, even on the first fan-out after an idle stretch. (A provider that enforces a strict fixed minute window may still want a little headroom for that residual.) (A streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for streamed calls.)
+RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. (A streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for streamed calls.)
 
 #### Joining the global rate limit directly
 
@@ -498,11 +506,11 @@ Routing stays on for the config-driven path (`configure_llm_client` /
 
 Two retry layers, kept deliberately separate:
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `text_llm_call`, `structured_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
-  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one.)
+  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
 
-  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One footnote: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, the litellm-native 503 entry (`litellm.exceptions.ServiceUnavailableError`) is a lazy stand-in resolved at `isinstance` time. `isinstance` checks — what the retry layer uses — behave identically, but a bare `except LLM_TRANSPORT_ERRORS:` / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one litellm-native class (Python's `except` matching bypasses the lazy check); every other member still catches as usual, and an openai-SDK 503 arrives as `openai.InternalServerError`, which matches. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
   Tune or opt out per call with the `retry=` argument:
 
@@ -553,7 +561,7 @@ Two retry layers, kept deliberately separate:
 
   > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active inner llmkit retry loop and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`.
 
-- **instructor's own low `validation_retries`** (default 1) handles *in-call* schema-validation repair — re-asking the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
+- **instructor's own in-call schema repair** re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's `max_retries` to **2** — instructor counts *total attempts*, so that is two in-call attempts, i.e. exactly one repair re-ask — and it is not a caller-facing knob. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ### Re-rolling on a semantically-bad result
 
@@ -573,7 +581,7 @@ result = await structured_llm_call(
 
 The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
 
-`on_result` is available on `structured_llm_call` (and its sync wrapper) and `text_llm_call` (the hook receives the response *text*). It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
+`on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 
 ## Development
 

@@ -17,7 +17,7 @@ class GoogleProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Google AI Studio"
-    _model_prefix: str = "gemini/"
+    _model_prefix: ClassVar[str] = "gemini/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
 

@@ -13,6 +13,7 @@ tests use). Per-field constraint handling lives in
 from __future__ import annotations
 
 import asyncio
+import warnings
 from enum import Enum
 
 import pytest
@@ -285,6 +286,89 @@ def test_bare_properties_root_still_builds() -> None:
         _ = model()
 
 
+def test_propertyless_object_root_raises_clear_value_error() -> None:
+    """An explicit ``{"type": "object"}`` with no ``properties`` must fail loud
+    (suggesting ``additionalProperties: true`` for free-form intent) — pre-fix
+    it silently built a zero-field ``extra='forbid'`` model that validated only
+    ``{}`` and rejected every real response."""
+    with pytest.raises(
+        ValueError, match=r"Unsupported object at '\$'.*'additionalProperties': true"
+    ):
+        _ = model_from_json_schema({"type": "object"})
+
+
+def test_propertyless_nested_object_raises_naming_field_path() -> None:
+    """The same propertyless-object failure nested as a field names the field's
+    path, not the root."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"meta": {"type": "object"}},
+        "required": ["meta"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no 'properties'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_propertyless_object_with_additional_properties_true_builds_open() -> None:
+    """``additionalProperties: true`` is the one shape that makes a propertyless
+    object meaningful (free-form): it builds ``extra='allow'`` and keeps
+    whatever keys arrive, at the root and nested."""
+    root = model_from_json_schema({"type": "object", "additionalProperties": True})
+    assert root.model_validate({"anything": 1}).model_dump() == {"anything": 1}
+
+    nested = model_from_json_schema(
+        {
+            "type": "object",
+            "properties": {"meta": {"type": "object", "additionalProperties": True}},
+            "required": ["meta"],
+        }
+    )
+    inst = nested.model_validate({"meta": {"free": "form"}})
+    assert inst.model_dump() == {"meta": {"free": "form"}}
+
+
+# --- Malformed ``required`` fails loudly ------------------------------------
+
+
+def test_non_list_required_raises_clear_value_error() -> None:
+    """``"required": "a"`` (a bare string, not a list) must fail loud — pre-fix
+    it was silently ignored, so every field built optional and the model
+    validated payloads missing fields the author marked required."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": "a",
+    }
+    with pytest.raises(ValueError, match=r"'required' must be a list of property-name strings"):
+        _ = model_from_json_schema(schema)
+
+
+def test_non_string_required_entry_raises_clear_value_error() -> None:
+    """A non-string entry inside ``required`` is the same malformed-`required`
+    failure and names the offending entry."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a", 1],
+    }
+    with pytest.raises(ValueError, match=r"'required' entries must be property-name strings"):
+        _ = model_from_json_schema(schema)
+
+
+def test_required_name_missing_from_properties_raises_clear_value_error() -> None:
+    """A ``required`` name with no matching property (a schema typo) must fail
+    loud naming the missing property — pre-fix it degraded silently in BOTH
+    directions: payloads missing 'ghost' were accepted, and payloads carrying
+    it were rejected as an extra under ``extra='forbid'``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["a", "ghost"],
+    }
+    with pytest.raises(ValueError, match=r"'required' names \['ghost'\] not present"):
+        _ = model_from_json_schema(schema)
+
+
 # --- Required-but-nullable fields accept null ------------------------------
 
 
@@ -520,15 +604,16 @@ def test_non_nullable_enum_with_null_member_raises() -> None:
 
 def test_nullable_enum_with_only_null_member_raises() -> None:
     """A nullable enum whose only member is ``null`` collapses to an empty value
-    list once ``null`` is dropped — it must fail loud (no empty ``Enum``), not
-    build a member-less enum."""
+    list once ``null`` is dropped — it must fail loud (no empty ``Enum``) with a
+    message naming the ACTUAL defect (only-null members), not the misleading
+    "must be a non-empty list" the post-strip emptiness used to produce."""
     schema: dict[str, object] = {
         "title": "M",
         "type": "object",
         "properties": {"choice": {"type": ["string", "null"], "enum": [None]}},
         "required": ["choice"],
     }
-    with pytest.raises(ValueError, match=r"non-empty list"):
+    with pytest.raises(ValueError, match=r"non-null member.*only null"):
         _ = model_from_json_schema(schema)
 
 
@@ -660,11 +745,12 @@ def test_pure_ref_cycle_raises_clear_value_error() -> None:
         _ = model_from_json_schema(schema)
 
 
-@pytest.mark.parametrize("reserved", ["_id", "model_config", "model_dump"])
+@pytest.mark.parametrize("reserved", ["_id", "model_config", "model_dump", "model_fields"])
 def test_reserved_property_name_raises_clear_value_error(reserved: str) -> None:
-    """A pydantic-reserved property name fails with a clear ValueError naming
-    the property and its path — never a NameError/TypeError, a leaked pydantic
-    protected-namespace error, or (for ``_id``) a silently dropped field."""
+    """A genuinely-breaking property name — leading underscore (silently dropped
+    as a private attribute) or the ``model_`` protected namespace (TypeError /
+    conflicts-with-member errors, or shadowed model machinery) — fails with a
+    clear ValueError naming the property and its path."""
     schema: dict[str, object] = {
         "type": "object",
         "properties": {reserved: {"type": "string"}},
@@ -672,6 +758,25 @@ def test_reserved_property_name_raises_clear_value_error(reserved: str) -> None:
     }
     with pytest.raises(ValueError, match=rf"Unsupported property '{reserved}' at"):
         _ = model_from_json_schema(schema)
+
+
+def test_v1_shim_property_names_build_and_round_trip() -> None:
+    """Names that shadow pydantic's deprecated v1 shims (``schema``, ``json``,
+    ``copy``, ...) are perfectly good fields — the reserved-name guard lets them
+    through, and the shadow ``UserWarning`` pydantic emits for them is
+    suppressed so a legitimate schema builds without warning spam."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"schema": {"type": "string"}, "json": {"type": "string"}},
+        "required": ["schema", "json"],
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any leaked UserWarning fails the build
+        model = model_from_json_schema(schema)
+    inst = model.model_validate({"schema": "s", "json": "j"})
+    assert inst.model_dump() == {"schema": "s", "json": "j"}
+    # And the dump re-validates — a full round-trip through the shim names.
+    assert model.model_validate(inst.model_dump()).model_dump() == {"schema": "s", "json": "j"}
 
 
 @pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])

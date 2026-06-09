@@ -30,7 +30,10 @@ import warnings
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from typing import Protocol, cast
+
+from pydantic import ValidationError
 
 from llmkit.exceptions import (
     LLM_SCHEMA_ERRORS,
@@ -39,6 +42,14 @@ from llmkit.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The unwrapped causes that are *genuinely* schema-shaped when dug out of an
+# ``InstructorRetryException``: pydantic rejected the parse, or the response
+# wasn't valid JSON at all. A wrapped cause outside this set (and outside the
+# transport set) is a *permanent* error — e.g. an exhausted 401/400/403 that
+# instructor re-raised — which must fail fast instead of burning the
+# validation budget on doomed re-asks.
+_SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = (ValidationError, JSONDecodeError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +90,10 @@ class RetryPolicy:
     (:func:`~llmkit.exceptions.underlying_provider_error`) and routes a wrapped
     transport cause to ``max_attempts`` — so a 429/5xx/network blip inside a
     structured call gets the full transport budget, exactly like the text path.
+    A wrapped cause that is neither transport- nor schema-shaped — a *permanent*
+    error such as an exhausted 401/400/403 — is not retried on either budget:
+    it propagates immediately, matching the fail-fast contract the bare-4xx
+    text path already honours.
 
     Attributes:
         max_attempts: Total *transport* attempts, including the first
@@ -294,7 +309,10 @@ async def with_retries[T](
             :data:`~llmkit.exceptions.LLM_TRANSPORT_ERRORS`, so an
             ``InstructorRetryException`` wrapping a 429/5xx/network blip is
             charged the full ``max_attempts``, and only genuine validation
-            failures are charged the lower validation budget.
+            failures are charged the lower validation budget. A wrapped cause
+            that is neither transport- nor schema-shaped (a permanent
+            401/400/403) propagates immediately under every configuration,
+            unless ``retry_on`` explicitly lists the wrapper type.
         validation_max_attempts: Total number of *schema-validation*
             attempts (1 = no retry). When set together with
             ``validation_retry_on``, failures matching that tuple are charged
@@ -374,6 +392,24 @@ async def with_retries[T](
                 # exists to prevent. Fall back to the curated transport set.
                 transport_types = retry_on if retry_on is not None else LLM_TRANSPORT_ERRORS
                 is_transport_cause = isinstance(cause, transport_types)
+                # Wrapped *permanent* errors fail fast: instructor wraps an
+                # exhausted 401/400/403 (any non-transient provider error) in
+                # the same InstructorRetryException as genuine schema failures,
+                # so without this guard the wrapper would match
+                # ``validation_retry_on`` below and burn a validation retry on
+                # a request that can never succeed — violating the documented
+                # fail-fast contract the bare-4xx text path already honours.
+                # When the unwrapped cause differs from the wrapper and is
+                # neither transport- nor schema-shaped, propagate immediately.
+                # An explicit ``retry_on`` that lists the wrapper type still
+                # wins: the caller asked for exactly that retry.
+                wraps_permanent_cause = (
+                    cause is not e
+                    and not is_transport_cause
+                    and not isinstance(cause, _SCHEMA_SHAPED_CAUSES)
+                )
+                if wraps_permanent_cause and (retry_on is None or not isinstance(e, retry_on)):
+                    raise
                 is_validation = (
                     use_validation_budget
                     and not is_transport_cause

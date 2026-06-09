@@ -12,8 +12,23 @@ independent, per-provider dimensions:
   off by default.
 
 The LiteLLM call layer (:mod:`llmkit._litellm`) wraps every provider call in
-:meth:`GlobalRateLimiter.acquire_async`, keyed by the **provider name**; the
-sync call path drives the same async coroutine, so it inherits the throttle.
+:meth:`GlobalRateLimiter.acquire_async`, keyed by the **provider name**. The
+sync call wrappers drive that same async coroutine over a *fresh event loop
+per call* (:func:`llmkit.sync.run_sync`) — which inherits the RPM/TPM gates
+(their buckets are keyed by name only and shared across loops) but **not**
+the concurrency cap, whose async semaphore is keyed per (provider, loop) and
+is therefore always uncontended on a fresh loop. So the sync wrappers
+additionally hold the loop-agnostic per-provider ``threading.Semaphore``
+(:meth:`GlobalRateLimiter.concurrency_slot_sync`) in the *calling thread*
+around the whole bridged call, and cross-thread sync fan-out shares one cap.
+
+One honest caveat follows from the two semaphores being independent: a
+workload that mixes *async* callers (sharing a long-lived loop, bounded by
+that loop's asyncio semaphore) with *sync* callers in other threads (bounded
+by the threading semaphore) can momentarily hold up to ``2 x max_concurrent``
+in-flight calls per provider — each population is capped, but the two caps do
+not share slots, because an asyncio primitive cannot span loops. RPM/TPM are
+unaffected: those buckets are shared across every loop and thread.
 
 On by default, scoped per provider
 ----------------------------------
@@ -298,8 +313,12 @@ class GlobalRateLimiter:
     accumulate. A consequence is that the concurrency cap is enforced per
     (provider, loop): truly concurrent loops in different threads do not share
     one async semaphore — which is unavoidable, since an asyncio primitive can't
-    span loops. Cross-thread *sync* callers share the loop-agnostic
-    ``threading.Semaphore`` and so do share one cap.
+    span loops. Cross-thread *sync* callers therefore share the loop-agnostic
+    ``threading.Semaphore`` instead: llmkit's own sync call wrappers hold it
+    via :meth:`concurrency_slot_sync` around the whole bridged call, and
+    :meth:`acquire_sync` holds it for hand-rolled sync provider calls. The
+    mixed sync+async caveat (up to ``2 x max_concurrent`` momentarily, one cap
+    per population) is documented in the module docstring.
 
     Enabled by default with a per-provider concurrency cap of 8; RPM and TPM
     are opt-in and off by default. See the module docstring for the rationale,
@@ -534,6 +553,35 @@ class GlobalRateLimiter:
         _ = sem.acquire()
         try:
             yield RateLimitSlot(tpm_bucket)
+        finally:
+            sem.release()
+
+    @classmethod
+    @contextlib.contextmanager
+    def concurrency_slot_sync(cls, provider_key: str) -> Generator[None]:
+        """Hold only the loop-agnostic *concurrency* slot for ``provider_key``.
+
+        The cross-thread half of the concurrency cap for llmkit's own sync
+        call wrappers. Those wrappers drive the async call path over a fresh
+        event loop per call (:func:`llmkit.sync.run_sync`), so the async
+        per-(provider, loop) semaphore they pass through inside is always
+        uncontended and cannot bound sync fan-out across threads. The wrappers
+        therefore hold this shared ``threading.Semaphore`` in the *calling*
+        thread around the whole bridged call — blocking that thread while
+        waiting, which is the correct backpressure for a sync caller.
+
+        Concurrency only, on purpose: the RPM/TPM buckets are already
+        loop-agnostic (keyed by name, lock-guarded) and are acquired inside
+        the async path the bridge drives — gating them here too would debit
+        each sync call twice. A no-op when limiting is disabled.
+        """
+        if not cls._enabled:
+            yield
+            return
+        sem = cls._get_sync_semaphore(_normalize_key(provider_key))
+        _ = sem.acquire()
+        try:
+            yield
         finally:
             sem.release()
 

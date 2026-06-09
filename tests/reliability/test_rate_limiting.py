@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llmkit import _litellm, rate_limiting
+from llmkit import _litellm, rate_limiting, structured_output
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
     RateLimitSlot,
@@ -44,6 +44,7 @@ from llmkit.rate_limiting import (
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
+from tests._support import OkSchema, quiet_logging
 
 
 @pytest.fixture(autouse=True)
@@ -450,6 +451,74 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
     release.set()
     for thread in threads:
         thread.join(timeout=1.0)
+
+
+def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
+    """N threads fanning out the sync call wrappers never exceed the provider cap.
+
+    Regression for the fresh-loop hole: ``structured_llm_call_sync`` /
+    ``text_llm_call_sync`` drive the async path via ``run_sync``, which creates
+    a *fresh event loop per call* — so the per-(provider, loop) asyncio
+    semaphore inside has a single user per call and bounded nothing across
+    threads (six threads observed six concurrent in-flight calls under a cap of
+    2). The wrappers now hold the loop-agnostic ``threading.Semaphore`` in the
+    calling thread around the whole bridged call. Fully offline: the transport
+    is faked to sleep briefly while an instrumented counter records the
+    in-flight peak; both wrappers are mixed in one fan-out because they must
+    share the one per-provider budget.
+    """
+    configure_rate_limit(max_concurrent=2)
+    lock = threading.Lock()
+    state: dict[str, int] = {"current": 0, "peak": 0}
+
+    async def _hold_briefly() -> None:
+        """One faked in-flight transport call: count in, sleep, count out."""
+        with lock:
+            state["current"] += 1
+            state["peak"] = max(state["peak"], state["current"])
+        try:
+            await asyncio.sleep(0.15)
+        finally:
+            with lock:
+                state["current"] -= 1
+
+    async def _fake_text(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+        await _hold_briefly()
+        return "ok", None
+
+    async def _fake_structured(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        await _hold_briefly()
+        return OkSchema(ok=True), None
+
+    provider = MagicMock()
+    provider.name = "openai"
+    provider.model = "fake-model"
+
+    def _text_call() -> None:
+        _ = structured_output.text_llm_call_sync("hi", feature="test", provider=provider)
+
+    def _structured_call() -> None:
+        _ = structured_output.structured_llm_call_sync(
+            "hi", OkSchema, feature="test", provider=provider
+        )
+
+    with (
+        quiet_logging(),
+        patch("llmkit._litellm.acompletion_text", _fake_text),
+        patch("llmkit._litellm.acompletion_structured", _fake_structured),
+    ):
+        threads = [
+            threading.Thread(target=_text_call if i % 2 else _structured_call) for i in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+    assert state["peak"] <= 2, f"cap=2 but {state['peak']} sync calls were in flight at once"
+    # And the cap paced, not serialised, the fan-out: with six 0.15s calls and
+    # two slots, the two populations genuinely overlap.
+    assert state["peak"] == 2
 
 
 # ---------------------------------------------------------------------------

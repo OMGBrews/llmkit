@@ -64,7 +64,7 @@ class BedrockProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "AWS Bedrock"
-    _model_prefix: str = "bedrock/"
+    _model_prefix: ClassVar[str] = "bedrock/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.ANTHROPIC_JSON
     _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 

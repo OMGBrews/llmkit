@@ -11,8 +11,8 @@ carries default-behavior changes and a small breaking surface) and has not yet
 been published to PyPI — the last published version is `0.1.2`. It moves to a
 dated `## [0.2.0]` section when the release is cut.
 
-**Migrating from 0.1.2.** Most code keeps working unchanged, but three changes
-flip a default or move a symbol — review these first:
+**Migrating from 0.1.2.** Most code keeps working unchanged, but four changes
+flip a default, change a contract, or move a symbol — review these first:
 
 - **Transient-error retries are on by default.** Every call function now retries
   the recoverable set on its own. If you already wrap calls in your own retry
@@ -24,14 +24,20 @@ flip a default or move a symbol — review these first:
   or `enabled=False` to turn it off. RPM/TPM remain opt-in (off unless set), so
   an unset request is byte-identical to before — note a migrator's old
   per-minute tuning stays inert until you set `rpm=`/`tpm=`.
+- **The `LogSink` protocol changed** (breaking for custom sinks): `write(record)`
+  now returns `None`, not `Path | None`. A third-party sink must drop the
+  return; path tracking moved to `capture_llm_log_paths()` and
+  `LocalYamlLogSink.write_returning_path()` (see _Removed_).
 - **A few symbols moved or were removed** (all breaking — see _Removed_):
   `get_provider`/`get_llm_config` → `build_provider`/`describe_llm`;
   `with_retries(max_retries=...)` → `max_attempts=...`; the `*Provider` classes,
   `with_retries`, and `GlobalRateLimiter` are no longer re-exported from the
   package root (import them from `llmkit.providers` / `llmkit.retry` /
-  `llmkit.rate_limiting`). The Anthropic SDK is now the opt-in
-  `omg-llmkit[anthropic]` extra — install it (or `[bedrock]` / `[all]`) only if
-  you route Anthropic or Bedrock.
+  `llmkit.rate_limiting`); `capture_llm_log_paths` / `capture_llm_records` moved
+  from `llmkit.structured_output` to the new `llmkit.capture` module (the
+  top-level `from llmkit import ...` is unchanged). The Anthropic SDK is now the
+  opt-in `omg-llmkit[anthropic]` extra — install it (or `[bedrock]` / `[all]`)
+  only if you route Anthropic or Bedrock.
 
 ### Added
 
@@ -54,24 +60,32 @@ flip a default or move a symbol — review these first:
   `object` with `properties` and a `required` array; scalars (`string` /
   `integer` / `number` / `boolean`, plus `null` / nullable via
   `["string", "null"]` or an `anyOf` null branch); `array` with `items`
-  (including arrays of objects); `enum` (string or integer members); and nested
-  objects inline or via local `$ref` (`#/$defs/...` / `#/definitions/...`).
-  Anything outside the subset raises a clear `ValueError` naming the construct
-  and its path, rather than silently producing a wrong model. Two footguns the
-  CaCL dogfood hit are handled and tested: (1) a non-required field maps to an
-  *optional* Pydantic field defaulting to `None`, and the generated model's
-  `model_dump` / `model_dump_json` default to `exclude_none=True`, so an
-  omitted optional is **absent** rather than `"field": null` (which would fail
-  downstream re-validation against the same schema); pass `exclude_none=False`
-  to keep the nulls. (2) A title-less or empty-titled schema still yields a
-  validly-named class (default `JsonSchemaModel`), which `create_model` and
-  `instructor` both require. Generated models set `extra="forbid"`, so a
-  response carrying a key not in the schema is rejected rather than silently
-  kept (a hallucinated extra field fails loudly — stricter than JSON Schema's
-  permissive `additionalProperties` default). Per-field bounds outside the
-  supported set are dropped, and a constraint that doesn't match the field's
-  type, or a mixed string/integer `enum`, is handled safely (see _Fixed_).
-  Exported from the package root.
+  (including arrays of objects); `enum` (string or integer members); nested
+  objects inline or via local `$ref` (`#/$defs/...` / `#/definitions/...`); and
+  `additionalProperties` as `true` / `false` / absent (a *typed*
+  `additionalProperties` map is rejected). Anything outside the subset raises a
+  clear `ValueError` naming the construct and its path, rather than silently
+  producing a wrong model. Two footguns the CaCL dogfood hit are handled and
+  tested: (1) a non-required field maps to an *optional* Pydantic field
+  defaulting to `None`, and the generated model's `model_dump` /
+  `model_dump_json` drop a `None` left in an **optional** field by default, so
+  an omitted optional is **absent** rather than `"field": null` (which would
+  fail downstream re-validation against the same schema) while an
+  explicitly-null *required* nullable field is kept; pass `exclude_none=False`
+  to keep every null, or `exclude_none=True` to drop them all. (2) A title-less
+  or empty-titled schema still yields a validly-named class (default
+  `JsonSchemaModel`), which `create_model` and `instructor` both require.
+  Generated models default to `extra="forbid"`, so a response carrying a key
+  not in the schema is rejected rather than silently kept (a hallucinated extra
+  field fails loudly — stricter than JSON Schema's permissive
+  `additionalProperties` default); `"additionalProperties": true` opts an
+  object into `extra="allow"`, and an explicit `"type": "object"` with no
+  `properties` raises (set `"additionalProperties": true` for an intentionally
+  free-form object) instead of silently building a zero-field strict model that
+  rejects every real response. Per-field bounds outside the supported set are
+  dropped, and a constraint that doesn't match the field's type, or a mixed
+  string/integer `enum`, is handled safely (see _Fixed_). Exported from the
+  package root.
 - A `py.typed` marker so consumers' type checkers honor llmkit's type hints
   (the package is basedpyright-clean and already declares the `Typing :: Typed`
   classifier, but without the PEP 561 marker downstream tools treated it as
@@ -83,8 +97,12 @@ flip a default or move a symbol — review these first:
   **opt-in** — unlike concurrency, there is no universally sane per-minute
   default (it's your account's metered limit), so leaving them unset sends a
   request **byte-identical** to the prior behaviour. Each is a per-provider
-  **token bucket**: it tolerates a burst up to the configured ceiling, then
-  smooths to the sustained rate; TPM is debited by each call's measured
+  **token bucket** with a deliberately *small* burst depth — `min(max_concurrent,
+  rpm)` requests for RPM, roughly one second of tokens for TPM, **not** a full
+  minute's quota — so a cold or idle bucket admits a fan-out-sized burst and
+  then smooths to the sustained rate without ever emitting ~2× the published
+  per-minute limit inside one provider-side window; TPM is debited by each
+  call's measured
   `usage.total_tokens` (a streamed call usually reports no usage and so does not
   debit TPM, consistent with cost being `None` for streams). This addresses the
   CaCL dogfood gap where a migrator's old `rate_limit_rpm` went inert under the
@@ -114,10 +132,11 @@ flip a default or move a symbol — review these first:
   deliberately avoided: it targets instructor's `from_bedrock` (boto3) client
   and drops `model` when driven through `from_litellm`, this library's call
   seam. `reasoning_effort` is forwarded where the underlying model supports it. The
-  first cut targets plain on-demand models (default
-  `anthropic.claude-3-5-sonnet-20240620-v1:0`); 4.x models reachable only via a
-  cross-region inference profile are supported by passing the profile-prefixed
-  id as `model`. `boto3` (for SigV4 signing) ships via the opt-in
+  default model is Claude Haiku 4.5 via its **cross-region inference profile**
+  id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on
+  Bedrock are typically reached through inference profiles rather than plain
+  on-demand ids; pass a different profile-, partition-, or on-demand-prefixed id
+  as `model` to route elsewhere. `boto3` (for SigV4 signing) ships via the opt-in
   `omg-llmkit[bedrock]` extra, so non-Bedrock installs gain no AWS dependency.
   `BedrockProvider` is exported from the package root.
 - Direct **DeepSeek** provider (`Provider.DEEPSEEK` / `DeepSeekProvider`,
@@ -171,9 +190,13 @@ flip a default or move a symbol — review these first:
   `exclusiveMaximum` map to `ge`/`le`/`gt`/`lt`, and `minLength`/`maxLength`
   plus `minItems`/`maxItems` map to `min_length`/`max_length`, so generated
   models validate value bounds, not just shape. Bounds are resolved through
-  `$ref` and nullable wrappers; constraints outside the supported set (e.g.
-  `pattern`, `format`, `multipleOf`) remain silently dropped with no partial
-  enforcement, and per-field `description` passthrough is unchanged.
+  `$ref` chains of any depth and through nullable wrappers; exclusive bounds
+  are recognised in their numeric (Draft 2020-12) form only — the Draft-4 /
+  OpenAPI-3.0 boolean form (`"exclusiveMinimum": true` beside a `"minimum"`) is
+  dropped, leaving the sibling *inclusive* bound; constraints outside the
+  supported set (e.g. `pattern`, `format`, `multipleOf`) remain silently
+  dropped with no partial enforcement, and per-field `description` passthrough
+  is unchanged.
 - `capture_llm_records()` context manager — captures the per-call
   `LLMCallRecord` objects (approximate cost, resolved model/provider, duration,
   error) for calls in its scope, with no custom sink, across both the async
@@ -244,7 +267,8 @@ flip a default or move a symbol — review these first:
   budget. Programming errors (e.g. `TypeError`) still propagate immediately. The budget is the new
   per-call `retry: RetryPolicy` argument: pass `retry=NO_RETRY` to opt out or a
   custom `RetryPolicy` to tune it. This layer stays **separate** from
-  instructor's in-call schema-repair budget (`validation_retries`, default 1) —
+  instructor's in-call schema-repair budget (instructor's `max_retries`, which
+  llmkit pins to `2` — two in-call attempts, i.e. one repair re-ask) —
   no double-counting — and each attempt remains its own logged call (so
   `capture_llm_log_paths` sees one path per attempt). Streaming retries only a
   failure that occurs **before the first chunk** is yielded; a partially
@@ -264,10 +288,10 @@ flip a default or move a symbol — review these first:
   catch-set contract is unchanged. `NO_RETRY` disables **both** budgets (a single
   attempt). `RetryPolicy` gains `validation_max_attempts` and
   `validation_retry_on` (defaulting to `LLM_SCHEMA_ERRORS`); this cross-call
-  layer remains separate from instructor's in-call `validation_retries`
-  (default 1, which repairs malformed JSON *within* one attempt before any
-  `ValidationError` reaches the retry layer). Flagged by the PIA Maker and FiW
-  dogfoods of the 0.2.0 RC.
+  layer remains separate from instructor's in-call repair (instructor's
+  `max_retries`, pinned to `2` — one repair re-ask that fixes malformed JSON
+  *within* one attempt before any `ValidationError` reaches the retry layer).
+  Flagged by the PIA Maker and FiW dogfoods of the 0.2.0 RC.
 - **Unified the public retry attempt-count on `max_attempts`.** `RetryPolicy`
   already used `max_attempts`; `with_retries(...)` now uses it too, with the same
   semantics everywhere — *total attempts including the first* (`N`, not `1 + N`).
@@ -307,7 +331,8 @@ flip a default or move a symbol — review these first:
   the shared call layer growing per-provider knowledge. No change for the
   existing providers (their kwarg dicts are unchanged); the request shape is
   byte-identical for `api_key` / `api_base` providers.
-- `get_provider` now **fails loud** on an unknown provider instead of silently
+- Provider dispatch (`build_provider`, the renamed `get_provider` — see
+  _Removed_) now **fails loud** on an unknown provider instead of silently
   constructing an `OllamaProvider`. The previous `else` catch-all meant a
   newly-added `Provider` enum member routed to a confusing local-Ollama failure;
   dispatch is now an exhaustive `match` whose fall-through calls
@@ -317,10 +342,10 @@ flip a default or move a symbol — review these first:
 - The provider layer is reorganized from a single `providers.py` module into a
   `llmkit.providers` **package** with one module per provider over a
   provider-agnostic `base` module, so adding a provider is a self-contained new
-  file plus one wiring line. Purely internal: the public API is unchanged — every
-  symbol (`Provider`, `LLMClientConfig`, the `*Provider` classes, `get_provider`,
-  `get_llm_config`, …) imports from `llmkit` and `llmkit.providers` exactly as
-  before.
+  file plus one wiring line. The reorganization itself is purely internal —
+  `Provider`, `LLMClientConfig`, and the `*Provider` classes keep importing from
+  `llmkit.providers` — though this release *separately* renames
+  `get_provider`/`get_llm_config` and trims the root re-exports (see _Removed_).
 - `LLMClientConfig.model` is now optional (`str | None`, default `None`); a
   falsy model resolves to the selected provider's own default model instead of
   producing a broken `"<prefix>/"` LiteLLM id.
@@ -354,6 +379,34 @@ flip a default or move a symbol — review these first:
   logging records it as the effective provider. Also flagged the
   `temperature=0.2` default and the per-call `provider=` override prominently in
   the README (onboarding papercuts from the greenfield integration).
+- **`import llmkit` no longer imports LiteLLM eagerly**, roughly halving import
+  time (measured ~5.3s → ~2.4s in a CI-like environment); LiteLLM loads on the
+  first call. The one observable seam: the litellm-native 503 entry in
+  `LLM_TRANSPORT_ERRORS` (`litellm.exceptions.ServiceUnavailableError`) is now
+  a lazy stand-in resolved at `isinstance` time — classification behaves
+  identically once litellm is loaded, but a bare `except LLM_TRANSPORT_ERRORS:`
+  / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one
+  litellm-native class (Python's `except` matching bypasses the lazy check).
+  Every other member still catches as usual, an openai-SDK 503 arrives as
+  `openai.InternalServerError` and matches, and `isinstance` checks — what the
+  retry layer uses — are unaffected.
+- **The sync bridge's default `timeout` is now 600 seconds** (was 60), and
+  `run_sync` accepts `timeout=None` for unbounded. The budget governs a
+  `*_sync` call made from inside a running event loop (the worker-thread path);
+  60s was shorter than a routine slow completion plus on-by-default retries,
+  so the old default could abandon a healthy call. The same release also makes
+  the timeout actually fire at the deadline (see _Fixed_).
+- `structured_llm_call` / `structured_llm_call_sync` now bound their output
+  type parameter to Pydantic (`[T: BaseModel]`). With the new `py.typed`
+  marker, passing a dataclass or plain class as `output_schema` is a *type
+  error* in your checker instead of a runtime failure inside instructor.
+  Non-breaking for every valid caller.
+- Dependency floors raised to the effective minimums the resolver already
+  forced in practice: `openai>=2.20.0`, `pydantic>=2.8.0`, `httpx>=0.28.0` —
+  lower-bound resolution (e.g. `uv --resolution lowest`) now succeeds instead
+  of reporting no solution. Package metadata also moved to a PEP 639 SPDX
+  license expression (`License-Expression: MIT`, with the LICENSE file still
+  shipped).
 
 ### Removed
 
@@ -375,6 +428,14 @@ flip a default or move a symbol — review these first:
   `Path | None` return from `write` and return `None`. The shipped
   `LocalYamlLogSink` is updated; consumers tracking file paths use
   `capture_llm_log_paths()` or `LocalYamlLogSink.write_returning_path()`.
+- **Breaking:** `capture_llm_log_paths` (and the new `capture_llm_records`) no
+  longer live in `llmkit.structured_output` — the capture seam moved to the new
+  `llmkit.capture` module, so the 0.1.x deep import
+  `from llmkit.structured_output import capture_llm_log_paths` now raises
+  `ImportError`. Import from `llmkit.capture`, or use the unchanged top-level
+  `from llmkit import capture_llm_log_paths, capture_llm_records`. (Relatedly,
+  the new `LLMCallOptions` is defined in `llmkit.options`; the top-level
+  `from llmkit import LLMCallOptions` is the supported path.)
 - **Headline-surface trim (Breaking for `from llmkit import` of these names).**
   The seven concrete `*Provider` classes
   (`OpenRouterProvider` / `OllamaProvider` / `GoogleProvider` /
@@ -396,6 +457,18 @@ flip a default or move a symbol — review these first:
   longer discards the already-written YAML path. Sanitized `feature`/`label`
   filename components are also clamped to 80 UTF-8 bytes, so a long label can
   no longer make every log write fail with `ENAMETOOLONG`.
+- **`LocalYamlLogSink` is hardened against collisions, path traversal, and
+  header forgery.** Per-call YAML filenames now carry a `uuid4` suffix and are
+  opened with exclusive-create, so two concurrent calls with the same
+  timestamp/feature/label can no longer share a path or silently truncate each
+  other's log — note this changes the **filename format**, so tooling that
+  globs or parses log filenames should expect the extra suffix. `feature` and
+  `label` are sanitized before they reach the filesystem (separators and
+  control characters stripped, `.` runs collapsed), so a value like
+  `"../escape"` can no longer write outside `log_dir`. And the values
+  interpolated into the `#` verdict header are flattened to one line, so an
+  embedded newline cannot forge a second verdict line and corrupt `head -1`
+  triage.
 - **A failed `text_llm_call` attempt logs `response: null`, not `""`.** The
   empty-string initializer made a pre-content failure indistinguishable from a
   successful empty completion; the record now matches the documented
@@ -439,6 +512,16 @@ flip a default or move a symbol — review these first:
   `max_attempts × max_attempts` with no warning. The stream loop now collapses
   to a single pass under an outer llmkit retry loop (with the same
   `RuntimeWarning`) and arms the guard around its own attempts.
+- **A stream abandoned by its consumer is no longer logged as a clean `ok`
+  call.** Breaking out of (or closing) `stream_text_with_log`, or cancelling
+  the consuming task, produced a log record indistinguishable from a successful
+  call carrying a partial transcript. The record now keeps the partial
+  transcript but carries the error marker
+  `llmkit.STREAM_ABANDONED_ERROR` ("Abandoned: stream closed
+  by consumer before completion"), so the YAML verdict header reads `# ERROR`;
+  `GeneratorExit` / `CancelledError` are always re-raised, never swallowed, and
+  the abandoned-stream record is written deterministically at close time rather
+  than whenever garbage collection finalizes the generator.
 - **Structured calls get the documented single in-call schema repair.**
   instructor turns an integer `max_retries` into `stop_after_attempt(n)` — *n
   attempts total* — so the previous `max_retries=1` meant zero repair re-asks
@@ -467,6 +550,17 @@ flip a default or move a symbol — review these first:
   an object) without `"type": "object"` previously fell through to the object
   builder and silently produced a zero-field, `extra="forbid"` model that
   rejected every real response.
+- **`model_from_json_schema` rejects a propertyless `{"type": "object"}` with
+  a clear error.** An explicit object — root or nested — with no `properties`
+  key likewise built a zero-field strict model that rejected every real
+  response; it now raises a `ValueError` naming the path and suggesting
+  `"additionalProperties": true` for an intentionally free-form object (which
+  builds an open `extra="allow"` model).
+- **`model_from_json_schema` validates the `required` array instead of
+  silently mis-building.** A non-list `required` (or a non-string entry) was
+  silently ignored — making *every* field optional — and a `required` name
+  with no matching property built a model that was wrong in both directions.
+  Both now raise a clear `ValueError` naming the offending value.
 - **`model_from_json_schema` enforces constraints on array items.** Bounds on
   an array's `items` schema (`minLength`, `minimum`, …) — keywords in the
   documented supported set — were silently dropped, so schema-violating
@@ -484,23 +578,20 @@ flip a default or move a symbol — review these first:
   `no 'type', 'enum', or '$ref' — got keys ['$ref']` error. Resolution now
   loops; a cycle made purely of `$ref`s fails with the same clear
   recursive-schema error that object-level recursion already raised.
-- **`model_from_json_schema` rejects pydantic-reserved property names with a
-  clear error.** A property named like `_id` (silently dropped as a private
-  attribute), `model_config` (`TypeError`), or `model_dump` (a leaked
-  protected-namespace error) crashed or corrupted deep inside `create_model`.
-  Such names now fail with the module's standard `ValueError` naming the
-  property and its path.
+- **`model_from_json_schema` rejects the property names pydantic genuinely
+  cannot carry — and only those — with a clear error.** A property with a
+  leading underscore (like `_id`, silently dropped as a private attribute) or
+  in pydantic's `model_*` protected namespace (`model_config` → `TypeError`,
+  `model_dump` → a leaked protected-namespace error) crashed or corrupted deep
+  inside `create_model`; such names now fail with the module's standard
+  `ValueError` naming the property and its path. Names that merely shadow
+  pydantic's *deprecated v1 shims* (`schema`, `json`, `dict`, `copy`,
+  `validate`, `construct`, `parse_obj`, …) work fine as fields, so they build
+  working fields — without pydantic's shadows-an-attribute warning spam.
 - **`model_from_json_schema` rejects a non-dict `anyOf`/`oneOf` branch with a
   clear error.** A branch list like `["string", {"type": "null"}]` raised an
   opaque `AttributeError` (calling `.get` on the `str`); it now fails with a
   `ValueError` naming the keyword and field path.
-- **The default Bedrock model is current again.** The previous default,
-  `anthropic.claude-3-5-sonnet-20240620-v1:0`, was retired upstream in late
-  2025, so configuring `Provider.BEDROCK` without naming a model failed at call
-  time with an AWS error that never implicated the stale default. The default
-  is now Claude Haiku 4.5 via its cross-region inference profile
-  (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — the model the provider's
-  `ANTHROPIC_JSON` mode pin was measured against.
 - **Transient transport failures in a *structured* call now get the full
   transport retry budget.** instructor wraps every exhausted attempt —
   including a 429/503/network failure — in `InstructorRetryException`, which is
@@ -510,6 +601,26 @@ flip a default or move a symbol — review these first:
   layer now unwraps `InstructorRetryException` to its underlying provider error
   (`underlying_provider_error`) and routes a transport cause to the transport
   budget; a genuine schema failure still uses the validation budget.
+- **A *permanent* 4xx inside a structured call now fails fast, as documented.**
+  The same instructor wrapping caught a 401/400/403 too, and because the
+  wrapper is in `LLM_SCHEMA_ERRORS`, a structured call with (say) a bad API key
+  was *retried* on the validation budget — four provider requests plus a
+  backoff sleep before the caller saw the error, while the plain-text path
+  failed after one. A wrapped cause that is neither transport- nor
+  schema-shaped now re-raises immediately — exactly one attempt — matching the
+  fail-fast contract; an explicit `retry_on` that lists the wrapper type still
+  retries, preserving caller intent.
+- **The per-provider concurrency cap now binds the sync wrappers across
+  threads.** Each `*_sync` call runs on a fresh event loop whose per-`(provider,
+  loop)` asyncio semaphore was always uncontended, so a thread-pool fan-out of
+  `structured_llm_call_sync` / `text_llm_call_sync` was effectively unlimited.
+  The sync wrappers now hold a loop-agnostic per-provider `threading.Semaphore`
+  in the calling thread around the whole bridged call, so cross-thread sync
+  fan-out shares one cap. One honest caveat (documented in
+  `llmkit.rate_limiting`): async callers on a shared loop and sync callers in
+  other threads are capped on independent semaphores, so a workload mixing both
+  can momentarily hold up to 2 × `max_concurrent` in-flight calls per provider;
+  RPM/TPM budgets are shared across both populations.
 - **The on-by-default concurrency limiter no longer raises "bound to a different
   event loop" across sync calls.** The per-provider async semaphore was cached
   in a process-global registry keyed by provider name alone, but an
@@ -627,7 +738,9 @@ flip a default or move a symbol — review these first:
   union), for both the `type`-list and `anyOf`/`oneOf` shapes. A `null` member
   on a *non-nullable* field still fails loud (a type that forbids `null` but an
   enum that permits it is contradictory), as does an enum whose only member is
-  `null`.
+  `null` — with an error naming the actual defect (a nullable enum needs at
+  least one non-null member), not a misleading "'enum' must be a non-empty
+  list".
 
 ## [0.1.2] — 2026-06-05
 

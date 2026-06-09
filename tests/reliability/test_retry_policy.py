@@ -180,7 +180,10 @@ def test_litellm_service_unavailable_503_is_in_transport_set() -> None:
     ``openai.InternalServerError`` (its MRO goes straight to
     ``openai.APIStatusError``), so the subclass-of-openai pattern the rest of
     the transport set relies on never covered it — it must be (and is) listed
-    explicitly in ``LLM_TRANSPORT_ERRORS``.
+    explicitly in ``LLM_TRANSPORT_ERRORS``, via a lazy stand-in that resolves
+    litellm's class at ``isinstance`` time (litellm is imported in this test
+    session, so the real class matches here; the litellm-free import path is
+    pinned in ``tests/packaging/test_litellm_lazy_import.py``).
     """
     err = _litellm_503()
     # The premise that forces the explicit listing: no openai 5xx subclassing.
@@ -568,6 +571,44 @@ async def test_instructor_wrapped_schema_error_uses_validation_budget() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("cls", "status"),
+    [
+        pytest.param(openai.AuthenticationError, 401, id="401"),
+        pytest.param(openai.BadRequestError, 400, id="400"),
+        pytest.param(openai.PermissionDeniedError, 403, id="403"),
+    ],
+)
+async def test_instructor_wrapped_permanent_4xx_fails_fast(
+    cls: type[openai.APIStatusError], status: int
+) -> None:
+    """An ``InstructorRetryException`` wrapping a *permanent* 4xx (bad key,
+    malformed request) fails fast: exactly one outer attempt, no retry on
+    either budget — the same fail-fast contract the bare-4xx text path
+    honours. Regression test: the wrapper itself matched
+    ``validation_retry_on``, so a wrapped 401 used to burn a validation-budget
+    retry (a whole extra instructor call pair) on a request that could never
+    succeed."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        raise InstructorRetryException(_status_error(cls, status), n_attempts=1, total_usage=0)
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        pytest.raises(InstructorRetryException),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "make_transport_cause",
     [
         pytest.param(lambda: _status_error(openai.RateLimitError, 429), id="429"),
@@ -628,6 +669,35 @@ async def test_retry_on_none_wrapped_validation_cause_uses_validation_budget() -
         )
 
     assert calls[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_on_none_wrapped_permanent_4xx_fails_fast() -> None:
+    """Even under ``retry_on=None`` ("retry on any Exception"), an
+    ``InstructorRetryException`` wrapping a permanent 401 propagates after a
+    single attempt: the unwrapped cause is neither transport- nor
+    schema-shaped, so the fail-fast contract overrides the blanket retry for
+    the wrapper, exactly as under the curated default sets."""
+    from instructor.core import InstructorRetryException
+
+    calls = [0]
+
+    async def _fn() -> str:
+        calls[0] += 1
+        raise InstructorRetryException(
+            _status_error(openai.AuthenticationError, 401), n_attempts=1, total_usage=0
+        )
+
+    with pytest.raises(InstructorRetryException):
+        _ = await with_retries(
+            _fn,
+            max_attempts=4,
+            retry_on=None,
+            validation_max_attempts=2,
+            validation_retry_on=LLM_SCHEMA_ERRORS,
+        )
+
+    assert calls[0] == 1
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,7 @@ from llmkit.retry import (
     retry_progress_callback,
 )
 from llmkit.structured_output import (
+    STREAM_ABANDONED_ERROR,
     stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,
@@ -112,6 +113,7 @@ __all__ = [
     "text_llm_call",
     "text_llm_call_sync",
     "stream_text_with_log",
+    "STREAM_ABANDONED_ERROR",
     "capture_llm_log_paths",
     "capture_llm_records",
     "LLMCallOptions",

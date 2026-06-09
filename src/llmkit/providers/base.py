@@ -271,12 +271,12 @@ class BaseProvider(ABC):
     # ``_model_prefix`` keeps a ``""`` default deliberately: an empty prefix is
     # legitimate (it still assembles a well-formed bare-model id), so unlike the
     # three hooks above a missing value is not a footgun and is left unguarded.
-    _model_prefix: str = ""
+    _model_prefix: ClassVar[str] = ""
     #: Whether this provider runs against a local endpoint (no data leaves the
     #: host). A provider trait rather than a dispatch special-case, so locality
     #: stays defined alongside the provider it describes (see
     #: :func:`~llmkit.providers.describe_llm`). Cloud providers leave this False.
-    is_local: bool = False
+    is_local: ClassVar[bool] = False
 
     #: The routing-contract hooks validated for every concrete subclass.
     _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")

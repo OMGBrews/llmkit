@@ -328,6 +328,49 @@ def test_bound_on_referenced_def_is_found() -> None:
         _ = model(n=9)
 
 
+def test_bound_at_end_of_three_hop_ref_chain_enforced() -> None:
+    """A bound declared at the end of a 3-hop ``$ref`` chain is enforced —
+    pre-fix the constraint extractor unwrapped at most two hops and silently
+    dropped the bound (while the type resolver already looped to arbitrary
+    depth, so the model built and ACCEPTED out-of-bounds values)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/A"}},
+        "required": ["n"],
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/C"},
+            "C": {"type": "integer", "minimum": 10},
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(n=10), "n") == 10
+    with pytest.raises(ValidationError):
+        _ = model(n=9)
+
+
+def test_bound_behind_nullable_wrapped_ref_chain_enforced() -> None:
+    """A bound behind a nullable ``anyOf`` wrapping a 2-hop ``$ref`` chain is
+    enforced, and ``null`` still passes — the same depth-limit regression in
+    its nullable-wrapped form."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]}},
+        "required": ["n"],
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"type": "integer", "minimum": 10},
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(n=None), "n") is None
+    assert _attr(model(n=10), "n") == 10
+    with pytest.raises(ValidationError):
+        _ = model(n=9)
+
+
 def test_ref_sibling_bound_is_applied() -> None:
     """A bound sitting ALONGSIDE a ``$ref`` (Draft 2020-12 sibling keywords)
     is enforced — pre-fix the ref resolution REPLACED the schema, so

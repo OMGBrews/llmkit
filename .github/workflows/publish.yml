@@ -10,7 +10,12 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      confirm_version:
+        description: "Version to publish — must exactly match `version` in pyproject.toml on the selected ref (e.g. 0.2.0)"
+        required: true
+        type: string
 
 jobs:
   build:
@@ -19,7 +24,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check release tag matches pyproject version
-        # Only the release trigger carries a tag; workflow_dispatch has none.
+        # Only the release trigger carries a tag; workflow_dispatch is guarded
+        # by its confirm_version input below.
         if: github.event_name == 'release'
         run: |
           project_version="$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
@@ -29,6 +35,21 @@ jobs:
             exit 1
           fi
           echo "Tag and pyproject version agree: ${project_version}"
+
+      - name: Check confirm_version input matches pyproject version
+        # A manual dispatch carries no tag, so it must name the version it
+        # intends to publish — a stray dispatch can otherwise burn the
+        # immutable PyPI slot for whatever version the ref carries.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONFIRM_VERSION: ${{ inputs.confirm_version }}
+        run: |
+          project_version="$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "$project_version" != "$CONFIRM_VERSION" ]; then
+            echo "::error::confirm_version input (${CONFIRM_VERSION}) does not match pyproject version ${project_version}"
+            exit 1
+          fi
+          echo "confirm_version and pyproject version agree: ${project_version}"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

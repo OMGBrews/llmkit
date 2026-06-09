@@ -40,7 +40,7 @@ class OpenRouterProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "OpenRouter"
-    _model_prefix: str = "openrouter/"
+    _model_prefix: ClassVar[str] = "openrouter/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
     _default_model: ClassVar[str] = "google/gemini-2.0-flash-001"
 

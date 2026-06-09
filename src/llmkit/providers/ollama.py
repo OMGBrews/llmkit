@@ -21,10 +21,10 @@ class OllamaProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Ollama"
-    _model_prefix: str = "ollama_chat/"
+    _model_prefix: ClassVar[str] = "ollama_chat/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "llama3.2"
-    is_local: bool = True
+    is_local: ClassVar[bool] = True
 
     def __init__(
         self,

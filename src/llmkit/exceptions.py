@@ -30,15 +30,21 @@ The recoverable set is split into two subsets the retry layer budgets
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the two, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
-catching exactly what they did before.
+catching exactly what they did before. One member is special: the
+litellm-native 503 entry is a lazy stand-in
+(:class:`_LiteLLMServiceUnavailableError`) that resolves litellm's class at
+``isinstance`` time, keeping ``import llmkit`` free of the multi-second
+litellm import — see its docstring for the one ``except``-clause limit.
 
 ``with_retries()`` (see :mod:`llmkit.retry`) is the transient-retry
-layer; instructor's own ``validation_retries`` handles in-call schema-repair
-separately.
+layer; in-call schema repair is handled separately by instructor's retry
+loop (``max_retries``, pinned to 2 in :mod:`llmkit._litellm`).
 """
 
+import sys
+from typing import override
+
 import httpx
-import litellm
 import openai
 from instructor.core import InstructorRetryException
 from pydantic import ValidationError
@@ -72,12 +78,59 @@ from pydantic import ValidationError
 # isinstance-tuple can't express a status-code predicate; a raw
 # ``APIStatusError`` outside those mappings is unexpected enough to surface
 # rather than retry.
+
+
+class _LazyServiceUnavailableMeta(type):
+    """Resolves litellm's 503 class at *classification* time, not import time.
+
+    ``litellm.exceptions.ServiceUnavailableError`` belongs in the transport
+    set, but a module-level ``import litellm`` here would make every
+    ``import llmkit`` pay the full multi-second litellm import (this module is
+    imported eagerly by ``llmkit/__init__.py``). A litellm exception
+    *instance* cannot exist unless ``litellm`` is already in ``sys.modules``,
+    so the class is resolved lazily inside ``__instancecheck__``: before
+    litellm is loaded nothing can match, and once it is, the resolved class
+    is cached.
+    """
+
+    _resolved: type[Exception] | None = None
+
+    @override
+    def __instancecheck__(cls, instance: object) -> bool:
+        if cls._resolved is None:
+            if "litellm" not in sys.modules:
+                # litellm not loaded — no litellm exception instance can exist.
+                return False
+            import litellm
+
+            cls._resolved = litellm.exceptions.ServiceUnavailableError
+        return isinstance(instance, cls._resolved)
+
+
+class _LiteLLMServiceUnavailableError(Exception, metaclass=_LazyServiceUnavailableMeta):
+    """Lazy stand-in for ``litellm.exceptions.ServiceUnavailableError``.
+
+    Matches exactly what the real class matches in ``isinstance`` checks —
+    the form every consumer of the transport set uses to classify errors —
+    without importing litellm at ``import llmkit`` time. Never raise this
+    class directly.
+
+    Known limit: ``except`` matching bypasses ``__instancecheck__``, so a
+    bare ``except LLM_TRANSPORT_ERRORS`` clause does not catch the
+    litellm-native 503 specifically (every other member still matches; an
+    openai-SDK 503 arrives as ``openai.InternalServerError`` and matches
+    too). Use ``isinstance`` — as the retry layer does — where the
+    litellm-native class matters.
+    """
+
+
 LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     openai.RateLimitError,
     openai.InternalServerError,
     # litellm-native 503 — does not subclass ``openai.InternalServerError``
-    # (only ``openai.APIStatusError``), so it needs an explicit entry.
-    litellm.exceptions.ServiceUnavailableError,
+    # (only ``openai.APIStatusError``), so it needs an explicit entry; the
+    # lazy stand-in keeps ``import llmkit`` litellm-free.
+    _LiteLLMServiceUnavailableError,
     openai.APIConnectionError,
     httpx.RequestError,
     TimeoutError,

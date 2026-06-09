@@ -334,6 +334,54 @@ def test_mid_stream_failure_still_logs_partial_transcript() -> None:
     assert "stream died" in captured[0].error
 
 
+def test_abandoned_stream_logs_abandonment_marker_not_ok(tmp_path: Path) -> None:
+    """A consumer that breaks out of a stream mid-flight never logs as ``ok``.
+
+    Regression: ``GeneratorExit`` is a ``BaseException``, so it bypassed
+    ``_stream_once``'s ``except Exception`` and the ``finally`` logged the
+    partial transcript with ``error=None`` — a ``# ok`` verdict over a
+    truncated response, indistinguishable from a stream the model finished.
+    An abandoned stream now records ``STREAM_ABANDONED_ERROR`` (alongside the
+    partial transcript), so the written YAML's ``head -1`` verdict reads
+    ``ERROR``, never ``ok``.
+    """
+    from collections.abc import AsyncIterator
+
+    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        async def _gen() -> AsyncIterator[str]:
+            for delta in ("a", "b", "c", "d"):
+                yield delta
+
+        return _gen()
+
+    with (
+        patch("llmkit._litellm.astream_text", side_effect=_fake_stream),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> list[LLMCallRecord]:
+            with capture_llm_records() as records:
+                stream = structured_output.stream_text_with_log("hi", feature="summary")
+                async for _chunk in stream:
+                    break  # abandon after the first chunk
+                await stream.aclose()
+            return records
+
+        captured = asyncio.run(_run())
+
+    assert len(captured) == 1
+    assert cast("object", captured[0].response) == "a"  # the partial transcript is kept
+    assert captured[0].error == structured_output.STREAM_ABANDONED_ERROR
+
+    # End to end through the file sink: the head -1 triage line must carry the
+    # ERROR verdict, not read like a completed call.
+    path = LocalYamlLogSink(tmp_path).write_returning_path(captured[0])
+    assert path is not None
+    verdict_line = path.read_text().splitlines()[0]
+    assert verdict_line.startswith("# ERROR")
+    assert "Abandoned" in path.read_text()
+
+
 class _ExplodingDumpSchema(BaseModel):
     """A schema whose custom serializer raises — only ``model_dump`` breaks;
     construction and field access stay fine."""

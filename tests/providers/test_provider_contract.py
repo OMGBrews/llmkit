@@ -18,6 +18,7 @@ provider from tripping class-statement lints in the test module.
 
 from __future__ import annotations
 
+import typing
 from typing import cast
 
 import instructor
@@ -141,3 +142,21 @@ def test_shipped_providers_satisfy_the_contract(provider_cls: type[BaseProvider]
     assert provider_cls._provider_name
     assert provider_cls._default_model
     assert isinstance(provider_cls._mode, instructor.Mode)
+
+
+@pytest.mark.parametrize("provider_cls", [BaseProvider, *_SHIPPED_PROVIDERS])
+def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvider]) -> None:
+    """All class-level routing config is uniformly annotated ``ClassVar``.
+
+    The three enforced hooks plus ``_model_prefix`` and ``is_local`` are class
+    routing config, never per-instance state. A mixed annotation style sends a
+    provider author contradictory signals about which attributes are
+    class-level, so this pins the convention for the base and every shipped
+    provider (each redeclares the attrs it overrides).
+    """
+    hints: dict[str, object] = typing.get_type_hints(provider_cls)
+    routing_attrs = ("_provider_name", "_mode", "_default_model", "_model_prefix", "is_local")
+    for attr in routing_attrs:
+        assert typing.get_origin(hints[attr]) is typing.ClassVar, (
+            f"{provider_cls.__name__}.{attr} must be annotated ClassVar"
+        )

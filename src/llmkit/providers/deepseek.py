@@ -34,7 +34,7 @@ class DeepSeekProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "DeepSeek"
-    _model_prefix: str = "deepseek/"
+    _model_prefix: ClassVar[str] = "deepseek/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
     _default_model: ClassVar[str] = "deepseek-chat"
 

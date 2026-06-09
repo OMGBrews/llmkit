@@ -31,7 +31,7 @@ class OpenAIProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "OpenAI"
-    _model_prefix: str = "openai/"
+    _model_prefix: ClassVar[str] = "openai/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
 

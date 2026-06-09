@@ -23,7 +23,7 @@ class AnthropicProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Anthropic"
-    _model_prefix: str = "anthropic/"
+    _model_prefix: ClassVar[str] = "anthropic/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.ANTHROPIC_JSON
     _default_model: ClassVar[str] = "claude-sonnet-4-6"
 

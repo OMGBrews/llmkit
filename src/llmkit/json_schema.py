@@ -31,6 +31,9 @@ construct, rather than silently producing a wrong model:
 * ``enum`` (on a scalar field)
 * nested objects, inline or via local ``$defs`` / ``$ref`` references
   (``#/$defs/Name`` or the legacy ``#/definitions/Name``)
+* ``additionalProperties``: ``true`` (an open object — extra keys are accepted
+  and kept) or ``false`` / absent (strict ``extra="forbid"``, the default); a
+  *typed* ``additionalProperties`` map is rejected
 
 Per-field constraints
 ----------------------
@@ -81,6 +84,7 @@ from __future__ import annotations
 
 import keyword
 import re
+import warnings
 from collections.abc import Callable, Mapping
 from enum import Enum
 from typing import (
@@ -545,6 +549,13 @@ class _Converter:
             # still rejects the contradiction loudly.
             if nullable and isinstance(inner["enum"], list):
                 non_null_members: list[JsonValue] = [v for v in inner["enum"] if v is not None]
+                if not non_null_members:
+                    # Stripping would leave a member-less Enum; name the actual
+                    # defect (only-null members), not the post-strip emptiness.
+                    raise ValueError(
+                        f"Unsupported enum at {field_path!r}: a nullable enum must have "
+                        + "at least one non-null member — 'enum' contains only null."
+                    )
                 inner = {**inner, "enum": cast("JsonValue", non_null_members)}
             return self._build_enum(inner, field_path), nullable
 
@@ -608,16 +619,31 @@ class _Converter:
         # with the target's, so merge rather than replace — outer keys win on
         # conflict, matching the nullable-merge precedence above. Without the
         # merge, ``{"$ref": "#/$defs/Count", "minimum": 5}`` would silently
-        # drop the bound.
-        if "$ref" in schema:
-            _, target = self._resolve_ref(cast("str", schema["$ref"]))
-            siblings = {k: v for k, v in schema.items() if k != "$ref"}
-            schema = {**target, **siblings}
-        inner, _ = self._unwrap_nullable(schema, field_path)
-        if "$ref" in inner:
-            _, target = self._resolve_ref(cast("str", inner["$ref"]))
-            siblings = {k: v for k, v in inner.items() if k != "$ref"}
-            inner, _ = self._unwrap_nullable({**target, **siblings}, field_path)
+        # drop the bound. Like :meth:`_field_type`, resolve $refs and unwrap
+        # nullability in a loop to arbitrary (acyclic) depth, so a bound at the
+        # end of a long chain — or behind a nullable wrapper mid-chain — is
+        # still found rather than silently dropped. ``_field_type`` runs first
+        # on every property and already rejects $ref cycles; ``seen_refs`` here
+        # is the same guard, kept so this loop can never spin on its own.
+        seen_refs: set[str] = set()
+        inner = schema
+        while True:
+            if "$ref" in inner:
+                ref_name, target = self._resolve_ref(cast("str", inner["$ref"]))
+                if ref_name in seen_refs:
+                    raise ValueError(
+                        f"Unsupported recursive schema at {field_path!r}: $ref "
+                        + f"'#/$defs/{ref_name}' forms a reference cycle "
+                        + "(self-referential / cyclic schemas are not supported)."
+                    )
+                seen_refs.add(ref_name)
+                siblings = {k: v for k, v in inner.items() if k != "$ref"}
+                inner = {**target, **siblings}
+                continue
+            unwrapped, _ = self._unwrap_nullable(inner, field_path)
+            if unwrapped is inner:
+                break
+            inner = unwrapped
 
         raw_type = inner.get("type")
         types: set[str] = (
@@ -764,13 +790,60 @@ class _Converter:
             raise ValueError(
                 f"Unsupported object at {field_path!r}: 'properties' must be a mapping."
             )
+        # ``additionalProperties`` picks the model's extra policy:
+        #   absent / false -> strict ``extra="forbid"`` (the good LLM default);
+        #   true           -> ``extra="allow"`` (author wants open-ended keys);
+        #   a typed dict    -> unsupported, raise.
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            raise ValueError(
+                f"Unsupported 'additionalProperties' at {field_path!r}: typed "
+                + "additionalProperties maps are not supported (only true/false or absent)."
+            )
+        # A propertyless ``type: "object"`` would build a zero-field
+        # ``extra="forbid"`` model that validates only ``{}`` and rejects every
+        # real response — the silent-wrong-model failure this module refuses.
+        # Only ``additionalProperties: true`` (an intentionally free-form
+        # object, the ``extra="allow"`` base) makes a propertyless object
+        # meaningful, so everything else fails loud.
+        if properties is None and additional is not True:
+            raise ValueError(
+                f"Unsupported object at {field_path!r}: 'type' is 'object' but there is "
+                + "no 'properties' — this would build a zero-field model that rejects "
+                + "every real response. Declare 'properties', or set "
+                + "'additionalProperties': true for an intentionally free-form object."
+            )
         props: JsonDict = cast("JsonDict", properties) if isinstance(properties, dict) else {}
         required_raw = schema.get("required")
-        required: set[str] = (
-            {str(r) for r in cast("list[JsonValue]", required_raw)}
-            if isinstance(required_raw, list)
-            else set()
-        )
+        if required_raw is None:
+            required_list: list[JsonValue] = []
+        elif isinstance(required_raw, list):
+            required_list = cast("list[JsonValue]", required_raw)
+        else:
+            # A non-list ``required`` (e.g. ``"required": "id"``) silently made
+            # every field optional pre-fix — a wrong model, so fail loud.
+            raise ValueError(
+                f"Unsupported object at {field_path!r}: 'required' must be a list of "
+                + f"property-name strings, got {type(required_raw).__name__}."
+            )
+        required: set[str] = set()
+        for entry in required_list:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"Unsupported object at {field_path!r}: 'required' entries must be "
+                    + f"property-name strings, got {entry!r}."
+                )
+            required.add(entry)
+        # A ``required`` name with no matching property is a schema typo that
+        # would otherwise degrade silently in BOTH directions: the model accepts
+        # payloads missing the field and (under ``extra="forbid"``) rejects
+        # payloads that legitimately carry it.
+        missing = required - set(props)
+        if missing:
+            raise ValueError(
+                f"Unsupported object at {field_path!r}: 'required' names "
+                + f"{sorted(missing)} not present in 'properties'."
+            )
 
         # ``fields`` feeds ``create_model``'s dynamic ``**field_definitions``
         # splat (each value a ``(annotation, FieldInfo)`` tuple). The annotation
@@ -785,21 +858,26 @@ class _Converter:
             # Reject names pydantic cannot carry as public fields BEFORE they
             # reach ``create_model``, which otherwise fails opaquely deep inside
             # pydantic (or worse: silently). A leading underscore is treated as a
-            # private attribute and the field is *silently dropped*; a name that
-            # collides with a ``BaseModel`` member (``model_config`` ->
-            # ``TypeError``, ``model_dump`` -> protected-namespace ``ValueError``,
-            # ``schema`` / ``copy`` / ``dict`` -> a shadow warning) is reserved.
+            # private attribute and the field is *silently dropped*; the
+            # ``model_`` prefix is pydantic's protected namespace and collides
+            # with real machinery (``model_config`` -> ``TypeError``,
+            # ``model_dump`` -> a conflicts-with-member ``ValueError``). Names
+            # that merely shadow pydantic's *deprecated v1 shims* (``schema``,
+            # ``json``, ``copy``, ``dict``, ...) work fine as fields, so they
+            # pass through — their shadow warning is suppressed at
+            # ``create_model`` below.
             if prop_name.startswith("_"):
                 raise ValueError(
                     f"Unsupported property {prop_name!r} at {field_path!r}: property names "
                     + "may not start with an underscore — pydantic treats them as private "
                     + "attributes and would silently drop the field."
                 )
-            if hasattr(_JsonSchemaModel, prop_name):
+            if prop_name.startswith("model_"):
                 raise ValueError(
-                    f"Unsupported property {prop_name!r} at {field_path!r}: the name is "
-                    + "reserved by pydantic's BaseModel (e.g. 'model_config', 'model_dump', "
-                    + "'schema', 'copy') and cannot be used as a field; rename the property."
+                    f"Unsupported property {prop_name!r} at {field_path!r}: the 'model_' "
+                    + "prefix is pydantic's protected namespace ('model_config', "
+                    + "'model_dump', ...) and cannot be used as a field; rename the "
+                    + "property."
                 )
             if not isinstance(prop_schema, dict):
                 raise ValueError(
@@ -843,16 +921,6 @@ class _Converter:
             )
             fields[prop_name] = (annotation, field_info)
 
-        # ``additionalProperties`` picks the model's extra policy:
-        #   absent / false -> strict ``extra="forbid"`` (the good LLM default);
-        #   true           -> ``extra="allow"`` (author wants open-ended keys);
-        #   a typed dict    -> unsupported, raise.
-        additional = schema.get("additionalProperties")
-        if isinstance(additional, dict):
-            raise ValueError(
-                f"Unsupported 'additionalProperties' at {field_path!r}: typed "
-                + "additionalProperties maps are not supported (only true/false or absent)."
-            )
         base: type[_JsonSchemaModel] = (
             _JsonSchemaModelAllow if additional is True else _JsonSchemaModel
         )
@@ -866,8 +934,17 @@ class _Converter:
         # ``create_model`` is a dynamic factory whose ``**field_definitions`` is
         # typed ``Any | tuple[Any, Any]`` in the stubs, so splatting the runtime
         # field map lands every keyword argument on ``Any``. Confined and
-        # documented here rather than scattered.
-        model = create_model(model_name, __base__=base, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
+        # documented here rather than scattered. The deprecated v1-shim names
+        # allowed through above (``schema`` / ``json`` / ...) are valid fields
+        # but trip pydantic's shadows-an-attribute ``UserWarning``; suppress
+        # exactly that one so a legitimate schema builds without warning spam.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r'Field name ".*" in .* shadows an attribute in parent',
+                category=UserWarning,
+            )
+            model = create_model(model_name, __base__=base, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
         model.__llmkit_optional_fields__ = frozenset(optional_fields)
         if ref_name is not None:
             self._built[ref_name] = model
@@ -941,6 +1018,8 @@ def model_from_json_schema(
     * ``array`` (``items``), including arrays of objects
     * ``enum`` (string or integer members)
     * nested objects, inline or via local ``$ref`` (``#/$defs/...``)
+    * ``additionalProperties``: ``true`` (open object, extra keys kept) or
+      ``false`` / absent (strict); a typed map raises ``ValueError``
 
     Per-field constraints (carried into ``Field``; everything else dropped):
 
@@ -956,17 +1035,21 @@ def model_from_json_schema(
     Serialization contract:
         A non-required field becomes an optional Pydantic field defaulting to
         ``None``, and the generated model's ``model_dump`` /
-        ``model_dump_json`` default to ``exclude_none=True`` — so an omitted
-        optional is *absent* from the dump, not ``"field": null`` (which
-        would fail downstream re-validation). Pass ``exclude_none=False`` to
-        keep the nulls.
+        ``model_dump_json`` drop unset *optional* fields by default — so an
+        omitted optional is *absent* from the dump, not ``"field": null``
+        (which would fail downstream re-validation). The drop is scoped: a
+        required-but-nullable field set to ``None`` is kept. Pass
+        ``exclude_none=False`` to keep every null, or ``exclude_none=True``
+        to drop them all.
 
     Strictness:
-        Generated models set ``extra="forbid"``, so a response carrying a key
-        not in the schema is *rejected*. This is deliberately stricter than
-        JSON Schema's permissive ``additionalProperties`` default — for an LLM
-        output contract you want a hallucinated extra field to fail loudly, not
-        pass silently.
+        Generated models default to ``extra="forbid"``, so a response carrying
+        a key not in the schema is *rejected*. This is deliberately stricter
+        than JSON Schema's permissive ``additionalProperties`` default — for an
+        LLM output contract you want a hallucinated extra field to fail loudly,
+        not pass silently. An object whose schema sets ``additionalProperties:
+        true`` opts into ``extra="allow"`` instead (extra keys are accepted and
+        kept); ``false`` or absent keeps the strict default.
 
     Returns:
         A ``type[BaseModel]`` subclass ready to use as ``output_schema``.
