@@ -351,11 +351,6 @@ def _safe_model_name(raw: object) -> str:
     return cleaned or _DEFAULT_MODEL_NAME
 
 
-def _as_dict(value: JsonValue) -> JsonDict:
-    """Narrow a JSON value to a schema dict (``object``)."""
-    return cast("JsonDict", value)
-
-
 def _nullable(annotation: object) -> object:
     """Union a runtime-built field annotation with ``None``.
 
@@ -445,7 +440,7 @@ class _Converter:
             raise ValueError(f"Unresolvable $ref {ref!r}: no '{name}' in $defs/definitions.")
         return name, cast("JsonDict", target)
 
-    def _unwrap_nullable(self, schema: JsonDict) -> tuple[JsonDict, bool]:
+    def _unwrap_nullable(self, schema: JsonDict, field_path: str) -> tuple[JsonDict, bool]:
         """Split a possibly-nullable schema into (inner schema, is_nullable).
 
         Handles the two shapes real consumers emit: ``type: ["string",
@@ -480,7 +475,14 @@ class _Converter:
         keyword = "anyOf" if schema.get("anyOf") else "oneOf" if schema.get("oneOf") else None
         any_of = schema.get("anyOf") or schema.get("oneOf")
         if isinstance(any_of, list):
-            branches = [_as_dict(b) for b in cast("list[JsonValue]", any_of)]
+            branches: list[JsonDict] = []
+            for branch in cast("list[JsonValue]", any_of):
+                if not isinstance(branch, dict):
+                    raise ValueError(
+                        f"Unsupported {keyword} branch at {field_path!r}: each branch must "
+                        + f"be a schema object, got {type(branch).__name__}."
+                    )
+                branches.append(cast("JsonDict", branch))
             non_null = [b for b in branches if b.get("type") != "null"]
             nullable = any(b.get("type") == "null" for b in branches)
             if len(non_null) != 1:
@@ -505,16 +507,33 @@ class _Converter:
         also listed in ``required`` must accept the provider's ``null``, not
         reject it.
         """
+        # A property may chain $ref -> nullable-wrapper -> $ref -> ... to
+        # arbitrary (acyclic) depth, so resolve $refs and unwrap nullability in
+        # a loop until neither applies, accumulating nullability. A $ref name
+        # seen twice on one chain is a pure-$ref cycle: fail loud naming it
+        # (object-level recursion is caught separately by ``_in_progress`` in
+        # ``_build_object``, which this never reaches).
         ref_name: str | None = None
-        if "$ref" in schema:
-            ref_name, schema = self._resolve_ref(cast("str", schema["$ref"]))
-
-        inner, nullable = self._unwrap_nullable(schema)
-
-        if "$ref" in inner:
-            ref_name, inner = self._resolve_ref(cast("str", inner["$ref"]))
-            inner, inner_nullable = self._unwrap_nullable(inner)
+        nullable = False
+        seen_refs: set[str] = set()
+        inner = schema
+        while True:
+            if "$ref" in inner:
+                resolved_name, target = self._resolve_ref(cast("str", inner["$ref"]))
+                if resolved_name in seen_refs:
+                    raise ValueError(
+                        f"Unsupported recursive schema at {field_path!r}: $ref "
+                        + f"'#/$defs/{resolved_name}' forms a reference cycle "
+                        + "(self-referential / cyclic schemas are not supported)."
+                    )
+                seen_refs.add(resolved_name)
+                ref_name, inner = resolved_name, target
+                continue
+            unwrapped, inner_nullable = self._unwrap_nullable(inner, field_path)
             nullable = nullable or inner_nullable
+            if unwrapped is inner:
+                break
+            inner = unwrapped
 
         if "enum" in inner:
             # The canonical nullable-enum spelling carries ``null`` as an enum
@@ -551,7 +570,9 @@ class _Converter:
             # on the element annotation — the list field's own ``Field`` only
             # carries ``minItems``/``maxItems``. Wrap BEFORE the nullable
             # union so a ``null`` element still passes unbounded.
-            element = _with_constraints(element, self._field_constraints(items_schema))
+            element = _with_constraints(
+                element, self._field_constraints(items_schema, f"{field_path}[]")
+            )
             if element_nullable:
                 element = _nullable(element)
             return _as_list(element), nullable
@@ -559,7 +580,7 @@ class _Converter:
             return _SCALAR_TYPES[jtype], nullable
         raise ValueError(f"Unsupported JSON-schema type {jtype!r} at {field_path!r}.")
 
-    def _field_constraints(self, schema: JsonDict) -> _FieldConstraints:
+    def _field_constraints(self, schema: JsonDict, field_path: str) -> _FieldConstraints:
         """Pull the supported per-field bounds off one property schema.
 
         Mirrors :meth:`_field_type`'s ``$ref`` / nullable unwrapping so a
@@ -592,11 +613,11 @@ class _Converter:
             _, target = self._resolve_ref(cast("str", schema["$ref"]))
             siblings = {k: v for k, v in schema.items() if k != "$ref"}
             schema = {**target, **siblings}
-        inner, _ = self._unwrap_nullable(schema)
+        inner, _ = self._unwrap_nullable(schema, field_path)
         if "$ref" in inner:
             _, target = self._resolve_ref(cast("str", inner["$ref"]))
             siblings = {k: v for k, v in inner.items() if k != "$ref"}
-            inner, _ = self._unwrap_nullable({**target, **siblings})
+            inner, _ = self._unwrap_nullable({**target, **siblings}, field_path)
 
         raw_type = inner.get("type")
         types: set[str] = (
@@ -761,6 +782,25 @@ class _Converter:
         # ``None``, never an explicitly-null required field.
         optional_fields: set[str] = set()
         for prop_name, prop_schema in props.items():
+            # Reject names pydantic cannot carry as public fields BEFORE they
+            # reach ``create_model``, which otherwise fails opaquely deep inside
+            # pydantic (or worse: silently). A leading underscore is treated as a
+            # private attribute and the field is *silently dropped*; a name that
+            # collides with a ``BaseModel`` member (``model_config`` ->
+            # ``TypeError``, ``model_dump`` -> protected-namespace ``ValueError``,
+            # ``schema`` / ``copy`` / ``dict`` -> a shadow warning) is reserved.
+            if prop_name.startswith("_"):
+                raise ValueError(
+                    f"Unsupported property {prop_name!r} at {field_path!r}: property names "
+                    + "may not start with an underscore — pydantic treats them as private "
+                    + "attributes and would silently drop the field."
+                )
+            if hasattr(_JsonSchemaModel, prop_name):
+                raise ValueError(
+                    f"Unsupported property {prop_name!r} at {field_path!r}: the name is "
+                    + "reserved by pydantic's BaseModel (e.g. 'model_config', 'model_dump', "
+                    + "'schema', 'copy') and cannot be used as a field; rename the property."
+                )
             if not isinstance(prop_schema, dict):
                 raise ValueError(
                     f"Unsupported property {prop_name!r} at {field_path!r}: "
@@ -781,7 +821,7 @@ class _Converter:
             desc = description if isinstance(description, str) else None
             # Per-field value bounds (ge/le/gt/lt/min_length/max_length). Only
             # the supported keywords cross over; everything else is dropped.
-            c = self._field_constraints(prop)
+            c = self._field_constraints(prop, f"{field_path}.{prop_name}")
             optional = prop_name not in required
             if optional:
                 optional_fields.add(prop_name)

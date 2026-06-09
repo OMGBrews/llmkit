@@ -478,6 +478,22 @@ flip a default or move a symbol — review these first:
   was honored). Sibling keywords now merge over the resolved target with
   outer-wins precedence, matching Draft 2020-12 and the module's existing
   merge behavior.
+- **`model_from_json_schema` resolves `$ref` chains of arbitrary depth.** Field
+  type resolution unwrapped at most two `$ref` hops, so a three-or-more-hop
+  chain (`A → B → C → scalar`) fell through to the self-contradictory
+  `no 'type', 'enum', or '$ref' — got keys ['$ref']` error. Resolution now
+  loops; a cycle made purely of `$ref`s fails with the same clear
+  recursive-schema error that object-level recursion already raised.
+- **`model_from_json_schema` rejects pydantic-reserved property names with a
+  clear error.** A property named like `_id` (silently dropped as a private
+  attribute), `model_config` (`TypeError`), or `model_dump` (a leaked
+  protected-namespace error) crashed or corrupted deep inside `create_model`.
+  Such names now fail with the module's standard `ValueError` naming the
+  property and its path.
+- **`model_from_json_schema` rejects a non-dict `anyOf`/`oneOf` branch with a
+  clear error.** A branch list like `["string", {"type": "null"}]` raised an
+  opaque `AttributeError` (calling `.get` on the `str`); it now fails with a
+  `ValueError` naming the keyword and field path.
 - **The default Bedrock model is current again.** The previous default,
   `anthropic.claude-3-5-sonnet-20240620-v1:0`, was retired upstream in late
   2025, so configuring `Provider.BEDROCK` without naming a model failed at call

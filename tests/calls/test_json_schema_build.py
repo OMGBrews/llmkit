@@ -625,6 +625,69 @@ def test_mutually_recursive_schema_raises_clear_value_error() -> None:
         _ = model_from_json_schema(schema)
 
 
+def test_deep_ref_chain_resolves() -> None:
+    """A ``$ref`` chain deeper than two hops resolves to the final scalar
+    rather than falling through to the self-contradictory "no 'type'" error."""
+    schema: dict[str, object] = {
+        "title": "Deep",
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/A"}},
+        "required": ["x"],
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/C"},
+            "C": {"type": "integer"},
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["x"].annotation is int
+
+
+def test_pure_ref_cycle_raises_clear_value_error() -> None:
+    """A cycle made only of ``$ref``s (no object in between) fails with the
+    recursive-schema error, never an infinite loop or the "no 'type'" message."""
+    schema: dict[str, object] = {
+        "title": "Loop",
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/A"}},
+        "required": ["x"],
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        },
+    }
+    with pytest.raises(ValueError, match="recursive"):
+        _ = model_from_json_schema(schema)
+
+
+@pytest.mark.parametrize("reserved", ["_id", "model_config", "model_dump"])
+def test_reserved_property_name_raises_clear_value_error(reserved: str) -> None:
+    """A pydantic-reserved property name fails with a clear ValueError naming
+    the property and its path — never a NameError/TypeError, a leaked pydantic
+    protected-namespace error, or (for ``_id``) a silently dropped field."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {reserved: {"type": "string"}},
+        "required": [reserved],
+    }
+    with pytest.raises(ValueError, match=rf"Unsupported property '{reserved}' at"):
+        _ = model_from_json_schema(schema)
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
+def test_non_dict_union_branch_raises_clear_value_error(keyword: str) -> None:
+    """A non-dict branch in ``anyOf``/``oneOf`` (e.g. the bare string ``"string"``)
+    fails with a clear ValueError naming the keyword and path, not an
+    ``AttributeError`` from calling ``.get`` on a ``str``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"x": {keyword: ["string", {"type": "null"}]}},
+        "required": ["x"],
+    }
+    with pytest.raises(ValueError, match=rf"Unsupported {keyword} branch at"):
+        _ = model_from_json_schema(schema)
+
+
 # --- Round-trip through structured_llm_call against a faked transport -------
 
 
