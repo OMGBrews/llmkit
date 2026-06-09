@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -20,10 +20,10 @@ class OllamaProvider(BaseProvider):
     for fully local/private LLM access. No data leaves the host.
     """
 
-    _provider_name: str = "Ollama"
+    _provider_name: ClassVar[str] = "Ollama"
     _model_prefix: str = "ollama_chat/"
-    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
-    _default_model: str = "llama3.2"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
+    _default_model: ClassVar[str] = "llama3.2"
     is_local: bool = True
 
     def __init__(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -33,10 +33,10 @@ class DeepSeekProvider(BaseProvider):
     seen with other providers' reasoning modes.
     """
 
-    _provider_name: str = "DeepSeek"
+    _provider_name: ClassVar[str] = "DeepSeek"
     _model_prefix: str = "deepseek/"
-    _mode: instructor.Mode = instructor.Mode.JSON
-    _default_model: str = "deepseek-chat"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
+    _default_model: ClassVar[str] = "deepseek-chat"
 
     def __init__(
         self,

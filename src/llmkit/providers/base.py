@@ -26,12 +26,13 @@ package's ``__init__.py``.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import instructor
 
@@ -254,23 +255,65 @@ class BaseProvider(ABC):
     against.
     """
 
-    _provider_name: str = ""
+    # Routing-contract hooks every concrete provider MUST set. They are
+    # declared without class-level default *values* on purpose: a silent
+    # default here is a footgun (a forgotten ``_mode`` would inherit a
+    # JSON-schema mode that silently regresses Gemini/DeepSeek structured
+    # output; a forgotten ``_default_model`` would assemble a dangling
+    # ``"<prefix>/"`` id; a forgotten ``_provider_name`` would degrade logging,
+    # rate-limit keying, and ``describe_llm``). ``__init_subclass__`` below
+    # turns the "every provider names these" convention into an enforced
+    # contract — an incomplete provider fails loudly at import, not at routing
+    # time with a provider-shaped misbehavior.
+    _provider_name: ClassVar[str]
+    _mode: ClassVar[instructor.Mode]
+    _default_model: ClassVar[str]
+    # ``_model_prefix`` keeps a ``""`` default deliberately: an empty prefix is
+    # legitimate (it still assembles a well-formed bare-model id), so unlike the
+    # three hooks above a missing value is not a footgun and is left unguarded.
     _model_prefix: str = ""
-    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
-    _default_model: str = ""
     #: Whether this provider runs against a local endpoint (no data leaves the
     #: host). A provider trait rather than a dispatch special-case, so locality
     #: stays defined alongside the provider it describes (see
     #: :func:`~llmkit.providers.describe_llm`). Cloud providers leave this False.
     is_local: bool = False
 
+    #: The routing-contract hooks validated for every concrete subclass.
+    _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Reject a concrete provider that omits a routing-contract hook.
+
+        Fires at class definition (import time), so an incomplete provider
+        fails the moment its module is imported — earlier and louder than a
+        construction-time check, and before any call can route through it.
+
+        Only *concrete* (instantiable) subclasses must satisfy the contract:
+        an intermediate ABC that leaves an abstract method (e.g.
+        ``completion_kwargs``) unimplemented is exempt until a concrete
+        subclass fills it in. ``inspect.isabstract`` is the structural signal,
+        so no provider needs to opt in or out by hand.
+        """
+        super().__init_subclass__(**kwargs)
+        if inspect.isabstract(cls):
+            return
+        missing = [hook for hook in cls._required_hooks if not getattr(cls, hook, None)]
+        if missing:
+            raise TypeError(
+                f"{cls.__name__} is an incomplete provider: it must set "
+                + f"{', '.join(missing)}. Every concrete BaseProvider subclass names its own "
+                + "provider, instructor mode, and default model so structured-output routing, "
+                + "rate-limit keying, and the assembled LiteLLM id are explicit — never "
+                + "inherited from a silent class-level default."
+            )
+
     def __init__(self, model: str | None = None, reasoning_effort: str | None = None) -> None:
         # A falsy model (None or "") falls back to the provider's own default
         # so the LiteLLM id assembled by ``litellm_model`` is always well-formed
-        # (``<prefix><model>``) and never a dangling ``"<prefix>/"``. Each
-        # concrete provider sets ``_default_model`` to the same value its ctor
-        # documents as the default, so config-built and directly-built providers
-        # agree on the fallback model.
+        # (``<prefix><model>``) and never a dangling ``"<prefix>/"``. The
+        # ``__init_subclass__`` contract guarantees ``_default_model`` is a
+        # non-empty value every concrete provider set, so this fallback is
+        # well-formed by construction, not merely by convention.
         self._model: str = model or self._default_model
         self._reasoning_effort: str | None = reasoning_effort
 

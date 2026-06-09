@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -63,10 +63,10 @@ class BedrockProvider(BaseProvider):
     ``ModuleNotFound`` deep on the first completion.
     """
 
-    _provider_name: str = "AWS Bedrock"
+    _provider_name: ClassVar[str] = "AWS Bedrock"
     _model_prefix: str = "bedrock/"
-    _mode: instructor.Mode = instructor.Mode.ANTHROPIC_JSON
-    _default_model: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.ANTHROPIC_JSON
+    _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def __init__(
         self,

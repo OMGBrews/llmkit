@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -16,10 +16,10 @@ class GoogleProvider(BaseProvider):
     latency, pinned to Gemini's native JSON-schema mode for instructor.
     """
 
-    _provider_name: str = "Google AI Studio"
+    _provider_name: ClassVar[str] = "Google AI Studio"
     _model_prefix: str = "gemini/"
-    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
-    _default_model: str = "gemini-2.5-flash-lite"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
+    _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
 
     def __init__(
         self,

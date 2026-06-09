@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -39,10 +39,10 @@ class OpenRouterProvider(BaseProvider):
     OpenRouter-specific flag.
     """
 
-    _provider_name: str = "OpenRouter"
+    _provider_name: ClassVar[str] = "OpenRouter"
     _model_prefix: str = "openrouter/"
-    _mode: instructor.Mode = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
-    _default_model: str = "google/gemini-2.0-flash-001"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
+    _default_model: ClassVar[str] = "google/gemini-2.0-flash-001"
 
     def __init__(
         self,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -22,10 +22,10 @@ class AnthropicProvider(BaseProvider):
     :func:`~llmkit.providers.base.require_anthropic_sdk`).
     """
 
-    _provider_name: str = "Anthropic"
+    _provider_name: ClassVar[str] = "Anthropic"
     _model_prefix: str = "anthropic/"
-    _mode: instructor.Mode = instructor.Mode.ANTHROPIC_JSON
-    _default_model: str = "claude-sonnet-4-6"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.ANTHROPIC_JSON
+    _default_model: ClassVar[str] = "claude-sonnet-4-6"
 
     def __init__(
         self,

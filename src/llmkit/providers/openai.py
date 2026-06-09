@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import override
+from typing import ClassVar, override
 
 import instructor
 
@@ -30,10 +30,10 @@ class OpenAIProvider(BaseProvider):
     ``api_base`` is only forwarded when a ``base_url`` is given).
     """
 
-    _provider_name: str = "OpenAI"
+    _provider_name: ClassVar[str] = "OpenAI"
     _model_prefix: str = "openai/"
-    _mode: instructor.Mode = instructor.Mode.JSON_SCHEMA
-    _default_model: str = "gpt-4.1-mini"
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
+    _default_model: ClassVar[str] = "gpt-4.1-mini"
 
     def __init__(
         self,
