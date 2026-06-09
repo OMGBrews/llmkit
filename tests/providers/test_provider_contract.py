@@ -55,6 +55,7 @@ def _define_provider(name: str, bases: tuple[type, ...], **hooks: object) -> typ
     abstract classes), then sets whatever hooks the caller passes — so a caller
     can omit one to exercise the loud failure.
     """
+
     def _completion_kwargs(_self: BaseProvider) -> dict[str, object]:
         return {}
 
