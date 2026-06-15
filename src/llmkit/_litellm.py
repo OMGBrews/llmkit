@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from typing import cast
 
 import instructor
@@ -253,24 +253,34 @@ async def acompletion_structured[T: BaseModel](
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     client = instructor.from_litellm(_acompletion, mode=provider.instructor_mode)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        result = await client.chat.completions.create_with_completion(
-            model=provider.litellm_model(model),
-            messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
-            response_model=output_schema,
-            temperature=temperature,
-            # instructor's in-call schema-repair budget. instructor counts
-            # *total attempts* (the int becomes tenacity stop_after_attempt),
-            # so 2 = two attempts total = exactly one schema-repair re-ask;
-            # 1 would mean no repair ever happens. The cross-call
-            # transient/validation budgets live in llmkit.retry.
-            max_retries=2,
-            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
-            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-            **({"reasoning_effort": effort} if effort is not None else {}),
+        # instructor's ``from_litellm`` is overloaded on whether the completion
+        # is sync or async; basedpyright has been seen to resolve the *sync*
+        # overload for our ``async def _acompletion`` on some platforms (CI x86_64
+        # vs local arm64), which types ``create_with_completion`` as a
+        # non-awaitable ``tuple`` and breaks the ``await``. Casting the call to the
+        # awaitable it is at runtime pins the async shape across platforms — and,
+        # because instructor types the completion half of the tuple as ``Any``,
+        # this same cast narrows it to the litellm ``ModelResponse`` we read
+        # cost/usage from (so it refines ``Any`` rather than being a redundant
+        # cast). raw-llm — the instructor/litellm boundary.
+        parsed, completion = await cast(
+            "Awaitable[tuple[T, ModelResponse]]",
+            client.chat.completions.create_with_completion(
+                model=provider.litellm_model(model),
+                messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
+                response_model=output_schema,
+                temperature=temperature,
+                # instructor's in-call schema-repair budget. instructor counts
+                # *total attempts* (the int becomes tenacity stop_after_attempt),
+                # so 2 = two attempts total = exactly one schema-repair re-ask;
+                # 1 would mean no repair ever happens. The cross-call
+                # transient/validation budgets live in llmkit.retry.
+                max_retries=2,
+                **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
+                **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+                **({"reasoning_effort": effort} if effort is not None else {}),
+            ),
         )
-        # instructor types the raw completion half of the tuple as Any; it is a
-        # litellm ModelResponse. Narrow once so cost/usage read a real type.
-        parsed, completion = cast("tuple[T, ModelResponse]", result)
         slot.record_tokens(_total_tokens(completion))
     return parsed, _response_cost(completion)
 
