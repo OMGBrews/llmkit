@@ -44,7 +44,7 @@ from llmkit.rate_limiting import (
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
-from tests._support import OkSchema, quiet_logging
+from tests._support import quiet_logging
 
 
 @pytest.fixture(autouse=True)
@@ -203,14 +203,15 @@ def test_async_semaphore_not_reused_across_event_loops() -> None:
     """A saturated provider on one loop must not crash the next loop.
 
     An ``asyncio.Semaphore`` binds to the event loop it first *blocks* on and
-    thereafter raises ``RuntimeError`` if awaited from another. The sync bridge
-    runs a fresh loop per ``run_sync`` call, so the process-global registry must
-    key the async semaphore per-loop; otherwise the second call reuses the
-    first loop's (now-closed) semaphore and raises "bound to a different event
-    loop" the moment it has to block. This is a plain ``def`` (not the auto
-    async fixture) precisely so it drives two *separate* loops via
-    ``asyncio.run``, and it deliberately does **not** ``configure`` between them
-    — that would clear the registry and mask the bug.
+    thereafter raises ``RuntimeError`` if awaited from another. A process can run
+    several loops — llmkit's persistent sync loop, a host's own async loop, and
+    the short-lived loops the sync bridge's reentrant fallback spins up — so the
+    process-global registry must key the async semaphore per-loop; otherwise a
+    call on a second loop reuses the first loop's (now-closed) semaphore and
+    raises "bound to a different event loop" the moment it has to block. This is
+    a plain ``def`` (not the auto async fixture) precisely so it drives two
+    *separate* loops via ``asyncio.run``, and it deliberately does **not**
+    ``configure`` between them — that would clear the registry and mask the bug.
     """
     GlobalRateLimiter.configure(max_concurrent=1)
 
@@ -456,23 +457,23 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
 def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     """N threads fanning out the sync call wrappers never exceed the provider cap.
 
-    Regression for the fresh-loop hole: ``structured_llm_call_sync`` /
-    ``text_llm_call_sync`` drive the async path via ``run_sync``, which creates
-    a *fresh event loop per call* — so the per-(provider, loop) asyncio
-    semaphore inside has a single user per call and bounded nothing across
-    threads (six threads observed six concurrent in-flight calls under a cap of
-    2). The wrappers now hold the loop-agnostic ``threading.Semaphore`` in the
-    calling thread around the whole bridged call. Fully offline: the transport
-    is faked to sleep briefly while an instrumented counter records the
-    in-flight peak; both wrappers are mixed in one fan-out because they must
-    share the one per-provider budget.
+    Regression for the fresh-loop hole. Under the old fresh-loop-per-call bridge
+    the per-(provider, loop) asyncio semaphore had a single user per call and
+    bounded nothing across threads (six threads observed six concurrent in-flight
+    calls under a cap of 2). Now every sync call runs on the *one* persistent
+    loop, so that async semaphore is genuinely shared and bounds cross-thread
+    fan-out from *inside* the async path — no separate calling-thread semaphore.
+    Because the cap now lives inside the transport, the fake here patches
+    ``litellm.acompletion`` (deeper than the call functions) so the real
+    ``acompletion_text`` — and its ``acquire_async`` on the shared loop — runs;
+    an instrumented counter records the in-flight peak.
     """
     configure_rate_limit(max_concurrent=2)
     lock = threading.Lock()
     state: dict[str, int] = {"current": 0, "peak": 0}
 
-    async def _hold_briefly() -> None:
-        """One faked in-flight transport call: count in, sleep, count out."""
+    async def _fake_acompletion(**_kwargs: object) -> MagicMock:
+        """One faked in-flight provider call: count in, sleep, count out."""
         with lock:
             state["current"] += 1
             state["peak"] = max(state["peak"], state["current"])
@@ -481,35 +482,26 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
         finally:
             with lock:
                 state["current"] -= 1
-
-    async def _fake_text(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        await _hold_briefly()
-        return "ok", None
-
-    async def _fake_structured(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        await _hold_briefly()
-        return OkSchema(ok=True), None
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content="ok"))],
+            _hidden_params={},
+        )
 
     provider = MagicMock()
     provider.name = "openai"
     provider.model = "fake-model"
+    provider.completion_kwargs = MagicMock(return_value={"api_key": "k"})
+    provider.litellm_model = MagicMock(return_value="openai/fake")
+    provider.reasoning_effort = None
 
     def _text_call() -> None:
         _ = structured_output.text_llm_call_sync("hi", feature="test", provider=provider)
 
-    def _structured_call() -> None:
-        _ = structured_output.structured_llm_call_sync(
-            "hi", OkSchema, feature="test", provider=provider
-        )
-
     with (
         quiet_logging(),
-        patch("llmkit._litellm.acompletion_text", _fake_text),
-        patch("llmkit._litellm.acompletion_structured", _fake_structured),
+        patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion),
     ):
-        threads = [
-            threading.Thread(target=_text_call if i % 2 else _structured_call) for i in range(6)
-        ]
+        threads = [threading.Thread(target=_text_call) for _ in range(6)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -517,7 +509,7 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
 
     assert state["peak"] <= 2, f"cap=2 but {state['peak']} sync calls were in flight at once"
     # And the cap paced, not serialised, the fan-out: with six 0.15s calls and
-    # two slots, the two populations genuinely overlap.
+    # two slots, the calls genuinely overlap on the shared loop.
     assert state["peak"] == 2
 
 

@@ -25,8 +25,8 @@ import asyncio
 import logging
 import time
 import warnings
-from collections.abc import AsyncGenerator, Callable, Generator
-from contextlib import aclosing, contextmanager
+from collections.abc import AsyncGenerator, Callable
+from contextlib import aclosing
 from datetime import UTC, datetime
 from typing import cast
 
@@ -37,7 +37,6 @@ from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import DEFAULT_TEMPERATURE, LLMCallOptions, resolve_call_args
 from llmkit.providers import LLMProviderInterface
-from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.retry import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
@@ -98,28 +97,6 @@ def _build_call_provider(
 #: then reads ``# ERROR`` with this marker, so a truncated transcript is never
 #: mistaken for one the model finished (a plain ``# ok`` over partial text).
 STREAM_ABANDONED_ERROR = "Abandoned: stream closed by consumer before completion"
-
-
-@contextmanager
-def _sync_concurrency_slot(provider: LLMProviderInterface | None) -> Generator[None]:
-    """Hold the loop-agnostic per-provider concurrency slot for a sync call.
-
-    The sync wrappers drive the async call path over a *fresh event loop per
-    call* (:func:`run_sync`), so the per-(provider, loop) asyncio semaphore
-    acquired inside is always uncontended there and cannot bound sync fan-out
-    across threads. The cap is instead enforced here, in the calling thread,
-    via the limiter's loop-agnostic ``threading.Semaphore``
-    (:meth:`GlobalRateLimiter.concurrency_slot_sync`) — concurrency only;
-    the RPM/TPM buckets are loop-agnostic already and stay inside the async
-    path. With no resolvable ``provider`` (a build failure) the call proceeds
-    ungated, exactly like :func:`_build_call_provider` degrading: the
-    transport then surfaces the real configuration error.
-    """
-    if provider is None:
-        yield
-        return
-    with GlobalRateLimiter.concurrency_slot_sync(provider.name):
-        yield
 
 
 async def structured_llm_call[T: BaseModel](
@@ -331,60 +308,42 @@ def structured_llm_call_sync[T: BaseModel](
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.
 
-    For the handful of synchronous call sites that cannot ``await``.
-    Same arguments, same logging, same
-    output as the async version; the coroutine is driven to completion
-    via :func:`run_sync`, which handles running-event-loop detection. The
-    RPM/TPM rate gates are acquired inside the async path (their buckets are
-    shared across event loops), while the per-provider *concurrency* cap is
-    held in this calling thread around the whole call — ``run_sync`` drives a
-    fresh loop per call, so only the loop-agnostic sync semaphore can bound
-    fan-out across threads (see :func:`_sync_concurrency_slot`). ``max_tokens``
-    caps the completion length when set
-    (parity with :func:`text_llm_call`); ``None`` leaves it uncapped.
-    ``reasoning_effort`` is forwarded identically (``None`` defers to the
-    configured :class:`~llmkit.LLMClientConfig` value). ``retry`` is the
-    transient-error budget, inherited from the async path (default-on; pass
+    For the handful of synchronous call sites that cannot ``await``. Same
+    arguments, same logging, same output as the async version; the coroutine is
+    driven to completion via :func:`run_sync`, which routes it onto llmkit's
+    single persistent event loop (handling running-loop detection). All three
+    rate-limit dimensions — concurrency, RPM, and TPM — are acquired inside the
+    async path: because every sync call shares that one persistent loop, the
+    per-(provider, loop) async concurrency semaphore is genuinely shared and
+    bounds sync fan-out across threads, with no separate calling-thread
+    semaphore. ``max_tokens`` caps the completion length when set (parity with
+    :func:`text_llm_call`); ``None`` leaves it uncapped. ``reasoning_effort`` is
+    forwarded identically (``None`` defers to the configured
+    :class:`~llmkit.LLMClientConfig` value). ``retry`` is the transient-error
+    budget, inherited from the async path (default-on; pass
     :data:`~llmkit.NO_RETRY` to opt out). ``on_result`` is the same
     semantic-validation re-roll hook the async call takes (raise
     :class:`~llmkit.ResultValidationError` to reject a result and re-roll on the
     validation budget). ``options`` is the same opt-in :class:`LLMCallOptions`
     bundle the async call takes, with the same **config < options < explicit
-    keyword** precedence; it is forwarded untouched — only the *provider* is
-    pre-resolved here (to key the concurrency slot), and the built instance is
-    passed down so the async path reuses it under identical precedence.
+    keyword** precedence; every argument is forwarded untouched.
     """
-    # Resolve the provider here so the concurrency slot is keyed by the name
-    # the async path will account under; passing the built instance down means
-    # the async path reuses it (no double build, identical precedence).
-    call_provider = _build_call_provider(
-        resolve_call_args(
-            options,
+    return run_sync(
+        structured_llm_call(
+            prompt,
+            output_schema,
+            feature=feature,
+            label=label,
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
-            retry=retry,
             provider=provider,
-        ).provider
-    )
-    with _sync_concurrency_slot(call_provider):
-        return run_sync(
-            structured_llm_call(
-                prompt,
-                output_schema,
-                feature=feature,
-                label=label,
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                provider=call_provider,
-                retry=retry,
-                on_result=on_result,
-                options=options,
-            )
+            retry=retry,
+            on_result=on_result,
+            options=options,
         )
+    )
 
 
 async def text_llm_call(
@@ -544,40 +503,26 @@ def text_llm_call_sync(
 
     Same arguments, same logging, same plain-text result as the async version;
     the coroutine is driven to completion via :func:`run_sync`, matching the
-    structured sync wrapper — including holding the per-provider concurrency
-    slot in the calling thread around the call (see
-    :func:`structured_llm_call_sync` / :func:`_sync_concurrency_slot`).
+    structured sync wrapper — every rate-limit dimension (including the
+    per-provider concurrency cap) is enforced inside the async path on the shared
+    persistent loop, with no separate calling-thread semaphore (see
+    :func:`structured_llm_call_sync`).
     """
-    # Same provider pre-resolution as ``structured_llm_call_sync``: the
-    # concurrency slot is keyed by the provider name the async path accounts
-    # under, and the built instance is reused downstream (no double build).
-    call_provider = _build_call_provider(
-        resolve_call_args(
-            options,
+    return run_sync(
+        text_llm_call(
+            prompt,
+            feature=feature,
+            label=label,
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
-            retry=retry,
             provider=provider,
-        ).provider
-    )
-    with _sync_concurrency_slot(call_provider):
-        return run_sync(
-            text_llm_call(
-                prompt,
-                feature=feature,
-                label=label,
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                provider=call_provider,
-                retry=retry,
-                on_result=on_result,
-                options=options,
-            )
+            retry=retry,
+            on_result=on_result,
+            options=options,
         )
+    )
 
 
 async def stream_text_with_log(

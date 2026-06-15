@@ -1,29 +1,25 @@
-"""The sync bridge drains LiteLLM's pending logging before closing its loop.
+"""The sync bridge drives coroutines on one persistent loop, draining at exit.
+
+:func:`llmkit.sync.run_sync` routes every sync call onto a single persistent
+event loop so LiteLLM's process-global logging worker binds to one loop and is
+drained once, at shutdown — instead of a fresh loop per call, which races that
+worker under a concurrent fan-out (see ``test_sync_concurrency.py`` for the
+all-on-one-loop and no-flood regressions).
 
 LiteLLM doesn't ``await`` its success logging inline: after a successful async
 call it *eagerly constructs* the ``Logging.async_success_handler`` coroutine and
-hands it to a module-global ``LoggingWorker`` queue (``GLOBAL_LOGGING_WORKER``)
-to run as a background task. On the synchronous bridge that coroutine can still
-be sitting in the queue — created but never awaited — when
-:func:`llmkit.sync.run_sync` closes the loop, and Python then prints
-``RuntimeWarning: coroutine 'Logging.async_success_handler' was never awaited``
-to **stderr**: visible noise on an otherwise successful sync call (FiW sees this
-in their CLI and Lambda). ``run_sync`` now drains that pending logging before
-teardown (see :func:`llmkit._litellm.drain_async_logging`).
+hands it to a module-global ``LoggingWorker`` queue (``GLOBAL_LOGGING_WORKER``).
+That coroutine can still be queued — created but never awaited — when the
+process exits, and Python then prints ``RuntimeWarning: coroutine
+'Logging.async_success_handler' was never awaited`` to **stderr**: visible noise
+on an otherwise successful run. The persistent loop's :func:`atexit` shutdown
+drains that queue before closing the loop.
 
-Reproducing this offline needs care, because the warning is emitted by the
-**GC finalizer of the un-awaited coroutine** — and that coroutine stays
-reachable through the module-global worker queue until *interpreter shutdown*,
-well outside any in-process ``warnings.catch_warnings`` window. So the leak
-assertion runs in a **subprocess** under ``-W error::RuntimeWarning`` and
-checks that no "never awaited" line reaches stderr; the worker enqueues a stray
-coroutine exactly the way LiteLLM's post-call hook does
-(``ensure_initialized_and_enqueue``, the entry point in ``litellm/utils.py``),
-with no network and no provider credential. Confirmed to discriminate: the same
-script over a bare ``asyncio.run`` (the pre-fix bridge) prints the warning.
-
-The remaining behaviours — the worker-thread branch, the bounded drain, and
-error propagation — don't depend on shutdown timing and are checked in-process.
+These tests pin: the leak is gone at interpreter shutdown; the call's result and
+errors propagate; a timeout cancels the abandoned coroutine *on the loop*; a
+reentrant call (made from inside a running loop) is served by the worker-thread
+fallback without deadlock; and explicit :func:`~llmkit.sync.shutdown` is
+idempotent and lets the loop restart lazily.
 """
 
 from __future__ import annotations
@@ -32,6 +28,7 @@ import asyncio
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Coroutine
 from typing import Protocol, cast
@@ -39,6 +36,7 @@ from typing import Protocol, cast
 import pytest
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
+from llmkit import sync
 from llmkit.sync import run_sync
 
 
@@ -60,7 +58,8 @@ _worker = cast("_LoggingWorker", GLOBAL_LOGGING_WORKER)
 # A self-contained script: enqueue a logging coroutine onto LiteLLM's worker the
 # way its post-call hook does, then drive it through run_sync. Run as a
 # subprocess under -W error::RuntimeWarning so an un-awaited-coroutine warning
-# surfaces on stderr at interpreter teardown.
+# surfaces on stderr at interpreter teardown — where the persistent loop's
+# atexit shutdown must have drained it.
 _LEAK_SCRIPT = textwrap.dedent(
     """
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
@@ -79,11 +78,12 @@ _LEAK_SCRIPT = textwrap.dedent(
 
 
 def test_sync_call_does_not_leak_never_awaited_warning() -> None:
-    """A sync call draining LiteLLM's queued logging leaves stderr clean.
+    """A sync call leaves stderr clean through interpreter shutdown.
 
-    The subprocess promotes RuntimeWarning to an error and we assert the call
-    succeeds *and* nothing "never awaited" reaches stderr through interpreter
-    shutdown — the exact noise FiW observed.
+    LiteLLM's queued success-logging is drained by the persistent loop's atexit
+    shutdown, so the un-awaited-coroutine warning never surfaces. The subprocess
+    promotes RuntimeWarning to an error and we assert the call succeeds *and*
+    nothing "never awaited" reaches stderr — the exact noise FiW observed.
     """
     proc = subprocess.run(
         [sys.executable, "-W", "error::RuntimeWarning", "-c", _LEAK_SCRIPT],
@@ -97,58 +97,19 @@ def test_sync_call_does_not_leak_never_awaited_warning() -> None:
     assert "never awaited" not in proc.stderr, proc.stderr
 
 
-def test_sync_call_in_running_loop_drains_litellm_logging_queue() -> None:
-    """The worker-thread path (loop already running) drains the logging queue.
+def test_returns_result_on_success() -> None:
+    """The common path returns the coroutine's result."""
 
-    Calling ``run_sync`` from inside a live event loop routes through the
-    ThreadPoolExecutor branch, which drives a *second* loop in a worker thread.
-    That branch must drain LiteLLM's queued logging too: after the call the
-    worker queue is empty (the handler ran), not holding an orphaned coroutine.
-    """
-
-    async def _enqueue_and_return(value: int) -> int:
-        async def _async_success_handler() -> None:
-            return None
-
-        _worker.ensure_initialized_and_enqueue(_async_success_handler())
+    async def _ok(value: int) -> int:
         return value
 
-    async def _outer() -> int:
-        # run_sync detects the running loop and offloads to a worker thread.
-        return run_sync(_enqueue_and_return(11))
-
-    result = asyncio.run(_outer())
-    assert result == 11
-    queue = GLOBAL_LOGGING_WORKER._queue
-    assert queue is None or queue.qsize() == 0
+    assert run_sync(_ok(21)) == 21
 
 
-def test_drain_is_bounded_and_still_returns_result() -> None:
-    """A straggler that outruns the timeout is abandoned; the result stands.
+def test_call_error_propagates() -> None:
+    """A genuine error from the driven coroutine propagates to the caller.
 
-    The drain must not wedge the bridge on a hung callback: with a tiny timeout
-    a slow background task is cancelled after the deadline (warning-free, because
-    it was already started), and the call's own result is still returned intact.
-    """
-
-    async def _schedule_slow_stray() -> str:
-        async def _slow_log() -> None:
-            await asyncio.sleep(30)  # far past the drain deadline
-
-        # Held on the coroutine frame so it isn't GC'd before the drain sees it;
-        # the bridge is responsible for cancelling it at teardown.
-        stray = asyncio.create_task(_slow_log())
-        assert not stray.done()
-        return "ok"
-
-    result = run_sync(_schedule_slow_stray(), timeout=0.1)
-    assert result == "ok"
-
-
-def test_call_error_propagates_through_drain() -> None:
-    """A genuine error from the driven coroutine still propagates.
-
-    The drain wraps the call's teardown but must not swallow the caller's own
+    The bridge wraps the call's teardown but must not swallow the caller's own
     exception — nor hang on the logging the failing call had enqueued.
     """
 
@@ -159,97 +120,62 @@ def test_call_error_propagates_through_drain() -> None:
         _worker.ensure_initialized_and_enqueue(_async_success_handler())
         raise ValueError("boom")
 
-    raised = False
-    try:
+    with pytest.raises(ValueError, match="boom"):
         _ = run_sync(_boom())
-    except ValueError as exc:
-        raised = exc.args == ("boom",)
-    assert raised
 
 
-def test_keyboard_interrupt_abandons_pending_call() -> None:
-    """Ctrl-C mid-call abandons the call; the teardown drain must not resume it.
+def test_timeout_cancels_the_abandoned_task_on_the_loop() -> None:
+    """On timeout, ``run_sync`` cancels the coroutine on the persistent loop.
 
-    A ``KeyboardInterrupt`` raised in a loop callback (how a signal lands in a
-    running loop) stops ``run_until_complete`` with the main task still
-    *pending*. Regression: the teardown drain then restarted the loop and
-    **resumed the interrupted call itself** — here the 0.3s remainder of the
-    call completes inside the 1s logging flush, setting the flag and leaving
-    its result unretrieved. Fixed, the bridge cancels-and-settles the main task
-    before any drain runs: the flag is never set, the original
-    ``KeyboardInterrupt`` propagates, and teardown stays far below the drain
-    timeout. The logging drain itself still runs (queue left empty).
+    The wait is bounded by ``timeout``; past the deadline a
+    :class:`concurrent.futures.TimeoutError` (the builtin ``TimeoutError`` on
+    3.11+) propagates, and — unlike the old fresh-loop worker that leaked a
+    running coroutine — the task is cancelled *on the loop*, tearing down the
+    in-flight work rather than leaking it. A :class:`KeyboardInterrupt` in the
+    calling thread takes the same abandon-then-cancel path.
     """
-    completed: list[bool] = []
+    cancelled = threading.Event()
 
-    async def _interrupted_call() -> str:
-        loop = asyncio.get_running_loop()
+    async def _slow() -> str:
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "should never return"
 
-        def _interrupt() -> None:
-            raise KeyboardInterrupt
+    with pytest.raises(TimeoutError):
+        _ = run_sync(_slow(), timeout=0.1)
 
-        # The interrupt lands on the next loop iteration — i.e. while the call
-        # below is suspended in ``await``, exactly like SIGINT in a live loop.
-        _ = loop.call_soon(_interrupt)
-
-        async def _slow_handler() -> None:
-            await asyncio.sleep(1.0)
-
-        # Queued logging gives the teardown drain real work: the window in
-        # which the buggy bridge resumed the interrupted call.
-        _worker.ensure_initialized_and_enqueue(_slow_handler())
-        await asyncio.sleep(0.3)  # interrupted here; must never resume
-        completed.append(True)
-        return "should never complete"
-
-    start = time.monotonic()
-    with pytest.raises(KeyboardInterrupt):
-        _ = run_sync(_interrupted_call(), timeout=30)
-    elapsed = time.monotonic() - start
-
-    assert not completed, "interrupted call was resumed during teardown"
-    # Bounded by the ~1s logging flush, nowhere near the 30s drain budget.
-    assert elapsed < 5, f"teardown took {elapsed:.2f}s after interrupt"
-    queue = GLOBAL_LOGGING_WORKER._queue
-    assert queue is None or queue.qsize() == 0
+    assert cancelled.wait(timeout=2.0), "timed-out task was not cancelled on the loop"
 
 
-def test_settle_step_leaves_normal_paths_unchanged() -> None:
-    """The pre-drain settle is a no-op when the call finishes on its own.
+def test_reentrant_call_from_running_loop_returns_result() -> None:
+    """A ``run_sync`` made from inside a running loop is served, not deadlocked.
 
-    Regression guard for the interrupt fix: a call that returns normally still
-    yields its result with the queued logging drained, and a call that raises
-    still propagates its own exception — the cancel-and-settle step only
-    engages when the loop was stopped with the main task pending.
+    When the calling thread already has a running loop (an async framework, or a
+    coroutine that calls back into sync code), the bridge cannot block that
+    thread on the persistent loop, so it offloads to a one-shot worker thread
+    with its own fresh loop. The call must still complete and return its value.
     """
 
-    async def _ok(value: int) -> int:
-        async def _async_success_handler() -> None:
-            return None
-
-        _worker.ensure_initialized_and_enqueue(_async_success_handler())
+    async def _inner(value: int) -> int:
         return value
 
-    assert run_sync(_ok(21)) == 21
-    queue = GLOBAL_LOGGING_WORKER._queue
-    assert queue is None or queue.qsize() == 0
+    async def _outer() -> int:
+        # run_sync detects the running loop and uses the worker-thread fallback.
+        return run_sync(_inner(11))
 
-    async def _boom() -> int:
-        raise ValueError("still boom")
-
-    with pytest.raises(ValueError, match="still boom"):
-        _ = run_sync(_boom())
+    assert asyncio.run(_outer()) == 11
 
 
-def test_running_loop_timeout_releases_caller_promptly() -> None:
-    """On the worker-thread path a timeout unblocks the caller at the deadline.
+def test_reentrant_timeout_releases_caller_promptly() -> None:
+    """On the worker-thread fallback a timeout unblocks the caller at the deadline.
 
-    Regression: ``run_sync`` previously drove the worker through a
-    ``with ThreadPoolExecutor(...)`` block, whose ``__exit__`` calls
-    ``shutdown(wait=True)`` — so a ``TimeoutError`` could not leave the frame
-    until the (still-running) coroutine finished, silently defeating ``timeout``.
-    The executor is now torn down with ``wait=False`` so the error propagates at
-    the deadline while the abandoned worker drains in the background.
+    The reentrant fallback drives the coroutine on another thread, which cannot
+    be cancelled from here — so a timeout abandons only the *wait*. It must still
+    release the caller near the deadline (the executor is torn down with
+    ``wait=False``), not after the slow call finishes.
     """
 
     async def _slow(value: int) -> int:
@@ -257,14 +183,28 @@ def test_running_loop_timeout_releases_caller_promptly() -> None:
         return value
 
     async def _outer() -> None:
-        # Inside a running loop -> the ThreadPoolExecutor branch.
         start = time.monotonic()
         with pytest.raises(TimeoutError):
             _ = run_sync(_slow(99), timeout=0.2)
         elapsed = time.monotonic() - start
-        # Must unblock near the 0.2s deadline, not after the ~1.5s call.
-        assert elapsed < 1.0, (
-            f"timeout took {elapsed:.2f}s — executor blocked on shutdown(wait=True)"
-        )
+        assert elapsed < 1.0, f"timeout took {elapsed:.2f}s — caller not released at the deadline"
 
     asyncio.run(_outer())
+
+
+def test_shutdown_is_idempotent_and_loop_restarts() -> None:
+    """``shutdown`` is a safe no-op when repeated, and the loop restarts lazily.
+
+    A first call drives the persistent loop into existence; ``shutdown`` drains
+    and closes it; a second ``shutdown`` is a no-op (globals already cleared);
+    and a subsequent ``run_sync`` transparently starts a fresh persistent loop.
+    """
+
+    async def _echo(value: int) -> int:
+        return value
+
+    assert run_sync(_echo(1)) == 1
+    sync.shutdown()
+    sync.shutdown()  # idempotent: must not raise on an already-closed loop
+    # The bridge lazily starts a new persistent loop for the next call.
+    assert run_sync(_echo(2)) == 2

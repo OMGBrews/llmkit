@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Synchronous calls now run on one persistent event loop.** `run_sync` — and
+  the `structured_llm_call_sync` / `text_llm_call_sync` wrappers built on it —
+  previously drove each call on a *fresh event loop per call*. Under a concurrent
+  sync fan-out (many threads each making one sync call) those short-lived loops
+  raced LiteLLM's process-global logging worker, flooding stderr and occasionally
+  stalling an otherwise-successful call for up to LiteLLM's ~600 s request
+  timeout. Every sync call now runs on a single, lazily-started, process-global
+  loop on a dedicated daemon thread, so LiteLLM's logging worker binds once and is
+  drained once — at interpreter exit, via `atexit`. A call made from *inside* an
+  already-running event loop still falls back to a one-shot worker thread with its
+  own loop. On the persistent-loop path a `timeout` now also **cancels** the
+  coroutine on the loop (tearing down the in-flight provider request) instead of
+  leaking it. **No public API changed.** Internally, the per-calling-thread
+  concurrency `threading.Semaphore` the `*_sync` wrappers used is gone: the
+  per-provider concurrency cap is now enforced inside the async path by the shared
+  loop's semaphore, so a cross-thread sync fan-out is still bounded by it. The
+  hand-rolled public sync acquire path (`rate_limit_acquire_sync`) is unchanged.
+
 ## [0.2.0] — 2026-06-09
 
 Everything accumulated since `0.1.2` in one MINOR release: it carries

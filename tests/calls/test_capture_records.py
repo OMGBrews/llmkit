@@ -58,7 +58,13 @@ def test_capture_records_yields_record_with_cost_async() -> None:
 
 def test_capture_records_crosses_the_sync_bridge() -> None:
     """Capture survives the ``run_sync`` sync-bridge boundary: a record is
-    captured for a ``structured_llm_call_sync`` driven from the sync side."""
+    captured for a ``structured_llm_call_sync`` driven from the sync side.
+
+    This is the regression test for cross-thread context propagation on the
+    common (no-running-loop) path: ``run_sync`` now drives the coroutine on the
+    *persistent loop's* thread, so the capture ``ContextVar`` only reaches it
+    because the bridge runs the task inside a copy of the caller's context. A
+    bare ``run_coroutine_threadsafe`` would lose it and capture nothing."""
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
@@ -77,13 +83,13 @@ def test_capture_records_crosses_the_sync_bridge() -> None:
 def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
     """Capture survives a ``*_sync`` call made from *inside* a running loop.
 
-    On that path ``run_sync`` cannot drive the coroutine in-thread (a loop is
-    already running), so it offloads to a worker thread. A bare
+    On that path ``run_sync`` cannot use the persistent loop (a loop is already
+    running in this thread), so it offloads to a worker thread. A bare
     ``executor.submit`` would not propagate the capture ``ContextVar``, so the
     record would be silently lost — the buffer lives in the parent context the
     worker never sees. Regression for that running-loop sync-bridge case (the
-    no-running-loop test above exercises the in-thread path, which keeps the
-    context for free).
+    no-running-loop test above exercises the persistent-loop path, which also
+    crosses a thread boundary and so needs the same context copy).
     """
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),

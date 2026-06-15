@@ -13,22 +13,29 @@ independent, per-provider dimensions:
 
 The LiteLLM call layer (:mod:`llmkit._litellm`) wraps every provider call in
 :meth:`GlobalRateLimiter.acquire_async`, keyed by the **provider name**. The
-sync call wrappers drive that same async coroutine over a *fresh event loop
-per call* (:func:`llmkit.sync.run_sync`) — which inherits the RPM/TPM gates
-(their buckets are keyed by name only and shared across loops) but **not**
-the concurrency cap, whose async semaphore is keyed per (provider, loop) and
-is therefore always uncontended on a fresh loop. So the sync wrappers
-additionally hold the loop-agnostic per-provider ``threading.Semaphore``
-(:meth:`GlobalRateLimiter.concurrency_slot_sync`) in the *calling thread*
-around the whole bridged call, and cross-thread sync fan-out shares one cap.
+sync call wrappers drive that same async coroutine through
+:func:`llmkit.sync.run_sync`, which routes every sync call onto **one
+persistent event loop**. Because all sync calls share that loop, the
+per-(provider, loop) async concurrency semaphore is genuinely shared among
+them and bounds sync fan-out across threads directly — no separate
+calling-thread semaphore is needed. The semaphore is keyed per (provider, loop)
+only because an :class:`asyncio.Semaphore` binds to one loop and cannot be
+awaited from another; the persistent sync loop, any loop a host runs its own
+async calls on, and the short-lived loops the reentrant fallback spins up are
+therefore each their own key.
 
-One honest caveat follows from the two semaphores being independent: a
-workload that mixes *async* callers (sharing a long-lived loop, bounded by
-that loop's asyncio semaphore) with *sync* callers in other threads (bounded
-by the threading semaphore) can momentarily hold up to ``2 x max_concurrent``
-in-flight calls per provider — each population is capped, but the two caps do
-not share slots, because an asyncio primitive cannot span loops. RPM/TPM are
-unaffected: those buckets are shared across every loop and thread.
+One honest caveat follows from asyncio semaphores being per-loop: a process
+that drives calls on more than one loop — e.g. a host running llmkit's *async*
+call functions on its own event loop *and* llmkit's sync wrappers (on the
+persistent loop) — caps each loop's population independently, so it can
+momentarily hold up to ``loops x max_concurrent`` in-flight calls per provider.
+Each population is capped; the caps do not share slots, because an asyncio
+primitive cannot span loops. The hand-rolled sync acquire path
+(:meth:`acquire_sync` / :func:`rate_limit_acquire_sync`) is bounded by a
+loop-agnostic per-provider ``threading.Semaphore`` instead — for host code that
+issues sync provider calls *outside* llmkit's own loop. RPM/TPM are unaffected
+either way: those buckets are keyed by name and shared across every loop and
+thread.
 
 On by default, scoped per provider
 ----------------------------------
@@ -306,18 +313,19 @@ class GlobalRateLimiter:
 
     The *async* concurrency semaphore is additionally keyed by the running event
     loop, because an ``asyncio.Semaphore`` binds to the loop it first blocks on
-    and cannot be awaited from another. The sync bridge runs a fresh loop per
-    call, so a per-loop key is what keeps a saturated provider from raising
-    "bound to a different event loop" when the next sync call (or a mixed
-    async/sync app) reuses the registry; closed loops are pruned so they can't
-    accumulate. A consequence is that the concurrency cap is enforced per
-    (provider, loop): truly concurrent loops in different threads do not share
-    one async semaphore — which is unavoidable, since an asyncio primitive can't
-    span loops. Cross-thread *sync* callers therefore share the loop-agnostic
-    ``threading.Semaphore`` instead: llmkit's own sync call wrappers hold it
-    via :meth:`concurrency_slot_sync` around the whole bridged call, and
-    :meth:`acquire_sync` holds it for hand-rolled sync provider calls. The
-    mixed sync+async caveat (up to ``2 x max_concurrent`` momentarily, one cap
+    and cannot be awaited from another. A process can have several loops — the
+    persistent loop llmkit's sync bridge runs on (:func:`llmkit.sync.run_sync`),
+    any loop a host drives its own async calls on, and the short-lived loops the
+    sync bridge's reentrant fallback spins up — so a per-loop key keeps a
+    saturated provider on one loop from raising "bound to a different event loop"
+    on another; closed loops are pruned so they can't accumulate. A consequence
+    is that the concurrency cap is enforced per (provider, loop): truly
+    concurrent loops do not share one async semaphore (unavoidable — an asyncio
+    primitive can't span loops). llmkit's own sync wrappers all share the *one*
+    persistent loop, so its async semaphore bounds their cross-thread fan-out
+    directly. Host code issuing sync provider calls *outside* that loop instead
+    shares the loop-agnostic ``threading.Semaphore`` via :meth:`acquire_sync`.
+    The multi-loop caveat (up to ``loops x max_concurrent`` momentarily, one cap
     per population) is documented in the module docstring.
 
     Enabled by default with a per-provider concurrency cap of 8; RPM and TPM
@@ -423,13 +431,13 @@ class GlobalRateLimiter:
     def _get_async_semaphore(cls, key: str) -> asyncio.Semaphore:
         # An ``asyncio.Semaphore`` lazily binds to the event loop it first
         # *blocks* on and thereafter raises ``RuntimeError`` ("bound to a
-        # different event loop") if awaited from another. The sync bridge spins
-        # up a fresh loop for every ``run_sync`` call, and an app may mix async
-        # and sync entry points, so a process-global registry keyed by provider
-        # name alone would hand a loop-A semaphore to loop B and crash under
-        # contention. Key it by (provider, running loop) instead, and prune
-        # entries whose loop has closed so the short-lived loops the sync bridge
-        # retires can't accumulate without bound.
+        # different event loop") if awaited from another. A process can run
+        # several loops — llmkit's persistent sync loop, a host's own async
+        # loop, and the short-lived loops the sync bridge's reentrant fallback
+        # spins up — so a process-global registry keyed by provider name alone
+        # would hand a loop-A semaphore to loop B and crash under contention.
+        # Key it by (provider, running loop) instead, and prune entries whose
+        # loop has closed so the fallback's retired loops can't accumulate.
         loop = asyncio.get_running_loop()
         with cls._lock:
             registry = cls._async_semaphores
@@ -553,35 +561,6 @@ class GlobalRateLimiter:
         _ = sem.acquire()
         try:
             yield RateLimitSlot(tpm_bucket)
-        finally:
-            sem.release()
-
-    @classmethod
-    @contextlib.contextmanager
-    def concurrency_slot_sync(cls, provider_key: str) -> Generator[None]:
-        """Hold only the loop-agnostic *concurrency* slot for ``provider_key``.
-
-        The cross-thread half of the concurrency cap for llmkit's own sync
-        call wrappers. Those wrappers drive the async call path over a fresh
-        event loop per call (:func:`llmkit.sync.run_sync`), so the async
-        per-(provider, loop) semaphore they pass through inside is always
-        uncontended and cannot bound sync fan-out across threads. The wrappers
-        therefore hold this shared ``threading.Semaphore`` in the *calling*
-        thread around the whole bridged call — blocking that thread while
-        waiting, which is the correct backpressure for a sync caller.
-
-        Concurrency only, on purpose: the RPM/TPM buckets are already
-        loop-agnostic (keyed by name, lock-guarded) and are acquired inside
-        the async path the bridge drives — gating them here too would debit
-        each sync call twice. A no-op when limiting is disabled.
-        """
-        if not cls._enabled:
-            yield
-            return
-        sem = cls._get_sync_semaphore(_normalize_key(provider_key))
-        _ = sem.acquire()
-        try:
-            yield
         finally:
             sem.release()
 
