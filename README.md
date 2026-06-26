@@ -225,11 +225,11 @@ schema relies on one of those, validate it elsewhere.
 
 Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions:
 
-- **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server. The cap binds async callers and the `*_sync` wrappers alike — and because every `*_sync` call runs on llmkit's single persistent event loop, a thread-pool fan-out of sync calls shares one per-provider cap. One caveat follows from an `asyncio.Semaphore` being bound to a single loop: a process that drives calls on more than one loop (e.g. running the async call functions on its own event loop *and* the `*_sync` wrappers on the persistent loop) caps each loop's population independently, so it can momentarily hold up to *loops* × the cap per provider; RPM/TPM budgets are shared across all of them.
+- **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server. This cap is also **adaptive by default** — it backs off when a provider signals overload and recovers automatically (see [Adaptive concurrency](#adaptive-concurrency) below). The cap binds async callers and the `*_sync` wrappers alike — and because every `*_sync` call runs on llmkit's single persistent event loop, a thread-pool fan-out of sync calls shares one per-provider cap. One caveat follows from the concurrency gate being bound to a single loop: a process that drives calls on more than one loop (e.g. running the async call functions on its own event loop *and* the `*_sync` wrappers on the persistent loop) caps each loop's population independently, so it can momentarily hold up to *loops* × the cap per provider; the adaptive limit and the RPM/TPM budgets are shared across all of them.
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
 
 ```python
 from llmkit import configure_rate_limit
@@ -239,6 +239,35 @@ configure_rate_limit(rpm=3_500, tpm=2_000_000)
 ```
 
 RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. (A streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for streamed calls.)
+
+#### Adaptive concurrency
+
+The per-provider concurrency limit is **adaptive by default**: when a provider pushes back with an overload signal (HTTP **429 / 503 / 529**), llmkit lowers that provider's in-flight limit, and raises it back toward `max_concurrent` once the provider stops pushing back — a TCP-style additive-increase / multiplicative-decrease (AIMD) loop, with **zero per-account tuning**. It *discovers* a safe concurrency under a sustained-overload window that a fixed cap cannot ride out, and is the library-side generalization of a hand-tuned RPM ceiling.
+
+It only ever lowers the limit *below* `max_concurrent`, never above, so a provider that never throttles behaves **identically to a fixed cap** — adaptive concurrency is a no-op until the provider actually pushes back. The decrease only fires when you were genuinely *saturated* (running at the limit when the throttle arrived), so an isolated throttle received while running well under the cap doesn't penalise a healthy provider; recovery is paced by wall-clock time, so it is bounded regardless of how slowly your workload trickles. It is, honestly, a **trade**, not a free win: during a real overload it deliberately runs narrower (which is correct), and the residual cost is a brief reduced-width window after the provider recovers. Turn it off with `configure_rate_limit(adaptive=False)` to pin the limit at `max_concurrent`. (Adaptive concurrency is also a strong complement to `Retry-After`, [below](#retries) — the retry waits as the provider directs, while the fleet as a whole backs off.)
+
+```python
+from llmkit import configure_rate_limit
+
+configure_rate_limit(max_concurrent=8)             # adaptive (the default)
+configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, pre-feature behaviour
+```
+
+#### Observing backpressure
+
+Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` (`reason` is `"throttle"` or `"recover"`) each time a provider's limit changes. It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
+
+```python
+from llmkit import backpressure_callback, BackpressureEvent
+
+def on_backpressure(event: BackpressureEvent) -> None:
+    print(f"{event.provider}: {event.old_limit} -> {event.new_limit} ({event.reason})")
+
+with backpressure_callback(on_backpressure):
+    ...  # calls here report every adaptive limit change to on_backpressure
+```
+
+A callback that raises is swallowed and logged — observability can never break a call.
 
 #### Joining the global rate limit directly
 
@@ -510,7 +539,7 @@ Two retry layers, kept deliberately separate:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
   - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
 
-  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One footnote: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, the litellm-native 503 entry (`litellm.exceptions.ServiceUnavailableError`) is a lazy stand-in resolved at `isinstance` time. `isinstance` checks — what the retry layer uses — behave identically, but a bare `except LLM_TRANSPORT_ERRORS:` / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one litellm-native class (Python's `except` matching bypasses the lazy check); every other member still catches as usual, and an openai-SDK 503 arrives as `openai.InternalServerError`, which matches. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One footnote: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, the litellm-native 503 entry (`litellm.exceptions.ServiceUnavailableError`) is a lazy stand-in resolved at `isinstance` time. `isinstance` checks — what the retry layer uses — behave identically, but a bare `except LLM_TRANSPORT_ERRORS:` / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one litellm-native class (Python's `except` matching bypasses the lazy check); every other member still catches as usual, and an openai-SDK 503 arrives as `openai.InternalServerError`, which matches. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. **`Retry-After` is honoured first:** when a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
   Tune or opt out per call with the `retry=` argument:
 

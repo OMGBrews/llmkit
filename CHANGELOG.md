@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — unreleased
+
+Adaptive backpressure: the rate limiter now reacts to provider overload instead of
+offering a constant load into it. Motivated by a consumer's sustained `503`
+overload window that a fixed concurrency cap plus blind retries could not ride out.
+
+### Added
+
+- **Adaptive per-provider concurrency (AIMD), on by default.** The per-provider
+  concurrency limit now *moves*: a provider overload signal (HTTP 429 / 503 / 529)
+  received while saturated halves the limit (floored at 1, at most one decrease per
+  refractory window so a correlated burst is a single step), and it recovers toward
+  `max_concurrent` on a wall-clock interval once the provider stops pushing back. It
+  only ever lowers the limit *below* `max_concurrent`, never above — so a provider
+  that never throttles behaves identically to the previous fixed cap. Turn it off
+  with `configure_rate_limit(adaptive=False)`. The throttle signal is read from the
+  *unwrapped* provider error, so structured calls (where the error arrives wrapped
+  in `InstructorRetryException`) drive it too. `configure_rate_limit` gains an
+  `adaptive=` parameter and `RateLimitConfig` an `adaptive` field.
+- **Backpressure observability.** `backpressure_callback(cb)` installs a callback
+  (a context var, like `retry_progress_callback`, so it crosses the `run_sync`
+  boundary) that receives a `BackpressureEvent(provider, old_limit, new_limit,
+  reason)` on every adaptive limit change. New public symbols: `backpressure_callback`,
+  `BackpressureCallback`, `BackpressureEvent`.
+- **`Retry-After` is honoured.** When a retried provider error carries a
+  `Retry-After` (a `retry-after` / `retry-after-ms` header, an HTTP-date, or the
+  SDK's numeric attribute), the backoff waits that duration instead of the computed
+  exponential — capped at the new `RetryPolicy.retry_after_cap` field (default 60s)
+  so a hostile value can't wedge a call, read from the unwrapped error so structured
+  calls honour it, and honoured even when `backoff_base_seconds` is 0. Absent a
+  header, backoff is byte-identical to before. Applies to both `with_retries` and the
+  streaming retry loop.
+
+### Changed
+
+- The per-provider concurrency primitive is now a **FIFO** gate (replacing the
+  `asyncio.Semaphore`): waiters are admitted in strict arrival order, so a newcomer
+  can no longer barge ahead of an older waiter under sustained saturation.
+- A call **cancelled mid-acquire** (after its RPM token is deducted but before it
+  holds a concurrency slot — e.g. a `run_sync` timeout) now **refunds** the RPM
+  token, so a systematically-cancelled workload no longer silently shrinks its own
+  effective RPM.
+
+No breaking changes: `adaptive` defaults on but can only reduce load below the
+existing cap; `RateLimitConfig` / `configure_rate_limit` gain trailing optional
+fields/parameters; `RetryPolicy` gains a trailing field.
+
 ## [0.3.0] — 2026-06-15
 
 ### Changed
