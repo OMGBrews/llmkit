@@ -130,6 +130,20 @@ def test_non_positive_max_backoff_seconds_raises_value_error(bad_cap: float) -> 
         _ = RetryPolicy(max_backoff_seconds=bad_cap)
 
 
+def test_default_retry_after_cap_is_sixty_seconds() -> None:
+    """The shipped default caps a server-supplied ``Retry-After`` at 60s — a
+    separate ceiling from the 30s ``max_backoff_seconds`` on the *computed*
+    exponential, so a legitimate 45s server directive is still honoured."""
+    assert DEFAULT_RETRY_POLICY.retry_after_cap == 60.0
+
+
+@pytest.mark.parametrize("bad_cap", [0.0, -1.0])
+def test_non_positive_retry_after_cap_raises_value_error(bad_cap: float) -> None:
+    """``RetryPolicy`` rejects a non-positive ``retry_after_cap`` at construction."""
+    with pytest.raises(ValueError, match="retry_after_cap must be > 0"):
+        _ = RetryPolicy(retry_after_cap=bad_cap)
+
+
 # --- transient set excludes auth / non-429 4xx ---------------------------
 
 

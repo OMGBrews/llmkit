@@ -30,9 +30,12 @@ import warnings
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from json import JSONDecodeError
 from typing import Protocol, cast
 
+import httpx
 from pydantic import ValidationError
 
 from llmkit.exceptions import (
@@ -42,6 +45,113 @@ from llmkit.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Wall-clock read, indirected so offline tests can pin ``Retry-After`` dates.
+
+    The only consumer is :func:`_retry_after_seconds` when a provider sends a
+    ``Retry-After`` as an HTTP-date (rather than a delta-seconds count): the
+    delay is ``parsed_date - _utcnow()``. A test can monkeypatch
+    ``llmkit.retry._utcnow`` to make that arithmetic deterministic without real
+    sleeping — the same seam :func:`llmkit.rate_limiting._now` provides for the
+    token buckets.
+    """
+    return datetime.now(UTC)
+
+
+#: Default ceiling on a *server-supplied* ``Retry-After`` wait, in seconds. A
+#: separate concern from :attr:`RetryPolicy.max_backoff_seconds` (which caps the
+#: library's *computed* exponential): this bounds a value the provider chose, so
+#: a hostile or mistaken ``Retry-After: 99999`` cannot wedge a call, while a
+#: legitimate larger-than-``max_backoff_seconds`` directive (e.g. 45 s) is still
+#: honoured up to this cap.
+_DEFAULT_RETRY_AFTER_CAP: float = 60.0
+
+
+def _as_float(value: object) -> float | None:
+    """Best-effort parse of a ``Retry-After``-style value to non-negative seconds.
+
+    Accepts an ``int``/``float`` (an attribute) or a numeric ``str`` (a header);
+    returns ``None`` for anything else (a non-numeric string, ``None``, an odd
+    type). ``bool`` is rejected explicitly so a stray ``True`` is not read as
+    ``1.0``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _http_date_delay(raw: str) -> float | None:
+    """Seconds until an HTTP-date ``Retry-After``, or ``None`` if unparseable.
+
+    Clamps at zero (a past date means "retry now"). Reads the present through
+    :func:`_utcnow` so tests can pin it.
+    """
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - _utcnow()).total_seconds())
+
+
+def _header(headers: httpx.Headers, name: str) -> str | None:
+    """Read a single header value (case-insensitive), or ``None`` when absent.
+
+    Uses ``__getitem__`` (typed ``-> str``) rather than ``httpx.Headers.get``
+    (typed ``-> Any``) so the value stays precisely typed at the boundary.
+    """
+    try:
+        return headers[name]
+    except KeyError:
+        return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """The provider's requested wait from a retried error, or ``None`` if absent.
+
+    Honours an explicit ``Retry-After`` so a retry comes back *when the provider
+    said to* instead of on a blind exponential. The exception is **unwrapped
+    first** (:func:`~llmkit.exceptions.underlying_provider_error`) because a
+    structured call surfaces the provider error wrapped in
+    ``InstructorRetryException`` — without the unwrap the header would be invisible
+    on exactly the structured path. Read order, first hit wins:
+
+    1. a numeric ``retry_after`` attribute (the OpenAI/LiteLLM SDK surface);
+    2. a ``retry-after-ms`` header (milliseconds), divided to seconds;
+    3. a ``retry-after`` header, as delta-seconds or an HTTP-date.
+
+    Returns non-negative seconds, or ``None`` when no parseable value is present
+    (a ``ValidationError``/timeout/network error carries none) — the caller then
+    falls back to the computed exponential, byte-identically to before.
+    """
+    root = underlying_provider_error(exc)
+    direct = _as_float(getattr(root, "retry_after", None))
+    if direct is not None:
+        return max(0.0, direct)
+    headers = getattr(getattr(root, "response", None), "headers", None)
+    if not isinstance(headers, httpx.Headers):
+        return None
+    ms = _as_float(_header(headers, "retry-after-ms"))
+    if ms is not None:
+        return max(0.0, ms / 1000.0)
+    raw = _header(headers, "retry-after")
+    if raw is None:
+        return None
+    seconds = _as_float(raw)
+    if seconds is not None:
+        return max(0.0, seconds)
+    return _http_date_delay(raw)
+
 
 # The unwrapped causes that are *genuinely* schema-shaped when dug out of an
 # ``InstructorRetryException``: pydantic rejected the parse, or the response
@@ -112,6 +222,15 @@ class RetryPolicy:
             seconds — generous spacing for transient-error recovery while
             bounding the worst case. Must be > 0; to disable backoff
             entirely, set ``backoff_base_seconds=0`` instead.
+        retry_after_cap: Ceiling on a *server-supplied* ``Retry-After`` wait
+            (seconds). When a retried provider error carries ``Retry-After``,
+            the backoff honours it (capped here, plus a little jitter) instead
+            of the computed exponential — a server directive, honoured even
+            when ``backoff_base_seconds`` is 0. Distinct from
+            ``max_backoff_seconds`` (which caps the library's *own* exponential):
+            this bounds a value the provider chose, so a hostile
+            ``Retry-After: 99999`` can't wedge a call while a legitimate 45 s
+            directive is still respected. Defaults to 60 s; must be > 0.
         retry_on: The exception types treated as transient *transport*
             errors, retried against ``max_attempts``. Anything outside both
             sets (e.g. a programming error) propagates immediately. Defaults
@@ -125,6 +244,7 @@ class RetryPolicy:
     validation_max_attempts: int = 2
     backoff_base_seconds: float = 0.5
     max_backoff_seconds: float = 30.0
+    retry_after_cap: float = _DEFAULT_RETRY_AFTER_CAP
     retry_on: tuple[type[BaseException], ...] = field(default=LLM_TRANSPORT_ERRORS)
     validation_retry_on: tuple[type[BaseException], ...] = field(default=LLM_SCHEMA_ERRORS)
 
@@ -137,6 +257,8 @@ class RetryPolicy:
             )
         if self.max_backoff_seconds <= 0:
             raise ValueError(f"max_backoff_seconds must be > 0, got {self.max_backoff_seconds}")
+        if self.retry_after_cap <= 0:
+            raise ValueError(f"retry_after_cap must be > 0, got {self.retry_after_cap}")
 
 
 #: The budget applied when a call function's ``retry`` argument is left at
@@ -213,23 +335,30 @@ async def handle_retry_failure(
     error: BaseException,
     backoff_base_seconds: float,
     max_backoff_seconds: float = 30.0,
+    retry_after_cap: float = _DEFAULT_RETRY_AFTER_CAP,
 ) -> None:
     """Run the shared book-keeping for one *non-final* failed attempt.
 
     Logs a warning, fires the installed progress callback (swallowing any
-    error it raises), then sleeps a full-jitter backoff when configured —
-    in that order. Shared by :func:`with_retries` and the streaming retry
-    loop in :mod:`llmkit.structured_output` so both surfaces back off,
-    warn, and report identically. The final failure is *not* routed here:
-    callers learn about exhaustion from the re-raised exception.
+    error it raises), then sleeps — in that order. Shared by
+    :func:`with_retries` and the streaming retry loop in
+    :mod:`llmkit.structured_output` so both surfaces back off, warn, and report
+    identically. The final failure is *not* routed here: callers learn about
+    exhaustion from the re-raised exception.
 
     ``max_attempts`` is the budget the failing class is charged against
     (transport or validation), so the logged ``attempt/max_attempts`` pair
     reflects the actual ceiling for this error.
 
-    The full-jitter ceiling ``backoff_base_seconds * 2**(attempt-1)`` is
-    capped at ``max_backoff_seconds`` (default 30s), so a large attempt
-    budget can't grow the worst-case sleep unboundedly.
+    **The sleep honours ``Retry-After`` first.** If ``error`` carries a
+    provider ``Retry-After`` (:func:`_retry_after_seconds`), the sleep is that
+    duration capped at ``retry_after_cap`` plus a little jitter — a server
+    *directive*, honoured even when ``backoff_base_seconds`` is 0. Otherwise the
+    sleep is the usual full-jitter exponential whose ceiling
+    ``backoff_base_seconds * 2**(attempt-1)`` is capped at ``max_backoff_seconds``
+    (default 30s), so a large attempt budget can't grow the worst-case sleep
+    unboundedly. With no ``Retry-After`` and ``backoff_base_seconds == 0`` there
+    is no sleep — byte-identical to the pre-feature behaviour.
     """
     logger.warning("%s: attempt %d/%d failed: %s", tag, attempt, max_attempts, error)
     callback = _progress_callback.get()
@@ -238,7 +367,17 @@ async def handle_retry_failure(
             callback(label=tag, attempt=attempt, max_attempts=max_attempts, error=error)
         except Exception:
             logger.exception("%s: retry progress callback raised", tag)
-    if backoff_base_seconds > 0:
+    retry_after = _retry_after_seconds(error)
+    if retry_after is not None:
+        # The provider told us when to come back: honour it (capped so a hostile
+        # value can't wedge the call), plus jitter from the same band as the
+        # exponential so a fan-out doesn't synchronize its retries. Independent
+        # of ``backoff_base_seconds`` — a Retry-After is a directive, not opt-in
+        # backoff; when the base is 0 the jitter collapses to 0 and the sleep is
+        # exactly the capped server value.
+        delay = min(retry_after, retry_after_cap) + random.uniform(0, backoff_base_seconds)
+        await asyncio.sleep(delay)
+    elif backoff_base_seconds > 0:
         # int ** int widens to Any in the stubs (negative exponents yield
         # float); attempt >= 1 keeps the exponent non-negative, so cast the
         # power back to the int it really is before scaling to a float ceiling.
@@ -258,6 +397,7 @@ async def with_retries[T](
     label: str | None = None,
     backoff_base_seconds: float = 0.0,
     max_backoff_seconds: float = 30.0,
+    retry_after_cap: float = _DEFAULT_RETRY_AFTER_CAP,
     retry_on: tuple[type[BaseException], ...] | None = None,
     validation_max_attempts: int | None = None,
     validation_retry_on: tuple[type[BaseException], ...] | None = None,
@@ -298,6 +438,10 @@ async def with_retries[T](
         max_backoff_seconds: Ceiling on any single backoff sleep (default
             30s), capping the exponential term so a large ``max_attempts``
             can't grow the worst-case sleep unboundedly.
+        retry_after_cap: Ceiling on a *server-supplied* ``Retry-After`` wait
+            (default 60s). When a retried error carries ``Retry-After``, the
+            backoff honours it (capped here, plus jitter) instead of the
+            computed exponential — see :func:`handle_retry_failure`.
         retry_on: When set, only exceptions matching this tuple are retried
             against ``max_attempts``; anything else propagates immediately
             on the first raise (so programming errors are never retried).
@@ -438,6 +582,7 @@ async def with_retries[T](
                         error=e,
                         backoff_base_seconds=backoff_base_seconds,
                         max_backoff_seconds=max_backoff_seconds,
+                        retry_after_cap=retry_after_cap,
                     )
                 else:
                     logger.error("%s: all %d attempts failed: %s", tag, budget, e)

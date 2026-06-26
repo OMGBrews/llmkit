@@ -285,6 +285,7 @@ async def structured_llm_call[T: BaseModel](
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
         max_backoff_seconds=retry.max_backoff_seconds,
+        retry_after_cap=retry.retry_after_cap,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
         validation_retry_on=_result_validation_budget(retry),
@@ -479,6 +480,7 @@ async def text_llm_call(
         label=label or feature,
         backoff_base_seconds=retry.backoff_base_seconds,
         max_backoff_seconds=retry.max_backoff_seconds,
+        retry_after_cap=retry.retry_after_cap,
         retry_on=retry.retry_on,
         validation_max_attempts=retry.validation_max_attempts,
         validation_retry_on=_result_validation_budget(retry),
@@ -704,6 +706,7 @@ async def stream_text_with_log(
                     error=exc,
                     backoff_base_seconds=retry.backoff_base_seconds,
                     max_backoff_seconds=retry.max_backoff_seconds,
+                    retry_after_cap=retry.retry_after_cap,
                 )
     finally:
         _retry_active.reset(token)
