@@ -58,8 +58,11 @@ from llmkit.providers import (
     make_provider,
 )
 from llmkit.rate_limiting import (
+    BackpressureCallback,
+    BackpressureEvent,
     RateLimitConfig,
     RateLimitSlot,
+    backpressure_callback,
     configure_rate_limit,
     get_rate_limit_config,
     rate_limit_acquire_async,
@@ -101,6 +104,10 @@ __all__ = [
     "RateLimitSlot",
     "rate_limit_acquire_async",
     "rate_limit_acquire_sync",
+    # Backpressure observability (adaptive concurrency limit changes)
+    "backpressure_callback",
+    "BackpressureCallback",
+    "BackpressureEvent",
     # Retries (transient-error recovery, on by default via RetryPolicy)
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",

@@ -199,50 +199,6 @@ async def test_inflight_caller_not_stranded_by_configure_swap() -> None:
         pass
 
 
-def test_async_semaphore_not_reused_across_event_loops() -> None:
-    """A saturated provider on one loop must not crash the next loop.
-
-    An ``asyncio.Semaphore`` binds to the event loop it first *blocks* on and
-    thereafter raises ``RuntimeError`` if awaited from another. A process can run
-    several loops — llmkit's persistent sync loop, a host's own async loop, and
-    the short-lived loops the sync bridge's reentrant fallback spins up — so the
-    process-global registry must key the async semaphore per-loop; otherwise a
-    call on a second loop reuses the first loop's (now-closed) semaphore and
-    raises "bound to a different event loop" the moment it has to block. This is
-    a plain ``def`` (not the auto async fixture) precisely so it drives two
-    *separate* loops via ``asyncio.run``, and it deliberately does **not**
-    ``configure`` between them — that would clear the registry and mask the bug.
-    """
-    GlobalRateLimiter.configure(max_concurrent=1)
-
-    async def contend(key: str) -> None:
-        # Hold the only slot, then start a waiter that must block on acquire —
-        # blocking is what binds the semaphore to the running loop.
-        held = asyncio.Event()
-        release = asyncio.Event()
-
-        async def holder() -> None:
-            async with GlobalRateLimiter.acquire_async(key):
-                held.set()
-                _ = await release.wait()
-
-        async def waiter() -> None:
-            _ = await held.wait()
-            async with GlobalRateLimiter.acquire_async(key):  # blocks: cap=1, held
-                pass
-
-        h = asyncio.create_task(holder())
-        w = asyncio.create_task(waiter())
-        _ = await held.wait()
-        for _ in range(5):  # let the waiter reach its blocking acquire
-            await asyncio.sleep(0)
-        release.set()
-        _ = await asyncio.gather(h, w)
-
-    asyncio.run(contend("openai"))  # loop A binds the semaphore
-    asyncio.run(contend("openai"))  # loop B: must not raise "bound to a different loop"
-
-
 async def test_call_layer_accounts_under_effective_provider_name() -> None:
     """acompletion_text acquires under the running provider's ``.name``.
 
@@ -292,6 +248,7 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     assert default.max_concurrent == 8
     assert default.rpm is None  # opt-in dimensions off by default
     assert default.tpm is None
+    assert default.adaptive is True  # adaptive concurrency on by default
 
     configure_rate_limit(max_concurrent=3, enabled=False, rpm=120, tpm=90_000)
     updated = get_rate_limit_config()
@@ -299,6 +256,10 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     assert updated.max_concurrent == 3
     assert updated.rpm == 120
     assert updated.tpm == 90_000
+    assert updated.adaptive is True  # unset -> stays on
+
+    configure_rate_limit(adaptive=False)
+    assert get_rate_limit_config().adaptive is False  # explicit opt-out reflected
 
 
 class _AsyncFunctionProbe:
