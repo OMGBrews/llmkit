@@ -60,6 +60,15 @@ overload window that a fixed concurrency cap plus blind retries could not ride o
 - The per-provider concurrency primitive is now a **FIFO** gate (replacing the
   `asyncio.Semaphore`): waiters are admitted in strict arrival order, so a newcomer
   can no longer barge ahead of an older waiter under sustained saturation.
+- The opt-in **RPM token-bucket** now admits its waiters in **FIFO** order too, on
+  both the async and sync paths. Previously a waiter slept on a computed delay and
+  then re-contended, so a newcomer could take the freshly refilled request token an
+  older waiter was about to claim — leaving an individual waiter's latency unbounded
+  under sustained self-saturation. The async path serializes waiters on a
+  per-event-loop lock held across the refill wait; the sync path on a one-shot-ticket
+  queue with no event loop. The aggregate rate is unchanged (only *who* is admitted
+  next is ordered). The **TPM** gate is fair by construction — it deducts nothing at
+  admission, so it cannot barge — and is left as the plain wait-for-budget loop.
 - A call **cancelled mid-acquire** (after its RPM token is deducted but before it
   holds a concurrency slot — e.g. a `run_sync` timeout) now **refunds** the RPM
   token, so a systematically-cancelled workload no longer silently shrinks its own

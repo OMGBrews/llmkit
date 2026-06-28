@@ -268,9 +268,44 @@ class _RateBucket:
       above zero.
 
     State (the fill level and last-refill timestamp) is guarded by a plain
-    :class:`threading.Lock`, held only for the non-blocking refill-and-compare
-    arithmetic — never across a sleep — so a single bucket is safe to share
-    between the async and sync acquire paths (one true per-provider budget).
+    :class:`threading.Lock`, held only for non-blocking O(1) bookkeeping — the
+    refill-and-compare arithmetic and the per-running-loop FIFO-lock registry
+    (below) — never across a sleep or ``await``, so a single bucket is safe to
+    share between the async and sync acquire paths (one true per-provider budget).
+
+    **FIFO admission (the cost-deducting RPM path).** A waiter that finds too few
+    tokens must wait for a refill, but the deducted token is *scarce*: if every
+    waiter just slept on its own computed delay and re-contended, a newcomer
+    waking first could take the freshly refilled token an older waiter was about
+    to claim, and under sustained saturation an individual waiter's latency would
+    be unbounded. So :meth:`acquire_async` / :meth:`acquire_sync` admit in strict
+    arrival order — only the queue *head* contends for tokens; everyone else waits
+    behind it. Async waiters serialize on a **per-running-loop**
+    :class:`asyncio.Lock` (CPython's lock is FIFO) held across the refill-sleep;
+    it is keyed by loop — and closed loops pruned — because a lock's waiter
+    futures bind to one loop and a bucket is awaited from several (the persistent
+    sync loop, a host's own loop, the reentrant fallback's short-lived loops),
+    exactly the per-loop reality :meth:`GlobalRateLimiter._get_async_gate` has.
+    Sync waiters serialize on a deque of one-shot :class:`threading.Event`
+    tickets (a plain :class:`threading.Lock` would not be FIFO); the head hands
+    the baton to the next ticket when it exits — *including on an exception*, so a
+    waiter interrupted (e.g. ``KeyboardInterrupt`` while parked in its wait)
+    removes only itself and never wedges the queue. The token arithmetic still
+    runs under :attr:`_lock` on every admit, so the **aggregate rate is exact
+    regardless of queue**: serialization only orders *who* deducts next, never
+    adds a token. FIFO is therefore per-loop (and the sync queue is independent of
+    the async ones); cross-loop ordering is not strictly FIFO — the same bound the
+    per-loop concurrency gate already documents — but the rate stays globally
+    correct.
+
+    **The TPM gate is deliberately not serialized.**
+    :meth:`wait_for_budget_async` / :meth:`wait_for_budget_sync` deduct *nothing*
+    at admission (the debit is post-call, in :meth:`record`); they only block
+    while the bucket is exhausted. Once it refills above zero every blocked waiter
+    passes and none can take anything from another, so the TPM gate is fair by
+    construction — there is no scarce admission token to barge for. Adding a queue
+    there would only force an ordering onto the hot entry path of every call for
+    no fairness gain, so it keeps the plain refill-retry loop.
     """
 
     def __init__(self, rate_per_sec: float, capacity: float) -> None:
@@ -279,6 +314,14 @@ class _RateBucket:
         self._level: float = capacity
         self._updated: float = _now()
         self._lock: threading.Lock = threading.Lock()
+        # FIFO admission state for the cost-deducting acquire path (RPM); see the
+        # class docstring. Async waiters queue on a per-running-loop asyncio.Lock
+        # (keyed by loop and pruned, like _get_async_gate, since a Lock can't span
+        # loops); sync waiters queue on a deque of one-shot Event tickets under its
+        # own lock. wait_for_budget_* (TPM) is intentionally not serialized.
+        self._async_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+        self._sync_waiters: collections.deque[threading.Event] = collections.deque()
+        self._sync_lock: threading.Lock = threading.Lock()
 
     def _refill_locked(self) -> None:
         now = _now()
@@ -338,13 +381,79 @@ class _RateBucket:
             self._refill_locked()
             self._level = min(self._capacity, self._level + amount)
 
+    def _fifo_lock_for_loop(self) -> asyncio.Lock:
+        """The per-running-loop FIFO lock for the cost-deducting acquire path.
+
+        Get-or-create the :class:`asyncio.Lock` for the running loop, first
+        pruning entries whose loop has closed. Guarded by :attr:`_lock` (the
+        token-state lock) because the dict is touched from every loop/thread,
+        mirroring :meth:`GlobalRateLimiter._get_async_gate`. Keyed by loop because
+        a lock's waiter futures bind to the loop they are created on and a single
+        bucket is awaited from several loops; constructing the lock here is
+        loop-inert on Python >= 3.13 (it binds the loop lazily on first
+        ``acquire``), so it is safe to build under the threading lock. The running
+        loop is by definition not closed, so the returned lock can never be pruned
+        out from under the ``async with`` that follows.
+        """
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            for closed in [k for k in self._async_locks if k.is_closed()]:
+                del self._async_locks[closed]
+            lock = self._async_locks.get(loop)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._async_locks[loop] = lock
+            return lock
+
     async def acquire_async(self, cost: float) -> None:
-        while (wait := self._try_acquire(cost)) > 0:
-            await asyncio.sleep(wait)
+        """Deduct ``cost`` tokens, waiting in FIFO order behind earlier waiters.
+
+        Holds this loop's FIFO lock across the refill-sleep so only the queue
+        head contends for tokens and newcomers queue behind it (no barging). A
+        cancellation mid-sleep releases the held lock and the FIFO lock hands the
+        next waiter on; a cancellation while still *queued* just drops out of the
+        lock's wait queue (it holds nothing). Either way no token leaks, because
+        the deduct-and-return in :meth:`_try_acquire` is atomic with respect to
+        the ``await`` — a token is deducted only on the iteration that returns
+        ``0.0`` and exits, with no ``await`` between that deduction and return.
+        """
+        async with self._fifo_lock_for_loop():
+            while (wait := self._try_acquire(cost)) > 0:
+                await asyncio.sleep(wait)
 
     def acquire_sync(self, cost: float) -> None:
-        while (wait := self._try_acquire(cost)) > 0:
-            time.sleep(wait)
+        """Deduct ``cost`` tokens, waiting in FIFO order behind earlier waiters.
+
+        The sync mirror of :meth:`acquire_async`, with no event loop: each caller
+        enqueues a one-shot :class:`threading.Event` ticket and the head alone
+        contends for tokens, handing the baton to the next ticket on exit. The
+        enqueue is *inside* the ``try``, so the ``finally`` covers a ticket from
+        the instant it is appended: it removes *this* ticket by identity, so an
+        exception at any point after enqueue (e.g. a ``KeyboardInterrupt``
+        delivered during the append, the lock release, or the ``wait``) frees only
+        this waiter — a non-head waiter that leaves keeps the deque contiguous and
+        the real head still wakes the next ticket — so the queue can never wedge.
+        """
+        ticket = threading.Event()
+        try:
+            with self._sync_lock:
+                is_head = not self._sync_waiters
+                self._sync_waiters.append(ticket)
+            if is_head:
+                ticket.set()  # nobody ahead of us — proceed immediately
+            _ = ticket.wait()
+            while (wait := self._try_acquire(cost)) > 0:
+                time.sleep(wait)
+        finally:
+            with self._sync_lock:
+                was_head = bool(self._sync_waiters) and self._sync_waiters[0] is ticket
+                with contextlib.suppress(ValueError):
+                    self._sync_waiters.remove(ticket)
+                # Only the head owes the baton. A non-head waiter that was
+                # interrupted just drops itself; the still-running head will wake
+                # the next ticket when it finishes.
+                if was_head and self._sync_waiters:
+                    self._sync_waiters[0].set()
 
     async def wait_for_budget_async(self) -> None:
         while (wait := self._try_budget()) > 0:

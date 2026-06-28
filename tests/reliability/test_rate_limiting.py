@@ -27,9 +27,12 @@ restores a known default state around every test so nothing leaks.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import threading
-from collections.abc import AsyncGenerator, Iterator
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+from typing import override
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -527,6 +530,319 @@ def test_rate_bucket_record_drives_negative_then_recovers(
 
     clock["t"] += 6.0  # +600 tokens → back above zero
     assert bucket._try_budget() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Bucket waiter fairness: the cost-deducting acquire path admits in FIFO order.
+#
+# The RPM acquire path deducts a *scarce* token at admission, so under sustained
+# saturation a barging newcomer could starve an older waiter indefinitely. These
+# tests pin strict arrival-order admission on both the async (per-loop
+# asyncio.Lock) and sync (Event ticket-queue) paths, and that an interrupted sync
+# waiter drops only itself and never wedges the queue. Token availability is
+# driven by a frozen, manually-advanced clock so that *ordering* — not wall-clock
+# timing — is what is under test. (The TPM ``wait_for_budget`` path deducts
+# nothing at admission, so it cannot barge and is deliberately not serialized.)
+# ---------------------------------------------------------------------------
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+    """Poll ``predicate`` until true, raising if it stays false past ``timeout``.
+
+    Uses the real monotonic clock (the rate-limiter's ``_now`` is monkeypatched
+    to a frozen test clock, so it cannot be used for the timeout here).
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition not met within timeout")
+        time.sleep(0.001)
+
+
+def _install_controlled_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[asyncio.Future[None]], Callable[[], Awaitable[None]]]:
+    """Replace ``asyncio.sleep`` with a stub that parks each call on a test-owned
+    future, and return ``(gates, pump)``.
+
+    Each refill-sleep appends a future to ``gates`` and blocks on it, so the test
+    controls exactly when a parked waiter re-polls — and ``len(gates)`` reveals how
+    many waiters are parked at once. Under the FIFO lock only the *head* ever
+    reaches the sleep (the rest block on the lock), so ``gates`` holds exactly one
+    entry per outstanding head; a barging loop would park every waiter at once.
+    ``pump`` drains the ready queue via the *real* ``asyncio.sleep(0)``.
+    """
+    loop = asyncio.get_running_loop()
+    real_sleep = asyncio.sleep
+    gates: list[asyncio.Future[None]] = []
+
+    async def controlled_sleep(_delay: float) -> None:
+        fut: asyncio.Future[None] = loop.create_future()
+        gates.append(fut)
+        await fut
+
+    monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+
+    async def pump() -> None:
+        for _ in range(30):
+            await real_sleep(0)
+
+    return gates, pump
+
+
+async def test_rpm_bucket_serves_async_waiters_fifo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async RPM waiters are admitted strictly in arrival order — only the head
+    contends for tokens.
+
+    Each refill-sleep parks on a test-owned future, so exactly one waiter (the
+    FIFO head) is ever parked — the ``len(gates) == 1`` check is what a barging
+    loop fails (it would park all three at once). Releasing the head one token at a
+    time serves them in arrival order, with no over-admission.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    gates, pump = _install_controlled_sleep(monkeypatch)
+
+    bucket = _RateBucket(rate_per_sec=1.0, capacity=1.0)
+    assert bucket._try_acquire(1.0) == 0.0  # drain the initial token → empty, frozen
+
+    order: list[int] = []
+
+    async def waiter(i: int) -> None:
+        await bucket.acquire_async(1.0)
+        order.append(i)
+
+    tasks = [asyncio.create_task(waiter(i)) for i in range(3)]
+    await pump()
+    assert order == []  # all three blocked on the empty bucket
+    assert len(gates) == 1  # ONLY the head is parked; the rest queue on the per-loop lock
+
+    for expected in range(3):
+        clock["t"] += 1.0  # refill exactly one token (capacity 1 caps the refill)
+        gates[expected].set_result(None)  # wake the current head; it deducts and exits
+        await pump()
+        assert order == list(range(expected + 1))  # served strictly in arrival order
+        assert len(gates) == min(expected + 2, 3)  # the next head parks on a fresh gate
+
+    _ = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
+    assert order == [0, 1, 2]
+    assert bucket._level == 0.0  # exactly three tokens consumed for three waiters
+
+
+async def test_async_newcomer_cannot_barge_parked_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A newcomer cannot take a token while an older waiter is parked ahead of it.
+
+    The crux of the fairness fix: with a token *available* but the head still
+    parked, a freshly-arrived waiter must NOT grab it — it is queued behind the
+    head on the per-loop lock. Under the old barging loop the newcomer would poll
+    freely and serve out of order, so ``order == []`` here is what distinguishes
+    the fix.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    gates, pump = _install_controlled_sleep(monkeypatch)
+
+    bucket = _RateBucket(rate_per_sec=1.0, capacity=1.0)
+    assert bucket._try_acquire(1.0) == 0.0  # drain → empty
+
+    order: list[str] = []
+
+    async def waiter(name: str) -> None:
+        await bucket.acquire_async(1.0)
+        order.append(name)
+
+    head = asyncio.create_task(waiter("head"))
+    await pump()
+    assert len(gates) == 1 and order == []  # head parked on the empty bucket
+
+    clock["t"] += 1.0  # a token is now available — but the head is still parked on its gate
+    newcomer = asyncio.create_task(waiter("newcomer"))
+    await pump()
+    assert order == []  # newcomer did NOT barge the token; it is queued behind the head
+    assert len(gates) == 1  # newcomer is on the lock, not polling the bucket
+
+    gates[0].set_result(None)  # release the head; it takes the available token first
+    await pump()
+    assert order == ["head"]  # head served before the newcomer despite the newcomer arriving second
+
+    clock["t"] += 1.0
+    gates[1].set_result(None)  # now the newcomer (which parked once it became head) is served
+    _ = await asyncio.wait_for(asyncio.gather(head, newcomer), timeout=1.0)
+    assert order == ["head", "newcomer"]
+
+
+def test_rpm_bucket_serves_sync_waiters_fifo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sync RPM waiters are admitted strictly in arrival order (Event ticket-queue).
+
+    The threaded mirror of the async FIFO test: four threads queue on the empty
+    bucket, tokens are released one at a time via the clock, and each goes to the
+    current head. A high rate keeps the head's real spin-sleep ~1ms; the capacity
+    cap makes "one token per clock step" exact regardless of float fuzz.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)  # empty-wait ≈ 1ms
+    assert bucket._try_acquire(1.0) == 0.0  # drain → empty, frozen
+
+    order: list[int] = []
+    order_lock = threading.Lock()
+
+    def waiter(i: int) -> None:
+        bucket.acquire_sync(1.0)
+        with order_lock:
+            order.append(i)
+
+    threads: list[threading.Thread] = []
+    for i in range(4):
+        thread = threading.Thread(target=waiter, args=(i,))
+        threads.append(thread)
+        thread.start()
+        _wait_until(lambda i=i: len(bucket._sync_waiters) == i + 1)  # queued in arrival order
+
+    assert order == []  # all four blocked on the empty bucket
+
+    for expected in range(4):
+        clock["t"] += 1.0  # +1000 tokens at 1000/s, capped to capacity 1 → one token
+        _wait_until(lambda e=expected: len(order) == e + 1)
+        with order_lock:
+            assert order == list(range(expected + 1))  # head served; the rest wait their turn
+
+    for thread in threads:
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+    assert order == [0, 1, 2, 3]
+    assert bucket._level == 0.0  # exactly four tokens consumed for four waiters
+
+
+def test_sync_acquire_interrupt_does_not_wedge_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sync waiter interrupted mid-wait drops only itself; the queue still drains.
+
+    Reproduces the wedge the ticket-queue must not have: a *non-head* waiter that
+    raises (a ``KeyboardInterrupt`` delivered while parked in its ticket wait) must
+    remove only its own ticket by identity and never strand the waiters behind it —
+    and must never evict the still-running head with a positional pop.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+
+    # Make the 2nd ticket created (waiter B, queued behind the head) raise from its
+    # wait(), simulating a Ctrl-C delivered while B is parked. Threads are built
+    # *before* patching so their internal Events stay real — only the bucket's
+    # three tickets become interrupting Events.
+    counter = {"n": 0}
+
+    class _InterruptingEvent(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self._idx: int = counter["n"]
+            counter["n"] += 1
+
+        @override
+        def wait(self, timeout: float | None = None) -> bool:
+            if self._idx == 1:
+                raise KeyboardInterrupt("simulated Ctrl-C during ticket.wait()")
+            return super().wait(timeout)
+
+    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)
+    assert bucket._try_acquire(1.0) == 0.0  # drain → empty
+
+    order: list[str] = []
+    order_lock = threading.Lock()
+
+    def waiter(name: str) -> None:
+        with contextlib.suppress(KeyboardInterrupt):
+            bucket.acquire_sync(1.0)
+            with order_lock:
+                order.append(name)
+
+    a = threading.Thread(target=waiter, args=("A",))
+    b = threading.Thread(target=waiter, args=("B",))
+    c = threading.Thread(target=waiter, args=("C",))
+    # Patch the threading module's ``Event`` (what the bucket constructs tickets
+    # from). Threads are built above, *before* this, so their own internal Events
+    # stay real and only the bucket's three tickets become interrupting Events.
+    monkeypatch.setattr(threading, "Event", _InterruptingEvent)
+
+    a.start()
+    _wait_until(lambda: len(bucket._sync_waiters) == 1)  # A is the head, spinning
+
+    b.start()  # B enqueues behind A, then raises from wait() and removes itself
+    b.join(timeout=2.0)
+    assert not b.is_alive()
+    assert len(bucket._sync_waiters) == 1  # only A remains; B's exit did not wedge the queue
+
+    c.start()
+    _wait_until(lambda: len(bucket._sync_waiters) == 2)  # C queued behind A
+
+    clock["t"] += 1.0  # release a token → A served, hands the baton to C (not to dead B)
+    _wait_until(lambda: len(order) == 1)
+    clock["t"] += 1.0  # C served next — proof B's interrupt never stranded it
+    _wait_until(lambda: len(order) == 2)
+
+    a.join(timeout=2.0)
+    c.join(timeout=2.0)
+    assert order == ["A", "C"]  # B interrupted; A and C served in order, queue intact
+
+
+def test_sync_acquire_enqueue_window_exception_leaves_no_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception raised right after enqueue removes the ticket (no wedge).
+
+    Guards the fix that put the enqueue *inside* the try/finally: an exception in
+    the append→body window (here the deque raises immediately after appending,
+    standing in for a signal during the append or lock release) must still be
+    cleaned up by the finally. Pre-fix the append sat outside the try, so the
+    ticket leaked and the whole queue wedged.
+    """
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)
+    assert bucket._try_acquire(1.0) == 0.0  # drain → empty
+
+    armed = {"v": True}
+
+    class _AppendBoomDeque(collections.deque[threading.Event]):
+        @override
+        def append(self, x: threading.Event, /) -> None:
+            super().append(x)
+            if armed["v"]:  # boom exactly once, right after the ticket is enqueued
+                armed["v"] = False
+                raise RuntimeError("boom right after enqueue")
+
+    bucket._sync_waiters = _AppendBoomDeque()  # the bucket's own (empty) queue, instrumented
+
+    with pytest.raises(RuntimeError, match="boom"):
+        bucket.acquire_sync(1.0)
+    assert list(bucket._sync_waiters) == []  # the appended ticket was removed, not orphaned
+
+    clock["t"] += 1.0  # a token is available
+    bucket.acquire_sync(1.0)  # a subsequent waiter drains — the queue never wedged
+
+
+def test_async_fifo_lock_pruned_for_closed_loop() -> None:
+    """The per-loop FIFO lock registry prunes entries whose loop has closed.
+
+    The async FIFO lock is keyed by event loop (a lock's waiter futures bind to
+    one loop); like the concurrency gate's registry it must shed closed loops so a
+    process spinning short-lived loops cannot leak locks. One bucket is shared
+    across loops; each loop installs its own lock, and a later touch prunes the
+    dead one.
+    """
+    bucket = _RateBucket(rate_per_sec=1.0, capacity=10.0)
+
+    async def touch() -> None:
+        await bucket.acquire_async(1.0)
+
+    asyncio.run(touch())  # first loop installs its lock, then closes
+    assert len(bucket._async_locks) == 1
+    [first_loop] = list(bucket._async_locks)
+    assert first_loop.is_closed()
+
+    asyncio.run(touch())  # a second loop's touch prunes the closed one, installs its own
+    assert len(bucket._async_locks) == 1
+    [second_loop] = list(bucket._async_locks)
+    assert second_loop is not first_loop
 
 
 async def test_rpm_burst_is_capped_at_concurrency_not_a_full_minute(
