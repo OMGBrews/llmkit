@@ -36,9 +36,11 @@ from llmkit.capture import (
     capture_llm_records,
 )
 from llmkit.exceptions import (
+    LLM_BACKPRESSURE_ERRORS,
     LLM_RECOVERABLE_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
+    CircuitOpenError,
     ResultValidationError,
 )
 from llmkit.json_schema import model_from_json_schema
@@ -130,5 +132,7 @@ __all__ = [
     "LLM_RECOVERABLE_ERRORS",
     "LLM_TRANSPORT_ERRORS",
     "LLM_SCHEMA_ERRORS",
+    "LLM_BACKPRESSURE_ERRORS",
+    "CircuitOpenError",
     "ResultValidationError",
 ]

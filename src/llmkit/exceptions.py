@@ -7,7 +7,7 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into two subsets the retry layer budgets
+The recoverable set is split into three subsets the retry layer budgets
 **separately** (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
@@ -27,8 +27,16 @@ The recoverable set is split into two subsets the retry layer budgets
   charges a wrapped transport cause to the transport budget — so membership
   here is the default-but-not-final classification, not a promise the failure
   is genuinely schema-shaped.
+* :data:`LLM_BACKPRESSURE_ERRORS` — llmkit's *own* fail-fast backpressure
+  signal (:class:`CircuitOpenError`, raised by the opt-in per-provider circuit
+  breaker while it is open). It is recoverable in the catch-set sense — a host
+  that degrades on ``LLM_RECOVERABLE_ERRORS`` keeps catching it (a fast
+  fallback) instead of crashing on a new uncaught type — but it is deliberately
+  **not** retried: it lives outside the transport set, so ``with_retries`` and
+  the streaming loop (which key off the transport/schema subsets, never the
+  union) never re-ask a circuit the breaker already knows is open.
 
-``LLM_RECOVERABLE_ERRORS`` is the **union** of the two, preserved as the
+``LLM_RECOVERABLE_ERRORS`` is the **union** of the three, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
 catching exactly what they did before. One member is special: the
 litellm-native 503 entry is a lazy stand-in
@@ -152,13 +160,51 @@ LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     InstructorRetryException,
 )
 
-# The full recoverable set is the union of the two subsets — preserved as the
+
+class CircuitOpenError(Exception):
+    """Raised by the per-provider circuit breaker when it declines to admit a call.
+
+    The breaker (opt-in via ``configure_rate_limit(breaker=True)``) is the
+    aggregate guard that stops doomed work when a provider is *down*: once its
+    throttle rate over a rolling window crosses the trip threshold it opens, and
+    the limiter then raises this **immediately** — before any concurrency slot is
+    held or RPM token deducted — instead of admitting a call that would only burn
+    its retry budget into the storm. It is raised whenever the breaker won't admit
+    the call: while **OPEN** within its cooldown, and while **HALF_OPEN** when the
+    single recovery probe is already in flight (every other concurrent caller is
+    turned away so exactly one probe tests the provider). Either way the right
+    response is the same — fall back fast — and it carries :attr:`provider`, the
+    normalized (casefolded) provider key the breaker is keyed under (the same
+    identity :class:`~llmkit.BackpressureEvent` reports), so a host's fallback can
+    branch on *which* provider tripped.
+
+    Deliberately a **distinct, fail-fast** type, kept **out** of
+    :data:`LLM_TRANSPORT_ERRORS` (and so out of the default ``retry_on``):
+    retrying a circuit the breaker already knows is open would defeat its
+    purpose. It *is* a member of :data:`LLM_BACKPRESSURE_ERRORS` and therefore of
+    :data:`LLM_RECOVERABLE_ERRORS`, so a host that already writes
+    ``except LLM_RECOVERABLE_ERRORS`` to degrade on a 503 keeps catching this
+    (and falls back fast) rather than crashing on a new uncaught type.
+    """
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(f"circuit breaker open for provider {provider!r}")
+        self.provider: str = provider
+
+
+# llmkit's own fail-fast backpressure signal — kept in its own subset so the
+# recoverable *union* can carry it (for host ``except`` clauses) while the retry
+# layer, which budgets off the transport/schema subsets, never retries it.
+LLM_BACKPRESSURE_ERRORS: tuple[type[Exception], ...] = (CircuitOpenError,)
+
+# The full recoverable set is the union of the three subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
-# exactly what they did before even though the retry layer now budgets the two
-# subsets separately.
+# exactly what they did before even though the retry layer now budgets the
+# subsets separately (and never retries the backpressure subset).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
+    *LLM_BACKPRESSURE_ERRORS,
 )
 
 

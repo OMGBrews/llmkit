@@ -6,9 +6,11 @@ behaviour in ``test_default_retries.py``:
 * the shipped default budget (3 transport attempts / 2 validation, 0.5s base
   backoff, 30s per-sleep cap) and the jittered exponential-ceiling backoff;
 * ``LLM_RECOVERABLE_ERRORS`` membership — 429 / 5xx / network are transient,
-  auth and other 4xx are not — and that it's the union of the transport and
-  schema subsets; including litellm's own ``ServiceUnavailableError`` (its
-  503, which does not subclass ``openai.InternalServerError``);
+  auth and other 4xx are not — and that it's the union of the transport,
+  schema, and backpressure subsets (the last carrying the breaker's fail-fast
+  ``CircuitOpenError``, which must stay out of the retried transport set);
+  including litellm's own ``ServiceUnavailableError`` (its 503, which does not
+  subclass ``openai.InternalServerError``);
 * instructor's in-call schema-repair budget (``max_retries=2`` = two attempts
   total = one repair re-ask) as pinned by ``acompletion_structured``;
 * the ``with_retries`` primitive's ``max_attempts`` naming and the nested-retry
@@ -39,13 +41,18 @@ from llmkit import (
     DEFAULT_RETRY_POLICY,
     LLM_RECOVERABLE_ERRORS,
     NO_RETRY,
+    CircuitOpenError,
     LocalYamlLogSink,
     RetryPolicy,
     configure_llm_logging,
     structured_output,
 )
 from llmkit.capture import capture_llm_log_paths
-from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
+from llmkit.exceptions import (
+    LLM_BACKPRESSURE_ERRORS,
+    LLM_SCHEMA_ERRORS,
+    LLM_TRANSPORT_ERRORS,
+)
 from llmkit.retry import with_retries
 from tests._support import OkSchema, capture_structured_provider_kwargs
 
@@ -311,15 +318,27 @@ def test_instructor_in_call_budget_is_two_attempts_one_repair() -> None:
 # --- unified naming: max_attempts is the only name ------------------------
 
 
-def test_recoverable_set_is_union_of_transport_and_schema() -> None:
-    """``LLM_RECOVERABLE_ERRORS`` is exactly the union of the two subsets, so
-    the documented single catch-set contract is preserved after the split."""
-    assert set(LLM_RECOVERABLE_ERRORS) == set(LLM_TRANSPORT_ERRORS) | set(LLM_SCHEMA_ERRORS)
-    # The subsets are disjoint and each carries its expected members.
+def test_recoverable_set_union_invariant_still_holds() -> None:
+    """``LLM_RECOVERABLE_ERRORS`` is exactly the union of the *three* subsets
+    (transport + schema + backpressure), so the documented single catch-set
+    contract is preserved as the breaker's ``CircuitOpenError`` joins it."""
+    assert set(LLM_RECOVERABLE_ERRORS) == set(LLM_TRANSPORT_ERRORS) | set(LLM_SCHEMA_ERRORS) | set(
+        LLM_BACKPRESSURE_ERRORS
+    )
+    # The three subsets are pairwise disjoint and each carries its expected members.
     assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
+    assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
+    assert set(LLM_SCHEMA_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
     assert ValidationError in LLM_SCHEMA_ERRORS
     assert TimeoutError in LLM_TRANSPORT_ERRORS
     assert ValidationError not in LLM_TRANSPORT_ERRORS
+    # The breaker error is fail-fast: it is the backpressure subset, and crucially
+    # is NOT in the transport set (the default ``retry_on``) — so the retry layer
+    # never re-asks a circuit the breaker already knows is open.
+    assert CircuitOpenError in LLM_BACKPRESSURE_ERRORS
+    assert CircuitOpenError not in LLM_TRANSPORT_ERRORS
+    assert CircuitOpenError not in LLM_SCHEMA_ERRORS
+    assert CircuitOpenError in LLM_RECOVERABLE_ERRORS
 
 
 @pytest.mark.asyncio

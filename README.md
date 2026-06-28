@@ -229,7 +229,7 @@ Rate limiting is **on by default**, scoped **per provider** (keyed by the effect
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below).
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
 from llmkit import configure_rate_limit
@@ -255,7 +255,7 @@ configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, pre-feature
 
 #### Observing backpressure
 
-Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` (`reason` is `"throttle"` or `"recover"`) each time a provider's limit changes. It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
+Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` each time a provider's limit changes (`reason` is `"throttle"` or `"recover"`) or — when the circuit breaker is armed, [below](#circuit-breaker) — the breaker changes state (`"breaker_open"`, `"breaker_half_open"`, `"breaker_closed"`). It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
 
 ```python
 from llmkit import backpressure_callback, BackpressureEvent
@@ -268,6 +268,23 @@ with backpressure_callback(on_backpressure):
 ```
 
 A callback that raises is swallowed and logged — observability can never break a call.
+
+#### Circuit breaker
+
+Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** is the "limit is effectively 0 while the provider is down" case it cannot express. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Once a provider's throttle rate over a rolling window (the last 20 real outcomes, at least half of them throttled) trips it, llmkit **fails fast** for that provider: every call raises `CircuitOpenError` *immediately* — holding no concurrency slot and deducting no RPM token — for a cooldown, instead of letting each call burn its retry budget into the storm (the load-*adding* pathology of retries under sustained overload). After the cooldown a single probe tests recovery: a clean success closes the breaker, any failure re-opens it for another cooldown.
+
+```python
+from llmkit import configure_rate_limit, CircuitOpenError, structured_llm_call
+
+configure_rate_limit(breaker=True)  # opt in; off by default
+
+try:
+    result = await structured_llm_call(prompt, MySchema, feature="extract")
+except CircuitOpenError as exc:
+    ...  # the breaker is open for exc.provider — fall back fast, don't hammer it
+```
+
+It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it** — retrying a circuit you already know is open would defeat the point. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and two switches."
 
 #### Joining the global rate limit directly
 
@@ -539,7 +556,7 @@ Two retry layers, kept deliberately separate:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
   - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
 
-  `LLM_RECOVERABLE_ERRORS` remains the **union** of the two — keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One footnote: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, the litellm-native 503 entry (`litellm.exceptions.ServiceUnavailableError`) is a lazy stand-in resolved at `isinstance` time. `isinstance` checks — what the retry layer uses — behave identically, but a bare `except LLM_TRANSPORT_ERRORS:` / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one litellm-native class (Python's `except` matching bypasses the lazy check); every other member still catches as usual, and an openai-SDK 503 arrives as `openai.InternalServerError`, which matches. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. **`Retry-After` is honoured first:** when a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+  `LLM_RECOVERABLE_ERRORS` remains the documented single catch-set — now the **union of three** subsets: the two above plus `LLM_BACKPRESSURE_ERRORS` (llmkit's own fail-fast `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)). Keep using `LLM_RECOVERABLE_ERRORS` in `except` clauses; the split only changes how the *retry layer* budgets them — and the breaker subset is deliberately **never retried** (it sits outside the transport set the retry loop keys off, so re-asking a known-open circuit is impossible). One footnote: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, the litellm-native 503 entry (`litellm.exceptions.ServiceUnavailableError`) is a lazy stand-in resolved at `isinstance` time. `isinstance` checks — what the retry layer uses — behave identically, but a bare `except LLM_TRANSPORT_ERRORS:` / `except LLM_RECOVERABLE_ERRORS:` clause cannot catch that one litellm-native class (Python's `except` matching bypasses the lazy check); every other member still catches as usual, and an openai-SDK 503 arrives as `openai.InternalServerError`, which matches. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. **`Retry-After` is honoured first:** when a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
   Tune or opt out per call with the `retry=` argument:
 

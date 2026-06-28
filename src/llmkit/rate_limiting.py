@@ -129,6 +129,7 @@ provider. Two deliberate non-goals follow:
 import asyncio
 import collections
 import contextlib
+import enum
 import logging
 import threading
 import time
@@ -137,7 +138,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from llmkit.exceptions import underlying_provider_error
+from llmkit.exceptions import CircuitOpenError, underlying_provider_error
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,30 @@ _THROTTLE_STATUS_CODES: frozenset[int] = frozenset({429, 503, 529})
 _AIMD_DECREASE_FACTOR: float = 0.5
 _AIMD_DECREASE_COOLDOWN: float = 1.0
 _AIMD_RECOVERY_INTERVAL: float = 3.0
+
+#: Circuit-breaker tuning. Like the AIMD constants these are deliberately
+#: **internal**: the host owns the *switch* (``breaker``), the library owns the
+#: mechanism. The breaker is the "limit is effectively 0 for a cooldown" case
+#: AIMD's floor-of-1 cannot express — it stops doomed work outright when a
+#: provider is *down* (see opinions.md §6.4). Defaults are conservative because
+#: it is opt-in and flips "eventually succeeds" → "fails fast".
+#:
+#: * ``_BREAKER_WINDOW`` — size of the count-based ring of recent *real* outcomes
+#:   (a throttle or a success; a fast ``CircuitOpenError`` and an ambiguous
+#:   neutral error record nothing). O(N) state, no timestamps — one wrong OPEN is
+#:   bounded to a single cooldown by the HALF_OPEN probe, so a count ring beats a
+#:   time-bucketed window's complexity here.
+#: * ``_BREAKER_MIN_SAMPLES`` — never trip before the ring holds this many
+#:   outcomes, so one early throttle in a near-empty ring can't open the breaker.
+#:   Equal to the window, so the ring must be *full* before it can trip.
+#: * ``_BREAKER_THRESHOLD`` — open once the throttled fraction of a full ring
+#:   reaches this (0.5 ⇒ half of the recent real outcomes were throttles).
+#: * ``_BREAKER_COOLDOWN`` — seconds the breaker fast-fails while OPEN before it
+#:   admits a single HALF_OPEN probe to test whether the provider has recovered.
+_BREAKER_WINDOW: int = 20
+_BREAKER_MIN_SAMPLES: int = 20
+_BREAKER_THRESHOLD: float = 0.5
+_BREAKER_COOLDOWN: float = 30.0
 
 
 def _is_throttle_signal(exc: BaseException) -> bool:
@@ -355,26 +380,47 @@ class RateLimitSlot:
 
 @dataclass(frozen=True)
 class BackpressureEvent:
-    """A per-provider adaptive-concurrency limit change, for observability.
+    """A per-provider backpressure transition, for observability.
 
     Emitted to the callback installed by :func:`backpressure_callback` whenever
-    the AIMD limit actually moves, so a host can *see* backpressure in real time
-    (and wire its own metrics) instead of reconstructing it from call logs.
+    the AIMD limit actually moves *or* the opt-in circuit breaker changes state,
+    so a host can *see* backpressure in real time (and wire its own metrics)
+    instead of reconstructing it from call logs.
 
     Attributes:
         provider: The normalized (casefolded) provider key the budget is keyed by
             — the same identity the limiter accounts every dimension under.
-        old_limit: The per-provider concurrency limit before the change.
-        new_limit: The limit after the change.
-        reason: ``"throttle"`` (a provider overload signal lowered the limit) or
-            ``"recover"`` (sustained no-throttle time raised it back toward the
-            configured ceiling).
+        old_limit: The effective per-provider concurrency limit before the change.
+        new_limit: The effective limit after the change.
+        reason: which transition this is —
+
+            * ``"throttle"`` — a provider overload signal lowered the AIMD limit;
+            * ``"recover"`` — sustained no-throttle time raised the AIMD limit
+              back toward the configured ceiling;
+            * ``"breaker_open"`` — the breaker tripped and is now fast-failing;
+              ``new_limit`` is ``0`` (it admits nothing) and ``old_limit`` is the
+              ceiling it collapsed from;
+            * ``"breaker_half_open"`` — the cooldown elapsed and the breaker
+              admitted a single probe (``old_limit`` ``0`` → ``new_limit`` ``1``);
+            * ``"breaker_closed"`` — the probe succeeded; the breaker is back to
+              full capacity (``old_limit`` ``1`` → ``new_limit`` the ceiling).
+
+            The breaker reasons report the breaker's *own* effective ceiling
+            (ceiling → 0 → 1 → ceiling), which is independent of — and not to be
+            confused with — the AIMD limit the ``"throttle"`` / ``"recover"``
+            reasons carry.
     """
 
     provider: str
     old_limit: int
     new_limit: int
-    reason: Literal["throttle", "recover"]
+    reason: Literal[
+        "throttle",
+        "recover",
+        "breaker_open",
+        "breaker_half_open",
+        "breaker_closed",
+    ]
 
 
 class BackpressureCallback(Protocol):
@@ -420,10 +466,11 @@ def backpressure_callback(callback: BackpressureCallback | None) -> Generator[No
 
     The callback receives a :class:`BackpressureEvent` each time the adaptive
     limiter changes a provider's concurrency limit (a throttle-driven decrease or
-    a time-driven recovery). Read from a context variable, so it crosses the
-    ``run_sync`` thread boundary like the retry progress callback. Pass ``None``
-    to disable callbacks within an inner scope; the previous value is restored on
-    exit.
+    a time-driven recovery) or the opt-in circuit breaker changes state
+    (``breaker_open`` / ``breaker_half_open`` / ``breaker_closed``). Read from a
+    context variable, so it crosses the ``run_sync`` thread boundary like the
+    retry progress callback. Pass ``None`` to disable callbacks within an inner
+    scope; the previous value is restored on exit.
 
     Usage::
 
@@ -603,6 +650,152 @@ class _AdaptiveGate:
         return self._state.on_success()
 
 
+class _Admit(enum.Enum):
+    """A circuit breaker's verdict on one admission request.
+
+    * ``NORMAL`` — admit and account the outcome into the rolling window (CLOSED).
+    * ``PROBE`` — admit as the single HALF_OPEN probe; its outcome alone decides
+      whether the breaker closes or re-opens.
+    * ``REJECT`` — fast-fail with :class:`~llmkit.exceptions.CircuitOpenError`
+      (OPEN within its cooldown, or HALF_OPEN with a probe already in flight).
+    """
+
+    NORMAL = "normal"
+    PROBE = "probe"
+    REJECT = "reject"
+
+
+class _CircuitState(enum.Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class _CircuitBreaker:
+    """Per-provider circuit breaker over the shared throttle/success stream.
+
+    The aggregate guard that complements AIMD: AIMD drives the per-provider limit
+    *toward* 1 under sustained pushback; the breaker is the "limit is effectively
+    0 for a cooldown" case — once a provider's throttle rate over a rolling window
+    crosses the trip threshold it **opens**, and while open the limiter fast-fails
+    every call with :class:`~llmkit.exceptions.CircuitOpenError` instead of letting
+    each one burn its retry budget into the storm.
+
+    One instance per provider *name* (like :class:`_AdaptiveState` and the
+    RPM/TPM buckets — not per loop), shared across every event loop and sync
+    thread. State is a ``CLOSED / OPEN / HALF_OPEN`` machine plus a count-based
+    ring of the last :data:`_BREAKER_WINDOW` real outcomes:
+
+    * **CLOSED** — admit normally; each real outcome (a throttle or a success;
+      an ambiguous neutral error, like AIMD, records nothing) is appended to the
+      ring. Once the ring is full and its throttled fraction reaches
+      :data:`_BREAKER_THRESHOLD`, **open** (clearing the ring) and arm the
+      cooldown.
+    * **OPEN** — reject every admission for :data:`_BREAKER_COOLDOWN` seconds.
+      The fast rejections feed nothing back (no real call ran).
+    * **HALF_OPEN** — the first admission after the cooldown becomes a single,
+      process-wide, lock-guarded **probe**; everyone else is rejected until it
+      resolves. The probe's outcome alone decides: a clean success **closes** the
+      breaker (and clears the ring); any failure — a throttle, a neutral error,
+      or cancellation before/while it ran — **re-opens** it and re-arms the
+      cooldown, so a probe can never wedge the breaker HALF_OPEN.
+
+    State is guarded by a plain :class:`threading.Lock` (shared safely across
+    loops and threads, exactly like :class:`_RateBucket` / :class:`_AdaptiveState`),
+    held only for O(1) work and **never across an await**. Each mutator returns
+    the :class:`BackpressureEvent` to emit (or ``None``) so the caller fires the
+    observability callback *outside* the lock. The clock is read through
+    :func:`_now`, so cooldown is deterministic under a monkeypatched clock.
+    """
+
+    def __init__(self, provider: str, ceiling: int) -> None:
+        self._provider: str = provider
+        # The breaker's own effective ceiling, reported on transitions so an
+        # event reads ceiling → 0 (open) → 1 (one probe) → ceiling (closed).
+        self._ceiling: int = ceiling
+        self._state: _CircuitState = _CircuitState.CLOSED
+        self._window: collections.deque[bool] = collections.deque(maxlen=_BREAKER_WINDOW)
+        # When the breaker last opened, for the cooldown comparison. ``-inf`` is
+        # unused while CLOSED (the state guard gates every read of it).
+        self._opened_at: float = float("-inf")
+        # Whether the single HALF_OPEN probe is currently out — the lock-guarded
+        # flag that keeps a second concurrent call (on any loop) from probing too.
+        self._probe_in_flight: bool = False
+        self._lock: threading.Lock = threading.Lock()
+
+    def admit(self) -> tuple[_Admit, BackpressureEvent | None]:
+        """Decide whether to admit one call, transitioning OPEN → HALF_OPEN if the
+        cooldown has elapsed. Returns the verdict and any transition event to emit.
+        """
+        with self._lock:
+            if self._state is _CircuitState.CLOSED:
+                return _Admit.NORMAL, None
+            if self._state is _CircuitState.OPEN:
+                if _now() - self._opened_at < _BREAKER_COOLDOWN:
+                    return _Admit.REJECT, None
+                # Cooldown elapsed: admit exactly one probe and announce HALF_OPEN.
+                self._state = _CircuitState.HALF_OPEN
+                self._probe_in_flight = True
+                return _Admit.PROBE, BackpressureEvent(self._provider, 0, 1, "breaker_half_open")
+            # HALF_OPEN: the probe is in flight (or, defensively, just resolved on
+            # another loop). Admit a probe only if none is out; otherwise reject.
+            if self._probe_in_flight:
+                return _Admit.REJECT, None
+            self._probe_in_flight = True
+            return _Admit.PROBE, None
+
+    def on_record(self, *, throttled: bool) -> BackpressureEvent | None:
+        """Account one *normal* (non-probe) call outcome; open if the ring trips.
+
+        Only the CLOSED path accumulates the ring: a normal call that was admitted
+        CLOSED but completes after the breaker has since opened (or a probe is
+        underway) does not disturb the decision — the probe owns the transition.
+        """
+        with self._lock:
+            if self._state is not _CircuitState.CLOSED:
+                return None
+            self._window.append(throttled)
+            if len(self._window) < _BREAKER_MIN_SAMPLES:
+                return None
+            throttled_fraction = sum(self._window) / len(self._window)
+            if throttled_fraction < _BREAKER_THRESHOLD:
+                return None
+            return self._open_locked()
+
+    def on_probe_success(self) -> BackpressureEvent | None:
+        """Resolve the HALF_OPEN probe with a clean success: close and clear."""
+        with self._lock:
+            self._probe_in_flight = False
+            if self._state is not _CircuitState.HALF_OPEN:
+                return None
+            self._state = _CircuitState.CLOSED
+            self._window.clear()
+            return BackpressureEvent(self._provider, 1, self._ceiling, "breaker_closed")
+
+    def on_probe_failure(self) -> BackpressureEvent | None:
+        """Resolve the HALF_OPEN probe with *any* failure (throttle, neutral error,
+        or cancellation before it ran): re-open and re-arm the cooldown.
+
+        Always releases the probe claim, so the breaker can never wedge HALF_OPEN.
+        """
+        with self._lock:
+            self._probe_in_flight = False
+            if self._state is not _CircuitState.HALF_OPEN:
+                return None
+            return self._open_locked()
+
+    def _open_locked(self) -> BackpressureEvent:
+        # Caller holds ``self._lock``. Transition to OPEN, arm the cooldown, and
+        # clear the ring so the next CLOSED period (after a probe closes it) starts
+        # fresh. ``old_limit`` is the ceiling for every open — the breaker collapses
+        # effective capacity to 0 regardless of whether it tripped from CLOSED or a
+        # failed probe re-opened it.
+        self._state = _CircuitState.OPEN
+        self._opened_at = _now()
+        self._window.clear()
+        return BackpressureEvent(self._provider, self._ceiling, 0, "breaker_open")
+
+
 class GlobalRateLimiter:
     """Process-global, per-provider rate limiter for LLM API calls.
 
@@ -659,6 +852,11 @@ class GlobalRateLimiter:
     # ``_get_async_gate``.
     _async_gates: dict[tuple[str, asyncio.AbstractEventLoop], _AdaptiveGate] = {}
     _adaptive_states: dict[str, _AdaptiveState] = {}
+    # Circuit breakers are keyed by provider *name* alone (like the adaptive
+    # states and buckets, not per-loop): the breaker's only state is the lock-
+    # guarded outcome window, which has no loop affinity, so one breaker per
+    # provider is shared across every loop and thread.
+    _breaker_states: dict[str, _CircuitBreaker] = {}
     _sync_semaphores: dict[str, threading.Semaphore] = {}
     _rpm_buckets: dict[str, _RateBucket] = {}
     _tpm_buckets: dict[str, _RateBucket] = {}
@@ -667,6 +865,7 @@ class GlobalRateLimiter:
     _tpm: int | None = None
     _enabled: bool = True
     _adaptive: bool = True
+    _breaker: bool = False
 
     @classmethod
     def configure(
@@ -676,15 +875,16 @@ class GlobalRateLimiter:
         rpm: int | None = None,
         tpm: int | None = None,
         adaptive: bool = True,
+        breaker: bool = False,
     ) -> None:
         """Configure the global per-provider rate limit.
 
         Intended to be called once at startup before any LLM calls run.
         Calling again resets every dimension and clears all limiter registries
-        (gates, adaptive states, RPM/TPM buckets), so the new limits apply to
-        *subsequent* acquires; in-flight callers continue to release on the gate
-        object (and debit the TPM bucket) they snapshotted at acquire time, so
-        reconfiguration is always safe.
+        (gates, adaptive states, circuit breakers, RPM/TPM buckets), so the new
+        limits apply to *subsequent* acquires; in-flight callers continue to
+        release on the gate object (and debit the TPM bucket) they snapshotted at
+        acquire time, so reconfiguration is always safe.
 
         Args:
             max_concurrent: Maximum concurrent LLM API calls **per provider**.
@@ -704,6 +904,14 @@ class GlobalRateLimiter:
                 once throttling stops; with no throttles it sits at the ceiling,
                 identical to a fixed cap. When ``False``, the limit is pinned at
                 ``max_concurrent`` (the pre-feature behaviour).
+            breaker: Whether the per-provider **circuit breaker** is armed — off
+                by default. When ``True``, once a provider's throttle rate over a
+                rolling window crosses the trip threshold the limiter fast-fails
+                that provider's calls with
+                :class:`~llmkit.exceptions.CircuitOpenError` for a cooldown (one
+                HALF_OPEN probe then tests recovery), reading the *same* unwrapped
+                outcome stream AIMD uses. Off by default because it flips
+                "eventually succeeds" → "fails fast"; the host opts in.
 
         Raises:
             ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` /
@@ -723,18 +931,22 @@ class GlobalRateLimiter:
             cls._rpm = rpm
             cls._tpm = tpm
             cls._adaptive = adaptive
+            cls._breaker = breaker
             cls._async_gates = {}
             cls._adaptive_states = {}
+            cls._breaker_states = {}
             cls._sync_semaphores = {}
             cls._rpm_buckets = {}
             cls._tpm_buckets = {}
         logger.info(
-            "Configured LLM rate limit: max_concurrent=%d, rpm=%s, tpm=%s, enabled=%s, adaptive=%s",
+            "Configured LLM rate limit: max_concurrent=%d, rpm=%s, tpm=%s, enabled=%s, "
+            + "adaptive=%s, breaker=%s",
             max_concurrent,
             rpm,
             tpm,
             enabled,
             adaptive,
+            breaker,
         )
 
     @classmethod
@@ -764,6 +976,24 @@ class GlobalRateLimiter:
     def adaptive(cls) -> bool:
         """Whether the per-provider concurrency limit adapts (AIMD) to overload."""
         return cls._adaptive
+
+    @classmethod
+    def breaker(cls) -> bool:
+        """Whether the per-provider circuit breaker is armed (opt-in)."""
+        return cls._breaker
+
+    @classmethod
+    def _get_breaker(cls, key: str) -> _CircuitBreaker:
+        # One breaker per provider name, shared across loops/threads (the breaker
+        # has no loop affinity — only a lock-guarded outcome window). Created at
+        # the current ceiling; a ``configure`` swap clears this registry so a new
+        # breaker picks up the new ceiling, exactly like ``_get_adaptive_state``.
+        with cls._lock:
+            breaker = cls._breaker_states.get(key)
+            if breaker is None:
+                breaker = _CircuitBreaker(provider=key, ceiling=cls._max_concurrent)
+                cls._breaker_states[key] = breaker
+            return breaker
 
     @classmethod
     def _get_adaptive_state_locked(cls, key: str) -> _AdaptiveState:
@@ -865,19 +1095,26 @@ class GlobalRateLimiter:
         ``provider_key`` is the provider name (``provider.name``, e.g.
         ``"OpenAI"``), matched case-insensitively (casefolded via
         :func:`_normalize_key` before touching any registry); each provider
-        has an independent budget on every dimension. Passes the request-rate
-        (RPM) and token-rate (TPM) gates first — so a caller doesn't hold a
-        scarce concurrency slot while waiting on a rate gate — then acquires the
-        adaptive concurrency gate. Yields a :class:`RateLimitSlot`; call its
-        :meth:`~RateLimitSlot.record_tokens` once the response's usage is known
-        to debit the TPM budget. A no-op (yields an inert slot) when disabled.
+        has an independent budget on every dimension. When the **circuit breaker**
+        is armed it is consulted *first* — before any gate — so a known-open
+        provider raises :class:`~llmkit.exceptions.CircuitOpenError` immediately,
+        holding no slot and deducting no RPM token. Otherwise the call passes the
+        request-rate (RPM) and token-rate (TPM) gates first — so a caller doesn't
+        hold a scarce concurrency slot while waiting on a rate gate — then
+        acquires the adaptive concurrency gate. Yields a :class:`RateLimitSlot`;
+        call its :meth:`~RateLimitSlot.record_tokens` once the response's usage is
+        known to debit the TPM budget. A no-op (yields an inert slot) when disabled.
 
         When ``adaptive`` is on, the call's outcome is observed at the ``yield``:
         a provider overload signal (429/503/529, **unwrapped** so a structured
         call's wrapped error is seen) received while saturated lowers the
-        provider's limit; a success recovers it over time toward the ceiling.
-        Cancellation while acquiring the rate/concurrency gates — before the slot
-        is held — refunds the deducted RPM token.
+        provider's limit; a success recovers it over time toward the ceiling. The
+        breaker, when armed, reads the *same* unwrapped outcome: a throttle or
+        success feeds its rolling window, and a HALF_OPEN probe's outcome decides
+        whether it closes or re-opens. Cancellation while acquiring the
+        rate/concurrency gates — before the slot is held — refunds the deducted
+        RPM token (and releases a HALF_OPEN probe claim, re-opening the breaker so
+        it never wedges).
         """
         # Unsynchronized read of _enabled is intentional: a concurrent
         # configure() flip only changes whether *this* call is bounded, and an
@@ -891,11 +1128,26 @@ class GlobalRateLimiter:
         tpm_bucket = cls._get_tpm_bucket(provider_key)
         gate = cls._get_async_gate(provider_key)
         adaptive = cls._adaptive
+        # Circuit breaker (opt-in) is consulted before any gate: a known-open
+        # provider fast-fails here, before the RPM/TPM/concurrency phase below
+        # deducts a token or holds a slot, so it occupies nothing while the
+        # provider is down. ``admit`` may transition OPEN -> HALF_OPEN and hand
+        # this call the single probe (``is_probe``); the probe's outcome alone
+        # closes or re-opens the breaker.
+        breaker = cls._get_breaker(provider_key) if cls._breaker else None
+        is_probe = False
+        if breaker is not None:
+            decision, transition = breaker.admit()
+            _emit_backpressure(transition)
+            if decision is _Admit.REJECT:
+                raise CircuitOpenError(provider_key)
+            is_probe = decision is _Admit.PROBE
         # Acquire phase — RPM gate, then TPM gate, then the concurrency gate. If
         # cancelled here (after the RPM token is deducted but before a slot is
         # held), refund the token so a systematically-cancelled workload doesn't
         # silently shrink its own effective RPM — compounding the backpressure
-        # that caused the cancellation.
+        # that caused the cancellation. A probe cancelled here never ran, so it
+        # is a probe failure: release the claim and re-open (no wedged breaker).
         rpm_debited = False
         try:
             if rpm_bucket is not None:
@@ -907,21 +1159,37 @@ class GlobalRateLimiter:
         except BaseException:
             if rpm_debited and rpm_bucket is not None:
                 rpm_bucket.refund(1.0)
+            if is_probe and breaker is not None:
+                _emit_backpressure(breaker.on_probe_failure())
             raise
-        # Slot held: classify the outcome for AIMD (the exception, if any,
-        # propagates back into this context manager at the ``yield``), then always
-        # release the slot. The classification fires the backpressure callback
-        # outside the gate/state locks.
+        # Slot held: classify the outcome for AIMD and the breaker (the exception,
+        # if any, propagates back into this context manager at the ``yield``), then
+        # always release the slot. Classification fires the backpressure callback
+        # outside the gate/breaker locks. A non-throttle ("neutral") error is
+        # ambiguous overload-wise, so — exactly as AIMD ignores it — it feeds
+        # neither the window nor recovery; a probe, however, must resolve on *any*
+        # outcome so it can never wedge HALF_OPEN.
         try:
             try:
                 yield RateLimitSlot(tpm_bucket)
             except BaseException as exc:
-                if adaptive and _is_throttle_signal(exc):
+                throttled = _is_throttle_signal(exc) if (adaptive or breaker is not None) else False
+                if adaptive and throttled:
                     _emit_backpressure(gate.on_throttle())
+                if breaker is not None:
+                    if is_probe:
+                        _emit_backpressure(breaker.on_probe_failure())
+                    elif throttled:
+                        _emit_backpressure(breaker.on_record(throttled=True))
                 raise
             else:
                 if adaptive:
                     _emit_backpressure(gate.on_success())
+                if breaker is not None:
+                    if is_probe:
+                        _emit_backpressure(breaker.on_probe_success())
+                    else:
+                        _emit_backpressure(breaker.on_record(throttled=False))
         finally:
             gate.release()
 
@@ -960,7 +1228,8 @@ class RateLimitConfig:
     Returned by :func:`get_rate_limit_config` so a host can log or assert its
     effective limits at startup without reaching into limiter internals.
     ``rpm`` / ``tpm`` are ``None`` when those opt-in dimensions are off;
-    ``adaptive`` is whether the concurrency limit adapts to provider overload.
+    ``adaptive`` is whether the concurrency limit adapts to provider overload;
+    ``breaker`` is whether the per-provider circuit breaker is armed (opt-in).
     """
 
     enabled: bool
@@ -968,6 +1237,7 @@ class RateLimitConfig:
     rpm: int | None
     tpm: int | None
     adaptive: bool
+    breaker: bool
 
 
 def configure_rate_limit(
@@ -976,15 +1246,16 @@ def configure_rate_limit(
     rpm: int | None = None,
     tpm: int | None = None,
     adaptive: bool = True,
+    breaker: bool = False,
 ) -> None:
     """Configure the global, per-provider LLM rate limit.
 
     Rate limiting is on by default (concurrency cap 8 per provider, adaptive; RPM
-    and TPM off). Call this to change the concurrency cap, turn limiting off, opt
-    into a per-provider requests-/tokens-per-minute ceiling, or turn off adaptive
-    concurrency. Call once at startup before any LLM calls run. When enabled,
-    every provider call routed through the LiteLLM call layer passes through that
-    provider's limiters.
+    and TPM off; circuit breaker off). Call this to change the concurrency cap,
+    turn limiting off, opt into a per-provider requests-/tokens-per-minute
+    ceiling, turn off adaptive concurrency, or arm the circuit breaker. Call once
+    at startup before any LLM calls run. When enabled, every provider call routed
+    through the LiteLLM call layer passes through that provider's limiters.
 
     The binding limit on a metered cloud account is usually RPM/TPM rather than
     concurrency: set ``rpm=`` / ``tpm=`` to your account's published per-minute
@@ -1001,6 +1272,16 @@ def configure_rate_limit(
     ``max_concurrent``, never above, so with no throttles it is identical to a
     fixed cap.
 
+    The circuit breaker (``breaker``, **off** by default) is the aggregate guard
+    for a provider that is *down*: armed, it fast-fails a provider's calls with
+    :class:`~llmkit.exceptions.CircuitOpenError` once that provider's throttle
+    rate over a rolling window crosses the trip threshold, for a cooldown, then
+    lets a single probe test recovery. It is opt-in — unlike adaptive concurrency
+    (which only ever *reduces* load and so is a safe default), the breaker flips
+    "eventually succeeds" → "fails fast", so the host decides. ``CircuitOpenError``
+    is in :data:`~llmkit.exceptions.LLM_RECOVERABLE_ERRORS` (a host's existing
+    degrade-on-503 ``except`` keeps catching it) but never retried by the library.
+
     Args:
         max_concurrent: Maximum concurrent API calls **per provider** (the
             ceiling the adaptive limit starts at and recovers toward).
@@ -1011,12 +1292,15 @@ def configure_rate_limit(
             the token-rate dimension off (the default).
         adaptive: Whether the concurrency limit adapts to provider overload
             (on by default). ``False`` pins it at ``max_concurrent``.
+        breaker: Whether the per-provider circuit breaker is armed (**off** by
+            default). ``True`` makes a known-down provider fail fast for a
+            cooldown instead of letting every call burn its retry budget.
 
     Raises:
         ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` / ``tpm``
             is set to a non-positive value.
     """
-    GlobalRateLimiter.configure(max_concurrent, enabled, rpm, tpm, adaptive)
+    GlobalRateLimiter.configure(max_concurrent, enabled, rpm, tpm, adaptive, breaker)
 
 
 def get_rate_limit_config() -> RateLimitConfig:
@@ -1030,8 +1314,8 @@ def get_rate_limit_config() -> RateLimitConfig:
     Returns:
         A :class:`RateLimitConfig` snapshot of the current ``enabled`` flag,
         per-provider ``max_concurrent`` cap, per-provider ``rpm`` / ``tpm``
-        limits (``None`` when those dimensions are off), and the ``adaptive``
-        flag.
+        limits (``None`` when those dimensions are off), the ``adaptive`` flag,
+        and the ``breaker`` flag.
     """
     return RateLimitConfig(
         enabled=GlobalRateLimiter.is_enabled(),
@@ -1039,6 +1323,7 @@ def get_rate_limit_config() -> RateLimitConfig:
         rpm=GlobalRateLimiter.rpm(),
         tpm=GlobalRateLimiter.tpm(),
         adaptive=GlobalRateLimiter.adaptive(),
+        breaker=GlobalRateLimiter.breaker(),
     )
 
 

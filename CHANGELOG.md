@@ -23,10 +23,28 @@ overload window that a fixed concurrency cap plus blind retries could not ride o
   *unwrapped* provider error, so structured calls (where the error arrives wrapped
   in `InstructorRetryException`) drive it too. `configure_rate_limit` gains an
   `adaptive=` parameter and `RateLimitConfig` an `adaptive` field.
+- **Per-provider circuit breaker, opt-in (off by default).** Arm it with
+  `configure_rate_limit(breaker=True)`. Once a provider's throttle rate over a
+  rolling window (the last 20 real outcomes, ≥ 50% throttled) trips it, the limiter
+  **fails fast** for that provider — raising `CircuitOpenError` immediately, holding
+  no concurrency slot and deducting no RPM token — for a 30s cooldown, after which a
+  single probe tests recovery (a clean success closes it, any failure re-opens). It
+  reads the *same* unwrapped per-provider outcome stream as adaptive concurrency, and
+  is the "limit is effectively 0 while the provider is down" case that AIMD's
+  floor-of-1 cannot express. **Off by default** because, unlike adaptive concurrency
+  (which only ever *reduces* load), it flips "eventually succeeds" → "fails fast" — the
+  host opts in. `CircuitOpenError` is a new fail-fast exception carrying `.provider`;
+  it joins `LLM_RECOVERABLE_ERRORS` (via a new `LLM_BACKPRESSURE_ERRORS` subset) so a
+  host's existing degrade-on-503 `except` keeps catching it, but it is **never
+  retried** by the library. `BackpressureEvent.reason` widens with `"breaker_open"` /
+  `"breaker_half_open"` / `"breaker_closed"`. New public symbols: `CircuitOpenError`,
+  `LLM_BACKPRESSURE_ERRORS`; `configure_rate_limit` gains a `breaker=` parameter and
+  `RateLimitConfig` a `breaker` field.
 - **Backpressure observability.** `backpressure_callback(cb)` installs a callback
   (a context var, like `retry_progress_callback`, so it crosses the `run_sync`
   boundary) that receives a `BackpressureEvent(provider, old_limit, new_limit,
-  reason)` on every adaptive limit change. New public symbols: `backpressure_callback`,
+  reason)` on every adaptive limit change (and, when the breaker is armed, every
+  breaker transition). New public symbols: `backpressure_callback`,
   `BackpressureCallback`, `BackpressureEvent`.
 - **`Retry-After` is honoured.** When a retried provider error carries a
   `Retry-After` (a `retry-after` / `retry-after-ms` header, an HTTP-date, or the
@@ -48,8 +66,11 @@ overload window that a fixed concurrency cap plus blind retries could not ride o
   effective RPM.
 
 No breaking changes: `adaptive` defaults on but can only reduce load below the
-existing cap; `RateLimitConfig` / `configure_rate_limit` gain trailing optional
-fields/parameters; `RetryPolicy` gains a trailing field.
+existing cap; the circuit breaker defaults **off** (a host arms it explicitly);
+`RateLimitConfig` / `configure_rate_limit` gain trailing optional fields/parameters;
+`RetryPolicy` gains a trailing field; `LLM_RECOVERABLE_ERRORS` keeps catching exactly
+what it did plus the new fail-fast `CircuitOpenError` (which only ever arises once a
+host opts into the breaker).
 
 ## [0.3.0] — 2026-06-15
 

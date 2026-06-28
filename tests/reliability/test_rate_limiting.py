@@ -249,6 +249,7 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     assert default.rpm is None  # opt-in dimensions off by default
     assert default.tpm is None
     assert default.adaptive is True  # adaptive concurrency on by default
+    assert default.breaker is False  # circuit breaker opt-in, off by default
 
     configure_rate_limit(max_concurrent=3, enabled=False, rpm=120, tpm=90_000)
     updated = get_rate_limit_config()
@@ -257,9 +258,14 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
     assert updated.rpm == 120
     assert updated.tpm == 90_000
     assert updated.adaptive is True  # unset -> stays on
+    assert updated.breaker is False  # unset -> stays off
 
     configure_rate_limit(adaptive=False)
     assert get_rate_limit_config().adaptive is False  # explicit opt-out reflected
+
+    configure_rate_limit(breaker=True)
+    assert get_rate_limit_config().breaker is True  # explicit opt-in reflected
+    assert get_rate_limit_config().adaptive is True  # breaker opt-in doesn't disturb adaptive
 
 
 class _AsyncFunctionProbe:
