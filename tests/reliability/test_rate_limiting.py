@@ -31,7 +31,7 @@ import collections
 import contextlib
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator
 from typing import override
 from unittest.mock import MagicMock, patch
 
@@ -559,6 +559,36 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
         time.sleep(0.001)
 
 
+@contextlib.contextmanager
+def _drained_on_exit(clock: dict[str, float]) -> Generator[list[threading.Thread]]:
+    """Yield a list to register each *started* sync-waiter thread in, and on exit
+    release and join them all — even when the body raised.
+
+    The sync-waiter tests park daemon worker threads spinning on a frozen, empty
+    bucket; only stepping ``clock`` frees them. Without this, an assertion that
+    fails before a test's own joins would strand those threads spinning for the
+    rest of the pytest session (perturbing later tests; the daemon flag only
+    keeps a stray one from wedging interpreter shutdown). Stepping the clock one
+    tick frees the current head — capacity caps the refill at a single token — so
+    repeat until every worker has exited, then join. Never raises: it runs in a
+    ``finally``, so a real test failure still surfaces from the body.
+    """
+    threads: list[threading.Thread] = []
+    try:
+        yield threads
+    finally:
+        for _ in range(len(threads) + 2):
+            alive = sum(t.is_alive() for t in threads)
+            if alive == 0:
+                break
+            clock["t"] += 1.0  # free one token → the current head deducts and exits
+            stalled = time.monotonic() + 1.0
+            while sum(t.is_alive() for t in threads) >= alive and time.monotonic() < stalled:
+                time.sleep(0.001)
+        for t in threads:
+            t.join(timeout=2.0)
+
+
 def _install_controlled_sleep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[list[asyncio.Future[None]], Callable[[], Awaitable[None]]]:
@@ -692,26 +722,26 @@ def test_rpm_bucket_serves_sync_waiters_fifo(monkeypatch: pytest.MonkeyPatch) ->
         with order_lock:
             order.append(i)
 
-    threads: list[threading.Thread] = []
-    for i in range(4):
-        thread = threading.Thread(target=waiter, args=(i,))
-        threads.append(thread)
-        thread.start()
-        _wait_until(lambda i=i: len(bucket._sync_waiters) == i + 1)  # queued in arrival order
+    with _drained_on_exit(clock) as threads:
+        for i in range(4):
+            thread = threading.Thread(target=waiter, args=(i,), daemon=True)
+            thread.start()
+            threads.append(thread)  # registered started, so a mid-test failure still drains it
+            _wait_until(lambda i=i: len(bucket._sync_waiters) == i + 1)  # queued in arrival order
 
-    assert order == []  # all four blocked on the empty bucket
+        assert order == []  # all four blocked on the empty bucket
 
-    for expected in range(4):
-        clock["t"] += 1.0  # +1000 tokens at 1000/s, capped to capacity 1 → one token
-        _wait_until(lambda e=expected: len(order) == e + 1)
-        with order_lock:
-            assert order == list(range(expected + 1))  # head served; the rest wait their turn
+        for expected in range(4):
+            clock["t"] += 1.0  # +1000 tokens at 1000/s, capped to capacity 1 → one token
+            _wait_until(lambda e=expected: len(order) == e + 1)
+            with order_lock:
+                assert order == list(range(expected + 1))  # head served; the rest wait their turn
 
-    for thread in threads:
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
-    assert order == [0, 1, 2, 3]
-    assert bucket._level == 0.0  # exactly four tokens consumed for four waiters
+        for thread in threads:
+            thread.join(timeout=2.0)
+            assert not thread.is_alive()
+        assert order == [0, 1, 2, 3]
+        assert bucket._level == 0.0  # exactly four tokens consumed for four waiters
 
 
 def test_sync_acquire_interrupt_does_not_wedge_queue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -755,33 +785,37 @@ def test_sync_acquire_interrupt_does_not_wedge_queue(monkeypatch: pytest.MonkeyP
             with order_lock:
                 order.append(name)
 
-    a = threading.Thread(target=waiter, args=("A",))
-    b = threading.Thread(target=waiter, args=("B",))
-    c = threading.Thread(target=waiter, args=("C",))
+    a = threading.Thread(target=waiter, args=("A",), daemon=True)
+    b = threading.Thread(target=waiter, args=("B",), daemon=True)
+    c = threading.Thread(target=waiter, args=("C",), daemon=True)
     # Patch the threading module's ``Event`` (what the bucket constructs tickets
     # from). Threads are built above, *before* this, so their own internal Events
     # stay real and only the bucket's three tickets become interrupting Events.
     monkeypatch.setattr(threading, "Event", _InterruptingEvent)
 
-    a.start()
-    _wait_until(lambda: len(bucket._sync_waiters) == 1)  # A is the head, spinning
+    with _drained_on_exit(clock) as threads:
+        a.start()
+        threads.append(a)
+        _wait_until(lambda: len(bucket._sync_waiters) == 1)  # A is the head, spinning
 
-    b.start()  # B enqueues behind A, then raises from wait() and removes itself
-    b.join(timeout=2.0)
-    assert not b.is_alive()
-    assert len(bucket._sync_waiters) == 1  # only A remains; B's exit did not wedge the queue
+        b.start()  # B enqueues behind A, then raises from wait() and removes itself
+        threads.append(b)
+        b.join(timeout=2.0)
+        assert not b.is_alive()
+        assert len(bucket._sync_waiters) == 1  # only A remains; B's exit did not wedge the queue
 
-    c.start()
-    _wait_until(lambda: len(bucket._sync_waiters) == 2)  # C queued behind A
+        c.start()
+        threads.append(c)
+        _wait_until(lambda: len(bucket._sync_waiters) == 2)  # C queued behind A
 
-    clock["t"] += 1.0  # release a token → A served, hands the baton to C (not to dead B)
-    _wait_until(lambda: len(order) == 1)
-    clock["t"] += 1.0  # C served next — proof B's interrupt never stranded it
-    _wait_until(lambda: len(order) == 2)
+        clock["t"] += 1.0  # release a token → A served, hands the baton to C (not to dead B)
+        _wait_until(lambda: len(order) == 1)
+        clock["t"] += 1.0  # C served next — proof B's interrupt never stranded it
+        _wait_until(lambda: len(order) == 2)
 
-    a.join(timeout=2.0)
-    c.join(timeout=2.0)
-    assert order == ["A", "C"]  # B interrupted; A and C served in order, queue intact
+        a.join(timeout=2.0)
+        c.join(timeout=2.0)
+        assert order == ["A", "C"]  # B interrupted; A and C served in order, queue intact
 
 
 def test_sync_acquire_enqueue_window_exception_leaves_no_orphan(
