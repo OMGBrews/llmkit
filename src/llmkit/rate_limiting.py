@@ -75,7 +75,8 @@ concurrency cap alone leaves an old RPM tuning inert).
 
 A single ``max_concurrent`` / ``rpm`` / ``tpm`` value applies to *all*
 providers; there is intentionally no per-provider cap map, to keep the public
-surface small (three numbers, one switch).
+surface small (three numbers, three switches: ``enabled`` / ``adaptive`` /
+``breaker``).
 
 Token bucket, not sliding window
 --------------------------------

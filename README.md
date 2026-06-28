@@ -284,7 +284,7 @@ except CircuitOpenError as exc:
     ...  # the breaker is open for exc.provider — fall back fast, don't hammer it
 ```
 
-It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it** — retrying a circuit you already know is open would defeat the point. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and two switches."
+It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it** — retrying a circuit you already know is open would defeat the point. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and three switches" (`enabled` / `adaptive` / `breaker`).
 
 #### Joining the global rate limit directly
 
