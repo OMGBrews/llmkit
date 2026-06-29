@@ -1,13 +1,13 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to its *native* JSON-schema mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs truncated JSON. You pass a Pydantic model; you get a validated instance back.
-- **Provider switching is config, not code.** OpenRouter / Google / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch.
+- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -33,20 +33,25 @@ a clear one-line redirect to `import llmkit`, not a bare
 
 Requires Python ≥ 3.13.
 
-The core install routes OpenRouter, Google, OpenAI, DeepSeek, and Ollama with no
-extra dependencies. Two providers gate their dependencies behind opt-in extras so
-hosts pay only for what they call:
+The core install routes OpenRouter, Google AI Studio, OpenAI, DeepSeek, and Ollama
+with no extra dependencies. Three providers gate their dependencies behind opt-in
+extras so hosts pay only for what they call:
 
 ```bash
 pip install "omg-llmkit[anthropic]"  # direct Anthropic (Claude) routing
 pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (pulls in [anthropic] too)
+pip install "omg-llmkit[vertex]"     # Gemini via Google Cloud Vertex AI
 ```
 
 The Anthropic SDK is opt-in because `instructor` reaches it only at *call time*,
 on its `ANTHROPIC_JSON` usage-accounting path — plain `import llmkit` and a
-Google-only flow never touch it. Constructing the `AnthropicProvider` or
+Google-AI-Studio-only flow never touch it. Constructing the `AnthropicProvider` or
 `BedrockProvider` without the SDK raises a clear `install omg-llmkit[anthropic]`
-error at construction, not a cryptic failure on the first call.
+error at construction, not a cryptic failure on the first call. Vertex is the same
+shape: its `[vertex]` extra pulls only `google-auth` (LiteLLM mints the Vertex
+OAuth token through it), and constructing the `VertexProvider` without it raises a
+clear `install omg-llmkit[vertex]` error — a non-Vertex host takes on no Google
+dependency.
 
 ## Quick start
 
@@ -434,12 +439,14 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None
     base_url: str | None = None      # OpenRouter / OpenAI-compatible endpoints; unused by Google/Anthropic
     reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
     aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
+    vertex_project: str | None = None    # Vertex AI GCP project; unused by every other provider
+    vertex_location: str | None = None   # Vertex AI region (data residency); unused by every other provider
 ```
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
@@ -449,6 +456,14 @@ pip install "omg-llmkit[bedrock]"
 ```
 
 The default model is Claude Haiku 4.5 via its **cross-region inference profile** id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on Bedrock are typically reached through inference profiles rather than plain on-demand ids. Pass a different profile- or partition-prefixed id as `model` (e.g. `eu.anthropic.claude-...`) when your account routes elsewhere.
+
+`vertex_project` and `vertex_location` are the Vertex AI analog and are unused by every other provider. Vertex reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Vertex routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
+
+```bash
+pip install "omg-llmkit[vertex]"
+```
+
+**`vertex_location` is the data-processing residency control.** It selects the regional endpoint (`<location>-aiplatform.googleapis.com`) where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. The default model is Gemini 2.5 Flash-Lite (parity with the AI Studio provider). As with AI Studio, Gemini 2.5 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
@@ -478,11 +493,12 @@ result = structured_llm_call_sync(
 ```
 
 `make_provider` accepts the knobs each provider actually reads —
-`api_key`, `model`, `base_url`, `reasoning_effort`, `aws_region_name` — and
-ignores the ones a given provider doesn't use (e.g. `base_url` for Anthropic,
-`api_key` for Ollama or Bedrock, which signs via the ambient AWS credential
-chain). Leave `model` unset to inherit the provider's own default; the assembled
-LiteLLM id is always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
+`api_key`, `model`, `base_url`, `reasoning_effort`, `aws_region_name`,
+`vertex_project`, `vertex_location` — and ignores the ones a given provider
+doesn't use (e.g. `base_url` for Anthropic, `api_key` for Ollama or Bedrock,
+which signs via the ambient AWS credential chain, or for Vertex, which signs via
+Google ADC). Leave `model` unset to inherit the provider's own default; the
+assembled LiteLLM id is always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
 
 **A fully per-call host needs no global config at all.** If you pass `provider=`
 on *every* call, you don't have to call `configure_llm_client(...)` — there is no

@@ -26,6 +26,7 @@ from llmkit.providers import (
     OpenAIProvider,
     OpenRouterProvider,
     Provider,
+    VertexProvider,
     build_provider,
     make_provider,
 )
@@ -108,6 +109,21 @@ def test_make_provider_bedrock_region_only() -> None:
     assert provider.completion_kwargs() == {"aws_region_name": "us-east-1"}
 
 
+def test_make_provider_vertex_project_and_location_only() -> None:
+    """Vertex takes project + location, never an ``api_key`` (ambient ADC signs)."""
+    provider = make_provider(
+        Provider.VERTEX,
+        model="gemini-2.5-flash",
+        vertex_project="proj-123",
+        vertex_location="europe-west4",
+    )
+    assert isinstance(provider, VertexProvider)
+    assert provider.completion_kwargs() == {
+        "vertex_project": "proj-123",
+        "vertex_location": "europe-west4",
+    }
+
+
 def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
     """Bedrock's eager anthropic+boto3 checks succeed in the dev env.
 
@@ -131,6 +147,7 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
         (Provider.OPENAI, "openai/", "gpt-4.1-mini"),
         (Provider.DEEPSEEK, "deepseek/", "deepseek-chat"),
         (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+        (Provider.VERTEX, "vertex_ai/", "gemini-2.5-flash-lite"),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(

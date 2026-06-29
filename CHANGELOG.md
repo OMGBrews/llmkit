@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Google Vertex AI provider (`Provider.VERTEX` / `VertexProvider`).** A second
+  path to the same Gemini models the `GOOGLE` (AI Studio) provider reaches, now
+  through Google Cloud — the AI Studio ↔ Vertex split mirrors the existing
+  Anthropic ↔ Bedrock one. Routes `vertex_ai/<model>` and pins Gemini's native
+  `Mode.JSON_SCHEMA` for structured output. Like Bedrock it carries **no bearer
+  key**: Google credentials resolve from **Application Default Credentials**
+  (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a
+  workload-identity / metadata-server token), never through `LLMClientConfig`.
+- **`vertex_location` data-residency selection.** `LLMClientConfig` gains
+  `vertex_project` and `vertex_location` (and `make_provider` the matching
+  keyword args); both are unused by every other provider. `vertex_location`
+  selects the regional endpoint (`<location>-aiplatform.googleapis.com`) where the
+  request is processed, so a regional value (e.g. `"europe-west4"`) pins in-region
+  processing — the Vertex analog of Bedrock's `aws_region_name`. Left `None`, both
+  resolve from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the
+  location otherwise falling back to Google's default region. Default model is
+  Gemini 2.5 Flash-Lite (parity with the AI Studio provider).
+- **`omg-llmkit[vertex]` opt-in extra.** Pulls only `google-auth` (the minimal
+  credential dep LiteLLM's gemini-on-Vertex path imports to mint its OAuth token —
+  not the heavier `google-cloud-aiplatform`), so a non-Vertex host takes on no
+  Google dependency. Constructing `VertexProvider` without it raises a clear
+  `install omg-llmkit[vertex]` error eagerly at construction. Also pulled into the
+  `all` extra. New public symbol: `VertexProvider` (from `llmkit.providers`).
+
 ## [0.4.0] — 2026-06-28
 
 Adaptive backpressure: the rate limiter now reacts to provider overload instead of

@@ -55,7 +55,17 @@ def _require_sdk(
     optional trailing sentence appended to the message (e.g. to cross-reference
     a related extra).
     """
-    if importlib.util.find_spec(import_name) is None:
+    try:
+        spec = importlib.util.find_spec(import_name)
+    except ModuleNotFoundError:
+        # A dotted ``import_name`` (e.g. ``google.auth``) makes ``find_spec``
+        # import the parent package first; when the parent itself is absent it
+        # raises ``ModuleNotFoundError`` rather than returning ``None``. Treat
+        # that as "not installed" so the actionable message below fires either
+        # way (a plain top-level name like ``boto3`` returns ``None`` and never
+        # reaches here, so existing callers are unaffected).
+        spec = None
+    if spec is None:
         message = (
             f"The {provider_name} provider requires {label or import_name}, which is "
             "not installed. It ships in an opt-in extra so hosts that don't use "
@@ -106,6 +116,32 @@ def require_boto3_sdk(provider_name: str) -> None:
     )
 
 
+def require_google_auth_sdk(provider_name: str) -> None:
+    """Raise a clear, actionable error if ``google-auth`` is not installed.
+
+    LiteLLM's ``vertex_ai/`` path signs Gemini-on-Vertex requests with a Google
+    OAuth access token that it mints and refreshes through ``google.auth`` (the
+    Application Default Credentials chain), so the Vertex provider needs it at
+    call time. It is the minimal credential dependency the gemini-on-Vertex chat
+    path actually imports — deliberately **not** the much heavier
+    ``google-cloud-aiplatform`` (which targets instructor's ``from_vertexai``
+    google-SDK client, a path this library does not use). It ships in the opt-in
+    ``omg-llmkit[vertex]`` extra rather than the core install. Call this at
+    provider construction so a missing ``google-auth`` fails *eagerly* with a
+    fix, instead of as a cryptic ``ModuleNotFound`` deep on the first completion.
+    """
+    _require_sdk(
+        "google.auth",
+        provider_name=provider_name,
+        extra="vertex",
+        label="the google-auth library (google.auth)",
+        note=(
+            "(google-auth mints and refreshes the OAuth access token LiteLLM "
+            "signs Vertex AI requests with, via Application Default Credentials.)"
+        ),
+    )
+
+
 class Provider(StrEnum):
     """LLM providers the library can route to.
 
@@ -119,6 +155,7 @@ class Provider(StrEnum):
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
     BEDROCK = "bedrock"
+    VERTEX = "vertex"
 
 
 @dataclass(frozen=True)
@@ -160,6 +197,21 @@ class LLMClientConfig:
     chain** — environment, shared config, or instance/role — so they never
     pass through ``LLMClientConfig``. Leave it ``None`` to let the region
     resolve from the chain too (``AWS_REGION_NAME`` / ``AWS_REGION``).
+
+    ``vertex_project`` and ``vertex_location`` are the Vertex AI analog of
+    ``aws_region_name`` and are unused by every other provider. They are the
+    only Vertex-shaped fields on purpose: like Bedrock, the Vertex provider
+    carries **no secret** here — Google credentials resolve from **Application
+    Default Credentials** (``gcloud auth application-default login``,
+    ``GOOGLE_APPLICATION_CREDENTIALS``, or a workload-identity/metadata-server
+    token), never through ``LLMClientConfig``. ``vertex_location`` is the
+    **data-processing residency** control: it selects the regional endpoint
+    (``<location>-aiplatform.googleapis.com``) where the request runs, so a
+    regional value (e.g. ``"europe-west4"``) pins in-region processing while
+    the ``"global"`` endpoint gives no residency guarantee. Leave either
+    ``None`` to let it resolve from the environment (``VERTEXAI_PROJECT`` /
+    ``VERTEXAI_LOCATION``), with the location otherwise falling back to
+    Google's default region.
     """
 
     provider: Provider
@@ -168,6 +220,8 @@ class LLMClientConfig:
     base_url: str | None = None
     reasoning_effort: str | None = None
     aws_region_name: str | None = None
+    vertex_project: str | None = None
+    vertex_location: str | None = None
 
 
 # Module-level config source, registered once by the host application at a

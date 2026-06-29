@@ -11,7 +11,7 @@ requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "OMGBrews" }]
-keywords = ["llm", "litellm", "instructor", "structured-output", "openai", "anthropic", "gemini", "bedrock", "aws"]
+keywords = ["llm", "litellm", "instructor", "structured-output", "openai", "anthropic", "gemini", "bedrock", "aws", "vertex-ai", "google-cloud"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -52,17 +52,31 @@ bedrock = [
     "boto3>=1.34",
     "omg-llmkit[anthropic]",
 ]
+# Google Vertex AI routing. LiteLLM's vertex_ai/ path mints and refreshes the
+# Google OAuth access token it signs Gemini-on-Vertex requests with through
+# `google.auth` (the Application Default Credentials chain), so the Vertex
+# provider needs `google-auth` at call time. It is opt-in so non-Vertex installs
+# take on no Google dependency, and the VertexProvider raises a clear "install
+# omg-llmkit[vertex]" error at construction when it is absent. Deliberately just
+# `google-auth` (the minimal credential dep the gemini-on-Vertex chat path
+# imports), not the much heavier `google-cloud-aiplatform`, which targets
+# instructor's `from_vertexai` client — a path this library does not use.
+vertex = [
+    "google-auth>=2.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "ruff==0.15.0",
     "basedpyright>=1.39",
-    # The offline test suite imports the Anthropic and Bedrock providers and
-    # exercises their construction, which eagerly check for the Anthropic SDK
-    # and (for Bedrock) boto3. Pull in the `bedrock` extra — which itself
-    # includes `anthropic` — so both deps are present for dev/CI and
-    # `uv sync --extra dev` yields a fully green suite.
+    # The offline test suite imports the Anthropic, Bedrock, and Vertex providers
+    # and exercises their construction, which eagerly check for the Anthropic SDK
+    # / boto3 (Bedrock) and google-auth (Vertex). Pull in the `bedrock` extra —
+    # which itself includes `anthropic` — and `vertex`, so every provider's
+    # construction dependency is present for dev/CI and `uv sync --extra dev`
+    # yields a fully green suite.
     "omg-llmkit[bedrock]",
+    "omg-llmkit[vertex]",
 ]
 # Convenience: pull in every optional provider dependency at once, so a host
 # that wants the full provider surface can `pip install 'omg-llmkit[all]'`
@@ -70,6 +84,7 @@ dev = [
 all = [
     "omg-llmkit[anthropic]",
     "omg-llmkit[bedrock]",
+    "omg-llmkit[vertex]",
 ]
 
 [project.urls]

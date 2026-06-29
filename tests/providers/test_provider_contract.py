@@ -32,6 +32,7 @@ from llmkit.providers import (
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
+    VertexProvider,
 )
 from llmkit.providers.base import BaseProvider
 
@@ -46,6 +47,7 @@ _SHIPPED_PROVIDERS = [
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
+    VertexProvider,
 ]
 
 

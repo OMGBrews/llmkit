@@ -3,9 +3,9 @@
 Public facade for the provider layer. The provider-agnostic core lives in
 :mod:`llmkit.providers.base`; each concrete provider lives in its own
 sibling module (``openrouter``, ``ollama``, ``google``, ``anthropic``,
-``openai``, ``deepseek``, ``bedrock``). This package is the **single
-place** that imports every provider module and maps a :class:`Provider`
-to its implementation.
+``openai``, ``deepseek``, ``bedrock``, ``vertex``). This package is the
+**single place** that imports every provider module and maps a
+:class:`Provider` to its implementation.
 
 Adding a provider: create a ``providers/<name>.py`` with a
 :class:`BaseProvider` subclass and a ``build(config)`` classmethod, then
@@ -36,6 +36,7 @@ from llmkit.providers.google import GoogleProvider
 from llmkit.providers.ollama import OllamaProvider
 from llmkit.providers.openai import OpenAIProvider
 from llmkit.providers.openrouter import OpenRouterProvider
+from llmkit.providers.vertex import VertexProvider
 
 
 def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
@@ -76,6 +77,8 @@ def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
             return DeepSeekProvider.build(config)
         case Provider.BEDROCK:
             return BedrockProvider.build(config)
+        case Provider.VERTEX:
+            return VertexProvider.build(config)
     # Every Provider member is handled above, so the subject narrows to Never
     # here. assert_never makes that a *static* guarantee: basedpyright reports
     # a type error if a newly-added Provider member is missing its case, and it
@@ -91,6 +94,8 @@ def make_provider(
     base_url: str | None = None,
     reasoning_effort: str | None = None,
     aws_region_name: str | None = None,
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
 ) -> BaseProvider:
     """Construct a provider directly from raw credentials.
 
@@ -109,9 +114,10 @@ def make_provider(
 
     The accepted knobs mirror the fields each concrete provider reads;
     irrelevant ones are simply ignored (e.g. ``base_url`` for Anthropic,
-    ``api_key`` for Ollama/Bedrock). A falsy ``model`` resolves to the
-    provider's own default, so the assembled LiteLLM id is always
-    well-formed.
+    ``api_key`` for Ollama/Bedrock/Vertex, ``aws_region_name`` for
+    everything but Bedrock, ``vertex_project`` / ``vertex_location`` for
+    everything but Vertex). A falsy ``model`` resolves to the provider's own
+    default, so the assembled LiteLLM id is always well-formed.
 
     Args:
         provider: Which provider to construct.
@@ -125,6 +131,11 @@ def make_provider(
             ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; ignored by every other
             provider.
+        vertex_project: GCP project id for Vertex AI; ignored by every other
+            provider. ``None`` resolves from the environment / ADC.
+        vertex_location: Vertex AI region — the data-residency control;
+            ignored by every other provider. ``None`` resolves from the
+            environment, else Google's default region.
 
     Returns:
         A constructed provider, ready to pass as a per-call ``provider=``.
@@ -146,6 +157,8 @@ def make_provider(
         base_url=base_url,
         reasoning_effort=reasoning_effort,
         aws_region_name=aws_region_name,
+        vertex_project=vertex_project,
+        vertex_location=vertex_location,
     )
     return build_provider(config)
 
@@ -182,6 +195,7 @@ __all__ = [
     "OpenAIProvider",
     "DeepSeekProvider",
     "BedrockProvider",
+    "VertexProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

@@ -41,6 +41,7 @@ Provider -> credential it reads:
     DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
     Ollama      (local server on :11434)    https://ollama.com  (no key)
     Bedrock     AWS chain + AWS_REGION_NAME https://console.aws.amazon.com  (see below)
+    Vertex      Google ADC + VERTEXAI_*     https://console.cloud.google.com  (see below)
 
 Ollama reads no key — it needs a reachable server instead. Point ``OLLAMA_HOST``
 at it (default ``http://localhost:11434``); in the maintainer devcontainer
@@ -56,6 +57,18 @@ bedrock``) and export ``AWS_REGION_NAME`` plus ambient AWS credentials to run
 it; once boto3 is present, a missing region/credential is a hard failure like
 every other provider, not a skip. Secrets come from the AWS chain — they are
 never passed through ``LLMClientConfig``.
+
+Vertex AI is the same kind of structural exception. It needs both a GCP project
+*and* the optional ``google-auth`` dependency (``omg-llmkit[vertex]``), so its
+test is gated with ``pytest.importorskip("google.auth")``. Install the extra
+(``uv sync --extra dev`` already pulls it) and export ``VERTEXAI_PROJECT`` /
+``VERTEXAI_LOCATION`` plus resolvable Application Default Credentials
+(``gcloud auth application-default login``) to run it; once google-auth is
+present, a missing project/location/credential is a hard failure like every
+other provider, not a skip. Credentials come from the ADC chain — they are
+never passed through ``LLMClientConfig``; ``vertex_location`` selects the
+data-residency region. This is also where the ``Mode.JSON_SCHEMA`` pin for
+Vertex Gemini is *measured*, not trusted.
 """
 
 from __future__ import annotations
@@ -79,6 +92,7 @@ from llmkit.providers import (
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
+    VertexProvider,
 )
 
 # Every test in this module makes a real API call. The marker is what the
@@ -102,6 +116,18 @@ class _Boto3Module(Protocol):
     """
 
     def Session(self) -> _Boto3Session: ...
+
+
+class _GoogleAuthModule(Protocol):
+    """Typed view of the dynamically-imported ``google.auth`` module.
+
+    ``google.auth.default()`` resolves the ambient Application Default
+    Credentials, returning ``(credentials, project_id)`` or raising when none
+    resolve. Narrowing the ``importorskip`` result to this Protocol keeps the
+    credential probe precisely typed instead of leaking ``reportAny``.
+    """
+
+    def default(self) -> tuple[object, object]: ...
 
 
 class CountryProfile(BaseModel):
@@ -138,6 +164,9 @@ _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
 # profile. Override with another profile- or partition-prefixed id (e.g.
 # ``eu.anthropic.claude-...``) when the account routes elsewhere.
 _BEDROCK_MODEL = os.getenv("BEDROCK_SMOKE_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+# Gemini on Vertex: same model family as the AI Studio smoke model. Override
+# with another Vertex-available Gemini id if the project lacks access.
+_VERTEX_MODEL = os.getenv("VERTEX_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 # Where the Ollama server lives. Default is an in-process localhost server; in
 # the maintainer devcontainer Ollama runs on the *host*, so the container sets
@@ -286,4 +315,37 @@ async def test_bedrock_live() -> None:
     # Secrets resolve from the ambient AWS chain; only the region is explicit.
     await _assert_structured_roundtrip(
         BedrockProvider(model=_BEDROCK_MODEL, aws_region_name=region)
+    )
+
+
+@pytest.mark.asyncio
+async def test_vertex_live() -> None:
+    # google-auth ships only with the optional `omg-llmkit[vertex]` extra.
+    # Skipping when it's absent is a *structural* gate (the dependency isn't
+    # installed), not the env-driven mode switch this module forbids — and Vertex
+    # uniquely needs both that extra and a GCP project, which plain `--run-live`
+    # cannot assume. Once the extra IS installed, the usual hard-fail rule
+    # applies: a missing project/location/credential fails the test, not skips it.
+    google_auth = cast(
+        "_GoogleAuthModule",
+        pytest.importorskip("google.auth", reason="install omg-llmkit[vertex] for live Vertex"),
+    )
+    project = os.getenv("VERTEXAI_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("VERTEXAI_LOCATION")
+    if not project:
+        _missing("VERTEXAI_PROJECT (or GOOGLE_CLOUD_PROJECT) not set")
+    if not location:
+        _missing("VERTEXAI_LOCATION not set (it selects the data-residency region)")
+    try:
+        # Only the no-raise matters: this resolves the ambient ADC or errors.
+        _ = google_auth.default()
+    except Exception:  # google.auth.exceptions.DefaultCredentialsError and friends
+        _missing("no resolvable Google ADC (run `gcloud auth application-default login`)")
+    # Credentials resolve from the ambient ADC chain; only project + the
+    # residency location are explicit. Gemini 2.5 thinks by default — disable it
+    # so the smoke call doesn't burn reasoning tokens on a trivial prompt. This
+    # call is what *measures* the Mode.JSON_SCHEMA pin against live Vertex.
+    await _assert_structured_roundtrip(
+        VertexProvider(model=_VERTEX_MODEL, vertex_project=project, vertex_location=location),
+        reasoning_effort="disable",
     )
