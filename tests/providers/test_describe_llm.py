@@ -44,3 +44,14 @@ def test_describe_llm_marks_only_ollama_local() -> None:
 
     google = describe_llm(LLMClientConfig(provider=Provider.GOOGLE, api_key="k"))
     assert google.is_local is False
+
+
+def test_describe_llm_snapshots_vertex() -> None:
+    """Vertex resolves its name + default model in the snapshot; residency
+    fields don't affect the read accessor (they're routing, not display)."""
+    info = describe_llm(LLMClientConfig(provider=Provider.VERTEX, vertex_location="europe-west4"))
+    assert isinstance(info, LLMInfo)
+    assert info.provider == Provider.VERTEX
+    assert info.provider_name == "Google Vertex AI"
+    assert info.model == "gemini-2.5-flash-lite"
+    assert info.is_local is False
