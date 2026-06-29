@@ -39,7 +39,12 @@ class VertexProvider(BaseProvider):
     the regional endpoint (``<location>-aiplatform.googleapis.com``) where the
     request is processed. Pass a regional value (e.g. ``"europe-west4"``,
     ``"asia-northeast1"``) to pin in-region processing; the ``"global"`` endpoint
-    gives no residency guarantee.
+    gives no residency guarantee. Note Gemini availability is **region-specific**,
+    so a region chosen for residency may not host every model — including the
+    ``gemini-2.5-flash-lite`` default. A model not deployed in the region fails
+    with a Vertex ``400 FAILED_PRECONDITION`` ("Precondition check failed."), an
+    *availability* error distinct from auth/permission failures; pass a ``model``
+    the region actually serves.
 
     Structured output is pinned to ``instructor.Mode.JSON_SCHEMA`` — Gemini's
     native JSON-schema mode, the same mode the direct ``GoogleProvider`` pins,

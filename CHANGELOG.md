@@ -24,7 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   processing — the Vertex analog of Bedrock's `aws_region_name`. Left `None`, both
   resolve from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the
   location otherwise falling back to Google's default region. Default model is
-  Gemini 2.5 Flash-Lite (parity with the AI Studio provider).
+  Gemini 2.5 Flash-Lite (parity with the AI Studio provider). Note Gemini
+  availability is region-specific: a region chosen for residency may not host
+  every model (incl. the flash-lite default) — an unavailable model returns a
+  Vertex `400 FAILED_PRECONDITION`, so pin a `model` the region serves.
 - **`omg-llmkit[vertex]` opt-in extra.** Pulls only `google-auth` (the minimal
   credential dep LiteLLM's gemini-on-Vertex path imports to mint its OAuth token —
   not the heavier `google-cloud-aiplatform`), so a non-Vertex host takes on no
