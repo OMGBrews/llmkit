@@ -13,7 +13,12 @@ Two budgets, kept separate: *transport* failures (rate limits, transient
 5xx, network/timeout) get the full :attr:`RetryPolicy.max_attempts` budget;
 *schema-validation* failures get the lower
 :attr:`RetryPolicy.validation_max_attempts` budget, so a deterministic schema
-failure can't burn the full transport budget on doomed re-asks.
+failure can't burn the full transport budget on doomed re-asks. A third class
+gets **zero budget**: an output-limit truncation
+(:class:`~llmkit.exceptions.OutputLimitError`) propagates immediately under
+every configuration — including ``retry_on=None`` — because a re-ask with an
+identical token budget can only truncate again; only a ``retry_on`` that
+explicitly lists the type opts back in.
 
 Composing :func:`with_retries` around a call function that *already* retries
 (every call function does, by default) would otherwise multiply the budgets
@@ -39,6 +44,7 @@ import httpx
 from pydantic import ValidationError
 
 from llmkit.exceptions import (
+    LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
     underlying_provider_error,
@@ -186,10 +192,18 @@ class RetryPolicy:
     whichever budget matches its class, and the call stops when *that*
     budget is spent.
 
+    **One class gets zero budget.** An output-limit truncation
+    (:class:`~llmkit.exceptions.OutputLimitError`, ``finish_reason='length'``)
+    is retried on *neither* budget and propagates immediately: a re-ask with
+    an identical token budget can only truncate again, so neither a fresh
+    connection nor a schema repair can help. Listing the type explicitly in
+    ``retry_on`` opts back in.
+
     This layer is kept deliberately separate from instructor's in-call
-    schema-repair budget (``max_retries=2``: two attempts total, i.e. one
-    schema-repair re-ask per call) — the two are never conflated, so attempts
-    are not double-counted *within* one call.
+    schema-repair budget (two attempts total, i.e. one schema-repair re-ask
+    per call — which itself refuses the re-ask for a length truncation) — the
+    two are never conflated, so attempts are not double-counted *within* one
+    call.
     Note the layering at the seam: when instructor exhausts its own repair
     budget it raises ``InstructorRetryException``, which is in
     :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS` — so a persistent schema
@@ -456,7 +470,12 @@ async def with_retries[T](
             failures are charged the lower validation budget. A wrapped cause
             that is neither transport- nor schema-shaped (a permanent
             401/400/403) propagates immediately under every configuration,
-            unless ``retry_on`` explicitly lists the wrapper type.
+            unless ``retry_on`` explicitly lists the wrapper type. An
+            output-limit truncation
+            (:class:`~llmkit.exceptions.OutputLimitError`) likewise propagates
+            immediately even with ``retry_on=None`` — an identical token
+            budget can only truncate again — unless ``retry_on`` explicitly
+            lists the type.
         validation_max_attempts: Total number of *schema-validation*
             attempts (1 = no retry). When set together with
             ``validation_retry_on``, failures matching that tuple are charged
@@ -528,6 +547,21 @@ async def with_retries[T](
                 # wrapped schema failure (or an inner error in neither set)
                 # still falls through to the validation budget below.
                 cause = underlying_provider_error(e)
+                # Output-limit truncations are permanent under every
+                # configuration, including retry_on=None ("retry on any
+                # Exception"): a truncated generation retried with an identical
+                # token budget can only truncate again, so without this guard
+                # the bare OutputLimitError would fall into the retry-anything
+                # branch below and burn the full transport budget on doomed
+                # re-asks. Checked on the unwrapped cause for defense in depth
+                # (the transport raises it bare today; a wrapped form would
+                # also fail fast via wraps_permanent_cause below). A retry_on
+                # that explicitly lists the type still wins, matching the
+                # wraps_permanent_cause escape.
+                if isinstance(cause, LLM_OUTPUT_LIMIT_ERRORS) and (
+                    retry_on is None or not isinstance(e, retry_on)
+                ):
+                    raise
                 # With retry_on=None ("retry on any Exception") the routing
                 # still needs a transport set to classify the unwrapped cause
                 # against — otherwise a wrapped 429/network blip would match

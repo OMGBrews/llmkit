@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-07-12
+
+Structured calls now **fail fast on output-token-limit truncation**
+(`finish_reason='length'`) instead of blindly re-asking with the same budget.
+
+### Changed
+
+- **A length-truncated structured completion is no longer re-asked in-call.**
+  Previously instructor's in-call repair loop (two total attempts) retried a
+  truncation exactly like a malformed-JSON response — but a re-ask with an
+  identical token budget can only truncate again. The motivating production
+  failure was a stochastic degenerate repetition loop on Gemini: once looping,
+  generation only stops at the provider's output ceiling (65,535 tokens,
+  multiple minutes), and the blind re-ask looped again in **6 out of 6**
+  observed failures — doubling every multi-minute burn while holding a
+  concurrency slot. Truncation now surfaces immediately — one generation,
+  seconds — as the new `OutputLimitError`. The schema-repair re-ask for
+  genuinely repairable failures (malformed JSON / `ValidationError`) is
+  untouched, as is the `InstructorRetryException` wrap on exhaustion; default
+  requests remain byte-identical (still no `max_tokens` key unless set).
+- **The retry layer never retries an output-limit truncation, under any
+  configuration.** Both budgets of `RetryPolicy` / `with_retries` treat
+  `OutputLimitError` as permanent — including the `with_retries` default
+  `retry_on=None` ("retry on any Exception"), which would otherwise have
+  charged the new bare exception to the transport budget. An explicit
+  `retry_on` that lists the type still wins (opt-in resampling).
+
+### Added
+
+- **`OutputLimitError`** (exported from `llmkit`), following the
+  `CircuitOpenError` fail-fast-but-catchable precedent. Carries `model`,
+  `max_tokens` (`None` = no cap sent, provider ceiling), and
+  `completion_tokens` (best-effort from the truncated completion's usage) so
+  the failure is diagnosable from the error alone: `completion_tokens` at your
+  cap → raise the cap; a huge count under no cap → the prompt induces runaway
+  output.
+- **`LLM_OUTPUT_LIMIT_ERRORS`** subset, and `LLM_RECOVERABLE_ERRORS` is now
+  the union of **four** subsets (transport + schema + backpressure +
+  output-limit) — hosts that catch `LLM_RECOVERABLE_ERRORS` keep degrading
+  gracefully instead of crashing on a new uncaught type. Hosts composing
+  their catch-nets from the *subsets* should add `LLM_OUTPUT_LIMIT_ERRORS`
+  explicitly.
+- `tenacity` is now a direct dependency (already present transitively via
+  instructor; the floor matches instructor's own requirement).
+
+### Migration / risk
+
+- **Fail-fast trades away resample luck.** A caller running a *snug*
+  `max_tokens` whose healthy responses occasionally graze the cap previously
+  got a silent second sample that sometimes landed under the limit; it now
+  hard-fails with `OutputLimitError` instead. That is the intended trade —
+  the failure becomes legible ("raise your cap") rather than silent doubled
+  latency — but a borderline caller should either set caps with real headroom
+  (~8× median healthy output works well in the motivating host) or opt back
+  into resampling with `retry_on=(OutputLimitError, ...)`.
+
 ## [0.5.0] — 2026-06-29
 
 ### Added
@@ -914,6 +970,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
+[0.6.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.5.0
 [0.4.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.3.0

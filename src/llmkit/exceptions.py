@@ -7,7 +7,7 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into three subsets the retry layer budgets
+The recoverable set is split into four subsets the retry layer budgets
 **separately** (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
@@ -35,8 +35,13 @@ The recoverable set is split into three subsets the retry layer budgets
   **not** retried: it lives outside the transport set, so ``with_retries`` and
   the streaming loop (which key off the transport/schema subsets, never the
   union) never re-ask a circuit the breaker already knows is open.
+* :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
+  (:class:`OutputLimitError`, raised when a structured completion is cut off
+  by the output-token limit). Recoverable in the same catch-set sense as the
+  breaker, but **never retried** on either budget under any configuration:
+  re-asking with an identical token budget can only truncate again.
 
-``LLM_RECOVERABLE_ERRORS`` is the **union** of the three, preserved as the
+``LLM_RECOVERABLE_ERRORS`` is the **union** of the four, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
 catching exactly what they did before. One member is special: the
 litellm-native 503 entry is a lazy stand-in
@@ -46,7 +51,9 @@ litellm import — see its docstring for the one ``except``-clause limit.
 
 ``with_retries()`` (see :mod:`llmkit.retry`) is the transient-retry
 layer; in-call schema repair is handled separately by instructor's retry
-loop (``max_retries``, pinned to 2 in :mod:`llmkit._litellm`).
+loop (two total attempts, pinned in :mod:`llmkit._litellm` — with the one
+carve-out that a length truncation is never re-asked and surfaces as
+:class:`OutputLimitError` instead).
 """
 
 import sys
@@ -150,8 +157,8 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 # response still earns one cross-call retry.
 #   - ``ValidationError``           — pydantic could not parse the response
 #   - ``InstructorRetryException``  — instructor exhausted its in-call repair
-#     budget (``max_retries=2``: two attempts total, i.e. one schema-repair
-#     re-ask) for this attempt. NOTE: instructor wraps *any*
+#     budget (two attempts total, i.e. one schema-repair re-ask; see
+#     ``llmkit._litellm``) for this attempt. NOTE: instructor wraps *any*
 #     exhausted attempt this way, transport failures included — the retry layer
 #     unwraps it (``underlying_provider_error``) so a wrapped transport cause is
 #     charged the transport budget rather than this lower one.
@@ -197,14 +204,72 @@ class CircuitOpenError(Exception):
 # layer, which budgets off the transport/schema subsets, never retries it.
 LLM_BACKPRESSURE_ERRORS: tuple[type[Exception], ...] = (CircuitOpenError,)
 
-# The full recoverable set is the union of the three subsets — preserved as the
+
+class OutputLimitError(Exception):
+    """A structured completion was truncated by the output-token limit.
+
+    Raised by the structured path when the provider stopped generating at the
+    token ceiling (``finish_reason='length'`` / Gemini ``MAX_TOKENS``) before a
+    complete response could be parsed. Deliberately **never retried**:
+    re-asking with an identical token budget can only truncate again — the
+    motivating production failure was a degenerate repetition loop that burned
+    to the provider ceiling on the original ask *and* on every blind re-ask —
+    so instructor's in-call repair loop refuses the re-ask (see
+    :mod:`llmkit._litellm`) and :func:`~llmkit.retry.with_retries` propagates
+    it immediately under every configuration, unless a caller explicitly lists
+    the type in ``retry_on`` (an explicit opt-in wins).
+
+    Carries diagnostics so the fix is legible from the error alone:
+    ``completion_tokens`` at/near a ``max_tokens`` you set means "cap too snug
+    — raise it"; a huge ``completion_tokens`` under no cap
+    (``max_tokens=None``, the provider ceiling) means "the prompt induces
+    runaway output."
+
+    Follows the :class:`CircuitOpenError` precedent — a distinct fail-fast
+    type, kept **out** of :data:`LLM_TRANSPORT_ERRORS` (a fresh connection
+    doesn't change the budget) and :data:`LLM_SCHEMA_ERRORS` (a repair re-ask
+    doesn't either), but **in** :data:`LLM_OUTPUT_LIMIT_ERRORS` and therefore
+    in :data:`LLM_RECOVERABLE_ERRORS`, so a host that degrades on
+    ``except LLM_RECOVERABLE_ERRORS`` keeps catching it instead of crashing on
+    a new uncaught type.
+
+    Attributes:
+        model: The resolved litellm model string the call ran against.
+        max_tokens: The cap sent on this call; ``None`` means no cap was set
+            (the provider's own ceiling applied).
+        completion_tokens: Tokens actually generated before truncation,
+            best-effort from the truncated completion's usage (``None`` when
+            the provider reported none).
+    """
+
+    def __init__(
+        self, *, model: str, max_tokens: int | None, completion_tokens: int | None
+    ) -> None:
+        cap = "provider ceiling" if max_tokens is None else f"max_tokens={max_tokens}"
+        super().__init__(
+            f"structured completion for model {model!r} truncated by the output-token limit "
+            + f"({cap}, generated {completion_tokens} tokens); not retried — an identical "
+            + "budget can only truncate again"
+        )
+        self.model: str = model
+        self.max_tokens: int | None = max_tokens
+        self.completion_tokens: int | None = completion_tokens
+
+
+# llmkit's own fail-fast truncation signal — same pattern as the backpressure
+# subset: the recoverable *union* carries it (so host ``except`` nets keep
+# degrading gracefully) while the retry layer never retries it on any budget.
+LLM_OUTPUT_LIMIT_ERRORS: tuple[type[Exception], ...] = (OutputLimitError,)
+
+# The full recoverable set is the union of the four subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
 # exactly what they did before even though the retry layer now budgets the
-# subsets separately (and never retries the backpressure subset).
+# subsets separately (and never retries the backpressure/output-limit subsets).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
     *LLM_BACKPRESSURE_ERRORS,
+    *LLM_OUTPUT_LIMIT_ERRORS,
 )
 
 

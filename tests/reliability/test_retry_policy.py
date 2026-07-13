@@ -7,12 +7,14 @@ behaviour in ``test_default_retries.py``:
   backoff, 30s per-sleep cap) and the jittered exponential-ceiling backoff;
 * ``LLM_RECOVERABLE_ERRORS`` membership — 429 / 5xx / network are transient,
   auth and other 4xx are not — and that it's the union of the transport,
-  schema, and backpressure subsets (the last carrying the breaker's fail-fast
-  ``CircuitOpenError``, which must stay out of the retried transport set);
-  including litellm's own ``ServiceUnavailableError`` (its 503, which does not
-  subclass ``openai.InternalServerError``);
-* instructor's in-call schema-repair budget (``max_retries=2`` = two attempts
-  total = one repair re-ask) as pinned by ``acompletion_structured``;
+  schema, backpressure, and output-limit subsets (the last two carrying
+  llmkit's fail-fast ``CircuitOpenError`` / ``OutputLimitError``, which must
+  stay out of the retried transport set); including litellm's own
+  ``ServiceUnavailableError`` (its 503, which does not subclass
+  ``openai.InternalServerError``);
+* instructor's in-call schema-repair budget (a per-call ``AsyncRetrying``
+  stopping after two attempts total = one repair re-ask) as pinned by
+  ``acompletion_structured``;
 * the ``with_retries`` primitive's ``max_attempts`` naming and the nested-retry
   guard that stops an outer wrapper from multiplying the inner budget;
 * the validation/transport budget split (a deterministic schema failure can't
@@ -29,13 +31,16 @@ import random
 import warnings
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import httpx
 import litellm
 import openai
 import pytest
+from instructor.core.exceptions import IncompleteOutputException
 from pydantic import ValidationError
+from tenacity import AsyncRetrying
 
 from llmkit import (
     DEFAULT_RETRY_POLICY,
@@ -43,6 +48,7 @@ from llmkit import (
     NO_RETRY,
     CircuitOpenError,
     LocalYamlLogSink,
+    OutputLimitError,
     RetryPolicy,
     configure_llm_logging,
     structured_output,
@@ -50,6 +56,7 @@ from llmkit import (
 from llmkit.capture import capture_llm_log_paths
 from llmkit.exceptions import (
     LLM_BACKPRESSURE_ERRORS,
+    LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
 )
@@ -303,32 +310,46 @@ async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
 
 
 def test_instructor_in_call_budget_is_two_attempts_one_repair() -> None:
-    """The structured call pins instructor's ``max_retries`` to 2.
-
-    instructor feeds the int to tenacity's ``stop_after_attempt``, so the
-    value counts *total attempts*: 2 = two attempts total = exactly one
-    schema-repair re-ask. Regression test: the previous ``max_retries=1``
-    meant one attempt total — zero in-call repairs ever happened, despite the
-    documented "single repair" intent.
+    """The structured call feeds instructor a per-call ``AsyncRetrying`` that
+    keeps the historical budget: ``stop_after_attempt(2)`` counts *total
+    attempts*, so 2 = two attempts total = exactly one schema-repair re-ask.
+    The retry predicate declines exactly one class — instructor's
+    ``IncompleteOutputException`` (length truncation, which a same-budget
+    re-ask cannot fix) — and retries everything else. (Regression from the
+    int era: ``max_retries=1`` meant one attempt total — zero in-call repairs
+    ever happened despite the documented "single repair" intent. The declined
+    predicate's *bare-propagation* behaviour is pinned end-to-end in
+    ``test_output_limit_failfast.py``.)
     """
     seen = capture_structured_provider_kwargs()
-    assert seen["max_retries"] == 2
+    retrying = seen["max_retries"]
+    assert isinstance(retrying, AsyncRetrying)
+    assert getattr(retrying.stop, "max_attempt_number", None) == 2
+    predicate = cast("Callable[[BaseException], bool]", getattr(retrying.retry, "predicate", None))
+    assert callable(predicate)
+    assert predicate(TimeoutError("transient")) is True
+    assert predicate(ValidationError.from_exception_data("Bad", [])) is True
+    assert predicate(IncompleteOutputException(last_completion=None)) is False
 
 
 # --- unified naming: max_attempts is the only name ------------------------
 
 
 def test_recoverable_set_union_invariant_still_holds() -> None:
-    """``LLM_RECOVERABLE_ERRORS`` is exactly the union of the *three* subsets
-    (transport + schema + backpressure), so the documented single catch-set
-    contract is preserved as the breaker's ``CircuitOpenError`` joins it."""
+    """``LLM_RECOVERABLE_ERRORS`` is exactly the union of the *four* subsets
+    (transport + schema + backpressure + output-limit), so the documented
+    single catch-set contract is preserved as each fail-fast type
+    (``CircuitOpenError``, ``OutputLimitError``) joins it."""
     assert set(LLM_RECOVERABLE_ERRORS) == set(LLM_TRANSPORT_ERRORS) | set(LLM_SCHEMA_ERRORS) | set(
         LLM_BACKPRESSURE_ERRORS
-    )
-    # The three subsets are pairwise disjoint and each carries its expected members.
+    ) | set(LLM_OUTPUT_LIMIT_ERRORS)
+    # The four subsets are pairwise disjoint and each carries its expected members.
     assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
     assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
     assert set(LLM_SCHEMA_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
+    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_TRANSPORT_ERRORS)
+    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
+    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
     assert ValidationError in LLM_SCHEMA_ERRORS
     assert TimeoutError in LLM_TRANSPORT_ERRORS
     assert ValidationError not in LLM_TRANSPORT_ERRORS
@@ -339,6 +360,12 @@ def test_recoverable_set_union_invariant_still_holds() -> None:
     assert CircuitOpenError not in LLM_TRANSPORT_ERRORS
     assert CircuitOpenError not in LLM_SCHEMA_ERRORS
     assert CircuitOpenError in LLM_RECOVERABLE_ERRORS
+    # Same fail-fast contract for the output-limit subset: catchable via the
+    # union, retried on neither budget.
+    assert OutputLimitError in LLM_OUTPUT_LIMIT_ERRORS
+    assert OutputLimitError not in LLM_TRANSPORT_ERRORS
+    assert OutputLimitError not in LLM_SCHEMA_ERRORS
+    assert OutputLimitError in LLM_RECOVERABLE_ERRORS
 
 
 @pytest.mark.asyncio

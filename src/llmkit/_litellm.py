@@ -28,10 +28,13 @@ from typing import cast
 
 import instructor
 import litellm
+from instructor.core.exceptions import IncompleteOutputException
 from litellm import CustomStreamWrapper
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 from pydantic import BaseModel
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
+from llmkit.exceptions import OutputLimitError
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
@@ -155,6 +158,51 @@ def _total_tokens(raw: object) -> int | None:
     return None
 
 
+def _completion_tokens(raw: object) -> int | None:
+    """Best-effort completion-token count from a completion's ``usage``.
+
+    Sibling of :func:`_total_tokens`, for :class:`OutputLimitError`'s
+    diagnostics: how many tokens the provider actually generated before the
+    output-token limit cut the completion off. Returns ``None`` for any
+    missing/odd shape — the diagnostics degrade, never break the raise.
+    """
+    tokens = getattr(getattr(raw, "usage", None), "completion_tokens", None)
+    return tokens if isinstance(tokens, int) else None
+
+
+def _schema_repair_retrying() -> AsyncRetrying:
+    """instructor's in-call repair budget: one schema-repair re-ask — except
+    never for a length truncation.
+
+    ``stop_after_attempt(2)`` keeps the historical budget (instructor feeds
+    this to tenacity as *total attempts*, so 2 = one repair re-ask). The
+    predicate refuses to retry ``IncompleteOutputException`` — instructor's
+    truncated-by-the-output-token-limit signal, raised *before parsing* for
+    both the OpenAI shape (``finish_reason == "length"``) and the google-genai
+    shape (``FinishReason.MAX_TOKENS``) — because a re-ask with an identical
+    token budget can only truncate again; the observed production failure is a
+    degenerate repetition loop that burns to the provider ceiling on every
+    attempt. When the predicate declines, tenacity propagates the original
+    exception **bare** (no ``RetryError``, hence no ``InstructorRetryException``
+    wrap); :func:`acompletion_structured` catches it at the boundary and
+    re-raises :class:`~llmkit.exceptions.OutputLimitError`. Every other failure
+    keeps the repair re-ask and the exhaustion wrap exactly as before.
+
+    Deliberately **not** ``reraise=True``: that would make schema *exhaustion*
+    also propagate bare, bypassing instructor's ``RetryError`` →
+    ``InstructorRetryException`` wrapping and silently breaking the outer
+    retry layer's budget classification for every schema failure.
+
+    Built fresh per call — tenacity retrying objects mutate internal iteration
+    state, so a shared module-level instance would race across concurrent
+    structured calls on the same loop.
+    """
+    return AsyncRetrying(
+        stop=stop_after_attempt(2),
+        retry=retry_if_exception(lambda e: not isinstance(e, IncompleteOutputException)),
+    )
+
+
 def _coerce_text_content(content: object) -> str:
     """Coerce a completion's ``message.content`` to a single string.
 
@@ -220,12 +268,16 @@ async def acompletion_structured[T: BaseModel](
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
     completion (for cost) are both in hand. instructor's in-call schema-repair
-    budget is pinned to ``max_retries=2`` — instructor counts *total attempts*
-    (it feeds the int to tenacity's ``stop_after_attempt``), so 2 means two
-    attempts total = one schema-repair re-ask, deliberately low — and kept
-    separate from the transient-error retry layer (``with_retries`` in
-    :mod:`llmkit.retry`), which owns the cross-call 429/503/5xx and
-    schema-validation budgets.
+    budget is pinned to two total attempts (one schema-repair re-ask,
+    deliberately low) — with one carve-out: a completion truncated by the
+    output-token limit (``finish_reason='length'``) is **never** re-asked,
+    because an identical token budget can only truncate again; it surfaces
+    immediately as :class:`~llmkit.exceptions.OutputLimitError` carrying the
+    truncated attempt's diagnostics (see :func:`_schema_repair_retrying`).
+    The budget is kept separate from the transient-error retry layer
+    (``with_retries`` in :mod:`llmkit.retry`), which owns the cross-call
+    429/503/5xx and schema-validation budgets — and which likewise never
+    retries an ``OutputLimitError``.
 
     ``max_tokens`` caps the completion length when set; it is only included
     in the underlying call when not ``None``, so the default produces a
@@ -264,22 +316,35 @@ async def acompletion_structured[T: BaseModel](
         "instructor.AsyncInstructor",
         cast("object", instructor.from_litellm(_acompletion, mode=provider.instructor_mode)),
     )
+    litellm_model = provider.litellm_model(model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        result = await client.chat.completions.create_with_completion(
-            model=provider.litellm_model(model),
-            messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
-            response_model=output_schema,
-            temperature=temperature,
-            # instructor's in-call schema-repair budget. instructor counts
-            # *total attempts* (the int becomes tenacity stop_after_attempt),
-            # so 2 = two attempts total = exactly one schema-repair re-ask;
-            # 1 would mean no repair ever happens. The cross-call
-            # transient/validation budgets live in llmkit.retry.
-            max_retries=2,
-            **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
-            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-            **({"reasoning_effort": effort} if effort is not None else {}),
-        )
+        try:
+            result = await client.chat.completions.create_with_completion(
+                model=litellm_model,
+                messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
+                response_model=output_schema,
+                temperature=temperature,
+                # instructor's in-call schema-repair budget: two total attempts
+                # = exactly one schema-repair re-ask, except never for a length
+                # truncation (see _schema_repair_retrying). Built per call —
+                # tenacity retrying objects mutate iteration state. The
+                # cross-call transient/validation budgets live in llmkit.retry.
+                max_retries=_schema_repair_retrying(),
+                **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
+                **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+                **({"reasoning_effort": effort} if effort is not None else {}),
+            )
+        except IncompleteOutputException as e:
+            # The declined re-ask propagates instructor's exception bare (no
+            # InstructorRetryException wrap) — re-own it at the boundary so
+            # callers see one llmkit type carrying the diagnostics that make
+            # the fix legible ("cap too snug" vs "prompt causes runaway
+            # output"), with the instructor original on the cause chain.
+            raise OutputLimitError(
+                model=litellm_model,
+                max_tokens=max_tokens,
+                completion_tokens=_completion_tokens(e.last_completion),
+            ) from e
         # instructor types the raw completion half of the tuple as Any; it is a
         # litellm ModelResponse. Narrow once so cost/usage read a real type.
         parsed, completion = cast("tuple[T, ModelResponse]", result)
