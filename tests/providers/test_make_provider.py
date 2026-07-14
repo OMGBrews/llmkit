@@ -140,7 +140,7 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
 @pytest.mark.parametrize(
     ("provider", "expected_prefix", "expected_model"),
     [
-        (Provider.OPENROUTER, "openrouter/", "google/gemini-2.0-flash-001"),
+        (Provider.OPENROUTER, "openrouter/", "google/gemini-2.5-flash-lite"),
         (Provider.OLLAMA, "ollama_chat/", "llama3.2"),
         (Provider.GOOGLE, "gemini/", "gemini-2.5-flash-lite"),
         (Provider.ANTHROPIC, "anthropic/", "claude-sonnet-4-6"),

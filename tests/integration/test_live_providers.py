@@ -153,8 +153,13 @@ class CountryProfile(BaseModel):
 
 # Cheap, broadly-available default models per provider. Override via the
 # matching ``*_SMOKE_MODEL`` env var if a key lacks access to one of these.
-# An open model hosted by many OpenRouter providers (so it won't 404 when a
-# single vendor slug is retired) that supports OpenRouter structured outputs.
+# OpenRouter is deliberately covered TWICE — see the two tests below. This
+# constant is the *override* half: an open model hosted by many OpenRouter
+# providers (so it won't 404 when a single vendor slug is retired) and the one
+# measured to stochastically echo the schema under a non-strict json_schema, so
+# it doubles as the canary for the provider's strict-enforcement upgrade. The
+# provider's own default model is covered separately, and on purpose is NOT
+# overridable from the environment.
 _OPENROUTER_MODEL = os.getenv("OPENROUTER_SMOKE_MODEL", "mistralai/mistral-nemo")
 _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
@@ -195,9 +200,9 @@ async def _assert_structured_roundtrip(
     """Drive one real structured call and check the parsed result.
 
     ``reasoning_effort`` is opt-in per provider: only some provider/model
-    pairs accept it (Gemini's 2.5 thinking models do; e.g. OpenRouter's
-    ``gemini-2.0-flash-001`` does not, and litellm raises rather than drop
-    it). Default ``None`` sends nothing, so the call works everywhere.
+    pairs accept it (Gemini's 2.5 thinking models do; e.g. Mistral's models
+    do not, and litellm raises rather than drop it). Default ``None`` sends
+    nothing, so the call works everywhere.
 
     ``max_tokens`` is capped: OpenRouter checks *affordability* against the
     requested budget, and with no cap that budget defaults to the model's
@@ -252,10 +257,43 @@ def _ollama_up() -> bool:
 
 @pytest.mark.asyncio
 async def test_openrouter_live() -> None:
+    """OpenRouter on the *override* model — the strict-enforcement canary.
+
+    ``mistralai/mistral-nemo`` is the model measured to stochastically echo the
+    schema back (values nested under ``properties``) when the ``json_schema``
+    ``response_format`` is sent non-strict, which is what instructor's core
+    ``JSON_SCHEMA`` handler does. So this is the test that fails if the
+    provider's ``strict_json_schema`` upgrade ever regresses. It is *not*
+    redundant with the default-model test below: that one pins the model id,
+    this one pins the wire shape.
+    """
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
         _missing("OPENROUTER_API_KEY not set")
     await _assert_structured_roundtrip(OpenRouterProvider(api_key=key, model=_OPENROUTER_MODEL))
+
+
+@pytest.mark.asyncio
+async def test_openrouter_live_default_model() -> None:
+    """OpenRouter on its **own default** model — no ``model=``, no env override.
+
+    This test exists because ``OpenRouterProvider._default_model`` was
+    ``google/gemini-2.0-flash-001`` for several releases *after* OpenRouter
+    retired it: the slug left the catalog, so every call that took the default
+    died with ``NotFoundError: No endpoints found``, and no consumer could
+    construct the provider without naming a model. The live suite never caught
+    it because every OpenRouter test overrode the model.
+
+    Passing no ``model`` is therefore the entire point — the provider must
+    resolve its own default, so a retired default fails *this* release gate
+    instead of shipping. For the same reason there is deliberately no
+    ``*_SMOKE_MODEL`` env override here: one that could repoint this call at a
+    model the default isn't would restore the exact blind spot it closes.
+    """
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        _missing("OPENROUTER_API_KEY not set")
+    await _assert_structured_roundtrip(OpenRouterProvider(api_key=key))
 
 
 @pytest.mark.asyncio

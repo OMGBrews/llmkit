@@ -58,7 +58,15 @@ class OpenRouterProvider(BaseProvider):
     _provider_name: ClassVar[str] = "OpenRouter"
     _model_prefix: ClassVar[str] = "openrouter/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
-    _default_model: ClassVar[str] = "google/gemini-2.0-flash-001"
+    #: Gemini 2.5 Flash-Lite — cheap, fast, and honors the strict json_schema
+    #: ``response_format`` this provider sends (measured 2026-07-14: 10/10
+    #: valid structured round-trips through the public surface). Succeeds
+    #: ``google/gemini-2.0-flash-001``, which OpenRouter retired — it left the
+    #: catalog entirely, so through 0.7.0 *every* default-model call 404'd with
+    #: "No endpoints found". The live smoke suite now drives this default with no
+    #: ``model=`` override (``test_openrouter_live_default_model``), so the next
+    #: retirement fails the release gate instead of shipping.
+    _default_model: ClassVar[str] = "google/gemini-2.5-flash-lite"
     _strict_json_schema: ClassVar[bool] = True
 
     def __init__(

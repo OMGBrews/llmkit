@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
+  was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
+  gone from its catalog entirely, so *every* call that relied on the default
+  (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
+  naming a model) failed with `NotFoundError: "No endpoints found for
+  google/gemini-2.0-flash-001"`. The default is now
+  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
+  model the `GOOGLE` and `VERTEX` providers already default to, and measured
+  live at 10/10 valid strict-`json_schema` structured round-trips through the
+  public surface (2026-07-14). Callers who pass an explicit `model` were never
+  affected.
+
+### Changed
+
+- **The live smoke suite now exercises each OpenRouter path that can rot
+  independently.** It previously always overrode the model, which is why a dead
+  default shipped through a green release gate. There are now two OpenRouter
+  live tests: one drives the provider's *own default* with no `model=` and no
+  env override (so a retired default fails the gate instead of shipping), and
+  the existing one keeps pinning the strict-`json_schema` wire shape against
+  `mistralai/mistral-nemo`, the model measured to echo the schema back when the
+  `response_format` is sent non-strict.
+
 ## [0.7.0] — 2026-07-14
 
 Structured output works again for **Anthropic, Bedrock, and OpenRouter** on a
