@@ -199,6 +199,15 @@ async def _assert_structured_roundtrip(
     ``gemini-2.0-flash-001`` does not, and litellm raises rather than drop
     it). Default ``None`` sends nothing, so the call works everywhere.
 
+    ``max_tokens`` is capped: OpenRouter checks *affordability* against the
+    requested budget, and with no cap that budget defaults to the model's
+    full context window — so a low account balance rejects the call with a
+    402 that names credits, not the real coupling (observed 2026-07-14:
+    "You requested up to 65536 tokens, but can only afford 12176"). The cap
+    makes the gate's verdict depend on the pins, not the balance. 1024 is
+    ~15x what the smoke schema needs, so it can't cause the truncation
+    fail-fast (``OutputLimitError``) on a healthy provider.
+
     Every field of :class:`CountryProfile` is asserted: a half-working mode
     that empties or drops any field fails *deterministically* here rather
     than flaking green on the one easy field.
@@ -215,6 +224,7 @@ async def _assert_structured_roundtrip(
         label=provider.name,
         provider=provider,
         reasoning_effort=reasoning_effort,
+        max_tokens=1024,
     )
     assert isinstance(result, CountryProfile)
     assert result.country.strip().lower() == "france"
