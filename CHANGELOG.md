@@ -15,12 +15,26 @@ providers raised `RegistryError` before any request was sent.
 
 ### Fixed
 
-- **Anthropic and Bedrock repin `Mode.ANTHROPIC_JSON` → `Mode.JSON`; OpenRouter
-  repins `Mode.OPENROUTER_STRUCTURED_OUTPUTS` → `Mode.JSON_SCHEMA`.** The
-  surviving core modes with the same wire shape the originals were chosen
-  for: schema-in-system-prompt JSON for Claude, the OpenAI-style strict
-  `response_format` json-schema for OpenRouter (whose `require_parameters`
-  routing default continues to keep requests on endpoints that honor it).
+- **Anthropic, Bedrock, and OpenRouter all repin to `Mode.JSON_SCHEMA`**
+  (from `Mode.ANTHROPIC_JSON` / `Mode.ANTHROPIC_JSON` /
+  `Mode.OPENROUTER_STRUCTURED_OUTPUTS`): the strict OpenAI-style
+  `response_format` json-schema, which LiteLLM translates per provider and
+  OpenRouter accepts natively (its `require_parameters` routing default
+  continues to keep requests on endpoints that honor it). Chosen by live
+  measurement (2026-07-14, Haiku 4.5 direct and on Bedrock): `JSON_SCHEMA`
+  and `MD_JSON` validate every smoke-schema field; `JSON` fails because
+  Claude wraps the JSON in a markdown fence that instructor's parse path
+  does not strip; `TOOLS` cannot run on a lean install (LiteLLM's tools
+  branch imports its proxy machinery, which needs `fastapi`).
+- **OpenRouter structured requests are strict again.** The removed
+  `OPENROUTER_STRUCTURED_OUTPUTS` handler sent `"strict": true` +
+  `additionalProperties: false`; instructor's core `JSON_SCHEMA` handler
+  sends neither, and OpenRouter treats a non-strict json_schema as
+  *advisory* — measured: `mistralai/mistral-nemo` stochastically echoing
+  the schema itself. The `OpenRouterProvider` now opts into a
+  `strict_json_schema` provider trait and the LiteLLM call seam upgrades
+  the `response_format` to the original measured wire shape. Other
+  providers' requests are byte-identical to instructor's output.
 
 ### Changed
 
@@ -34,7 +48,7 @@ providers raised `RegistryError` before any request was sent.
 ### Removed
 
 - **The `[anthropic]` extra and the eager Anthropic-SDK construction gate.**
-  With the `Mode.JSON` repin no llmkit path can reach the Anthropic SDK:
+  With the `Mode.JSON_SCHEMA` repin no llmkit path can reach the Anthropic SDK:
   LiteLLM speaks the Anthropic HTTP API directly, and instructor >=1.15.4
   touches the SDK only inside `try/except ImportError`. `AnthropicProvider`
   and `BedrockProvider` construct without it (previously they raised

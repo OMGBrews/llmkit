@@ -180,7 +180,14 @@ def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvi
     provider (each redeclares the attrs it overrides).
     """
     hints: dict[str, object] = typing.get_type_hints(provider_cls)
-    routing_attrs = ("_provider_name", "_mode", "_default_model", "_model_prefix", "is_local")
+    routing_attrs = (
+        "_provider_name",
+        "_mode",
+        "_default_model",
+        "_model_prefix",
+        "is_local",
+        "_strict_json_schema",
+    )
     for attr in routing_attrs:
         assert typing.get_origin(hints[attr]) is typing.ClassVar, (
             f"{provider_cls.__name__}.{attr} must be annotated ClassVar"

@@ -64,6 +64,38 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     return await acompletion(**kwargs)
 
 
+async def _acompletion_strict_json_schema(
+    **kwargs: object,
+) -> ModelResponse | CustomStreamWrapper:
+    """:func:`_acompletion`, upgrading a ``json_schema`` ``response_format`` to strict.
+
+    instructor's ``JSON_SCHEMA`` handler emits ``response_format`` without
+    ``"strict": true`` or ``additionalProperties: false``, and a provider that
+    treats a non-strict json_schema as *advisory* (OpenRouter) then lets weak
+    models drift — measured 2026-07-14: ``mistralai/mistral-nemo``
+    stochastically echoing the schema itself. The pre-1.15.3
+    ``OPENROUTER_STRUCTURED_OUTPUTS`` handler sent exactly this strict shape,
+    so this wrapper restores the measured wire contract at the one seam the
+    library owns (the completion callable handed to ``from_litellm``). Used
+    only for providers that opt in via
+    :pyattr:`~llmkit.providers.base.BaseProvider.strict_json_schema`; the
+    mutation targets the request dict instructor builds fresh per call.
+    """
+    response_format = kwargs.get("response_format")
+    if (
+        isinstance(response_format, dict)
+        and cast("dict[str, object]", response_format).get("type") == "json_schema"
+    ):
+        json_schema = cast("dict[str, object]", response_format).get("json_schema")
+        if isinstance(json_schema, dict):
+            json_schema = cast("dict[str, object]", json_schema)
+            json_schema["strict"] = True
+            schema = json_schema.get("schema")
+            if isinstance(schema, dict):
+                cast("dict[str, object]", schema)["additionalProperties"] = False
+    return await _acompletion(**kwargs)
+
+
 async def drain_async_logging(*, timeout: float | None) -> None:
     """Flush LiteLLM's pending async logging on the current event loop.
 
@@ -303,6 +335,10 @@ async def acompletion_structured[T: BaseModel](
     provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    # The completion callable is the library's seam under instructor: providers
+    # that opt in via ``strict_json_schema`` (OpenRouter) get their
+    # ``response_format`` upgraded to strict enforcement on the way to LiteLLM.
+    completion = _acompletion_strict_json_schema if provider.strict_json_schema else _acompletion
     # instructor's ``from_litellm`` is overloaded on whether the completion is
     # sync or async; basedpyright has been seen to resolve the *sync* overload
     # for our ``async def _acompletion`` on some platforms (CI x86_64 vs local
@@ -314,7 +350,7 @@ async def acompletion_structured[T: BaseModel](
     # platform). raw-llm — the instructor boundary.
     client = cast(
         "instructor.AsyncInstructor",
-        cast("object", instructor.from_litellm(_acompletion, mode=provider.instructor_mode)),
+        cast("object", instructor.from_litellm(completion, mode=provider.instructor_mode)),
     )
     litellm_model = provider.litellm_model(model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:

@@ -13,17 +13,22 @@ class AnthropicProvider(BaseProvider):
     """Anthropic (Claude) LLM provider.
 
     Routes Claude through the Anthropic API (``anthropic/<model>``), pinned
-    to ``Mode.JSON`` for instructor: the schema travels in a system message,
-    ``response_format={"type": "json_object"}`` rides along (LiteLLM
-    translates it for the Anthropic API), and the response text is parsed
-    and validated against the schema.
+    to ``Mode.JSON_SCHEMA`` for instructor: the request carries the strict
+    ``response_format={"type": "json_schema", ...}``, which LiteLLM
+    translates for the Anthropic API, and the response text validates
+    directly against the schema.
 
     ``Mode.ANTHROPIC_JSON`` (the pin through 0.6.x) is gone: instructor
     1.15.3 removed it from the mode registry ``from_litellm`` validates
     against at client construction, so it now raises ``RegistryError``
-    before any request is sent. ``Mode.JSON`` is the surviving core
-    equivalent — the same schema-in-system-prompt wire shape the original
-    pin was chosen for.
+    before any request is sent. Of the surviving core modes, measured live
+    against Haiku 4.5 (2026-07-14): ``JSON_SCHEMA`` and ``MD_JSON`` validate
+    every field; ``JSON`` fails — Claude wraps the (correct) JSON in a
+    markdown fence and instructor's parse path does not strip fences; and
+    ``TOOLS`` cannot run at all on a lean install — LiteLLM's tools branch
+    imports its proxy machinery, which needs ``fastapi``. ``JSON_SCHEMA``
+    wins as the strictest surviving mode, and matches most other providers'
+    pins.
 
     No Anthropic SDK is required: LiteLLM speaks the Anthropic HTTP API
     directly, and instructor (>=1.15.4) reaches the SDK only on an optional
@@ -33,7 +38,7 @@ class AnthropicProvider(BaseProvider):
 
     _provider_name: ClassVar[str] = "Anthropic"
     _model_prefix: ClassVar[str] = "anthropic/"
-    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "claude-sonnet-4-6"
 
     def __init__(

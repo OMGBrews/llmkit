@@ -256,6 +256,11 @@ class LLMProviderInterface(Protocol):
         ...
 
     @property
+    def strict_json_schema(self) -> bool:
+        """Whether structured requests upgrade ``response_format`` to strict enforcement."""
+        ...
+
+    @property
     def reasoning_effort(self) -> str | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default."""
         ...
@@ -314,6 +319,19 @@ class BaseProvider(ABC):
     #: stays defined alongside the provider it describes (see
     #: :func:`~llmkit.providers.describe_llm`). Cloud providers leave this False.
     is_local: ClassVar[bool] = False
+    #: Whether structured requests upgrade instructor's ``json_schema``
+    #: ``response_format`` to *strict* server-side enforcement (``"strict":
+    #: true`` + top-level ``additionalProperties: false``) at the LiteLLM call
+    #: seam (see ``llmkit._litellm``). instructor's ``JSON_SCHEMA`` handler
+    #: sends neither, and some providers (OpenRouter) treat a non-strict
+    #: json_schema as advisory — weak models then drift (measured: the schema
+    #: echoed back with values nested inside ``properties``). A provider
+    #: trait, not a global: providers whose enforcement was measured fine
+    #: without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Vertex) keep
+    #: their measured wire shape untouched. Exposed via the
+    #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
+    #: pattern).
+    _strict_json_schema: ClassVar[bool] = False
 
     #: The routing-contract hooks validated for every concrete subclass.
     _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")
@@ -368,6 +386,15 @@ class BaseProvider(ABC):
     def instructor_mode(self) -> instructor.Mode:
         """The instructor mode pinning structured output for this provider."""
         return self._mode
+
+    @property
+    def strict_json_schema(self) -> bool:
+        """Whether structured requests upgrade ``response_format`` to strict enforcement.
+
+        See the ``_strict_json_schema`` trait above for the rationale; the
+        upgrade itself happens at the LiteLLM call seam in ``llmkit._litellm``.
+        """
+        return self._strict_json_schema
 
     @property
     def reasoning_effort(self) -> str | None:

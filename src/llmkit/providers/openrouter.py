@@ -18,12 +18,22 @@ class OpenRouterProvider(BaseProvider):
 
     Routes through OpenRouter's unified endpoint (``openrouter/<model>``),
     pinned to ``Mode.JSON_SCHEMA`` for instructor: the request carries the
-    OpenAI-style strict ``response_format={"type": "json_schema", ...}``,
-    which is exactly OpenRouter's structured-outputs surface.
+    OpenAI-style ``response_format={"type": "json_schema", ...}``, which is
+    exactly OpenRouter's structured-outputs surface.
     ``Mode.OPENROUTER_STRUCTURED_OUTPUTS`` (the pin through 0.6.x) sent the
     same request shape but was removed from the mode registry
     ``from_litellm`` validates against at client construction in instructor
     1.15.3, so it now raises ``RegistryError`` before any request is sent.
+
+    **Strict enforcement is restored at the call seam.** The removed mode's
+    handler additionally sent ``"strict": true`` and ``additionalProperties:
+    false``; instructor's core ``JSON_SCHEMA`` handler sends neither, and
+    OpenRouter treats a non-strict json_schema as *advisory* — measured
+    2026-07-14 on ``mistralai/mistral-nemo``: the model stochastically echoed
+    the schema itself with values nested inside ``properties``. This provider
+    therefore sets ``strict_json_schema``, which upgrades the
+    ``response_format`` at the LiteLLM call seam to the exact wire shape the
+    original pin was measured on.
 
     **Schema-honoring routing (the sharp edge).** OpenRouter advertises
     ``structured_outputs`` as a *model-level* capability, but the strict
@@ -49,6 +59,7 @@ class OpenRouterProvider(BaseProvider):
     _model_prefix: ClassVar[str] = "openrouter/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "google/gemini-2.0-flash-001"
+    _strict_json_schema: ClassVar[bool] = True
 
     def __init__(
         self,

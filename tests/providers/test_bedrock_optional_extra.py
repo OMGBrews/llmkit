@@ -8,7 +8,7 @@ missing ``boto3`` fails with a fix instead of as a cryptic ``ModuleNotFound``
 deep on the first completion.
 
 ``boto3`` is the provider's only eager construction check — the Anthropic
-SDK is not needed at all since the ``Mode.JSON`` repin (see
+SDK is not needed at all since the ``Mode.JSON_SCHEMA`` repin (see
 ``test_anthropic_sdk_not_required.py``).
 
 These tests simulate ``boto3``'s absence by stubbing

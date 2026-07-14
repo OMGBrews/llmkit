@@ -2,7 +2,7 @@
 
 Through 0.6.x the Anthropic and Bedrock providers pinned ``ANTHROPIC_JSON``
 and eagerly required the SDK (the ``omg-llmkit[anthropic]`` extra) for
-instructor's usage-accounting path. With the ``Mode.JSON`` repin that
+instructor's usage-accounting path. With the ``Mode.JSON_SCHEMA`` repin that
 coupling is gone: LiteLLM speaks the Anthropic HTTP API directly, and
 instructor (>=1.15.4) reaches the SDK only on an optional usage branch
 guarded by ``try/except ImportError``. These tests pin the new contract:

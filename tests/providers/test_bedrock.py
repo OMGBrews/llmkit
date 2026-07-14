@@ -3,10 +3,10 @@
 Parity with the other curated providers, plus the one thing Bedrock does
 differently: it authenticates through the **AWS credential chain**, not a
 bearer ``api_key``. The provider must expose the right LiteLLM model-prefix
-string (``bedrock/<model>``), pin ``Mode.JSON`` (the same mode the direct
-``AnthropicProvider`` uses, since the model is Claude; ``Mode.BEDROCK_JSON``
-is for instructor's ``from_bedrock`` client and drops ``model`` over
-``from_litellm``), and carry
+string (``bedrock/<model>``), pin ``Mode.JSON_SCHEMA`` (the same mode the
+direct ``AnthropicProvider`` uses, since the model is Claude;
+``Mode.BEDROCK_JSON`` is for instructor's ``from_bedrock`` client and drops
+``model`` over ``from_litellm``), and carry
 only ``aws_region_name`` — and only when set, so an
 unset region (and the secrets, always) resolve from the ambient AWS chain.
 ``build_provider`` must map ``Provider.BEDROCK`` explicitly and thread model /
@@ -37,7 +37,7 @@ def test_model_prefix_and_mode() -> None:
     assert provider.litellm_model("anthropic.claude-3-5-haiku-20241022-v1:0") == (
         "bedrock/anthropic.claude-3-5-haiku-20241022-v1:0"
     )
-    assert provider.instructor_mode is instructor.Mode.JSON
+    assert provider.instructor_mode is instructor.Mode.JSON_SCHEMA
 
 
 def test_completion_kwargs_with_region() -> None:

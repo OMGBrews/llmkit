@@ -26,21 +26,24 @@ class BedrockProvider(BaseProvider):
     also left unset, it resolves from the chain (``AWS_REGION_NAME`` /
     ``AWS_REGION``) like the credentials.
 
-    Structured output is pinned to ``instructor.Mode.JSON`` — the same mode
-    the direct :class:`AnthropicProvider` pins, for the same reason: the
-    underlying model is Claude. ``Mode.ANTHROPIC_JSON`` (the pin through
-    0.6.x) was measured to validate against Haiku 4.5 over LiteLLM — as were
-    ``JSON`` / ``JSON_SCHEMA`` / ``TOOLS``, while ``ANTHROPIC_TOOLS`` did not
-    — but instructor 1.15.3 removed it from the mode registry
-    ``from_litellm`` validates against at client construction, so it now
-    raises ``RegistryError`` before any request is sent; ``JSON`` is the
-    surviving measured mode. Note ``Mode.BEDROCK_JSON`` is deliberately
-    **not** used: it targets instructor's native ``from_bedrock`` (boto3)
-    client, whose request param is ``modelId``, so when driven through
-    ``from_litellm`` (this library's call seam) it drops ``model`` and
-    LiteLLM's ``acompletion`` fails with a missing-``model`` error. Non-Claude
-    Bedrock families (Llama, Titan) may need a different mode and are out of
-    scope for this first cut.
+    Structured output is pinned to ``instructor.Mode.JSON_SCHEMA`` — the
+    same mode the direct :class:`AnthropicProvider` pins, for the same
+    reason: the underlying model is Claude. ``Mode.ANTHROPIC_JSON`` (the pin
+    through 0.6.x) was removed from the mode registry ``from_litellm``
+    validates against at client construction in instructor 1.15.3, so it now
+    raises ``RegistryError`` before any request is sent. The surviving core
+    modes were re-measured live against Haiku 4.5 on instructor 1.15.4's
+    parse paths (2026-07-14): ``JSON_SCHEMA`` and ``MD_JSON`` validate every
+    field; ``JSON`` fails (Claude fences the JSON in markdown; the parse
+    path doesn't strip fences); ``TOOLS`` cannot run on a lean install
+    (LiteLLM's tools branch imports its proxy machinery, needing
+    ``fastapi``). Note ``Mode.BEDROCK_JSON`` is deliberately **not** used:
+    it targets instructor's native ``from_bedrock`` (boto3) client, whose
+    request param is ``modelId``, so when driven through ``from_litellm``
+    (this library's call seam) it drops ``model`` and LiteLLM's
+    ``acompletion`` fails with a missing-``model`` error. Non-Claude Bedrock
+    families (Llama, Titan) may need a different mode and are out of scope
+    for this first cut.
 
     The default model is Haiku 4.5 — the model the mode measurements above
     were actually run against — via its **cross-region inference profile** id
@@ -65,7 +68,7 @@ class BedrockProvider(BaseProvider):
 
     _provider_name: ClassVar[str] = "AWS Bedrock"
     _model_prefix: ClassVar[str] = "bedrock/"
-    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def __init__(
