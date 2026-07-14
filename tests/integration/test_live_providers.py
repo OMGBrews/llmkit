@@ -6,6 +6,20 @@ instance back — the one thing mocks can never prove: that our model
 strings, ``instructor.Mode`` pinning, and credential kwargs are actually
 accepted by the provider's API.
 
+Two kinds of test live here, and the difference is the model id:
+
+* ``test_live_default_model`` is parametrized over the whole :class:`Provider`
+  enum and passes **no** ``model=``, so each provider resolves its own
+  ``_default_model``. This is the gate that a default the vendor has retired
+  cannot ship (it is the one OpenRouter's dead ``google/gemini-2.0-flash-001``
+  slipped through for several releases). Its model ids are deliberately *not*
+  env-overridable.
+* The per-provider ``test_<name>_live`` tests drive an explicit, env-overridable
+  ``*_SMOKE_MODEL``. They pin wire-level behaviour (OpenRouter's strict
+  ``json_schema`` enforcement, Vertex's ``Mode.JSON_SCHEMA``) and give a
+  maintainer whose key lacks access to a default a way to still exercise the
+  provider.
+
 **These are the live half of an explicit split.** Every test in this module is
 marked ``@pytest.mark.live`` (via ``pytestmark`` below) and runs *only* when
 ``--run-live`` is passed. The ``conftest.py`` switch — never the presence of a
@@ -75,25 +89,17 @@ from __future__ import annotations
 
 import os
 import socket
-from typing import NoReturn, Protocol, cast
+from typing import NoReturn, Protocol, TypedDict, assert_never, cast
 
 import pytest
 from pydantic import BaseModel
 
 from llmkit import (
     LLMProviderInterface,
+    Provider,
     structured_llm_call,
 )
-from llmkit.providers import (
-    AnthropicProvider,
-    BedrockProvider,
-    DeepSeekProvider,
-    GoogleProvider,
-    OllamaProvider,
-    OpenAIProvider,
-    OpenRouterProvider,
-    VertexProvider,
-)
+from llmkit.providers import make_provider
 
 # Every test in this module makes a real API call. The marker is what the
 # ``--run-live`` switch in conftest.py keys off of: without the flag these are
@@ -255,6 +261,161 @@ def _ollama_up() -> bool:
         return False
 
 
+class _LiveCredentials(TypedDict, total=False):
+    """The credential kwargs a live provider needs, as accepted by ``make_provider``.
+
+    Deliberately excludes ``model``: these are the *credentials only*, so the
+    same resolved value can build either a default-model provider or an
+    override-model one without a caller being able to smuggle a model in.
+    """
+
+    api_key: str
+    base_url: str
+    aws_region_name: str
+    vertex_project: str
+    vertex_location: str
+
+
+def _require_env(*names: str) -> str:
+    """First non-empty value among ``names``; fail the live test if none is set."""
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    _missing(f"{' / '.join(names)} not set")
+
+
+def _live_credentials(provider: Provider) -> _LiveCredentials:
+    """Resolve one provider's real credentials, failing loudly when any is absent.
+
+    The **single** place the live suite probes for a credential — both the
+    default-model gate and the override-model tests below build from this, so
+    the two can never disagree about what a provider needs.
+
+    The ``match`` has no catch-all and ends in :func:`typing.assert_never`, which
+    is what makes the default-model coverage *structural* rather than a list
+    someone must remember to extend: a newly-added :class:`Provider` member with
+    no ``case`` here is a basedpyright error, and an unwired one raises rather
+    than silently resolving to nothing.
+    """
+    match provider:
+        case Provider.OPENROUTER:
+            return {"api_key": _require_env("OPENROUTER_API_KEY")}
+        case Provider.OLLAMA:
+            if not _ollama_up():
+                _missing(f"no Ollama server at {_OLLAMA_HOST} (run `ollama serve`)")
+            return {"base_url": _OLLAMA_HOST}
+        case Provider.GOOGLE:
+            return {"api_key": _require_env("GEMINI_API_KEY", "GOOGLE_API_KEY")}
+        case Provider.ANTHROPIC:
+            return {"api_key": _require_env("ANTHROPIC_API_KEY")}
+        case Provider.OPENAI:
+            return {"api_key": _require_env("OPENAI_API_KEY")}
+        case Provider.DEEPSEEK:
+            return {"api_key": _require_env("DEEPSEEK_API_KEY")}
+        case Provider.BEDROCK:
+            # boto3 ships only with the optional `omg-llmkit[bedrock]` extra.
+            # Skipping when it's absent is a *structural* gate (the dependency
+            # isn't installed), not the env-driven mode switch this module
+            # forbids — Bedrock uniquely needs both that extra and an AWS
+            # account, which plain `--run-live` cannot assume. Once the extra IS
+            # installed the usual hard-fail rule applies: a missing region or
+            # credential fails the test rather than skipping it.
+            boto3 = cast(
+                "_Boto3Module",
+                pytest.importorskip("boto3", reason="install omg-llmkit[bedrock] for live Bedrock"),
+            )
+            region = _require_env("AWS_REGION_NAME", "AWS_REGION")
+            if boto3.Session().get_credentials() is None:
+                _missing("no resolvable AWS credentials in the chain (env / profile / role)")
+            # Secrets resolve from the ambient AWS chain; only the region is explicit.
+            return {"aws_region_name": region}
+        case Provider.VERTEX:
+            # Same structural gate as Bedrock: google-auth ships only with the
+            # optional `omg-llmkit[vertex]` extra, and Vertex also needs a GCP
+            # project that `--run-live` cannot assume.
+            google_auth = cast(
+                "_GoogleAuthModule",
+                pytest.importorskip(
+                    "google.auth", reason="install omg-llmkit[vertex] for live Vertex"
+                ),
+            )
+            project = _require_env("VERTEXAI_PROJECT", "GOOGLE_CLOUD_PROJECT")
+            location = os.getenv("VERTEXAI_LOCATION")
+            if not location:
+                _missing("VERTEXAI_LOCATION not set (it selects the data-residency region)")
+            try:
+                # Only the no-raise matters: this resolves the ambient ADC or errors.
+                _ = google_auth.default()
+            except Exception:  # google.auth.exceptions.DefaultCredentialsError and friends
+                _missing("no resolvable Google ADC (run `gcloud auth application-default login`)")
+            # Credentials resolve from the ambient ADC chain; only project + the
+            # residency location are explicit.
+            return {"vertex_project": project, "vertex_location": location}
+    assert_never(provider)
+
+
+# Gemini 2.5 (AI Studio *and* Vertex) thinks by default; disable it so the smoke
+# call doesn't burn reasoning tokens on a trivial extraction. Every other
+# provider sends nothing — some models reject the knob outright.
+_REASONING_EFFORT: dict[Provider, str] = {
+    Provider.GOOGLE: "disable",
+    Provider.VERTEX: "disable",
+}
+
+
+async def _override_roundtrip(provider: Provider, model: str) -> None:
+    """Drive one real structured call on an explicitly-named (``*_SMOKE_MODEL``) model.
+
+    The override half of the split: this is what a maintainer whose key lacks
+    access to a provider's default can repoint, and what pins the *wire shape*
+    (see ``test_openrouter_live``). The model id it drives is deliberately
+    env-overridable — which is exactly why it can never stand in for
+    :func:`test_live_default_model`, whose model id must not be.
+    """
+    built = make_provider(provider, model=model, **_live_credentials(provider))
+    await _assert_structured_roundtrip(built, reasoning_effort=_REASONING_EFFORT.get(provider))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", list(Provider))
+async def test_live_default_model(provider: Provider) -> None:
+    """Every provider's own ``_default_model`` survives a real structured call.
+
+    This test exists because ``OpenRouterProvider._default_model`` was
+    ``google/gemini-2.0-flash-001`` for several releases *after* OpenRouter
+    retired it: the slug left the catalog, so every call that took the default
+    died with ``NotFoundError: No endpoints found``, and no consumer could
+    construct the provider without naming a model. The live suite never caught
+    it because every OpenRouter test passed an explicit ``model=``.
+
+    Passing **no model** is therefore the entire point — each provider must
+    resolve its own default, so a default the vendor has retired fails *this*
+    release gate instead of shipping. For the same reason there is deliberately
+    no ``*_SMOKE_MODEL`` override honoured here: one that could repoint this call
+    at a model the default isn't would restore the exact blind spot it closes.
+    The override models live in the per-provider tests below.
+
+    Parametrizing over :class:`Provider` (rather than hand-writing one test per
+    provider) is what keeps the coverage structural: a provider added later is
+    picked up here the moment its enum member exists, and :func:`_live_credentials`
+    will not type-check until someone says how to authenticate it.
+    """
+    built = make_provider(provider, model=None, **_live_credentials(provider))
+    try:
+        await _assert_structured_roundtrip(built, reasoning_effort=_REASONING_EFFORT.get(provider))
+    except Exception as exc:
+        # Vendors name a dead model inconsistently (OpenRouter's was a bare
+        # "404 No endpoints found"). Naming it ourselves means a red gate always
+        # says *which* id to go replace, whatever the provider chose to say.
+        exc.add_note(
+            f"This call used {provider.value}'s own _default_model, which resolved "
+            + f"to {built.litellm_model()!r}. If the vendor has retired that id, "
+            + f"replace {type(built).__name__}._default_model."
+        )
+        raise
+
+
 @pytest.mark.asyncio
 async def test_openrouter_live() -> None:
     """OpenRouter on the *override* model — the strict-enforcement canary.
@@ -267,133 +428,44 @@ async def test_openrouter_live() -> None:
     redundant with the default-model test below: that one pins the model id,
     this one pins the wire shape.
     """
-    key = os.getenv("OPENROUTER_API_KEY")
-    if not key:
-        _missing("OPENROUTER_API_KEY not set")
-    await _assert_structured_roundtrip(OpenRouterProvider(api_key=key, model=_OPENROUTER_MODEL))
-
-
-@pytest.mark.asyncio
-async def test_openrouter_live_default_model() -> None:
-    """OpenRouter on its **own default** model — no ``model=``, no env override.
-
-    This test exists because ``OpenRouterProvider._default_model`` was
-    ``google/gemini-2.0-flash-001`` for several releases *after* OpenRouter
-    retired it: the slug left the catalog, so every call that took the default
-    died with ``NotFoundError: No endpoints found``, and no consumer could
-    construct the provider without naming a model. The live suite never caught
-    it because every OpenRouter test overrode the model.
-
-    Passing no ``model`` is therefore the entire point — the provider must
-    resolve its own default, so a retired default fails *this* release gate
-    instead of shipping. For the same reason there is deliberately no
-    ``*_SMOKE_MODEL`` env override here: one that could repoint this call at a
-    model the default isn't would restore the exact blind spot it closes.
-    """
-    key = os.getenv("OPENROUTER_API_KEY")
-    if not key:
-        _missing("OPENROUTER_API_KEY not set")
-    await _assert_structured_roundtrip(OpenRouterProvider(api_key=key))
+    await _override_roundtrip(Provider.OPENROUTER, _OPENROUTER_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_google_live() -> None:
-    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not key:
-        _missing("GEMINI_API_KEY (or GOOGLE_API_KEY) not set")
-    # Gemini 2.5 thinks by default; disable it so the smoke call doesn't
-    # burn reasoning tokens on a trivial prompt.
-    await _assert_structured_roundtrip(
-        GoogleProvider(api_key=key, model=_GOOGLE_MODEL), reasoning_effort="disable"
-    )
+    await _override_roundtrip(Provider.GOOGLE, _GOOGLE_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_anthropic_live() -> None:
-    key = os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        _missing("ANTHROPIC_API_KEY not set")
-    await _assert_structured_roundtrip(AnthropicProvider(api_key=key, model=_ANTHROPIC_MODEL))
+    await _override_roundtrip(Provider.ANTHROPIC, _ANTHROPIC_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_openai_live() -> None:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        _missing("OPENAI_API_KEY not set")
-    await _assert_structured_roundtrip(OpenAIProvider(api_key=key, model=_OPENAI_MODEL))
+    await _override_roundtrip(Provider.OPENAI, _OPENAI_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_deepseek_live() -> None:
-    key = os.getenv("DEEPSEEK_API_KEY")
-    if not key:
-        _missing("DEEPSEEK_API_KEY not set")
     # Mode.JSON (not JSON_SCHEMA, which DeepSeek's API rejects) validates on
     # both deepseek-chat and deepseek-reasoner; the default smoke model is
     # deepseek-chat (V3). reasoning_effort is omitted: it's only meaningful for
     # deepseek-reasoner, and the provider forwards it when configured.
-    await _assert_structured_roundtrip(DeepSeekProvider(api_key=key, model=_DEEPSEEK_MODEL))
+    await _override_roundtrip(Provider.DEEPSEEK, _DEEPSEEK_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_ollama_live() -> None:
-    if not _ollama_up():
-        _missing(f"no Ollama server at {_OLLAMA_HOST} (run `ollama serve`)")
-    await _assert_structured_roundtrip(OllamaProvider(base_url=_OLLAMA_HOST, model=_OLLAMA_MODEL))
+    await _override_roundtrip(Provider.OLLAMA, _OLLAMA_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_bedrock_live() -> None:
-    # boto3 ships only with the optional `omg-llmkit[bedrock]` extra. Skipping
-    # when it's absent is a *structural* gate (the dependency isn't installed),
-    # not the env-driven mode switch this module forbids — and Bedrock uniquely
-    # needs both that extra and an AWS account, which plain `--run-live` cannot
-    # assume. Once the extra IS installed, the usual hard-fail rule applies:
-    # a missing region/credential fails the test rather than skipping it.
-    boto3 = cast(
-        "_Boto3Module",
-        pytest.importorskip("boto3", reason="install omg-llmkit[bedrock] for live Bedrock"),
-    )
-    region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION")
-    if not region:
-        _missing("AWS_REGION_NAME (or AWS_REGION) not set")
-    if boto3.Session().get_credentials() is None:
-        _missing("no resolvable AWS credentials in the chain (env / profile / role)")
-    # Secrets resolve from the ambient AWS chain; only the region is explicit.
-    await _assert_structured_roundtrip(
-        BedrockProvider(model=_BEDROCK_MODEL, aws_region_name=region)
-    )
+    await _override_roundtrip(Provider.BEDROCK, _BEDROCK_MODEL)
 
 
 @pytest.mark.asyncio
 async def test_vertex_live() -> None:
-    # google-auth ships only with the optional `omg-llmkit[vertex]` extra.
-    # Skipping when it's absent is a *structural* gate (the dependency isn't
-    # installed), not the env-driven mode switch this module forbids — and Vertex
-    # uniquely needs both that extra and a GCP project, which plain `--run-live`
-    # cannot assume. Once the extra IS installed, the usual hard-fail rule
-    # applies: a missing project/location/credential fails the test, not skips it.
-    google_auth = cast(
-        "_GoogleAuthModule",
-        pytest.importorskip("google.auth", reason="install omg-llmkit[vertex] for live Vertex"),
-    )
-    project = os.getenv("VERTEXAI_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
-    location = os.getenv("VERTEXAI_LOCATION")
-    if not project:
-        _missing("VERTEXAI_PROJECT (or GOOGLE_CLOUD_PROJECT) not set")
-    if not location:
-        _missing("VERTEXAI_LOCATION not set (it selects the data-residency region)")
-    try:
-        # Only the no-raise matters: this resolves the ambient ADC or errors.
-        _ = google_auth.default()
-    except Exception:  # google.auth.exceptions.DefaultCredentialsError and friends
-        _missing("no resolvable Google ADC (run `gcloud auth application-default login`)")
-    # Credentials resolve from the ambient ADC chain; only project + the
-    # residency location are explicit. Gemini 2.5 thinks by default — disable it
-    # so the smoke call doesn't burn reasoning tokens on a trivial prompt. This
-    # call is what *measures* the Mode.JSON_SCHEMA pin against live Vertex.
-    await _assert_structured_roundtrip(
-        VertexProvider(model=_VERTEX_MODEL, vertex_project=project, vertex_location=location),
-        reasoning_effort="disable",
-    )
+    # This call is what *measures* the Mode.JSON_SCHEMA pin against live Vertex.
+    await _override_roundtrip(Provider.VERTEX, _VERTEX_MODEL)
