@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omg-llmkit"
-version = "0.6.0"
+version = "0.7.0"
 description = "A thin, opinionated, local-first structured-output + logging layer over LiteLLM"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -43,7 +43,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # There is deliberately no `anthropic` extra anymore (removed with the
-# Mode.JSON repin): LiteLLM speaks the Anthropic HTTP API directly, and
+# Mode.JSON_SCHEMA repin): LiteLLM speaks the Anthropic HTTP API directly, and
 # instructor >=1.15.4 reaches the Anthropic SDK only on an optional
 # usage-accounting branch guarded by try/except ImportError — no llmkit code
 # path requires it. Direct Anthropic (Claude) routing works on the core

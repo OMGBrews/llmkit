@@ -4,14 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — 2026-07-14
 
 Structured output works again for **Anthropic, Bedrock, and OpenRouter** on a
 fresh install. instructor 1.15.3 removed `Mode.ANTHROPIC_JSON` and
 `Mode.OPENROUTER_STRUCTURED_OUTPUTS` from the mode registry that
 `from_litellm` validates at client construction, so under the unbounded
 `instructor>=1.15.1` floor every structured call through those three
-providers raised `RegistryError` before any request was sent.
+providers raised `RegistryError` before any request was sent. Every mode
+repin below was verified by a live structured round-trip against all eight
+providers (`--run-live`, 8/8 green, 2026-07-14).
 
 ### Fixed
 
@@ -1023,6 +1025,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
+[0.7.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.5.0
 [0.4.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.4.0
