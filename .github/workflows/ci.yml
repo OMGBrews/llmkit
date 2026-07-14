@@ -9,10 +9,19 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # Exact pin, unlike the actions/* above: setup-uv stopped publishing
+        # floating major tags at v8 as supply-chain hardening, so `@v8` does
+        # not resolve — only immutable release tags do.
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          # uv.lock is gitignored (a library doesn't commit its lock), so the
+          # default `**/uv.lock` key matches nothing in a fresh checkout and the
+          # cache never invalidates. pyproject.toml is what declares the deps.
+          cache-dependency-glob: pyproject.toml
 
       - name: Set up Python
         run: uv python install 3.13
