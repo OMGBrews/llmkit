@@ -17,7 +17,13 @@ class OpenRouterProvider(BaseProvider):
     """OpenRouter LLM provider.
 
     Routes through OpenRouter's unified endpoint (``openrouter/<model>``),
-    using its native structured-outputs mode for instructor.
+    pinned to ``Mode.JSON_SCHEMA`` for instructor: the request carries the
+    OpenAI-style strict ``response_format={"type": "json_schema", ...}``,
+    which is exactly OpenRouter's structured-outputs surface.
+    ``Mode.OPENROUTER_STRUCTURED_OUTPUTS`` (the pin through 0.6.x) sent the
+    same request shape but was removed from the mode registry
+    ``from_litellm`` validates against at client construction in instructor
+    1.15.3, so it now raises ``RegistryError`` before any request is sent.
 
     **Schema-honoring routing (the sharp edge).** OpenRouter advertises
     ``structured_outputs`` as a *model-level* capability, but the strict
@@ -41,7 +47,7 @@ class OpenRouterProvider(BaseProvider):
 
     _provider_name: ClassVar[str] = "OpenRouter"
     _model_prefix: ClassVar[str] = "openrouter/"
-    _mode: ClassVar[instructor.Mode] = instructor.Mode.OPENROUTER_STRUCTURED_OUTPUTS
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "google/gemini-2.0-flash-001"
 
     def __init__(

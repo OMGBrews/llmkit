@@ -125,12 +125,12 @@ def test_make_provider_vertex_project_and_location_only() -> None:
 
 
 def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
-    """Bedrock's eager anthropic+boto3 checks succeed in the dev env.
+    """Bedrock's eager boto3 check succeeds in the dev env.
 
-    ``BedrockProvider.__init__`` calls ``require_anthropic_sdk`` then
-    ``require_boto3_sdk`` *eagerly* at construction. Reaching a constructed
-    provider via ``make_provider`` at all proves both SDKs are importable here;
-    this asserts the region still threads through after those checks pass.
+    ``BedrockProvider.__init__`` calls ``require_boto3_sdk`` *eagerly* at
+    construction. Reaching a constructed provider via ``make_provider`` at all
+    proves boto3 is importable here; this asserts the region still threads
+    through after that check passes.
     """
     provider = make_provider(Provider.BEDROCK, aws_region_name="us-east-1")
     assert isinstance(provider, BedrockProvider)

@@ -146,6 +146,29 @@ def test_shipped_providers_satisfy_the_contract(provider_cls: type[BaseProvider]
     assert isinstance(provider_cls._mode, instructor.Mode)
 
 
+@pytest.mark.parametrize("provider_cls", _SHIPPED_PROVIDERS)
+def test_shipped_mode_constructs_an_instructor_client(provider_cls: type[BaseProvider]) -> None:
+    """Every shipped mode pin constructs an instructor client — offline, keyless.
+
+    ``instructor.from_litellm`` validates the mode against its LiteLLM mode
+    registry at *client construction* — instructor 1.15.3 removed
+    ``ANTHROPIC_JSON`` and ``OPENROUTER_STRUCTURED_OUTPUTS`` from that
+    registry, so three providers raised ``RegistryError`` before any request
+    was sent, while the mocked structured-call harness (which patches out
+    ``from_litellm`` itself) stayed green. Constructing against the real
+    registry here pins the contract, so the next registry drift fails CI
+    rather than production. The fake completion is ``async`` because the
+    production seam (``_litellm.acompletion_structured``) always hands
+    ``from_litellm`` an async completion.
+    """
+
+    async def _never_called(**_kwargs: object) -> object:
+        raise AssertionError("construction is the contract under test; no call expected")
+
+    client = instructor.from_litellm(_never_called, mode=provider_cls._mode)
+    assert isinstance(client, instructor.AsyncInstructor)
+
+
 @pytest.mark.parametrize("provider_cls", [BaseProvider, *_SHIPPED_PROVIDERS])
 def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvider]) -> None:
     """All class-level routing config is uniformly annotated ``ClassVar``.

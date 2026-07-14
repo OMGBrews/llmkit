@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Structured output works again for **Anthropic, Bedrock, and OpenRouter** on a
+fresh install. instructor 1.15.3 removed `Mode.ANTHROPIC_JSON` and
+`Mode.OPENROUTER_STRUCTURED_OUTPUTS` from the mode registry that
+`from_litellm` validates at client construction, so under the unbounded
+`instructor>=1.15.1` floor every structured call through those three
+providers raised `RegistryError` before any request was sent.
+
+### Fixed
+
+- **Anthropic and Bedrock repin `Mode.ANTHROPIC_JSON` → `Mode.JSON`; OpenRouter
+  repins `Mode.OPENROUTER_STRUCTURED_OUTPUTS` → `Mode.JSON_SCHEMA`.** The
+  surviving core modes with the same wire shape the originals were chosen
+  for: schema-in-system-prompt JSON for Claude, the OpenAI-style strict
+  `response_format` json-schema for OpenRouter (whose `require_parameters`
+  routing default continues to keep requests on endpoints that honor it).
+
+### Changed
+
+- **`instructor` is now declared `>=1.15.4,<2`** (was `>=1.15.1` unbounded).
+  The mode registry `from_litellm` construction runs against is a coupling
+  surface that has already broken once inside a patch series, so the range is
+  pinned to the semantics the modes are verified on. An offline, keyless test
+  now constructs every shipped provider's mode against the real registry, so
+  the next registry drift fails CI instead of production.
+
+### Removed
+
+- **The `[anthropic]` extra and the eager Anthropic-SDK construction gate.**
+  With the `Mode.JSON` repin no llmkit path can reach the Anthropic SDK:
+  LiteLLM speaks the Anthropic HTTP API directly, and instructor >=1.15.4
+  touches the SDK only inside `try/except ImportError`. `AnthropicProvider`
+  and `BedrockProvider` construct without it (previously they raised
+  `ModuleNotFoundError` pointing at `omg-llmkit[anthropic]`), the `[bedrock]`
+  extra no longer pulls the SDK in, and `require_anthropic_sdk` is gone from
+  `llmkit.providers.base`. Hosts that installed `omg-llmkit[anthropic]` can
+  simply drop the extra.
+
 ## [0.6.0] — 2026-07-12
 
 Structured calls now **fail fast on output-token-limit truncation**

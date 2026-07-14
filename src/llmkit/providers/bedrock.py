@@ -9,7 +9,6 @@ import instructor
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
-    require_anthropic_sdk,
     require_boto3_sdk,
 )
 
@@ -27,45 +26,46 @@ class BedrockProvider(BaseProvider):
     also left unset, it resolves from the chain (``AWS_REGION_NAME`` /
     ``AWS_REGION``) like the credentials.
 
-    Structured output is pinned to ``instructor.Mode.ANTHROPIC_JSON`` — the
-    same Claude-native JSON mode the direct :class:`AnthropicProvider` pins,
-    for the same reason: the underlying model is Claude. Note ``Mode.BEDROCK_JSON``
-    is deliberately **not** used: it targets instructor's native ``from_bedrock``
-    (boto3) client, whose request param is ``modelId``, so when driven through
-    ``from_litellm`` (this library's call seam) it drops ``model`` and LiteLLM's
-    ``acompletion`` fails with a missing-``model`` error. Over LiteLLM the
-    working Claude mode is ``ANTHROPIC_JSON`` (measured against Haiku 4.5;
-    ``JSON`` / ``JSON_SCHEMA`` / ``TOOLS`` also validate, ``ANTHROPIC_TOOLS``
-    does not). Non-Claude Bedrock families (Llama, Titan) may need a different
-    mode and are out of scope for this first cut.
+    Structured output is pinned to ``instructor.Mode.JSON`` — the same mode
+    the direct :class:`AnthropicProvider` pins, for the same reason: the
+    underlying model is Claude. ``Mode.ANTHROPIC_JSON`` (the pin through
+    0.6.x) was measured to validate against Haiku 4.5 over LiteLLM — as were
+    ``JSON`` / ``JSON_SCHEMA`` / ``TOOLS``, while ``ANTHROPIC_TOOLS`` did not
+    — but instructor 1.15.3 removed it from the mode registry
+    ``from_litellm`` validates against at client construction, so it now
+    raises ``RegistryError`` before any request is sent; ``JSON`` is the
+    surviving measured mode. Note ``Mode.BEDROCK_JSON`` is deliberately
+    **not** used: it targets instructor's native ``from_bedrock`` (boto3)
+    client, whose request param is ``modelId``, so when driven through
+    ``from_litellm`` (this library's call seam) it drops ``model`` and
+    LiteLLM's ``acompletion`` fails with a missing-``model`` error. Non-Claude
+    Bedrock families (Llama, Titan) may need a different mode and are out of
+    scope for this first cut.
 
-    The default model is Haiku 4.5 — the model the ``ANTHROPIC_JSON`` mode
-    choice above was actually measured against — via its **cross-region
-    inference profile** id (``us.anthropic....``). Newer Claude models on
-    Bedrock are generally reachable only through such a profile, not a bare
-    on-demand id, so the default carries the ``us.`` prefix; callers in other
-    AWS partitions should pass their region group's profile id (e.g.
-    ``eu.anthropic....``) as the ``model``. Inference profiles are otherwise
-    out of scope here.
+    The default model is Haiku 4.5 — the model the mode measurements above
+    were actually run against — via its **cross-region inference profile** id
+    (``us.anthropic....``). Newer Claude models on Bedrock are generally
+    reachable only through such a profile, not a bare on-demand id, so the
+    default carries the ``us.`` prefix; callers in other AWS partitions
+    should pass their region group's profile id (e.g. ``eu.anthropic....``)
+    as the ``model``. Inference profiles are otherwise out of scope here.
 
     ``reasoning_effort`` is forwarded to LiteLLM for Bedrock models that
     support thinking (e.g. Claude) and is harmless on those that don't.
 
     Bedrock pulls in ``boto3`` for request signing (AWS SigV4); it ships via
     the ``omg-llmkit[bedrock]`` extra rather than the core install, so
-    non-Bedrock users take on no extra dependency. Because it routes Claude
-    under ``ANTHROPIC_JSON``, it also needs the Anthropic SDK at call time —
-    the ``[bedrock]`` extra therefore pulls in the ``[anthropic]`` extra. Both
-    deps are checked *eagerly* at construction (Anthropic SDK first, then
-    ``boto3``): constructing this provider without the Anthropic SDK raises a
-    clear "install omg-llmkit[anthropic]" error, and without ``boto3`` an
-    "install omg-llmkit[bedrock]" error — instead of a cryptic
-    ``ModuleNotFound`` deep on the first completion.
+    non-Bedrock users take on no extra dependency. It is checked *eagerly* at
+    construction: constructing this provider without ``boto3`` raises a clear
+    "install omg-llmkit[bedrock]" error instead of a cryptic
+    ``ModuleNotFound`` deep on the first completion. (The Anthropic SDK is
+    **not** needed — see :class:`AnthropicProvider`; instructor >=1.15.4
+    never requires it on the LiteLLM path.)
     """
 
     _provider_name: ClassVar[str] = "AWS Bedrock"
     _model_prefix: ClassVar[str] = "bedrock/"
-    _mode: ClassVar[instructor.Mode] = instructor.Mode.ANTHROPIC_JSON
+    _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
     _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def __init__(
@@ -74,7 +74,6 @@ class BedrockProvider(BaseProvider):
         aws_region_name: str | None = None,
         reasoning_effort: str | None = None,
     ):
-        require_anthropic_sdk(self._provider_name)
         require_boto3_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
         self._aws_region_name: str | None = aws_region_name

@@ -13,11 +13,16 @@ and supplies what the LiteLLM call layer needs: a LiteLLM **model
 string** (provider-prefixed, e.g. ``openrouter/<model>``,
 ``gemini/<model>``), the completion kwargs that carry credentials
 (``api_key`` / ``api_base``), and the :class:`instructor.Mode` that pins
-structured output to the provider's *native* JSON-schema mode. The mode
-map is explicit on purpose — instructor's auto-mode falls back to
-``Mode.TOOLS``, which silently regresses Gemini structured output
-(measured 0% valid / silent-empty shapes), so every provider names its
-mode.
+the provider's structured-output strategy. The mode map is explicit on
+purpose — instructor's auto-mode falls back to ``Mode.TOOLS``, which
+silently regresses Gemini structured output (measured 0% valid /
+silent-empty shapes), so every provider names its mode. Since instructor
+1.15.3, ``from_litellm`` (this library's call seam) validates the mode
+against its LiteLLM registry at client construction, so only the core
+modes (``JSON``, ``JSON_SCHEMA``, ``TOOLS``, …) are pinnable — the
+per-provider modes it dropped raise ``RegistryError`` (see
+``tests/providers/test_provider_contract.py``, which constructs every
+shipped pin against the real registry).
 
 Dispatch (config → provider) and the public facade live in this
 package's ``__init__.py``.
@@ -75,28 +80,6 @@ def _require_sdk(
         if note:
             message += f"\n\n{note}"
         raise ModuleNotFoundError(message)
-
-
-def require_anthropic_sdk(provider_name: str) -> None:
-    """Raise a clear, actionable error if the Anthropic SDK is not installed.
-
-    The Anthropic and Bedrock providers both pin instructor's
-    ``ANTHROPIC_JSON`` mode. instructor reaches the Anthropic SDK only at
-    *call time*, on its ANTHROPIC_* usage-accounting path (``from
-    anthropic.types import Usage`` inside ``instructor/core/retry.py``), so
-    plain ``import llmkit`` and a Google-only flow never touch it. The SDK
-    therefore ships in the opt-in ``omg-llmkit[anthropic]`` extra rather than
-    the core install. Call this at provider construction so the failure
-    surfaces *eagerly* with a fix, instead of as a cryptic ``ModuleNotFound``
-    deep on the first completion.
-    """
-    _require_sdk(
-        "anthropic",
-        provider_name=provider_name,
-        extra="anthropic",
-        label="the Anthropic SDK",
-        note=("(Bedrock routes Claude and needs it too: 'omg-llmkit[bedrock]' pulls it in.)"),
-    )
 
 
 def require_boto3_sdk(provider_name: str) -> None:

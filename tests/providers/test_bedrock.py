@@ -3,10 +3,10 @@
 Parity with the other curated providers, plus the one thing Bedrock does
 differently: it authenticates through the **AWS credential chain**, not a
 bearer ``api_key``. The provider must expose the right LiteLLM model-prefix
-string (``bedrock/<model>``), pin Claude's native JSON mode
-(``Mode.ANTHROPIC_JSON`` — the same mode the direct ``AnthropicProvider`` uses,
-since the model is Claude; ``Mode.BEDROCK_JSON`` is for instructor's
-``from_bedrock`` client and drops ``model`` over ``from_litellm``), and carry
+string (``bedrock/<model>``), pin ``Mode.JSON`` (the same mode the direct
+``AnthropicProvider`` uses, since the model is Claude; ``Mode.BEDROCK_JSON``
+is for instructor's ``from_bedrock`` client and drops ``model`` over
+``from_litellm``), and carry
 only ``aws_region_name`` — and only when set, so an
 unset region (and the secrets, always) resolve from the ambient AWS chain.
 ``build_provider`` must map ``Provider.BEDROCK`` explicitly and thread model /
@@ -30,14 +30,14 @@ from llmkit.providers import BedrockProvider
 
 
 def test_model_prefix_and_mode() -> None:
-    """LiteLLM ``bedrock/`` prefix and Claude-on-Bedrock's native JSON mode."""
+    """LiteLLM ``bedrock/`` prefix and the measured Claude-on-Bedrock JSON mode."""
     provider = BedrockProvider(model="anthropic.claude-3-5-sonnet-20240620-v1:0")
     assert provider.name == "AWS Bedrock"
     assert provider.litellm_model() == "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
     assert provider.litellm_model("anthropic.claude-3-5-haiku-20241022-v1:0") == (
         "bedrock/anthropic.claude-3-5-haiku-20241022-v1:0"
     )
-    assert provider.instructor_mode is instructor.Mode.ANTHROPIC_JSON
+    assert provider.instructor_mode is instructor.Mode.JSON
 
 
 def test_completion_kwargs_with_region() -> None:
@@ -54,7 +54,7 @@ def test_completion_kwargs_without_region() -> None:
 
 def test_default_model() -> None:
     """A current, structured-output-capable default when none is given: Haiku 4.5
-    (the model ``ANTHROPIC_JSON`` was measured against) via its cross-region
+    (the model the mode pin was measured against) via its cross-region
     inference-profile id — newer Claude models on Bedrock aren't on-demand."""
     assert BedrockProvider().model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 

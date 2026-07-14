@@ -23,7 +23,15 @@ classifiers = [
 ]
 dependencies = [
     "litellm>=1.87.1",
-    "instructor>=1.15.1",
+    # instructor's `from_litellm` validates the provider mode pins against its
+    # LiteLLM mode registry at client construction (1.15.3 removed the
+    # non-core modes from that registry, which broke three providers with
+    # RegistryError; 1.15.4 is the version the current pins are verified on).
+    # The registry is an unstable coupling surface, so 2.x is excluded until
+    # measured. tests/providers/test_provider_contract.py constructs every
+    # shipped pin against the real registry, so a drift inside this range
+    # fails CI, not production.
+    "instructor>=1.15.4,<2",
     "openai>=2.20.0",
     "pydantic>=2.8.0",
     "pyyaml>=6.0.0",
@@ -34,26 +42,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Anthropic (Claude) routing, direct and via Bedrock. instructor imports the
-# Anthropic SDK *only at call time* — and only on its ANTHROPIC_* usage-
-# accounting path (`from anthropic.types import Usage` inside
-# instructor/core/retry.py, guarded by `mode in {ANTHROPIC_JSON, ...}`). Plain
-# `import instructor` / `from_litellm(..., ANTHROPIC_JSON)` construct fine
-# without it; the SDK is reached only when an Anthropic (or Bedrock, which pins
-# ANTHROPIC_JSON) completion actually runs. So it is opt-in: non-Anthropic
-# hosts (e.g. Google-only) take on no Anthropic dependency, and the Anthropic /
-# Bedrock providers raise a clear "install omg-llmkit[anthropic]" error at
-# construction when it is absent.
-anthropic = [
-    "anthropic>=0.69",
-]
+# There is deliberately no `anthropic` extra anymore (removed with the
+# Mode.JSON repin): LiteLLM speaks the Anthropic HTTP API directly, and
+# instructor >=1.15.4 reaches the Anthropic SDK only on an optional
+# usage-accounting branch guarded by try/except ImportError — no llmkit code
+# path requires it. Direct Anthropic (Claude) routing works on the core
+# install.
+#
 # AWS Bedrock routing. LiteLLM's bedrock/ path needs boto3 for SigV4 request
 # signing; it is opt-in so non-Bedrock installs take on no AWS dependency.
-# Bedrock routes Claude and pins instructor's ANTHROPIC_JSON mode, so it also
-# needs the Anthropic SDK at call time — hence it pulls in the `anthropic` extra.
 bedrock = [
     "boto3>=1.34",
-    "omg-llmkit[anthropic]",
 ]
 # Google Vertex AI routing. LiteLLM's vertex_ai/ path mints and refreshes the
 # Google OAuth access token it signs Gemini-on-Vertex requests with through
@@ -72,10 +71,9 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff==0.15.0",
     "basedpyright>=1.39",
-    # The offline test suite imports the Anthropic, Bedrock, and Vertex providers
-    # and exercises their construction, which eagerly check for the Anthropic SDK
-    # / boto3 (Bedrock) and google-auth (Vertex). Pull in the `bedrock` extra —
-    # which itself includes `anthropic` — and `vertex`, so every provider's
+    # The offline test suite imports the Bedrock and Vertex providers and
+    # exercises their construction, which eagerly checks for boto3 (Bedrock)
+    # and google-auth (Vertex). Pull in both extras so every provider's
     # construction dependency is present for dev/CI and `uv sync --extra dev`
     # yields a fully green suite.
     "omg-llmkit[bedrock]",
@@ -85,7 +83,6 @@ dev = [
 # that wants the full provider surface can `pip install 'omg-llmkit[all]'`
 # instead of enumerating extras.
 all = [
-    "omg-llmkit[anthropic]",
     "omg-llmkit[bedrock]",
     "omg-llmkit[vertex]",
 ]

@@ -6,7 +6,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 
 ## Why llmkit
 
-- **Structured output that actually validates.** Each provider is pinned to its *native* JSON-schema mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
+- **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
 - **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
@@ -33,25 +33,25 @@ a clear one-line redirect to `import llmkit`, not a bare
 
 Requires Python ≥ 3.13.
 
-The core install routes OpenRouter, Google AI Studio, OpenAI, DeepSeek, and Ollama
-with no extra dependencies. Three providers gate their dependencies behind opt-in
-extras so hosts pay only for what they call:
+The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
+DeepSeek, and Ollama with no extra dependencies. Two providers gate their
+dependencies behind opt-in extras so hosts pay only for what they call:
 
 ```bash
-pip install "omg-llmkit[anthropic]"  # direct Anthropic (Claude) routing
-pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (pulls in [anthropic] too)
+pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (boto3 for SigV4 signing)
 pip install "omg-llmkit[vertex]"     # Gemini via Google Cloud Vertex AI
 ```
 
-The Anthropic SDK is opt-in because `instructor` reaches it only at *call time*,
-on its `ANTHROPIC_JSON` usage-accounting path — plain `import llmkit` and a
-Google-AI-Studio-only flow never touch it. Constructing the `AnthropicProvider` or
-`BedrockProvider` without the SDK raises a clear `install omg-llmkit[anthropic]`
-error at construction, not a cryptic failure on the first call. Vertex is the same
-shape: its `[vertex]` extra pulls only `google-auth` (LiteLLM mints the Vertex
-OAuth token through it), and constructing the `VertexProvider` without it raises a
-clear `install omg-llmkit[vertex]` error — a non-Vertex host takes on no Google
-dependency.
+Bedrock's `[bedrock]` extra pulls only `boto3` (LiteLLM signs Bedrock requests
+with AWS SigV4 through it), and constructing the `BedrockProvider` without it
+raises a clear `install omg-llmkit[bedrock]` error at construction, not a
+cryptic failure on the first call. Vertex is the same shape: its `[vertex]`
+extra pulls only `google-auth` (LiteLLM mints the Vertex OAuth token through
+it), and constructing the `VertexProvider` without it raises a clear `install
+omg-llmkit[vertex]` error — a non-Vertex host takes on no Google dependency.
+Direct Anthropic routing needs no SDK at all: LiteLLM speaks the Anthropic
+HTTP API itself, so the `[anthropic]` extra that existed through 0.6.x is
+gone.
 
 ## Quick start
 
