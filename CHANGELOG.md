@@ -30,6 +30,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Structured-path transport errors are no longer double-sent inside the
+  rate-limiter slot.** instructor's in-call re-ask (the loop llmkit feeds its
+  `max_retries`) previously retried *every* failure except length truncation —
+  so a 429/5xx/network or a permanent 401/400/403 was re-sent immediately, with
+  no backoff and ignoring `Retry-After`, inside the single per-provider
+  concurrency slot: one request became two, invisible to the outer retry layer.
+  The in-call re-ask is now restricted to genuine parse failures (malformed
+  JSON / `ValidationError`), matching instructor's own default. A transient
+  error now makes **one** request per outer attempt (not two) and is retried by
+  the outer layer with the full transport budget and `Retry-After` honored; a
+  permanent error fails fast with no in-call duplicate. Every genuine parse
+  failure still gets its one repair re-ask and is retried on the (lower)
+  validation budget — this now correctly includes instructor's own
+  `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response) and
+  `AsyncValidationError` (a failing async field validator), which previously
+  failed fast; length truncation still fails fast as `OutputLimitError`.
 - **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
   was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
   gone from its catalog entirely, so *every* call that relied on the default

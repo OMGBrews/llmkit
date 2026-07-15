@@ -34,7 +34,7 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
-from llmkit.exceptions import OutputLimitError
+from llmkit.exceptions import REPAIRABLE_PARSE_ERRORS, OutputLimitError
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
@@ -203,27 +203,47 @@ def _completion_tokens(raw: object) -> int | None:
 
 
 def _schema_repair_retrying() -> AsyncRetrying:
-    """instructor's in-call repair budget: one schema-repair re-ask — except
-    never for a length truncation.
+    """instructor's in-call repair budget: one schema-repair re-ask, for a
+    genuine parse failure only.
 
     ``stop_after_attempt(2)`` keeps the historical budget (instructor feeds
     this to tenacity as *total attempts*, so 2 = one repair re-ask). The
-    predicate refuses to retry ``IncompleteOutputException`` — instructor's
-    truncated-by-the-output-token-limit signal, raised *before parsing* for
-    both the OpenAI shape (``finish_reason == "length"``) and the google-genai
-    shape (``FinishReason.MAX_TOKENS``) — because a re-ask with an identical
-    token budget can only truncate again; the observed production failure is a
-    degenerate repetition loop that burns to the provider ceiling on every
-    attempt. When the predicate declines, tenacity propagates the original
-    exception **bare** (no ``RetryError``, hence no ``InstructorRetryException``
-    wrap); :func:`acompletion_structured` catches it at the boundary and
-    re-raises :class:`~llmkit.exceptions.OutputLimitError`. Every other failure
-    keeps the repair re-ask and the exhaustion wrap exactly as before.
+    predicate retries **only** the parse failures in
+    :data:`REPAIRABLE_PARSE_ERRORS` — the same set instructor's own int-based
+    path restricts to (mirrored, not imported from its private tuple). This is
+    the whole point of the custom retrying: instructor's stock ``int``
+    ``max_retries`` would re-ask parse errors too, but llmkit added the custom
+    object for the truncation carve-out and must not, in doing so, silently
+    widen the re-ask to *every* exception. A transport (429/5xx/network) or
+    permanent (401/400/403) error therefore fails the predicate and is *not*
+    re-asked — otherwise it would be blindly re-sent inside the single
+    rate-limiter slot with zero backoff, ignoring ``Retry-After``, doubling the
+    real requests one structured call makes.
 
-    Deliberately **not** ``reraise=True``: that would make schema *exhaustion*
-    also propagate bare, bypassing instructor's ``RetryError`` →
-    ``InstructorRetryException`` wrapping and silently breaking the outer
-    retry layer's budget classification for every schema failure.
+    The explicit ``IncompleteOutputException`` exclusion is **defense in
+    depth**: that class (instructor's truncated-by-the-output-token-limit
+    signal, raised *before parsing* for both the OpenAI ``finish_reason ==
+    "length"`` and google-genai ``FinishReason.MAX_TOKENS`` shapes) already
+    subclasses none of :data:`REPAIRABLE_PARSE_ERRORS`, so the parse-only
+    predicate declines it today. The exclusion stays load-bearing in case a
+    future instructor reparents the class under a parse error — the
+    no-re-ask-on-truncation guarantee (a re-ask on an identical token budget
+    can only truncate again) must not silently vanish. When declined, tenacity
+    propagates ``IncompleteOutputException`` **bare** (no wrap);
+    :func:`acompletion_structured` re-raises
+    :class:`~llmkit.exceptions.OutputLimitError` at the boundary.
+
+    ``reraise=True`` matches instructor's own int path exactly. It changes only
+    the cause chain, not whether instructor wraps: any non-``IncompleteOutput``
+    exception escaping this loop — a declined transport/permanent error (**1**
+    call) or an exhausted parse re-ask (**2** calls) — is caught by
+    instructor's blanket ``except Exception as e: raise
+    InstructorRetryException(...) from e``, so the escaping type is always
+    ``InstructorRetryException``. What ``reraise`` controls is ``__cause__``:
+    the raw last error (``reraise=True``) rather than a tenacity ``RetryError``
+    hop. The wrap shape is therefore uniform — ``__cause__`` is the raw provider
+    error on the declined path and the raw last parse error on the exhausted
+    path — and :func:`~llmkit.exceptions.underlying_provider_error` unwraps both.
 
     Built fresh per call — tenacity retrying objects mutate internal iteration
     state, so a shared module-level instance would race across concurrent
@@ -231,7 +251,13 @@ def _schema_repair_retrying() -> AsyncRetrying:
     """
     return AsyncRetrying(
         stop=stop_after_attempt(2),
-        retry=retry_if_exception(lambda e: not isinstance(e, IncompleteOutputException)),
+        retry=retry_if_exception(
+            lambda e: (
+                isinstance(e, REPAIRABLE_PARSE_ERRORS)
+                and not isinstance(e, IncompleteOutputException)
+            )
+        ),
+        reraise=True,
     )
 
 
@@ -301,11 +327,14 @@ async def acompletion_structured[T: BaseModel](
     Uses ``create_with_completion`` so the parsed model *and* the raw
     completion (for cost) are both in hand. instructor's in-call schema-repair
     budget is pinned to two total attempts (one schema-repair re-ask,
-    deliberately low) — with one carve-out: a completion truncated by the
-    output-token limit (``finish_reason='length'``) is **never** re-asked,
-    because an identical token budget can only truncate again; it surfaces
-    immediately as :class:`~llmkit.exceptions.OutputLimitError` carrying the
-    truncated attempt's diagnostics (see :func:`_schema_repair_retrying`).
+    deliberately low) and restricted to genuine *parse* failures — a transport
+    or permanent provider error is **not** re-asked in-call (it would only be a
+    blind, backoff-free re-send inside the rate-limiter slot; the cross-call
+    layer handles it). A completion truncated by the output-token limit
+    (``finish_reason='length'``) is likewise **never** re-asked, because an
+    identical token budget can only truncate again; it surfaces immediately as
+    :class:`~llmkit.exceptions.OutputLimitError` carrying the truncated
+    attempt's diagnostics (see :func:`_schema_repair_retrying`).
     The budget is kept separate from the transient-error retry layer
     (``with_retries`` in :mod:`llmkit.retry`), which owns the cross-call
     429/503/5xx and schema-validation budgets — and which likewise never
@@ -361,9 +390,10 @@ async def acompletion_structured[T: BaseModel](
                 response_model=output_schema,
                 temperature=temperature,
                 # instructor's in-call schema-repair budget: two total attempts
-                # = exactly one schema-repair re-ask, except never for a length
-                # truncation (see _schema_repair_retrying). Built per call —
-                # tenacity retrying objects mutate iteration state. The
+                # = exactly one schema-repair re-ask, and only for a genuine
+                # parse failure — never for a length truncation, a transport, or
+                # a permanent error (see _schema_repair_retrying). Built per
+                # call — tenacity retrying objects mutate iteration state. The
                 # cross-call transient/validation budgets live in llmkit.retry.
                 max_retries=_schema_repair_retrying(),
                 **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)

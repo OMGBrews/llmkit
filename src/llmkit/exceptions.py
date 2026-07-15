@@ -57,12 +57,18 @@ carve-out that a length truncation is never re-asked and surfaces as
 """
 
 import sys
+from json import JSONDecodeError
 from typing import override
 
 import httpx
 import openai
-from instructor.core import InstructorRetryException
+from instructor.core.exceptions import (
+    AsyncValidationError,
+    InstructorRetryException,
+    ResponseParsingError,
+)
 from pydantic import ValidationError
+from tenacity import RetryError
 
 # Transient *transport* failures — the default transport retry budget retries
 # this exact set. We name the specific transient ``openai`` subclasses rather
@@ -156,15 +162,46 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 # full transport budget on doomed re-asks while a transiently-malformed JSON
 # response still earns one cross-call retry.
 #   - ``ValidationError``           — pydantic could not parse the response
-#   - ``InstructorRetryException``  — instructor exhausted its in-call repair
-#     budget (two attempts total, i.e. one schema-repair re-ask; see
-#     ``llmkit._litellm``) for this attempt. NOTE: instructor wraps *any*
-#     exhausted attempt this way, transport failures included — the retry layer
+#   - ``InstructorRetryException``  — instructor's in-call loop gave up. For a
+#     genuine parse failure that means the repair budget (two attempts total,
+#     i.e. one schema-repair re-ask; see ``llmkit._litellm``) was exhausted.
+#     NOTE: instructor wraps *any* failure escaping that loop this way —
+#     transport and permanent errors included, which llmkit's parse-only
+#     predicate declines after a single attempt (no re-ask). The retry layer
 #     unwraps it (``underlying_provider_error``) so a wrapped transport cause is
-#     charged the transport budget rather than this lower one.
+#     charged the transport budget rather than this lower one, and a wrapped
+#     permanent error fails fast on neither.
 LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     ValidationError,
     InstructorRetryException,
+)
+
+# The genuine *parse* failures — a malformed or schema-invalid response the model
+# can plausibly fix if asked again. This is the **single source of truth** for two
+# decisions that must never drift apart (a type instructor re-asks in-call must
+# also earn the validation budget across calls, never be mis-routed to fail-fast):
+#   * instructor's in-call re-ask predicate
+#     (:func:`llmkit._litellm._schema_repair_retrying`) retries exactly this set,
+#     mirroring instructor's own private ``_RETRYABLE_PARSE_ERRORS`` from public
+#     sources rather than importing the private tuple; and
+#   * the outer retry layer (:mod:`llmkit.retry`) treats an unwrapped cause in
+#     this set as *schema-shaped* — charged the lower validation budget — while a
+#     wrapped cause outside it (and outside the transport set) is a *permanent*
+#     error (an exhausted 401/400/403) that must fail fast.
+#   - ``ValidationError``       — pydantic rejected the parse
+#   - ``JSONDecodeError``       — the response wasn't valid JSON
+#   - ``AsyncValidationError``  — an async field validator rejected the parse
+#   - ``ResponseParsingError``  — instructor couldn't parse the response at all
+#     (e.g. a blocked/empty Gemini ``Mode.JSON`` generation)
+# Deliberately *not* in the exported ``LLM_*_ERRORS`` family: these raw parse
+# types are an internal routing detail (a structured call surfaces them wrapped
+# in ``InstructorRetryException`` ∈ ``LLM_SCHEMA_ERRORS``, which is what a host
+# catches), not a user-facing catch-set.
+REPAIRABLE_PARSE_ERRORS: tuple[type[Exception], ...] = (
+    ValidationError,
+    JSONDecodeError,
+    AsyncValidationError,
+    ResponseParsingError,
 )
 
 
@@ -276,26 +313,56 @@ LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
 def underlying_provider_error(exc: BaseException) -> BaseException:
     """Dig the original provider error out of an ``InstructorRetryException``.
 
-    instructor re-raises *every* exhausted attempt — transport failures (rate
-    limits, 5xx, network) just as much as schema-validation failures — wrapped
-    in a single ``InstructorRetryException``. The wrapper alone can't tell the
-    retry layer which budget the failure belongs to, so this returns the
-    wrapped root error: instructor stores it as the first positional ``arg``,
-    with the tenacity ``RetryError.__cause__``'s recorded last attempt as a
-    fallback. Any other exception (a bare ``ValidationError``, a transport
-    error that never went through instructor) is returned unchanged, so callers
-    can classify ``underlying_provider_error(exc)`` uniformly.
+    instructor wraps *every* failure that escapes its in-call loop this way —
+    transport failures (rate limits, 5xx, network) and permanent errors
+    (401/400/403) just as much as schema-validation ones. The wrapper alone
+    can't tell the retry layer which budget the failure belongs to, so this
+    returns the wrapped root error for the caller to classify.
+
+    The wrap shape on the pinned instructor 1.15.x: ``args[0]`` is always the
+    message ``str`` (never the exception), and the root error rides
+    ``__cause__`` **raw**. instructor's blanket
+    ``except Exception as e: raise InstructorRetryException(...) from e`` catches
+    whatever escapes its tenacity loop, and because llmkit pins that loop with
+    ``reraise=True`` (:func:`llmkit._litellm._schema_repair_retrying`), tenacity
+    re-raises the original error bare on *both* paths — a *declined* predicate
+    (every non-parse error, after the in-call re-ask was restricted to parse
+    failures) and an *exhausted* parse re-ask alike. So ``__cause__`` is the raw
+    provider/parse error in all current cases, handled by the second branch.
+
+    The first branch — ``__cause__`` a tenacity ``RetryError`` whose
+    ``last_attempt`` Future holds the root error — is **defensive**: it is the
+    shape instructor produced *before* ``reraise=True`` (and the shape a future
+    ``instructor<2`` could reintroduce), unwrapped via the public
+    ``Future.exception()``. The ``args[0]``-is-an-exception branch is likewise
+    retained only as harmless compatibility with instructor's pre-1.15 shape;
+    both are dead on 1.15.x but cheap insurance against the pinned range moving.
+
+    Any other exception (a bare ``ValidationError``, a transport error that
+    never went through instructor) is returned unchanged, so callers can
+    classify ``underlying_provider_error(exc)`` uniformly.
     """
     if isinstance(exc, InstructorRetryException):
+        # Pre-1.15 compat only: older instructor stored the root exception as
+        # the first positional arg. On 1.15.x ``args[0]`` is the message str,
+        # so this branch never fires there — kept because it is harmless.
         inner = exc.args[0] if exc.args else None
         if isinstance(inner, BaseException):
             return inner
-        # Fallback: instructor raises ``from`` a tenacity RetryError whose
-        # ``last_attempt`` Future holds the root exception.
-        last_attempt = getattr(exc.__cause__, "last_attempt", None)
-        recorded = getattr(last_attempt, "_exception", None)
-        if isinstance(recorded, BaseException):
-            return recorded
+        cause = exc.__cause__
+        if isinstance(cause, RetryError):
+            # Defensive (pre-``reraise=True`` / future-instructor shape): the
+            # last attempt's Future carries the root error. Public accessor,
+            # not the private ``._exception``.
+            recorded = cause.last_attempt.exception() if cause.last_attempt else None
+            if isinstance(recorded, BaseException):
+                return recorded
+        elif isinstance(cause, BaseException):
+            # The 1.15.x shape for every current case (``reraise=True``):
+            # instructor wrapped the raw error directly via ``raise ... from e``
+            # — whether the in-call predicate declined it (transport/permanent)
+            # or an exhausted parse re-ask re-raised it bare.
+            return cause
     return exc
 
 

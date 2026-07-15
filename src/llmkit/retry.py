@@ -37,16 +37,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from json import JSONDecodeError
 from typing import Protocol, cast
 
 import httpx
-from pydantic import ValidationError
 
 from llmkit.exceptions import (
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
+    REPAIRABLE_PARSE_ERRORS,
     underlying_provider_error,
 )
 
@@ -160,12 +159,14 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
 
 
 # The unwrapped causes that are *genuinely* schema-shaped when dug out of an
-# ``InstructorRetryException``: pydantic rejected the parse, or the response
-# wasn't valid JSON at all. A wrapped cause outside this set (and outside the
-# transport set) is a *permanent* error — e.g. an exhausted 401/400/403 that
-# instructor re-raised — which must fail fast instead of burning the
-# validation budget on doomed re-asks.
-_SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = (ValidationError, JSONDecodeError)
+# ``InstructorRetryException`` — exactly the parse failures instructor re-asks
+# in-call. Bound to the single source of truth in :mod:`llmkit.exceptions` so
+# the two can never drift: any type instructor re-asks in-call earns the
+# validation budget here rather than being mis-classified. A wrapped cause
+# *outside* this set (and outside the transport set) is a *permanent* error —
+# e.g. an exhausted 401/400/403 that instructor re-raised — which must fail fast
+# instead of burning the validation budget on doomed re-asks.
+_SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = REPAIRABLE_PARSE_ERRORS
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +202,8 @@ class RetryPolicy:
 
     This layer is kept deliberately separate from instructor's in-call
     schema-repair budget (two attempts total, i.e. one schema-repair re-ask
-    per call — which itself refuses the re-ask for a length truncation) — the
+    per call — fired only for a genuine parse failure, and refused for a length
+    truncation; a transport or permanent error is not re-asked in-call) — the
     two are never conflated, so attempts are not double-counted *within* one
     call.
     Note the layering at the seam: when instructor exhausts its own repair

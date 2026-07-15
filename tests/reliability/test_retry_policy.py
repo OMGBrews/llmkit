@@ -27,6 +27,7 @@ non-recoverable one is an ``openai`` auth/4xx status error.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import warnings
 from collections.abc import Callable
@@ -38,7 +39,12 @@ import httpx
 import litellm
 import openai
 import pytest
-from instructor.core.exceptions import IncompleteOutputException
+from instructor.core.exceptions import (
+    AsyncValidationError,
+    IncompleteOutputException,
+    InstructorRetryException,
+    ResponseParsingError,
+)
 from pydantic import ValidationError
 from tenacity import AsyncRetrying
 
@@ -59,6 +65,7 @@ from llmkit.exceptions import (
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
+    REPAIRABLE_PARSE_ERRORS,
 )
 from llmkit.retry import with_retries
 from tests._support import OkSchema, capture_structured_provider_kwargs
@@ -77,6 +84,17 @@ def _make_validation_error() -> ValidationError:
     except ValidationError as exc:
         return exc
     raise AssertionError("expected a ValidationError")  # pragma: no cover
+
+
+def _wrap_v2(inner: BaseException) -> InstructorRetryException:
+    """The real instructor 1.15.x wrap shape: a ``str`` message with the root
+    error on ``__cause__`` (``raise InstructorRetryException(str) from inner``),
+    as opposed to the pre-1.15 ``args[0]``-is-the-exception shape the other
+    hand-built tests here use to exercise the compat unwrap branch."""
+    try:
+        raise InstructorRetryException("boom", n_attempts=2, total_usage=0) from inner
+    except InstructorRetryException as exc:
+        return exc
 
 
 # --- RetryPolicy defaults & validation -----------------------------------
@@ -309,26 +327,51 @@ async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
 # --- instructor's in-call schema-repair budget -----------------------------
 
 
-def test_instructor_in_call_budget_is_two_attempts_one_repair() -> None:
+def test_instructor_in_call_budget_is_two_attempts_one_parse_repair() -> None:
     """The structured call feeds instructor a per-call ``AsyncRetrying`` that
-    keeps the historical budget: ``stop_after_attempt(2)`` counts *total
-    attempts*, so 2 = two attempts total = exactly one schema-repair re-ask.
-    The retry predicate declines exactly one class — instructor's
-    ``IncompleteOutputException`` (length truncation, which a same-budget
-    re-ask cannot fix) — and retries everything else. (Regression from the
-    int era: ``max_retries=1`` meant one attempt total — zero in-call repairs
-    ever happened despite the documented "single repair" intent. The declined
-    predicate's *bare-propagation* behaviour is pinned end-to-end in
-    ``test_output_limit_failfast.py``.)
+    keeps the historical budget (``stop_after_attempt(2)`` counts *total
+    attempts*, so 2 = two attempts total = one schema-repair re-ask) but
+    restricts the re-ask to *genuine parse failures* and sets ``reraise=True``,
+    mirroring instructor's own int-based path.
+
+    The predicate retries pydantic / JSON / instructor parse errors and
+    **declines everything else**: a transport (429/5xx/network) or permanent
+    (401/400/403) error is not re-asked in-call — re-asking it would only be a
+    blind, backoff-free re-send inside the single rate-limiter slot, doubling
+    the real requests a structured call makes. ``IncompleteOutputException``
+    (length truncation, which a same-budget re-ask cannot fix) stays declined
+    as defense in depth even though it is already outside the parse set today.
+    The declined predicate's wrap / bare-propagation behaviour is pinned
+    end-to-end in ``test_output_limit_failfast.py`` and
+    ``test_in_call_retry_scope.py``.
     """
     seen = capture_structured_provider_kwargs()
     retrying = seen["max_retries"]
     assert isinstance(retrying, AsyncRetrying)
     assert getattr(retrying.stop, "max_attempt_number", None) == 2
+    # ``reraise=True`` matches instructor's int path: on exhaustion the raw last
+    # error rides ``__cause__`` (no tenacity ``RetryError`` hop).
+    assert retrying.reraise is True
     predicate = cast("Callable[[BaseException], bool]", getattr(retrying.retry, "predicate", None))
     assert callable(predicate)
-    assert predicate(TimeoutError("transient")) is True
+    # The mirrored parse set (pydantic + stdlib JSON + instructor parse signals)
+    # is what instructor's own int path restricts its re-ask to.
+    assert REPAIRABLE_PARSE_ERRORS == (
+        ValidationError,
+        json.JSONDecodeError,
+        AsyncValidationError,
+        ResponseParsingError,
+    )
+    # Genuine parse failures are re-asked...
     assert predicate(ValidationError.from_exception_data("Bad", [])) is True
+    assert predicate(json.JSONDecodeError("bad", "{", 0)) is True
+    # ...every non-parse error is declined (the fix — no blind in-call re-send
+    # of transport/permanent errors). A plain ``ValueError`` is declined too:
+    # only the *specific* parse types opt in, not their ``ValueError`` base.
+    assert predicate(TimeoutError("transient")) is False
+    assert predicate(RuntimeError("permanent")) is False
+    assert predicate(ValueError("not a parse signal")) is False
+    # Defense in depth: length truncation stays declined.
     assert predicate(IncompleteOutputException(last_completion=None)) is False
 
 
@@ -627,6 +670,62 @@ async def test_instructor_wrapped_schema_error_uses_validation_budget() -> None:
         )
 
     assert calls[0] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_inner",
+    [
+        pytest.param(_make_validation_error, id="pydantic-ValidationError"),
+        pytest.param(lambda: ResponseParsingError("unparseable"), id="ResponseParsingError"),
+        pytest.param(lambda: AsyncValidationError("async-validator"), id="AsyncValidationError"),
+    ],
+)
+async def test_v2_wrapped_parse_error_uses_validation_budget(
+    make_inner: Callable[[], BaseException],
+) -> None:
+    """The **real** 1.15.x wrap shape (``raise InstructorRetryException(str) from
+    inner``, ``__cause__`` = raw error) routes *every* genuine parse failure to
+    the lower validation budget (2) — not just pydantic ``ValidationError`` but
+    instructor's own ``ResponseParsingError`` (e.g. a blocked/empty Gemini
+    ``Mode.JSON`` generation) and ``AsyncValidationError`` (a failing async field
+    validator). Before ``_SCHEMA_SHAPED_CAUSES`` was aligned with the in-call
+    re-ask set, the latter two hit the permanent-cause guard and failed fast
+    after a single attempt — a type instructor re-asks in-call being denied its
+    cross-call validation retry."""
+    calls = [0]
+
+    async def _fail(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        calls[0] += 1
+        raise _wrap_v2(make_inner())
+
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=_fail),
+        pytest.raises(InstructorRetryException),
+    ):
+        _ = await structured_output.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
+        )
+
+    assert calls[0] == 2
+
+
+def test_in_call_reask_set_and_schema_shaped_causes_are_one_tuple() -> None:
+    """The in-call re-ask predicate set and the outer validation-budget
+    ``_SCHEMA_SHAPED_CAUSES`` are the *same object* — the single source of truth
+    in ``llmkit.exceptions``. This is the structural guard against the two
+    drifting apart: a type instructor re-asks in-call is, by construction, also
+    charged the validation budget across calls rather than mis-routed to
+    fail-fast."""
+    from llmkit.retry import _SCHEMA_SHAPED_CAUSES
+
+    assert _SCHEMA_SHAPED_CAUSES is REPAIRABLE_PARSE_ERRORS
+    assert set(REPAIRABLE_PARSE_ERRORS) == {
+        ValidationError,
+        json.JSONDecodeError,
+        AsyncValidationError,
+        ResponseParsingError,
+    }
 
 
 @pytest.mark.asyncio
