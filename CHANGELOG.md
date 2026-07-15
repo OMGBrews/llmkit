@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A host can pick Gemini's structured-output strategy.**
+  `LLMClientConfig.gemini_structured_output` (`"schema"` | `"json"`, default
+  `"schema"`) selects the instructor `Mode` for the two Gemini providers (Vertex,
+  Google AI Studio) and is ignored by every other provider. `"schema"` preserves
+  today's behavior exactly — Gemini's native JSON-schema constrained decoding
+  (`Mode.JSON_SCHEMA`), with server-side schema enforcement. `"json"` switches to
+  `Mode.JSON`: JSON-mime-type output with the schema moved into the system prompt
+  and validated client-side. It exists because Gemini's constrained-decoding path
+  is a measured **repetition-loop trap** — a token mask that, once the model
+  starts looping, blocks exactly the tokens that would break the pattern, so the
+  call spins until `max_tokens` kills it (PIA Maker measured 67-83% first-attempt
+  runaway under `"schema"` vs 0% under `"json"` on real prompts, 2026-07-15).
+  `"json"` trades server-side schema enforcement for an escape from that trap, at
+  the cost of an occasional repair re-ask. Hosts that hit the loop no longer need
+  to subclass a provider to override the private `_mode` ClassVar; the default
+  changes nothing for anyone else. `make_provider(...)` accepts the same
+  `gemini_structured_output` knob for the per-call `provider=` seam. An
+  unrecognized value fails loudly at provider construction rather than silently
+  falling back.
+
 ### Fixed
 
 - **OpenRouter's default model works again.** `OpenRouterProvider._default_model`

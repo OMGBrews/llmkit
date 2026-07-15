@@ -18,7 +18,7 @@ never silently fall back to another provider.
 
 from __future__ import annotations
 
-from typing import assert_never
+from typing import Literal, assert_never
 
 from llmkit.providers.anthropic import AnthropicProvider
 from llmkit.providers.base import (
@@ -96,6 +96,7 @@ def make_provider(
     aws_region_name: str | None = None,
     vertex_project: str | None = None,
     vertex_location: str | None = None,
+    gemini_structured_output: Literal["schema", "json"] = "schema",
 ) -> BaseProvider:
     """Construct a provider directly from raw credentials.
 
@@ -136,6 +137,12 @@ def make_provider(
         vertex_location: Vertex AI region — the data-residency control;
             ignored by every other provider. ``None`` resolves from the
             environment, else Google's default region.
+        gemini_structured_output: Structured-output strategy for the Gemini
+            providers (Vertex, Google AI Studio); ignored by every other
+            provider. ``"schema"`` (default) keeps Gemini's native JSON-schema
+            constrained decoding; ``"json"`` switches to JSON-mime-type output
+            with client-side validation to escape the constrained-decoding
+            repetition-loop trap (see the Gemini provider docstrings).
 
     Returns:
         A constructed provider, ready to pass as a per-call ``provider=``.
@@ -159,6 +166,7 @@ def make_provider(
         aws_region_name=aws_region_name,
         vertex_project=vertex_project,
         vertex_location=vertex_location,
+        gemini_structured_output=gemini_structured_output,
     )
     return build_provider(config)
 

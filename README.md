@@ -447,6 +447,7 @@ class LLMClientConfig:
     aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
     vertex_project: str | None = None    # Vertex AI GCP project; unused by every other provider
     vertex_location: str | None = None   # Vertex AI region (data residency); unused by every other provider
+    gemini_structured_output: Literal["schema", "json"] = "schema"  # Gemini strategy; unused by every other provider
 ```
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
@@ -466,6 +467,15 @@ pip install "omg-llmkit[vertex]"
 **`vertex_location` is the data-processing residency control.** It selects the regional endpoint (`<location>-aiplatform.googleapis.com`) where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. The default model is Gemini 2.5 Flash-Lite (parity with the AI Studio provider). As with AI Studio, Gemini 2.5 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
 
 > **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host every model — including the `gemini-2.5-flash-lite` default. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a `model` the region actually serves (e.g. some regions offer `gemini-2.5-flash` but not `-flash-lite`). Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
+
+**`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); every other provider ignores it. `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
+
+```python
+configure_llm_client(lambda: LLMClientConfig(
+    provider=Provider.VERTEX,
+    gemini_structured_output="json",   # escape the constrained-decoding loop trap
+))
+```
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 

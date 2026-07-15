@@ -10,6 +10,7 @@ from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
     require_google_auth_sdk,
+    resolve_gemini_structured_output,
 )
 
 
@@ -46,16 +47,40 @@ class VertexProvider(BaseProvider):
     *availability* error distinct from auth/permission failures; pass a ``model``
     the region actually serves.
 
-    Structured output is pinned to ``instructor.Mode.JSON_SCHEMA`` — Gemini's
+    Structured output defaults to ``instructor.Mode.JSON_SCHEMA`` — Gemini's
     native JSON-schema mode, the same mode the direct ``GoogleProvider`` pins,
     for the same reason: the underlying model is Gemini. Note instructor's
     ``Mode.VERTEXAI_JSON`` / ``Mode.VERTEXAI_TOOLS`` are deliberately **not**
     used: they target instructor's native ``from_vertexai`` client (the
     ``google-cloud-aiplatform`` SDK), not this library's ``from_litellm`` call
     seam — the same kind of mismatch that rules out ``Mode.BEDROCK_JSON`` for
-    Bedrock. Over LiteLLM the working Gemini mode is ``JSON_SCHEMA`` (instructor
-    auto-mode would fall back to ``Mode.TOOLS``, which measurably regresses
-    Gemini structured output to empty/invalid shapes).
+    Bedrock. Over LiteLLM the working Gemini modes are ``JSON_SCHEMA`` and
+    ``JSON`` (instructor auto-mode would fall back to ``Mode.TOOLS``, which
+    measurably regresses Gemini structured output to empty/invalid shapes).
+
+    The strategy is host-selectable via the ``structured_output`` argument
+    (``LLMClientConfig.gemini_structured_output``), because Gemini's native
+    ``JSON_SCHEMA`` path is a measured **repetition-loop trap**. That path is
+    grammar-constrained decoding: a token mask enforces the schema, but once the
+    model starts to loop the mask blocks exactly the tokens that would break the
+    pattern, so the call spins until ``max_tokens`` kills it. PIA Maker measured
+    **67-83%** first-attempt runaway under ``JSON_SCHEMA`` versus **0%** under
+    ``Mode.JSON`` on real production prompts (interleaved arms, same
+    model/schema/prompt bytes; 2026-07-15).
+
+    - ``structured_output="schema"`` (default) keeps ``Mode.JSON_SCHEMA``:
+      server-side *schema* enforcement, and the pre-existing wire shape exactly.
+    - ``structured_output="json"`` switches to ``Mode.JSON``: the response is
+      still server-side guaranteed to be JSON *syntax* (the mime-type
+      constraint), but the schema moves into the system prompt and is validated
+      client-side, with instructor's single repair re-ask on a mismatch. This
+      gives up server-side *schema* enforcement to escape the loop trap. Choose
+      it when a non-trivial schema drives runaway loops on real workloads; the
+      cost is an occasional repair round-trip. (``DeepSeekProvider`` pins the
+      same ``Mode.JSON`` with the same trade.)
+
+    An unrecognized ``structured_output`` raises ``ValueError`` at construction
+    rather than silently falling back.
 
     ``reasoning_effort`` is forwarded to LiteLLM for Vertex Gemini models that
     support thinking and is harmless on those that don't. As with Google AI
@@ -73,6 +98,12 @@ class VertexProvider(BaseProvider):
 
     _provider_name: ClassVar[str] = "Google Vertex AI"
     _model_prefix: ClassVar[str] = "vertex_ai/"
+    # The default strategy, and the value ``__init_subclass__`` requires every
+    # concrete provider to name. The *effective* mode is resolved per instance
+    # from ``structured_output`` and returned by the ``instructor_mode``
+    # property below — the ClassVar stays the declared contract value, never
+    # shadowed through ``self`` (which would fail basedpyright and break the
+    # ``_mode`` → ``instructor_mode`` pattern for the other six providers).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
 
@@ -82,11 +113,25 @@ class VertexProvider(BaseProvider):
         vertex_project: str | None = None,
         vertex_location: str | None = None,
         reasoning_effort: str | None = None,
+        structured_output: str = "schema",
     ):
         require_google_auth_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
         self._vertex_project: str | None = vertex_project
         self._vertex_location: str | None = vertex_location
+        # Resolve the host-selected strategy once, loudly rejecting a typo.
+        self._instructor_mode: instructor.Mode = resolve_gemini_structured_output(structured_output)
+
+    @property
+    @override
+    def instructor_mode(self) -> instructor.Mode:
+        """The instructor mode pinning structured output, per the selected strategy.
+
+        ``"schema"`` (default) yields ``Mode.JSON_SCHEMA``; ``"json"`` yields
+        ``Mode.JSON`` — see the class docstring for the repetition-loop-trap
+        rationale behind the choice.
+        """
+        return self._instructor_mode
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
@@ -113,4 +158,5 @@ class VertexProvider(BaseProvider):
             vertex_project=config.vertex_project,
             vertex_location=config.vertex_location,
             reasoning_effort=config.reasoning_effort,
+            structured_output=config.gemini_structured_output,
         )

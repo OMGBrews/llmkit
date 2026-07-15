@@ -37,7 +37,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import instructor
 
@@ -125,6 +125,44 @@ def require_google_auth_sdk(provider_name: str) -> None:
     )
 
 
+#: The Gemini structured-output strategies a host may select, mapped to the
+#: instructor ``Mode`` each one pins. ``"schema"`` is Gemini's native
+#: JSON-schema constrained decoding (``responseSchema`` / ``Mode.JSON_SCHEMA``),
+#: the pre-existing default; ``"json"`` is JSON-mime-type-only output with the
+#: schema moved into the system prompt and validated client-side
+#: (``Mode.JSON``). See :func:`resolve_gemini_structured_output` and the Gemini
+#: provider docstrings for the measurement that motivates the choice.
+_GEMINI_STRUCTURED_OUTPUT_MODES: dict[str, instructor.Mode] = {
+    "schema": instructor.Mode.JSON_SCHEMA,
+    "json": instructor.Mode.JSON,
+}
+
+
+def resolve_gemini_structured_output(strategy: str) -> instructor.Mode:
+    """Map a Gemini structured-output strategy name to its instructor ``Mode``.
+
+    Single-sources the ``"schema"`` / ``"json"`` → ``Mode`` resolution the two
+    Gemini providers (:class:`~llmkit.providers.vertex.VertexProvider`,
+    :class:`~llmkit.providers.google.GoogleProvider`) both consume, so the valid
+    values and the loud-failure behavior live in exactly one place.
+
+    An unrecognized ``strategy`` raises :class:`ValueError` naming the valid
+    values. The failure is *deliberate*: the config field is typed
+    ``Literal["schema", "json"]`` but that annotation is not enforced at runtime,
+    so a typo (or a value from a dynamic/untyped config source) must fail loudly
+    at provider construction rather than silently falling back to a default and
+    shipping the wrong structured-output guarantee.
+    """
+    try:
+        return _GEMINI_STRUCTURED_OUTPUT_MODES[strategy]
+    except KeyError:
+        valid = ", ".join(repr(name) for name in _GEMINI_STRUCTURED_OUTPUT_MODES)
+        raise ValueError(
+            f"Unknown Gemini structured-output strategy {strategy!r}; "
+            + f"valid values are {valid}."
+        ) from None
+
+
 class Provider(StrEnum):
     """LLM providers the library can route to.
 
@@ -195,6 +233,20 @@ class LLMClientConfig:
     ``None`` to let it resolve from the environment (``VERTEXAI_PROJECT`` /
     ``VERTEXAI_LOCATION``), with the location otherwise falling back to
     Google's default region.
+
+    ``gemini_structured_output`` selects the structured-output *strategy* for
+    the two Gemini providers (Vertex, Google AI Studio) and is ignored by every
+    other provider. ``"schema"`` (the default) preserves the pre-existing wire
+    behavior exactly — Gemini's native JSON-schema constrained decoding
+    (``responseSchema`` / ``instructor.Mode.JSON_SCHEMA``), with server-side
+    schema enforcement. ``"json"`` switches to JSON-mime-type-only output
+    (``Mode.JSON``): the schema moves into the system prompt and is validated
+    client-side, trading server-side schema enforcement for an escape from
+    Gemini's constrained-decoding repetition-loop trap (measured 67-83%
+    first-attempt runaway under ``"schema"`` vs 0% under ``"json"`` on real
+    workloads — PIA Maker, 2026-07-15; see the Gemini provider docstrings). An
+    unrecognized value fails loudly at provider construction — the ``Literal``
+    type is not runtime-enforced, so a typo must not silently fall back.
     """
 
     provider: Provider
@@ -205,6 +257,7 @@ class LLMClientConfig:
     aws_region_name: str | None = None
     vertex_project: str | None = None
     vertex_location: str | None = None
+    gemini_structured_output: Literal["schema", "json"] = "schema"
 
 
 # Module-level config source, registered once by the host application at a
