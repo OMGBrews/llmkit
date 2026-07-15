@@ -35,12 +35,17 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iter
 from typing import override
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
+from instructor.core import InstructorRetryException
 
-from llmkit import _litellm, rate_limiting, structured_output
+from llmkit import CircuitOpenError, _litellm, rate_limiting, structured_output
 from llmkit.rate_limiting import (
+    _BREAKER_MIN_SAMPLES,
     GlobalRateLimiter,
     RateLimitSlot,
+    _CircuitState,
     _RateBucket,
     configure_rate_limit,
     get_rate_limit_config,
@@ -422,6 +427,303 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
     release.set()
     for thread in threads:
         thread.join(timeout=1.0)
+
+
+# --- sync/async parity: shared breaker + AIMD state and interrupt hardening ---
+#
+# The sync acquire path now shares the per-provider circuit breaker and AIMD
+# ``_AdaptiveState`` with the async path (only the in-flight *count* is its own
+# population), and hardens the RPM-refund / permit-release the old fixed-semaphore
+# path skipped. These tests are all offline and assert state transitions, not
+# timing, to stay off the wall clock.
+
+
+def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
+    request = httpx.Request("POST", "https://api.test/v1/chat/completions")
+    return cls("boom", response=httpx.Response(status, request=request), body=None)
+
+
+def _wrapped_throttle(status: int) -> InstructorRetryException:
+    """A throttle wrapped as instructor surfaces it on the structured path."""
+    return InstructorRetryException(
+        _status_error(openai.RateLimitError, status), n_attempts=1, total_usage=0
+    )
+
+
+def test_sync_acquire_raises_circuit_open_when_breaker_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the breaker OPEN, a sync acquire fast-fails with ``CircuitOpenError``
+    before any gate — holding no slot — exactly like the async path.
+
+    The breaker is driven OPEN through its own ``on_record`` API (a full window of
+    throttles); the frozen clock keeps it inside the cooldown so it rejects.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: stays OPEN
+    configure_rate_limit(max_concurrent=8, breaker=True)
+    key = "openai"
+    breaker = GlobalRateLimiter._get_breaker(key)
+    for _ in range(_BREAKER_MIN_SAMPLES):  # a full window of throttles opens it
+        _ = breaker.on_record(throttled=True)
+    assert breaker._state is _CircuitState.OPEN
+
+    # ``acquire_sync`` fetches the gate *before* consulting the breaker, so
+    # pre-create it and assert the rejected call left that very object untouched.
+    # (Fetching the gate only after the acquire builds a fresh, trivially-empty
+    # gate that could not detect a slot wrongly taken before the breaker check.)
+    gate = GlobalRateLimiter._get_sync_gate(key)
+    assert gate._in_flight == 0
+
+    with pytest.raises(CircuitOpenError) as excinfo:
+        with rate_limit_acquire_sync(key):
+            raise AssertionError("body must not run while the breaker is OPEN")
+
+    assert excinfo.value.provider == key
+    # No concurrency slot was taken by the rejected call — same gate, still empty.
+    assert GlobalRateLimiter._get_sync_gate(key) is gate
+    assert gate._in_flight == 0
+
+
+def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-bearing parity test: a *sync* throttle-while-saturated halves the
+    shared per-provider AIMD limit, and a subsequent *async* acquire enforces the
+    halved cap — proving the state is genuinely SHARED, not mirrored per path.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no recovery
+    configure_rate_limit(max_concurrent=2)
+    key = "google"
+    holder_in = threading.Event()
+    release_holder = threading.Event()
+
+    def holder() -> None:
+        with rate_limit_acquire_sync(key):
+            holder_in.set()
+            _ = release_holder.wait(timeout=2.0)
+
+    hthread = threading.Thread(target=holder)
+    hthread.start()
+    assert holder_in.wait(timeout=1.0)  # sync gate in_flight == 1
+
+    # A second sync acquire saturates the gate (in_flight == 2 == limit); its body
+    # raises a (wrapped, structured-path) throttle, so the saturation gate fires.
+    with pytest.raises(InstructorRetryException):
+        with rate_limit_acquire_sync(key):
+            raise _wrapped_throttle(429)
+
+    # The SHARED per-provider AIMD limit dropped 2 -> 1 from the sync-side throttle.
+    assert GlobalRateLimiter._adaptive_states[key].limit() == 1
+
+    release_holder.set()
+    hthread.join(timeout=1.0)
+    assert GlobalRateLimiter._get_sync_gate(key)._in_flight == 0
+
+    # The ASYNC path now enforces the shared, lowered cap of 1: three async
+    # acquirers on a fresh loop, only one in flight at a time.
+    async def _async_peak_under_shared_limit() -> int:
+        current = 0
+        peak = 0
+        hold = asyncio.Event()
+
+        async def run() -> None:
+            nonlocal current, peak
+            async with GlobalRateLimiter.acquire_async(key):
+                current += 1
+                peak = max(peak, current)
+                try:
+                    _ = await hold.wait()
+                finally:
+                    current -= 1
+
+        tasks = [asyncio.create_task(run()) for _ in range(3)]
+        for _ in range(30):
+            await asyncio.sleep(0)
+        observed = peak
+        hold.set()
+        _ = await asyncio.gather(*tasks)
+        return observed
+
+    assert asyncio.run(_async_peak_under_shared_limit()) == 1
+
+
+def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sync acquire that fails *after* the RPM token is deducted but *before* the
+    slot is granted refunds the token — the bucket level is restored, mirroring the
+    async path's cancellation refund.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no refill
+    configure_rate_limit(max_concurrent=8, rpm=480)
+    key = "openai"
+    rpm_bucket = GlobalRateLimiter._get_rpm_bucket(key)
+    assert rpm_bucket is not None
+    full_level = rpm_bucket._level  # capacity min(8, 480) == 8, starts full
+
+    # Force a failure between the RPM debit and the slot grant by making the
+    # concurrency gate's acquire raise (the phase after RPM/TPM, before a slot).
+    gate = GlobalRateLimiter._get_sync_gate(key)
+
+    def _boom() -> None:
+        raise RuntimeError("slot grant failed")
+
+    monkeypatch.setattr(gate, "acquire", _boom)
+
+    with pytest.raises(RuntimeError):
+        with rate_limit_acquire_sync(key):
+            raise AssertionError("body must not run when the grant fails")
+
+    # The token debited before the failed grant was refunded: bucket full again.
+    assert rpm_bucket._level == full_level
+
+
+def test_exception_during_sync_body_leaks_no_permit() -> None:
+    """An exception in the ``with`` body releases the concurrency slot (finally),
+    so the full cap is available again — the permit-leak fix over the old
+    ``sem.acquire()``-outside-``try`` path.
+    """
+    configure_rate_limit(max_concurrent=1)
+    key = "openai"
+    gate = GlobalRateLimiter._get_sync_gate(key)
+
+    with pytest.raises(RuntimeError):
+        with rate_limit_acquire_sync(key):
+            raise RuntimeError("boom in body")
+
+    assert gate._in_flight == 0  # slot released despite the exception
+
+    # Full cap reclaimed: a fresh acquire from another thread still enters. A
+    # leaked single permit (cap 1) would have wedged this forever.
+    entered = threading.Event()
+
+    def worker() -> None:
+        with rate_limit_acquire_sync(key):
+            entered.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert entered.wait(timeout=1.0), "permit leaked: the slot was never released"
+    thread.join(timeout=1.0)
+    assert gate._in_flight == 0
+
+
+def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More-than-cap sync waiters queue in strict FIFO order, and a waiter woken
+    without a free slot *parks* on the poll interval rather than busy-spinning.
+
+    Regression for the never-cleared one-shot ``threading.Event`` ticket: a
+    committing head wakes the next head unconditionally, so a head roused with no
+    capacity would — with an un-cleared Event — see ``ticket.wait(timeout)`` return
+    instantly every iteration and peg a core (measured >100k ``limit()`` reads in
+    0.3s) instead of honouring the ~20Hz poll. Two holders saturate a cap-2 gate,
+    three waiters queue in a pinned arrival order, and freeing exactly one slot
+    admits the FIFO head while promoting the next waiter to a *set-but-uncommittable*
+    head — the precise spin condition. Counting live ``_AdaptiveState.limit()`` reads
+    over a held real interval separates a bounded poll (a handful) from the spin.
+    None of the pre-existing sync tests drove more than one genuinely-queued waiter,
+    so this path — and the spin — was previously untested.
+    """
+    configure_rate_limit(max_concurrent=2)
+    key = "openai"
+    gate = GlobalRateLimiter._get_sync_gate(key)
+
+    release_h0 = threading.Event()
+    release_h1 = threading.Event()
+    hold_waiters = threading.Event()
+    order: list[int] = []
+    order_lock = threading.Lock()
+
+    def holder(release: threading.Event) -> None:
+        with rate_limit_acquire_sync(key):
+            _ = release.wait(timeout=5.0)
+
+    def waiter(i: int) -> None:
+        with rate_limit_acquire_sync(key):
+            with order_lock:
+                order.append(i)
+            _ = hold_waiters.wait(timeout=5.0)
+
+    h0 = threading.Thread(target=holder, args=(release_h0,), daemon=True)
+    h1 = threading.Thread(target=holder, args=(release_h1,), daemon=True)
+    h0.start()
+    h1.start()
+    _wait_until(lambda: gate._in_flight == 2)  # both slots held
+
+    waiters: list[threading.Thread] = []
+    for i in range(3):
+        t = threading.Thread(target=waiter, args=(i,), daemon=True)
+        t.start()
+        waiters.append(t)
+        # Pin deque order: don't start the next until this one has actually queued.
+        _wait_until(lambda i=i: len(gate._waiters) == i + 1)
+
+    orig_limit = rate_limiting._AdaptiveState.limit
+    try:
+        # Free exactly one slot: the FIFO head (W0) commits and, per the wake path,
+        # sets the NEXT head (W1) — which now has no capacity (H1 + W0 hold both
+        # slots) and so must park, not spin.
+        release_h0.set()
+        _wait_until(lambda: order == [0])
+
+        # W1 is now the head with a set-but-uncommittable ticket: the exact spin
+        # condition. Count its live-limit reads over a real interval.
+        calls = {"n": 0}
+
+        def counting(self: rate_limiting._AdaptiveState) -> int:
+            calls["n"] += 1
+            return orig_limit(self)
+
+        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", counting)
+        time.sleep(0.2)  # a real interval (this test does not freeze the clock)
+        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", orig_limit)
+        # ~4 for a 0.05s poll over 0.2s; the un-cleared-ticket spin was >100k.
+        assert calls["n"] < 50, f"queued head busy-spun: {calls['n']} limit() reads in 0.2s"
+
+        # Draining the rest admits W1 then W2 — strict FIFO end to end.
+        release_h1.set()
+        _wait_until(lambda: order == [0, 1])
+        hold_waiters.set()  # W0, W1 exit → slots free → W2 admitted
+        _wait_until(lambda: order == [0, 1, 2])
+    finally:
+        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", orig_limit)
+        release_h0.set()
+        release_h1.set()
+        hold_waiters.set()
+        for t in (h0, h1, *waiters):
+            t.join(timeout=2.0)
+
+    assert order == [0, 1, 2]  # admitted in strict arrival order
+    assert gate._in_flight == 0  # every slot released
+
+
+def test_sync_gate_drop_waiter_keeps_queue_contiguous_and_advances_head() -> None:
+    """Dropping an abandoned ticket (the interrupt path's baton hand-off) removes
+    only that waiter and hands the head baton on when — and only when — the head left.
+
+    Drives ``_SyncAdaptiveGate._drop_waiter`` directly (the ``finally`` an interrupted
+    ``acquire`` runs): a non-head waiter that leaves keeps the deque contiguous and
+    signals nobody, so the real head keeps its turn; dropping the head wakes the new
+    head so the queue can never wedge. The parity change's docstrings promise this
+    but no thread-level test exercised it.
+    """
+    gate = rate_limiting._SyncAdaptiveGate(rate_limiting._AdaptiveState(provider="x", ceiling=2))
+    t0, t1, t2 = (threading.Event() for _ in range(3))
+    gate._waiters.extend([t0, t1, t2])
+
+    # A non-head waiter leaving drops only itself and wakes no one (head keeps turn).
+    gate._drop_waiter(t1)
+    assert list(gate._waiters) == [t0, t2]
+    assert not t0.is_set() and not t2.is_set()
+
+    # The head leaving hands the baton to the new head.
+    gate._drop_waiter(t0)
+    assert list(gate._waiters) == [t2]
+    assert t2.is_set()
+
+    # Dropping the last waiter empties the queue and signals nobody (nothing to wake).
+    gate._drop_waiter(t2)
+    assert list(gate._waiters) == []
 
 
 def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
@@ -1164,8 +1466,8 @@ async def test_concurrency_semaphore_shared_across_key_casings() -> None:
     assert entered_second.is_set()
 
 
-def test_sync_semaphore_shared_across_key_casings() -> None:
-    """The sync path shares one threading.Semaphore across key casings too."""
+def test_sync_gate_shared_across_key_casings() -> None:
+    """The sync path shares one concurrency gate across key casings too."""
     configure_rate_limit(max_concurrent=1)
     entered_second = threading.Event()
     release_first = threading.Event()

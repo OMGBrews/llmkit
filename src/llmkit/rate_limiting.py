@@ -24,17 +24,28 @@ awaited from another; the persistent sync loop, any loop a host runs its own
 async calls on, and the short-lived loops the reentrant fallback spins up are
 therefore each their own key.
 
-One honest caveat follows from asyncio semaphores being per-loop: a process
-that drives calls on more than one loop — e.g. a host running llmkit's *async*
-call functions on its own event loop *and* llmkit's sync wrappers (on the
-persistent loop) — caps each loop's population independently, so it can
-momentarily hold up to ``loops x max_concurrent`` in-flight calls per provider.
-Each population is capped; the caps do not share slots, because an asyncio
-primitive cannot span loops. The hand-rolled sync acquire path
-(:meth:`acquire_sync` / :func:`rate_limit_acquire_sync`) is bounded by a
-loop-agnostic per-provider ``threading.Semaphore`` instead — for host code that
-issues sync provider calls *outside* llmkit's own loop. RPM/TPM are unaffected
-either way: those buckets are keyed by name and shared across every loop and
+One honest caveat follows from the concurrency gate being per-population: a
+process that drives calls on more than one population — e.g. a host running
+llmkit's *async* call functions on its own event loop, llmkit's sync wrappers
+(on the persistent loop), and the hand-rolled sync path from its own threads —
+caps each population independently, so it can momentarily hold up to
+``populations x max_concurrent`` in-flight calls per provider. Each population
+is capped; the caps do not share *slots*, because an asyncio primitive cannot
+span loops and threads are a third population with no loop at all. The
+hand-rolled sync acquire path (:meth:`acquire_sync` /
+:func:`rate_limit_acquire_sync`) is bounded by a loop-agnostic per-provider
+:class:`_SyncAdaptiveGate` — for host code that issues sync provider calls
+*outside* llmkit's own loop.
+
+What the sync path *does* now share with the async path — the parity this
+module deliberately provides — is the **backpressure state**, not the in-flight
+count. Both paths read one per-provider :class:`_AdaptiveState` (the AIMD limit)
+and one per-provider :class:`_CircuitBreaker`, so a throttle observed on either
+path lowers the limit the *other* then honours, and an open breaker fast-fails
+on both. That is same-semantics-per-population, not one merged cap: the sync
+in-flight count is its own population (threads), but the *limit* it enforces and
+the breaker it consults are shared. RPM/TPM are likewise unaffected by
+population: those buckets are keyed by name and shared across every loop and
 thread.
 
 On by default, scoped per provider
@@ -194,6 +205,18 @@ _THROTTLE_STATUS_CODES: frozenset[int] = frozenset({429, 503, 529})
 _AIMD_DECREASE_FACTOR: float = 0.5
 _AIMD_DECREASE_COOLDOWN: float = 1.0
 _AIMD_RECOVERY_INTERVAL: float = 3.0
+
+#: Bounded re-check interval (seconds) for a blocked **sync** concurrency waiter
+#: (:class:`_SyncAdaptiveGate`). The sync gate and the async gate park on
+#: different primitives over the *same* shared :class:`_AdaptiveState`, so an
+#: async-side success that raises the limit wakes no sync waiter — nothing on the
+#: sync side signalled. A sync waiter therefore never blocks *unboundedly* on its
+#: own condition: it re-reads the live limit at most this many seconds later, so a
+#: cross-population limit increase can lift it in bounded time. Kept small so that
+#: latency stays low; a decrease/refill is still honoured immediately via the
+#: normal release path. Deliberately a module constant (not a public knob), like
+#: the AIMD constants.
+_SYNC_GATE_POLL_INTERVAL: float = 0.05
 
 #: Circuit-breaker tuning. Like the AIMD constants these are deliberately
 #: **internal**: the host owns the *switch* (``breaker``), the library owns the
@@ -760,6 +783,138 @@ class _AdaptiveGate:
         return self._state.on_success()
 
 
+class _SyncAdaptiveGate:
+    """A FIFO **sync** concurrency gate whose capacity is a live ``_AdaptiveState``.
+
+    The threading counterpart to :class:`_AdaptiveGate`, and the replacement for
+    the old fixed ``threading.Semaphore``. Both gates read their capacity from the
+    *same* shared per-provider :class:`_AdaptiveState` on every admit, so a
+    throttle observed on **either** the async or the sync path lowers the limit
+    the **other** path then honours (true shared backpressure, not a mirror). One
+    gate per provider *name* — threads have no event-loop affinity, so unlike the
+    async gate this needs no per-loop key.
+
+    **FIFO, no barging.** Waiters queue on a deque of one-shot
+    :class:`threading.Event` tickets; only the head contends for a slot and a
+    newcomer always queues behind anyone already waiting, even if a slot is
+    momentarily free. ``_in_flight`` is incremented at grant time so the count is
+    always exact. A freed slot (:meth:`release`) wakes the head, which self-grants
+    and wakes the next head in turn.
+
+    **Never leaks a permit on interruption.** Every wait lives inside a
+    ``try/finally``: a waiter interrupted (e.g. ``KeyboardInterrupt`` while parked)
+    removes only itself and, if it was the head, hands the baton to the next
+    ticket, so the queue can never wedge and no slot is lost. A caller that holds
+    a slot releases it through :meth:`release` in the acquirer's ``finally``.
+
+    **Bounded re-check (the cross-population subtlety).** The sync gate and the
+    async gate park on different primitives over one shared
+    :class:`_AdaptiveState`, so an **async-side** success that *raises* the limit
+    signals nothing on the sync side — no sync ``release`` runs. A blocked sync
+    head must therefore not wait unboundedly on a condition only sync releases
+    fire: it waits with a bounded :data:`_SYNC_GATE_POLL_INTERVAL` timeout and
+    re-reads the live limit each time, so a cross-population limit increase can
+    never strand it (it is admitted within one poll interval). A same-side
+    decrease/release is still honoured immediately.
+
+    State (``_in_flight`` + the waiter deque) is guarded by a plain
+    :class:`threading.Lock`, held only for O(1) bookkeeping, never across a wait.
+    Exposes the same :meth:`is_saturated` / :meth:`on_throttle` / :meth:`on_success`
+    surface :class:`_AdaptiveGate` does, so the shared outcome-classification
+    helper (:func:`_record_gate_outcome`) drives both paths identically.
+    """
+
+    def __init__(self, state: _AdaptiveState) -> None:
+        self._state: _AdaptiveState = state
+        self._in_flight: int = 0
+        self._waiters: collections.deque[threading.Event] = collections.deque()
+        self._lock: threading.Lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Admit one call, blocking in FIFO order until a slot is free.
+
+        On success ``_in_flight`` is incremented for this caller; on *any*
+        ``BaseException`` before the grant it holds no slot and leaves the queue
+        contiguous (the ``finally`` drops this ticket and hands the head baton on).
+        """
+        ticket = threading.Event()
+        slot_held = False
+        try:
+            with self._lock:
+                # Fast path: nobody ahead of us and capacity free — take a slot.
+                if not self._waiters and self._in_flight < self._state.limit():
+                    self._in_flight += 1
+                    slot_held = True
+                    return
+                self._waiters.append(ticket)
+            while True:
+                # Bounded wait: a same-side release sets our ticket immediately; the
+                # timeout re-checks the live limit so a cross-population (async-side)
+                # limit increase can never strand us. See the class docstring.
+                _ = ticket.wait(_SYNC_GATE_POLL_INTERVAL)
+                with self._lock:
+                    if (
+                        self._waiters
+                        and self._waiters[0] is ticket
+                        and self._in_flight < self._state.limit()
+                    ):
+                        # Commit. Dequeue and wake the next head (idempotent calls)
+                        # first; the adjacent ``_in_flight += 1``/``slot_held``
+                        # stores are the atomic grant with no call between them.
+                        _ = self._waiters.popleft()
+                        if self._waiters:
+                            self._waiters[0].set()
+                        self._in_flight += 1
+                        slot_held = True
+                        return
+                    # Woken but cannot commit yet — a head roused with no capacity
+                    # (the committing head wakes the next head unconditionally, and a
+                    # release after an AIMD *decrease* may leave in_flight still >=
+                    # the lowered limit). Clear the one-shot ticket before re-parking
+                    # so ``wait`` genuinely blocks for the poll interval instead of
+                    # returning instantly on a still-set Event and busy-spinning. Safe
+                    # under ``self._lock`` because every ``set`` (commit above,
+                    # ``release``, ``_drop_waiter``) also runs under it, so a
+                    # concurrent set is serialized against this clear and any set that
+                    # lands after the lock releases just makes the next ``wait`` return
+                    # at once — no wakeup is lost, and the poll interval backstops it.
+                    ticket.clear()
+        finally:
+            if not slot_held:
+                self._drop_waiter(ticket)
+
+    def _drop_waiter(self, ticket: threading.Event) -> None:
+        """Remove an abandoned ticket, handing the baton on if it was the head."""
+        with self._lock:
+            was_head = bool(self._waiters) and self._waiters[0] is ticket
+            with contextlib.suppress(ValueError):
+                self._waiters.remove(ticket)
+            # Only the head owes the baton. A non-head waiter that leaves keeps the
+            # deque contiguous and the real head still wakes the next ticket.
+            if was_head and self._waiters:
+                self._waiters[0].set()
+
+    def release(self) -> None:
+        """Release a held slot and wake the head to claim the freed capacity."""
+        with self._lock:
+            self._in_flight -= 1
+            if self._waiters:
+                self._waiters[0].set()
+
+    def is_saturated(self) -> bool:
+        """Whether the gate is at its limit right now (this holder included)."""
+        with self._lock:
+            return self._in_flight >= self._state.limit()
+
+    def on_throttle(self) -> BackpressureEvent | None:
+        """Feed a throttle outcome to the shared state (gated on saturation)."""
+        return self._state.on_throttle(saturated=self.is_saturated())
+
+    def on_success(self) -> BackpressureEvent | None:
+        """Feed a success outcome to the shared state (drives recovery)."""
+        return self._state.on_success()
+
+
 class _Admit(enum.Enum):
     """A circuit breaker's verdict on one admission request.
 
@@ -906,6 +1061,71 @@ class _CircuitBreaker:
         return BackpressureEvent(self._provider, self._ceiling, 0, "breaker_open")
 
 
+class _ConcurrencyGate(Protocol):
+    """The outcome-feedback surface shared by the async and sync concurrency gates.
+
+    Both :class:`_AdaptiveGate` (async) and :class:`_SyncAdaptiveGate` (sync)
+    implement it, so :func:`_record_gate_outcome` can drive either path through
+    the *same* classification code — the parity is one implementation, not two
+    parallel copies.
+    """
+
+    def is_saturated(self) -> bool: ...
+    def on_throttle(self) -> BackpressureEvent | None: ...
+    def on_success(self) -> BackpressureEvent | None: ...
+
+
+def _record_gate_outcome(
+    gate: _ConcurrencyGate,
+    breaker: _CircuitBreaker | None,
+    *,
+    is_probe: bool,
+    adaptive: bool,
+    outcome: BaseException | None,
+) -> None:
+    """Feed one call's outcome to AIMD and the breaker, emitting backpressure.
+
+    The single shared classifier at the ``yield`` for **both**
+    :meth:`GlobalRateLimiter.acquire_async` and
+    :meth:`GlobalRateLimiter.acquire_sync`, so their per-provider feedback is
+    genuinely identical rather than a parallel copy that can drift.
+
+    ``gate`` is the concurrency gate the call held (async or sync); ``breaker`` is
+    the provider's :class:`_CircuitBreaker` or ``None`` when the breaker is off;
+    ``is_probe`` marks a HALF_OPEN probe (whose outcome alone resolves the
+    breaker); ``adaptive`` is whether AIMD is on; ``outcome`` is the exception the
+    call body raised, or ``None`` on success.
+
+    A throttle (429/503/529, **unwrapped** so a structured call's wrapped error is
+    seen) while saturated lowers the AIMD limit; a success recovers it. A
+    non-throttle ("neutral") error is ambiguous overload-wise, so — exactly as
+    AIMD ignores it — it feeds neither the window nor recovery; a probe, however,
+    must resolve on *any* outcome so it can never wedge HALF_OPEN. Backpressure
+    events fire outside the gate/breaker locks.
+    """
+    throttled = (
+        _is_throttle_signal(outcome)
+        if (outcome is not None and (adaptive or breaker is not None))
+        else False
+    )
+    if outcome is not None:
+        if adaptive and throttled:
+            _emit_backpressure(gate.on_throttle())
+        if breaker is not None:
+            if is_probe:
+                _emit_backpressure(breaker.on_probe_failure())
+            elif throttled:
+                _emit_backpressure(breaker.on_record(throttled=True))
+    else:
+        if adaptive:
+            _emit_backpressure(gate.on_success())
+        if breaker is not None:
+            if is_probe:
+                _emit_backpressure(breaker.on_probe_success())
+            else:
+                _emit_backpressure(breaker.on_record(throttled=False))
+
+
 class GlobalRateLimiter:
     """Process-global, per-provider rate limiter for LLM API calls.
 
@@ -918,33 +1138,42 @@ class GlobalRateLimiter:
     The async path (:meth:`acquire_async`) is what the LiteLLM call layer
     uses; the sync path (:meth:`acquire_sync`) is retained for synchronous
     LangChain-style chat-model wrappers whose ``_generate``/``_stream``
-    methods cannot drive the async acquire.
+    methods cannot drive the async acquire. The two paths share their
+    **backpressure state** — one per-provider :class:`_AdaptiveState` (the AIMD
+    limit) and one per-provider :class:`_CircuitBreaker` — so a throttle observed
+    on either lowers the limit the other honours and an open breaker fast-fails on
+    both. They do **not** share the in-flight *count*: the async gate binds to a
+    loop and threads are a third population, so each population caps
+    independently (same-semantics-per-population, not one merged cap).
 
-    Each provider gets its own concurrency semaphore plus (when RPM/TPM are
+    Each provider gets its own concurrency gate plus (when RPM/TPM are
     configured) its own request/token buckets, created on first touch and held
     in per-dimension registries keyed by provider name. Lazy creation is
     guarded by a ``threading.Lock`` so first-touch races can't construct
-    competing limiters for the same key. Each acquirer snapshots its semaphore
+    competing limiters for the same key. Each acquirer snapshots its gate
     (and TPM bucket) locally, so a later :meth:`configure` swap (which clears
     the registries) does not strand in-flight callers — they release back onto,
     and debit, their own snapshot.
 
-    The *async* concurrency semaphore is additionally keyed by the running event
-    loop, because an ``asyncio.Semaphore`` binds to the loop it first blocks on
-    and cannot be awaited from another. A process can have several loops — the
-    persistent loop llmkit's sync bridge runs on (:func:`llmkit.sync.run_sync`),
-    any loop a host drives its own async calls on, and the short-lived loops the
-    sync bridge's reentrant fallback spins up — so a per-loop key keeps a
-    saturated provider on one loop from raising "bound to a different event loop"
-    on another; closed loops are pruned so they can't accumulate. A consequence
-    is that the concurrency cap is enforced per (provider, loop): truly
-    concurrent loops do not share one async semaphore (unavoidable — an asyncio
-    primitive can't span loops). llmkit's own sync wrappers all share the *one*
-    persistent loop, so its async semaphore bounds their cross-thread fan-out
-    directly. Host code issuing sync provider calls *outside* that loop instead
-    shares the loop-agnostic ``threading.Semaphore`` via :meth:`acquire_sync`.
-    The multi-loop caveat (up to ``loops x max_concurrent`` momentarily, one cap
-    per population) is documented in the module docstring.
+    The *async* concurrency gate (:class:`_AdaptiveGate`) is additionally keyed by
+    the running event loop, because its waiter futures bind to the loop they are
+    created on and cannot be awaited from another. A process can have several loops
+    — the persistent loop llmkit's sync bridge runs on
+    (:func:`llmkit.sync.run_sync`), any loop a host drives its own async calls on,
+    and the short-lived loops the sync bridge's reentrant fallback spins up — so a
+    per-loop key keeps a saturated provider on one loop from raising "bound to a
+    different event loop" on another; closed loops are pruned so they can't
+    accumulate. A consequence is that the concurrency cap is enforced per
+    (provider, loop): truly concurrent loops do not share one async gate
+    (unavoidable — an asyncio primitive can't span loops). llmkit's own sync
+    wrappers all share the *one* persistent loop, so its async gate bounds their
+    cross-thread fan-out directly. Host code issuing sync provider calls *outside*
+    that loop instead shares the loop-agnostic per-provider
+    :class:`_SyncAdaptiveGate` via :meth:`acquire_sync`. Both gates read one shared
+    per-provider :class:`_AdaptiveState`, so the AIMD limit (and the breaker) is
+    shared across every population even though each gate's in-flight *count* is its
+    own. The multi-population caveat (up to ``populations x max_concurrent``
+    momentarily, one cap per population) is documented in the module docstring.
 
     Enabled by default with a per-provider concurrency cap of 8; RPM and TPM
     are opt-in and off by default. See the module docstring for the rationale,
@@ -967,7 +1196,12 @@ class GlobalRateLimiter:
     # guarded outcome window, which has no loop affinity, so one breaker per
     # provider is shared across every loop and thread.
     _breaker_states: dict[str, _CircuitBreaker] = {}
-    _sync_semaphores: dict[str, threading.Semaphore] = {}
+    # Sync concurrency gates are keyed by provider *name* alone — threads have no
+    # event-loop affinity, so unlike the async gate this needs no per-loop key.
+    # Its capacity is the SAME shared per-provider ``_AdaptiveState`` the async
+    # gate reads, so a throttle on either path lowers the limit the other honours.
+    # See ``_get_sync_gate``.
+    _sync_gates: dict[str, _SyncAdaptiveGate] = {}
     _rpm_buckets: dict[str, _RateBucket] = {}
     _tpm_buckets: dict[str, _RateBucket] = {}
     _max_concurrent: int = 8
@@ -1045,7 +1279,7 @@ class GlobalRateLimiter:
             cls._async_gates = {}
             cls._adaptive_states = {}
             cls._breaker_states = {}
-            cls._sync_semaphores = {}
+            cls._sync_gates = {}
             cls._rpm_buckets = {}
             cls._tpm_buckets = {}
         logger.info(
@@ -1143,13 +1377,20 @@ class GlobalRateLimiter:
             return gate
 
     @classmethod
-    def _get_sync_semaphore(cls, key: str) -> threading.Semaphore:
+    def _get_sync_gate(cls, key: str) -> _SyncAdaptiveGate:
+        # One sync gate per provider name, shared across threads (threads have no
+        # loop affinity, so unlike the async gate this needs no per-loop key). Its
+        # capacity is the SAME shared per-provider ``_AdaptiveState`` the async
+        # gate reads, so a throttle observed on either path lowers the limit the
+        # other honours. A ``configure`` swap clears this registry (and the shared
+        # states) so a new gate picks up the new ceiling, exactly like
+        # ``_get_async_gate``.
         with cls._lock:
-            sem = cls._sync_semaphores.get(key)
-            if sem is None:
-                sem = threading.Semaphore(cls._max_concurrent)
-                cls._sync_semaphores[key] = sem
-            return sem
+            gate = cls._sync_gates.get(key)
+            if gate is None:
+                gate = _SyncAdaptiveGate(cls._get_adaptive_state_locked(key))
+                cls._sync_gates[key] = gate
+            return gate
 
     @classmethod
     def _get_rpm_bucket(cls, key: str) -> _RateBucket | None:
@@ -1274,32 +1515,21 @@ class GlobalRateLimiter:
             raise
         # Slot held: classify the outcome for AIMD and the breaker (the exception,
         # if any, propagates back into this context manager at the ``yield``), then
-        # always release the slot. Classification fires the backpressure callback
-        # outside the gate/breaker locks. A non-throttle ("neutral") error is
-        # ambiguous overload-wise, so — exactly as AIMD ignores it — it feeds
-        # neither the window nor recovery; a probe, however, must resolve on *any*
-        # outcome so it can never wedge HALF_OPEN.
+        # always release the slot. ``_record_gate_outcome`` is the single shared
+        # classifier :meth:`acquire_sync` also calls, so the feedback is one
+        # implementation rather than two parallel copies that can drift.
         try:
             try:
                 yield RateLimitSlot(tpm_bucket)
             except BaseException as exc:
-                throttled = _is_throttle_signal(exc) if (adaptive or breaker is not None) else False
-                if adaptive and throttled:
-                    _emit_backpressure(gate.on_throttle())
-                if breaker is not None:
-                    if is_probe:
-                        _emit_backpressure(breaker.on_probe_failure())
-                    elif throttled:
-                        _emit_backpressure(breaker.on_record(throttled=True))
+                _record_gate_outcome(
+                    gate, breaker, is_probe=is_probe, adaptive=adaptive, outcome=exc
+                )
                 raise
             else:
-                if adaptive:
-                    _emit_backpressure(gate.on_success())
-                if breaker is not None:
-                    if is_probe:
-                        _emit_backpressure(breaker.on_probe_success())
-                    else:
-                        _emit_backpressure(breaker.on_record(throttled=False))
+                _record_gate_outcome(
+                    gate, breaker, is_probe=is_probe, adaptive=adaptive, outcome=None
+                )
         finally:
             gate.release()
 
@@ -1308,27 +1538,98 @@ class GlobalRateLimiter:
     def acquire_sync(cls, provider_key: str) -> Generator[RateLimitSlot]:
         """Hold a sync slot for ``provider_key`` for the ``with`` block.
 
-        The synchronous counterpart to :meth:`acquire_async`, with identical
-        per-provider semantics across all three dimensions. ``provider_key`` is
-        the provider name (``provider.name``, e.g. ``"OpenAI"``), matched
-        case-insensitively. A no-op when disabled.
+        The synchronous counterpart to :meth:`acquire_async`, with the *same*
+        per-provider backpressure semantics. ``provider_key`` is the provider name
+        (``provider.name``, e.g. ``"OpenAI"``), matched case-insensitively
+        (casefolded via :func:`_normalize_key`). When the **circuit breaker** is
+        armed it is consulted *first* — before any gate, exactly as on the async
+        path — so a known-open provider raises
+        :class:`~llmkit.exceptions.CircuitOpenError` immediately, holding no slot
+        and deducting no RPM token (a HALF_OPEN probe is tracked for the single
+        process-wide probe). Otherwise the call passes the request-rate (RPM) and
+        token-rate (TPM) gates first — so a caller doesn't hold a scarce
+        concurrency slot while waiting on a rate gate — then acquires the adaptive
+        concurrency gate (:class:`_SyncAdaptiveGate`). Yields a
+        :class:`RateLimitSlot`; call its :meth:`~RateLimitSlot.record_tokens` once
+        the response's usage is known to debit the TPM budget. A no-op (yields an
+        inert slot) when disabled.
+
+        When ``adaptive`` is on, the call's outcome is observed at the ``yield``
+        through the *same* :func:`_record_gate_outcome` helper the async path uses:
+        a provider overload signal (429/503/529, **unwrapped**) received while
+        saturated lowers the provider's limit; a success recovers it. Because the
+        concurrency gate reads the **shared** per-provider :class:`_AdaptiveState`,
+        a throttle observed here lowers the limit the *async* path then honours,
+        and vice versa — the AIMD limit and the breaker are one per-provider state
+        across both paths. The sync in-flight *count* is still its own population
+        (an asyncio primitive cannot span loops, and threads are a third
+        population), so this is same-semantics-per-population, not one merged cap.
+        On any :class:`BaseException` while acquiring the rate/concurrency gates —
+        before the slot is held — the deducted RPM token is refunded and a
+        HALF_OPEN probe claim is resolved (re-opening the breaker so it never
+        wedges); the slot release lives in ``finally``. Catching
+        :class:`BaseException` (``KeyboardInterrupt`` is not an ``Exception``) is
+        the permit-leak fix over the old fixed-semaphore path.
         """
         if not cls._enabled:
             yield RateLimitSlot()
             return
         provider_key = _normalize_key(provider_key)
         rpm_bucket = cls._get_rpm_bucket(provider_key)
-        if rpm_bucket is not None:
-            rpm_bucket.acquire_sync(1.0)
         tpm_bucket = cls._get_tpm_bucket(provider_key)
-        if tpm_bucket is not None:
-            tpm_bucket.wait_for_budget_sync()
-        sem = cls._get_sync_semaphore(provider_key)
-        _ = sem.acquire()
+        gate = cls._get_sync_gate(provider_key)
+        adaptive = cls._adaptive
+        # Circuit breaker (opt-in) is consulted before any gate, mirroring
+        # ``acquire_async``: a known-open provider fast-fails here, before the
+        # RPM/TPM/concurrency phase deducts a token or holds a slot. ``admit`` may
+        # transition OPEN -> HALF_OPEN and hand this call the single probe
+        # (``is_probe``); the breaker is the SAME object the async path consults.
+        breaker = cls._get_breaker(provider_key) if cls._breaker else None
+        is_probe = False
+        if breaker is not None:
+            decision, transition = breaker.admit()
+            _emit_backpressure(transition)
+            if decision is _Admit.REJECT:
+                raise CircuitOpenError(provider_key)
+            is_probe = decision is _Admit.PROBE
+        # Acquire phase — RPM gate, then TPM gate, then the concurrency gate. On
+        # ANY BaseException here (after the RPM token is deducted but before a slot
+        # is held), refund the token so a systematically-interrupted workload
+        # doesn't silently shrink its own effective RPM, and resolve a probe claim
+        # (a probe interrupted here never ran). ``BaseException`` — not
+        # ``Exception`` — because ``KeyboardInterrupt`` is the permit-leak case the
+        # old ``sem.acquire()``-outside-``try`` path could not cover.
+        rpm_debited = False
         try:
-            yield RateLimitSlot(tpm_bucket)
+            if rpm_bucket is not None:
+                rpm_bucket.acquire_sync(1.0)
+                rpm_debited = True
+            if tpm_bucket is not None:
+                tpm_bucket.wait_for_budget_sync()
+            gate.acquire()
+        except BaseException:
+            if rpm_debited and rpm_bucket is not None:
+                rpm_bucket.refund(1.0)
+            if is_probe and breaker is not None:
+                _emit_backpressure(breaker.on_probe_failure())
+            raise
+        # Slot held: classify the outcome for AIMD and the breaker through the
+        # single shared helper (identical to ``acquire_async``), then always
+        # release the slot.
+        try:
+            try:
+                yield RateLimitSlot(tpm_bucket)
+            except BaseException as exc:
+                _record_gate_outcome(
+                    gate, breaker, is_probe=is_probe, adaptive=adaptive, outcome=exc
+                )
+                raise
+            else:
+                _record_gate_outcome(
+                    gate, breaker, is_probe=is_probe, adaptive=adaptive, outcome=None
+                )
         finally:
-            sem.release()
+            gate.release()
 
 
 @dataclass(frozen=True)
