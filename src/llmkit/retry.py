@@ -230,7 +230,9 @@ class RetryPolicy:
             retry) — lower than ``max_attempts`` on purpose.
         backoff_base_seconds: Full-jitter backoff base; the sleep before
             retry *n* is a random delay in
-            ``[0, min(base * 2**(n-1), max_backoff_seconds)]``.
+            ``[0, min(base * 2**(n-1), max_backoff_seconds)]``. Must be >= 0
+            (``0`` disables the computed backoff); a negative base would jitter
+            a server ``Retry-After`` *backwards* into an immediate retry.
         max_backoff_seconds: Ceiling on any single backoff sleep. Caps the
             exponential term so a large ``max_attempts`` can't grow the
             worst-case sleep unboundedly (at the default base, attempt 15
@@ -271,6 +273,8 @@ class RetryPolicy:
             raise ValueError(
                 f"validation_max_attempts must be >= 1, got {self.validation_max_attempts}"
             )
+        if self.backoff_base_seconds < 0:
+            raise ValueError(f"backoff_base_seconds must be >= 0, got {self.backoff_base_seconds}")
         if self.max_backoff_seconds <= 0:
             raise ValueError(f"max_backoff_seconds must be > 0, got {self.max_backoff_seconds}")
         if self.retry_after_cap <= 0:
