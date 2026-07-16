@@ -162,6 +162,22 @@ def test_non_positive_max_backoff_seconds_raises_value_error(bad_cap: float) -> 
         _ = RetryPolicy(max_backoff_seconds=bad_cap)
 
 
+@pytest.mark.parametrize("bad_base", [-0.5, -1.0])
+def test_negative_backoff_base_seconds_raises_value_error(bad_base: float) -> None:
+    """``RetryPolicy`` rejects a negative ``backoff_base_seconds`` at
+    construction: a negative base jitters a server ``Retry-After`` *backwards*
+    into an immediate retry against a provider that said when to come back.
+    Zero stays valid — it is the documented way to disable computed backoff."""
+    with pytest.raises(ValueError, match="backoff_base_seconds must be >= 0"):
+        _ = RetryPolicy(backoff_base_seconds=bad_base)
+
+
+def test_zero_backoff_base_seconds_is_accepted() -> None:
+    """``backoff_base_seconds=0`` is valid — the documented way to disable the
+    computed exponential backoff (a server ``Retry-After`` is still honoured)."""
+    assert RetryPolicy(backoff_base_seconds=0.0).backoff_base_seconds == 0.0
+
+
 def test_default_retry_after_cap_is_sixty_seconds() -> None:
     """The shipped default caps a server-supplied ``Retry-After`` at 60s — a
     separate ceiling from the 30s ``max_backoff_seconds`` on the *computed*
