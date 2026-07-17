@@ -34,7 +34,10 @@ dependencies = [
     "instructor>=1.15.4,<2",
     "openai>=2.20.0",
     "pydantic>=2.8.0",
-    "pyyaml>=6.0.0",
+    # 6.0.0/6.0.1 ship no cp313 wheel and their sdist fails to build on 3.13
+    # (their pinned Cython predates the 3.13 C API); 6.0.2 is the first release
+    # with a 3.13 wheel, so it is the true floor under `requires-python >=3.13`.
+    "pyyaml>=6.0.2",
     "httpx>=0.28.0",
     # Imported directly (the per-call AsyncRetrying fed to instructor's
     # max_retries); floor matches instructor's own tenacity requirement.
@@ -68,7 +71,10 @@ vertex = [
 ]
 dev = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
+    # 0.23.0–0.23.4 mis-collect package-scoped async tests on pytest 8
+    # ('Package' object has no attribute 'obj' / zero tests collected);
+    # 0.23.5 is the first release that collects and runs the suite.
+    "pytest-asyncio>=0.23.5",
     "ruff==0.15.0",
     "basedpyright>=1.39",
     # The offline test suite imports the Bedrock and Vertex providers and
