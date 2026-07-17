@@ -18,7 +18,17 @@ on:
         type: string
 
 jobs:
+  ci:
+    # Run the full CI gate (lint, format, types, offline tests, dependency
+    # floors, wheel smoke test) against the exact ref being released, before
+    # anything is built for upload. `build` needs this, so a tag cut from a ref
+    # CI never ran — a side branch, or a main commit whose CI failed — can't
+    # reach the immutable PyPI slot untested. Runs the same jobs a push/PR does;
+    # ci.yml exposes them via its `workflow_call` trigger.
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

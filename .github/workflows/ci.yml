@@ -11,6 +11,13 @@ on:
     # instructor/litellm/pydantic release that breaks llmkit surfaces here
     # within a week instead of at a consumer's `pip install`.
     - cron: "0 6 * * 1"
+  # Callable from publish.yml so a release runs this full gate against the exact
+  # tagged ref before the wheel is built for upload. CI otherwise triggers only
+  # on push-to-main and PRs, so a tag cut from a ref CI never ran (a side branch,
+  # or a main commit whose CI failed) would reach the immutable PyPI slot
+  # untested. No inputs: the caller checks out the same ref and runs the jobs
+  # verbatim.
+  workflow_call:
 
 jobs:
   check:
