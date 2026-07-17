@@ -67,10 +67,39 @@ jobs:
         # not resolve — only immutable release tags do.
         uses: astral-sh/setup-uv@v8.3.2
         with:
-          # This job only builds; it installs no dependencies, so there is
-          # nothing worth caching. Left at the default, setup-uv would key the
-          # cache off a gitignored uv.lock and warn that it never invalidates.
-          enable-cache: false
+          enable-cache: true
+          # uv.lock is gitignored (a library doesn't commit its lock), so the
+          # default `**/uv.lock` key matches nothing in a fresh checkout and the
+          # cache never invalidates. pyproject.toml is what declares the deps.
+          cache-dependency-glob: pyproject.toml
+          # Keep this job's cache distinct from ci.yml's — same pyproject.toml,
+          # but a release-time environment of its own.
+          cache-suffix: publish
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # Gate the publish on the same offline suite CI runs. publish.yml fires on
+      # release/dispatch, while ci.yml runs only on push-to-main and PRs — so a
+      # tag cut from a ref CI never saw (a side branch, or main before its run
+      # finished) would otherwise build and ship straight to an immutable PyPI
+      # slot with no test, lint, or type check behind it. Running the gate here
+      # answers "does this exact ref pass?" directly, with no dependence on a
+      # separate CI run having happened for this commit.
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+
+      - name: basedpyright (recommended tier, no baseline)
+        run: uv run basedpyright
+
+      - name: Tests
+        run: uv run pytest
 
       - name: Build sdist and wheel
         run: uv build
