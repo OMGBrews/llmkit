@@ -4,9 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, Mondays 06:00 UTC. uv.lock is gitignored, so `check` and `floors`
+    # both re-resolve from pyproject.toml on every run — this cron re-tests the
+    # freshest resolution even when nobody pushes, so an upstream
+    # instructor/litellm/pydantic release that breaks llmkit surfaces here
+    # within a week instead of at a consumer's `pip install`.
+    - cron: "0 6 * * 1"
 
 jobs:
   check:
+    # Newest compatible resolution (uv's default). The full gate: lint, format,
+    # types, and tests.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,6 +31,9 @@ jobs:
           # default `**/uv.lock` key matches nothing in a fresh checkout and the
           # cache never invalidates. pyproject.toml is what declares the deps.
           cache-dependency-glob: pyproject.toml
+          # Keep this job's cache distinct from the floors job's — same
+          # pyproject.toml, different resolution, different installed set.
+          cache-suffix: highest
 
       - name: Set up Python
         run: uv python install 3.13
@@ -40,3 +52,88 @@ jobs:
 
       - name: Tests
         run: uv run pytest
+
+  floors:
+    # Lowest declared direct-dependency versions (`--resolution lowest-direct`).
+    # Guards the compatibility floors in pyproject.toml: if a change starts
+    # relying on a newer-than-floor API of litellm/instructor/pydantic, this job
+    # fails instead of the declared floor quietly becoming a lie a fresh
+    # `pip install` would resolve into. The critical 0.7.0 mode-pin break was a
+    # live instance of exactly this — an untested resolution shipping broken.
+    #
+    # pytest only, not the full gate — the floors' value is the *runtime* signal.
+    # basedpyright is deliberately excluded: json_schema.py's `_DumpKwargs`
+    # TypedDict mirrors *current* pydantic's dump surface (a documented superset
+    # that is never actually passed at runtime), so type-checking against the
+    # floor pydantic's stubs reports false signature-mismatch errors. Ruff and
+    # format are dependency-independent and already covered by `check`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+          cache-suffix: lowest-direct
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies at their declared floors
+        run: uv sync --resolution lowest-direct --extra dev
+
+      - name: Tests
+        run: uv run pytest
+
+  package:
+    # Builds the wheel and smoke-tests the *installed artifact* in a clean
+    # environment. The two-package hatchling config, the py.typed marker, and
+    # that `import llmkit` works from the built wheel are otherwise validated
+    # only at publish time — against an immutable PyPI slot a broken artifact is
+    # already on its way to.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          # This job builds and installs into a throwaway venv; there is no
+          # project sync worth caching, and the default key would tie to a
+          # gitignored uv.lock and warn that it never invalidates.
+          enable-cache: false
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Install the built wheel into a clean environment
+        run: |
+          uv venv --python 3.13 /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+
+      - name: Smoke-test the installed package
+        run: |
+          /tmp/smoke/bin/python - <<'PY'
+          from importlib.resources import files
+          import llmkit  # resolves to the installed wheel, not the source tree
+
+          assert (files("llmkit") / "py.typed").is_file(), "py.typed marker missing from the wheel"
+
+          # The omg_llmkit shim must raise its actionable redirect — a bare
+          # ModuleNotFoundError would mean the package failed to install at all.
+          try:
+              import omg_llmkit
+          except ModuleNotFoundError:
+              raise SystemExit("omg_llmkit shim not installed")
+          except ImportError as exc:
+              assert "imported as" in str(exc), f"unexpected shim error: {exc}"
+          else:
+              raise SystemExit("omg_llmkit shim should raise, not import cleanly")
+
+          print("wheel smoke test passed")
+          PY
