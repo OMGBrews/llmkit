@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`llmkit.__version__`.** The package now exposes its version, resolved from
+  installed distribution metadata (`omg-llmkit`) so it can never drift from
+  what pip installed. A source tree without dist metadata reports
+  `"0.0.0+unknown"` rather than raising at import.
 - **A host can pick Gemini's structured-output strategy.**
   `LLMClientConfig.gemini_structured_output` (`"schema"` | `"json"`, default
   `"schema"`) selects the instructor `Mode` for the two Gemini providers (Vertex,

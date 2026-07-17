@@ -31,6 +31,9 @@ the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 # suppressed inline — disable the rule for this re-export module only.
 # pyright: reportImportCycles=false
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
 from llmkit.capture import (
     capture_llm_log_paths,
     capture_llm_records,
@@ -88,6 +91,15 @@ from llmkit.structured_output import (
     text_llm_call_sync,
 )
 
+# Distribution version, resolved from installed metadata rather than hardcoded
+# so it can never drift from what pip installed. The distribution is
+# ``omg-llmkit`` (the import name is ``llmkit``); a source tree with no dist
+# metadata falls back to a sentinel instead of raising at import.
+try:
+    __version__ = _version("omg-llmkit")
+except PackageNotFoundError:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
+
 __all__ = [
     # Providers + config
     "LLMProviderInterface",
@@ -139,4 +151,6 @@ __all__ = [
     "CircuitOpenError",
     "OutputLimitError",
     "ResultValidationError",
+    # Package metadata
+    "__version__",
 ]
