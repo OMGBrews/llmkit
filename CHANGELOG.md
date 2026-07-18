@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`except LLM_RECOVERABLE_ERRORS:` now actually catches a litellm-native
+  503.** The litellm 503 entry in `LLM_TRANSPORT_ERRORS` matched only via a
+  lazy `isinstance` hook (the metaclass stand-in that keeps `import llmkit`
+  litellm-free), and Python's `except` matching bypasses such hooks — so the
+  retry layer classified and retried genuine 503s correctly, but once the
+  budget was exhausted the raw litellm class blew straight through the
+  *documented* host degrade pattern with no warning. llmkit's transport
+  boundary now re-raises every litellm-native 503 as a new llmkit-owned
+  **`ServiceUnavailableError`** — a plain, statically-listed member of
+  `LLM_TRANSPORT_ERRORS` (the `CircuitOpenError` / `OutputLimitError`
+  precedent) — carrying `provider`, `model`, `status_code` (always 503), and
+  the original `response`, with the litellm original on `__cause__`. Behaviour
+  preserved by measurement: a server `Retry-After` stays readable through the
+  copied `response`, and `status_code == 503` keeps the AIMD/breaker throttle
+  classification intact. **Compatibility note:** code that caught
+  `litellm.exceptions.ServiceUnavailableError` directly around llmkit calls
+  must switch to `llmkit.ServiceUnavailableError` (or the documented
+  catch-set); the raw litellm class still classifies as transport in
+  `isinstance` checks, so a host's own litellm call wrapped in `with_retries`
+  retries its 503s exactly as before.
+
 ### Added
 
 - **`llmkit.__version__`.** The package now exposes its version, resolved from

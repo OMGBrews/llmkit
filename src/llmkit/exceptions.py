@@ -43,11 +43,16 @@ The recoverable set is split into four subsets the retry layer budgets
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the four, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
-catching exactly what they did before. One member is special: the
-litellm-native 503 entry is a lazy stand-in
-(:class:`_LiteLLMServiceUnavailableError`) that resolves litellm's class at
-``isinstance`` time, keeping ``import llmkit`` free of the multi-second
-litellm import — see its docstring for the one ``except``-clause limit.
+catching exactly what they did before. The 503 case deserves a note:
+litellm's own ``ServiceUnavailableError`` cannot be listed statically
+(that would cost every ``import llmkit`` the multi-second litellm import),
+so the transport boundary (:mod:`llmkit._litellm`) re-raises every
+litellm-native 503 as llmkit's own :class:`ServiceUnavailableError` — a
+plain class in the tuple, so the documented ``except`` pattern genuinely
+catches it. A lazy stand-in (:class:`_LiteLLMServiceUnavailableError`)
+additionally keeps *raw* litellm 503s classifying as transport in
+``isinstance`` checks (e.g. a host's own litellm call wrapped in
+:func:`~llmkit.retry.with_retries`).
 
 ``with_retries()`` (see :mod:`llmkit.retry`) is the transient-retry
 layer; in-call schema repair is handled separately by instructor's retry
@@ -132,25 +137,106 @@ class _LiteLLMServiceUnavailableError(Exception, metaclass=_LazyServiceUnavailab
     """Lazy stand-in for ``litellm.exceptions.ServiceUnavailableError``.
 
     Matches exactly what the real class matches in ``isinstance`` checks —
-    the form every consumer of the transport set uses to classify errors —
+    the form the retry layer and rate limiter use to classify errors —
     without importing litellm at ``import llmkit`` time. Never raise this
     class directly.
 
-    Known limit: ``except`` matching bypasses ``__instancecheck__``, so a
-    bare ``except LLM_TRANSPORT_ERRORS`` clause does not catch the
-    litellm-native 503 specifically (every other member still matches; an
-    openai-SDK 503 arrives as ``openai.InternalServerError`` and matches
-    too). Use ``isinstance`` — as the retry layer does — where the
-    litellm-native class matters.
+    Known limit: ``except`` matching bypasses ``__instancecheck__``, so an
+    ``except`` clause over the transport tuple does not match this entry.
+    That limit no longer reaches hosts through llmkit's call functions: the
+    transport boundary (:func:`normalize_service_unavailable`, applied in
+    :mod:`llmkit._litellm`) re-raises every litellm-native 503 as
+    :class:`ServiceUnavailableError`, a plain tuple member ``except`` does
+    match. This stand-in stays for ``isinstance`` classification of the raw
+    litellm class — the shape a host's *own* litellm call wrapped in
+    :func:`~llmkit.retry.with_retries` still raises.
     """
+
+
+class ServiceUnavailableError(Exception):
+    """A provider reported itself unavailable (HTTP 503).
+
+    llmkit's **owned, catchable** form of litellm's ``ServiceUnavailableError``.
+    litellm's class cannot appear in the transport tuple statically (the
+    import-time cost), and the lazy stand-in above matches only in
+    ``isinstance`` checks — CPython's ``except`` matching bypasses metaclass
+    hooks — so a raw litellm 503 escaping the library would slip through the
+    documented ``except LLM_RECOVERABLE_ERRORS`` net. The transport boundary
+    (:mod:`llmkit._litellm`) therefore re-raises every litellm-native 503 as
+    this class via :func:`normalize_service_unavailable`, with the original on
+    ``__cause__`` — the :class:`CircuitOpenError` / :class:`OutputLimitError`
+    precedent of one plain llmkit-owned type per fail signal.
+
+    Carries exactly the fields downstream consumers read (measured against
+    litellm's class, 2026-07-18): ``status_code == 503`` keeps the AIMD/breaker
+    throttle classification seeing the overload signal, and ``response`` keeps
+    a server ``Retry-After`` header readable by the retry layer's backoff —
+    so normalization changes the *type* a host catches, never the retry timing
+    or backpressure behaviour.
+
+    Attributes:
+        provider: litellm's provider tag for the failing call (its
+            ``llm_provider``), or ``None`` when the original carried none.
+        model: The model string the call ran against, or ``None``.
+        status_code: Always ``503``.
+        response: The original error's ``httpx.Response`` (carrying any
+            ``Retry-After`` header), or ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None,
+        model: str | None,
+        response: httpx.Response | None,
+    ) -> None:
+        super().__init__(message)
+        self.provider: str | None = provider
+        self.model: str | None = model
+        self.status_code: int = 503
+        self.response: httpx.Response | None = response
+
+
+def normalize_service_unavailable(exc: Exception) -> Exception:
+    """llmkit's :class:`ServiceUnavailableError` for a litellm-native 503; any
+    other exception unchanged.
+
+    The transport boundary (:mod:`llmkit._litellm`) calls this on every error
+    leaving a provider call and re-raises a changed result ``from`` the
+    original, so the litellm class — which ``except`` clauses over the
+    transport tuple cannot match — never propagates to a host raw. Attribute
+    reads are best-effort with ``isinstance`` narrowing: a litellm 503 missing
+    an expected field still normalizes, with that field ``None``.
+
+    Deliberately *not* in ``llmkit.__init__``'s exports: like
+    :data:`REPAIRABLE_PARSE_ERRORS`, it is an internal boundary detail — hosts
+    interact with the resulting :class:`ServiceUnavailableError`, not the
+    normalization itself.
+    """
+    if not isinstance(exc, _LiteLLMServiceUnavailableError):
+        return exc
+    provider = getattr(exc, "llm_provider", None)
+    model = getattr(exc, "model", None)
+    response = getattr(exc, "response", None)
+    return ServiceUnavailableError(
+        str(exc),
+        provider=provider if isinstance(provider, str) else None,
+        model=model if isinstance(model, str) else None,
+        response=response if isinstance(response, httpx.Response) else None,
+    )
 
 
 LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     openai.RateLimitError,
     openai.InternalServerError,
-    # litellm-native 503 — does not subclass ``openai.InternalServerError``
-    # (only ``openai.APIStatusError``), so it needs an explicit entry; the
-    # lazy stand-in keeps ``import llmkit`` litellm-free.
+    # llmkit-owned 503 — what the transport boundary re-raises for every
+    # litellm-native 503, so ``except`` clauses over this tuple catch it.
+    ServiceUnavailableError,
+    # Raw litellm-native 503 — matches in ``isinstance`` classification only
+    # (see the stand-in's docstring); kept so a host's own litellm call
+    # wrapped in ``with_retries`` still retries its 503s. The lazy stand-in
+    # keeps ``import llmkit`` litellm-free.
     _LiteLLMServiceUnavailableError,
     openai.APIConnectionError,
     httpx.RequestError,

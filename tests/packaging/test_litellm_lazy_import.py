@@ -55,6 +55,30 @@ def test_transport_classification_works_without_litellm_loaded() -> None:
     )
 
 
+def test_owned_503_is_except_catchable_without_litellm_loaded() -> None:
+    """llmkit's own ``ServiceUnavailableError`` — the class the transport
+    boundary re-raises litellm 503s as — is a plain, statically-listed tuple
+    member: a literal ``except`` clause over the documented catch-set matches
+    it with litellm never imported. This is the property the lazy stand-in
+    alone could not provide (``except`` matching bypasses metaclass hooks).
+    """
+    _run_python(
+        textwrap.dedent(
+            """
+            import sys
+            import llmkit
+            try:
+                raise llmkit.ServiceUnavailableError(
+                    'down', provider='openai', model='gpt-4o-mini', response=None
+                )
+            except llmkit.LLM_RECOVERABLE_ERRORS:
+                pass
+            assert 'litellm' not in sys.modules
+            """
+        )
+    )
+
+
 def test_litellm_503_classifies_as_transport_once_litellm_imported() -> None:
     """Once litellm IS loaded, its real 503 still classifies as transport.
 
