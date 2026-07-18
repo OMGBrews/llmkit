@@ -34,7 +34,11 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
-from llmkit.exceptions import REPAIRABLE_PARSE_ERRORS, OutputLimitError
+from llmkit.exceptions import (
+    REPAIRABLE_PARSE_ERRORS,
+    OutputLimitError,
+    normalize_service_unavailable,
+)
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 
@@ -56,12 +60,27 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     patching ``llmkit._litellm.litellm.acompletion`` to stub the provider; the
     per-call ``reportArgumentType`` suppressions at each caller cover the
     over-strict argument shapes (credential splat, message-list typing).
+
+    This is also the boundary where a litellm-native 503 is re-owned: litellm's
+    ``ServiceUnavailableError`` matches the transport tuple only via a metaclass
+    ``isinstance`` hook that ``except`` clauses bypass, so left raw it would slip
+    through a host's documented ``except LLM_RECOVERABLE_ERRORS`` net. It is
+    re-raised as :class:`llmkit.exceptions.ServiceUnavailableError` (original on
+    ``__cause__``); every other exception propagates untouched. This cannot be an
+    ``except <type>`` clause — that is the very matching the litellm class fails —
+    hence the catch-all plus ``isinstance`` inside the normalizer.
     """
     acompletion = cast(
         "Callable[..., Coroutine[object, object, ModelResponse | CustomStreamWrapper]]",
         litellm.acompletion,
     )
-    return await acompletion(**kwargs)
+    try:
+        return await acompletion(**kwargs)
+    except Exception as e:
+        normalized = normalize_service_unavailable(e)
+        if normalized is not e:
+            raise normalized from e
+        raise
 
 
 async def _acompletion_strict_json_schema(
@@ -506,10 +525,20 @@ async def astream_text(
         # stream=True makes acompletion return a CustomStreamWrapper, whose
         # async iteration yields typed ModelResponseStream chunks.
         stream = cast("CustomStreamWrapper", resp)
-        async for chunk in stream:
-            delta = _chunk_delta_text(chunk)
-            if delta:
-                yield delta
+        try:
+            async for chunk in stream:
+                delta = _chunk_delta_text(chunk)
+                if delta:
+                    yield delta
+        except Exception as e:
+            # A 503 can also surface mid-iteration (the wrapper fetches chunks
+            # lazily, after ``_acompletion`` has returned) — re-own it exactly
+            # as the call-time boundary does, so the stream path keeps the
+            # ``except LLM_RECOVERABLE_ERRORS`` contract too.
+            normalized = normalize_service_unavailable(e)
+            if normalized is not e:
+                raise normalized from e
+            raise
         # Best-effort TPM accounting: a stream usually reports no usage (we
         # don't request stream_options=include_usage), so this is typically a
         # no-op — consistent with cost being None for streamed calls. When the

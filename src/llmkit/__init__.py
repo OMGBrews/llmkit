@@ -47,6 +47,7 @@ from llmkit.exceptions import (
     CircuitOpenError,
     OutputLimitError,
     ResultValidationError,
+    ServiceUnavailableError,
 )
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
@@ -151,6 +152,7 @@ __all__ = [
     "CircuitOpenError",
     "OutputLimitError",
     "ResultValidationError",
+    "ServiceUnavailableError",
     # Package metadata
     "__version__",
 ]
