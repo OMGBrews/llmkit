@@ -98,6 +98,44 @@ def test_make_provider_openai_no_base_url_stays_none() -> None:
     assert kwargs == {"api_key": "sk-test"}
 
 
+@pytest.mark.parametrize(
+    "provider_enum",
+    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK],
+)
+def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) -> None:
+    """A ``base_url`` reaches LiteLLM as ``api_base`` — never silently dropped.
+
+    These three providers historically ignored ``base_url`` under a false
+    "endpoints are fixed" rationale, so a gateway-routed config silently sent
+    every request to the public endpoint — a data-egress surprise for exactly
+    the users who set an endpoint override. LiteLLM accepts ``api_base`` on
+    the ``anthropic/`` / ``gemini/`` / ``deepseek/`` routes, so the override
+    must land on the wire kwargs.
+    """
+    provider = make_provider(
+        provider_enum, api_key="sk-test", base_url="https://gateway.example/v1"
+    )
+    assert provider.completion_kwargs() == {
+        "api_key": "sk-test",
+        "api_base": "https://gateway.example/v1",
+    }
+
+
+@pytest.mark.parametrize(
+    "provider_enum",
+    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK],
+)
+def test_make_provider_no_base_url_omits_api_base(provider_enum: Provider) -> None:
+    """Without a ``base_url``, no ``api_base`` key is sent at all.
+
+    Like OpenAI (and unlike OpenRouter/Ollama, which substitute an endpoint
+    literal), these providers must leave the endpoint unset so LiteLLM uses
+    each provider's real default — the pre-existing wire shape, byte-identical.
+    """
+    provider = make_provider(provider_enum, api_key="sk-test")
+    assert provider.completion_kwargs() == {"api_key": "sk-test"}
+
+
 def test_make_provider_bedrock_region_only() -> None:
     """Bedrock takes a region, never an ``api_key`` (ambient AWS chain signs)."""
     provider = make_provider(

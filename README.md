@@ -442,7 +442,7 @@ class LLMClientConfig:
     provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None
-    base_url: str | None = None      # OpenRouter / OpenAI-compatible endpoints; unused by Google/Anthropic
+    base_url: str | None = None      # endpoint override (forwarded as api_base); unused by Bedrock/Vertex
     reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
     aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
     vertex_project: str | None = None    # Vertex AI GCP project; unused by every other provider
@@ -507,9 +507,9 @@ result = structured_llm_call_sync(
 `make_provider` accepts the knobs each provider actually reads —
 `api_key`, `model`, `base_url`, `reasoning_effort`, `aws_region_name`,
 `vertex_project`, `vertex_location` — and ignores the ones a given provider
-doesn't use (e.g. `base_url` for Anthropic, `api_key` for Ollama or Bedrock,
-which signs via the ambient AWS credential chain, or for Vertex, which signs via
-Google ADC). Leave `model` unset to inherit the provider's own default; the
+doesn't use (e.g. `base_url` for Bedrock/Vertex, whose endpoints derive from
+region/location, or `api_key` for Ollama or Bedrock, which signs via the
+ambient AWS credential chain, or for Vertex, which signs via Google ADC). Leave `model` unset to inherit the provider's own default; the
 assembled LiteLLM id is always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
 
 **A fully per-call host needs no global config at all.** If you pass `provider=`

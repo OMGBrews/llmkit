@@ -114,7 +114,7 @@ def make_provider(
     single-tenant by design — see :mod:`llmkit.rate_limiting`).
 
     The accepted knobs mirror the fields each concrete provider reads;
-    irrelevant ones are simply ignored (e.g. ``base_url`` for Anthropic,
+    irrelevant ones are simply ignored (e.g. ``base_url`` for Bedrock/Vertex,
     ``api_key`` for Ollama/Bedrock/Vertex, ``aws_region_name`` for
     everything but Bedrock, ``vertex_project`` / ``vertex_location`` for
     everything but Vertex). A falsy ``model`` resolves to the provider's own
@@ -126,8 +126,10 @@ def make_provider(
             ambient AWS credential chain).
         model: Default model for this provider; ``None`` uses the provider's
             built-in default.
-        base_url: Endpoint override (OpenRouter / Ollama / OpenAI-compatible
-            gateways); ignored by providers with fixed endpoints.
+        base_url: Endpoint override forwarded to LiteLLM as ``api_base``
+            (gateways, proxies, compatible endpoints) for every
+            key-authenticated provider; ignored by Bedrock/Vertex, whose
+            endpoints derive from region/location.
         reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
             ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; ignored by every other

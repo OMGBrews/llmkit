@@ -44,6 +44,11 @@ class GoogleProvider(BaseProvider):
 
     An unrecognized ``structured_output`` raises ``ValueError`` at construction
     rather than silently falling back.
+
+    An optional ``base_url`` points the provider at a Gemini-compatible
+    gateway (LiteLLM accepts ``api_base`` on the ``gemini/`` route); left
+    unset, LiteLLM uses Google AI Studio's default endpoint (so ``api_base``
+    is only forwarded when a ``base_url`` is given).
     """
 
     _provider_name: ClassVar[str] = "Google AI Studio"
@@ -58,11 +63,13 @@ class GoogleProvider(BaseProvider):
         self,
         api_key: str,
         model: str | None = None,
+        base_url: str | None = None,
         reasoning_effort: str | None = None,
         structured_output: str = "schema",
     ):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key
+        self._base_url: str | None = base_url
         # Resolve the host-selected strategy once, loudly rejecting a typo.
         self._instructor_mode: instructor.Mode = resolve_gemini_structured_output(structured_output)
 
@@ -79,14 +86,18 @@ class GoogleProvider(BaseProvider):
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        return {"api_key": self._api_key}
+        kwargs: dict[str, object] = {"api_key": self._api_key}
+        if self._base_url:
+            kwargs["api_base"] = self._base_url
+        return kwargs
 
     @classmethod
     def build(cls, config: LLMClientConfig) -> GoogleProvider:
-        """Construct from an :class:`LLMClientConfig`."""
+        """Construct from an :class:`LLMClientConfig` (``base_url`` passed through)."""
         return cls(
             api_key=config.api_key or "",
             model=config.model,
+            base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
             structured_output=config.gemini_structured_output,
         )
