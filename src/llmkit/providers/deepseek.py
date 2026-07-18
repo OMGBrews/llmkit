@@ -31,6 +31,11 @@ class DeepSeekProvider(BaseProvider):
     because output is validated through instructor, a too-small ``max_tokens``
     cap surfaces as a loud retry error rather than the silently-empty shape
     seen with other providers' reasoning modes.
+
+    An optional ``base_url`` points the provider at a DeepSeek-compatible
+    gateway (LiteLLM accepts ``api_base`` on the ``deepseek/`` route); left
+    unset, LiteLLM uses DeepSeek's default endpoint (so ``api_base`` is only
+    forwarded when a ``base_url`` is given).
     """
 
     _provider_name: ClassVar[str] = "DeepSeek"
@@ -42,20 +47,26 @@ class DeepSeekProvider(BaseProvider):
         self,
         api_key: str,
         model: str | None = None,
+        base_url: str | None = None,
         reasoning_effort: str | None = None,
     ):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key
+        self._base_url: str | None = base_url
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        return {"api_key": self._api_key}
+        kwargs: dict[str, object] = {"api_key": self._api_key}
+        if self._base_url:
+            kwargs["api_base"] = self._base_url
+        return kwargs
 
     @classmethod
     def build(cls, config: LLMClientConfig) -> DeepSeekProvider:
-        """Construct from an :class:`LLMClientConfig`."""
+        """Construct from an :class:`LLMClientConfig` (``base_url`` passed through)."""
         return cls(
             api_key=config.api_key or "",
             model=config.model,
+            base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
         )

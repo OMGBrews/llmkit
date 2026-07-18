@@ -189,9 +189,13 @@ class LLMClientConfig:
     host's config module.
 
     Only the *active* provider's fields need be populated. ``api_key`` is
-    unused by Ollama (which talks to a local endpoint) and ``base_url`` is
-    unused by Google/Anthropic/DeepSeek/Bedrock (whose endpoints are
-    fixed). Per-call
+    unused by Ollama (which talks to a local endpoint). ``base_url``
+    overrides the endpoint (forwarded to LiteLLM as ``api_base``) for every
+    key-authenticated provider — OpenRouter, Ollama, OpenAI, Anthropic,
+    Google, DeepSeek — with each provider's own default endpoint standing
+    when it is unset; it is unused only by Bedrock and Vertex, whose
+    endpoints derive from ``aws_region_name`` / ``vertex_location`` instead.
+    Per-call
     ``model`` overrides (e.g. the strong/small roles the host resolves)
     are passed at call time and are not part of this config — this carries
     only the provider's *default* model.
