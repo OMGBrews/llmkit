@@ -6,7 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A config knob the selected provider does not read is now rejected, not
+  silently ignored.** `LLMClientConfig` / `make_provider` accepted every
+  provider-shaped field for every provider and each provider used only the ones
+  it needed, dropping the rest — so a config populated generically (all fields
+  filled from a settings object) *looked* like it pinned a credential or
+  endpoint that was in fact ignored. `build_provider` — the single seam
+  `make_provider`, `configure_llm_client`, and a direct `build_provider(config)`
+  all flow through — now raises a `ValueError` naming the offending field(s) and
+  what the provider does read. Each provider declares its accepted knobs
+  (`_accepted_config_fields`), enforced at import. **Migration:** populate only
+  the active provider's fields — an `api_key` on Bedrock/Vertex, a `base_url` on
+  a fixed-endpoint provider, or a non-default `gemini_structured_output` on a
+  non-Gemini provider now raises instead of being dropped. (The config docstring
+  always said only the active provider's fields need be populated; this enforces
+  it.)
+- **Bearer providers resolve their API key explicitly: config, then the
+  provider's environment variable, else raise.** The five key-authenticated
+  providers (OpenRouter, Anthropic, OpenAI, DeepSeek, Google AI Studio) coerced
+  a missing `api_key` to `""` and handed it to LiteLLM, which *silently* fell
+  back to the ambient provider env key — an invisible identity/billing swap
+  (reachable even from a stray `.env`, since importing LiteLLM runs
+  `load_dotenv()`). Resolution is now explicit and documented: the configured
+  key wins; else the provider's own variable (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`);
+  else a `ValueError` at construction naming the variable. **Migration:**
+  env-var-based setups keep working unchanged; a provider built with neither a
+  configured key nor its env var now fails loudly at construction instead of at
+  call time (or silently succeeding off an ambient key).
+- **`$ref` structural siblings and empty `properties` now raise in
+  `model_from_json_schema`.** A structural keyword beside a `$ref` (`type`,
+  `enum`, `items`, `properties`, …) that differs from the referenced schema was
+  silently dropped on the annotation path — most visibly a `$ref`-sibling
+  `enum`, which widened the field to an unconstrained scalar. It now raises
+  unless it restates the target's value (metadata and bounds still merge,
+  outer-wins). An explicit empty `{"properties": {}}` now raises like an absent
+  `properties` (both would build a zero-field model that rejects every
+  response), unless `additionalProperties: true` is set.
+
+### Security
+
+- **`LLMClientConfig` no longer leaks `api_key` in its `repr`.** The frozen
+  dataclass's generated repr rendered `api_key='sk-...'` verbatim, so any
+  host-side `print(config)`, log line, or exception reporter's locals capture
+  could exfiltrate the credential. A set key now renders as `api_key=<redacted>`
+  (presence stays debuggable; the value never prints), and the repr shows only
+  fields that differ from their default. **Compatibility note:** code parsing
+  the repr string will see the new format.
+
 ### Fixed
+
+- **A `$def`'s `description` now survives a nullable-wrapped or chained `$ref`.**
+  `model_from_json_schema` rescued a `$ref` target's model-facing `description`
+  only for a bare top-level `$ref`, so wrapping it in `anyOf`+`null` (a nullable
+  field) dropped the guidance instructor sends to the model. Unifying `$ref` /
+  nullable resolution into one pass carries the description through for bare,
+  nullable-wrapped, and multi-hop `$ref` fields alike (nearest hop wins).
 
 - **Explicit per-call keywords now beat `options` even at default-equal
   values.** The documented precedence (**config < options < explicit
