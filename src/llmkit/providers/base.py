@@ -35,9 +35,9 @@ import inspect
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from enum import StrEnum
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, cast, override, runtime_checkable
 
 import instructor
 
@@ -181,7 +181,7 @@ class Provider(StrEnum):
     VERTEX = "vertex"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class LLMClientConfig:
     """Provider selection + credentials for the active LLM provider.
 
@@ -264,6 +264,32 @@ class LLMClientConfig:
     vertex_project: str | None = None
     vertex_location: str | None = None
     gemini_structured_output: Literal["schema", "json"] = "schema"
+
+    @override
+    def __repr__(self) -> str:
+        # The generated dataclass repr renders ``api_key='sk-...'`` verbatim,
+        # so any host-side ``print(config)``, log line, or exception reporter's
+        # locals capture would exfiltrate the credential. Mask it: a *set* key
+        # shows ``api_key=<redacted>`` (presence stays debuggable, the value
+        # never prints), while an empty ``""`` stays visible as itself since it
+        # is not a secret and an accidental empty key is worth seeing.
+        #
+        # Only fields that differ from their default are shown — the same
+        # signal-over-noise choice ``LLMCallOptions.__repr__`` makes; ``provider``
+        # has no default, so it always prints. ``field(repr=False)`` on ``api_key``
+        # alone was rejected for the reason ``options.py`` documents: it would drop
+        # the field entirely, hiding whether a key is set at all.
+        parts: list[str] = []
+        for f in fields(self):
+            value = cast("object", getattr(self, f.name))
+            default = cast("object", f.default)
+            if default is not MISSING and value == default:
+                continue
+            shown = repr(value)
+            if f.name == "api_key" and value:
+                shown = "<redacted>"
+            parts.append(f"{f.name}={shown}")
+        return f"{type(self).__name__}({', '.join(parts)})"
 
 
 # Module-level config source, registered once by the host application at a
