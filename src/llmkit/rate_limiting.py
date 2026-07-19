@@ -421,7 +421,7 @@ class _RateBucket:
         mirroring :meth:`GlobalRateLimiter._get_async_gate`. Keyed by loop because
         a lock's waiter futures bind to the loop they are created on and a single
         bucket is awaited from several loops; constructing the lock here is
-        loop-inert on Python >= 3.13 (it binds the loop lazily on first
+        loop-inert on Python >= 3.12 (it binds the loop lazily on first
         ``acquire``), so it is safe to build under the threading lock. The running
         loop is by definition not closed, so the returned lock can never be pruned
         out from under the ``async with`` that follows.

@@ -31,7 +31,7 @@ post-install smoke test. A mistaken `import omg_llmkit` (the install name) raise
 a clear one-line redirect to `import llmkit`, not a bare
 `ModuleNotFoundError` that leaves you guessing.
 
-Requires Python ≥ 3.13.
+Requires Python ≥ 3.12.
 
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
 DeepSeek, and Ollama with no extra dependencies. Two providers gate their
