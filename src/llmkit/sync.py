@@ -29,17 +29,30 @@ concurrency on one loop (LiteLLM's intended mode), with the per-provider
 concurrency cap enforced inside the async path by ``GlobalRateLimiter``'s
 now-shared async semaphore (keyed on ``L``).
 
-**The reentrant fallback.** :func:`run_sync` cannot block the calling thread on
-``L`` when that thread *already* has a running loop — an async framework calling
-a ``*_sync`` helper, or a coroutine running on ``L`` itself that calls back into
-sync code. Blocking would either freeze the caller's own loop forever or, in the
-``L``-on-``L`` case, deadlock. So when a loop is already running in the calling
-thread, the coroutine is offloaded to a one-shot worker thread with its own
-fresh loop (:func:`_run_and_drain`), which drains LiteLLM's logging before
-closing that loop. This path keeps the old fresh-loop semantics — including the
-documented "a timed-out worker keeps running" caveat — and is the only remaining
-fresh-loop path; because it runs on a non-main worker thread it can never be
-interrupted by a signal mid-call.
+**Reentrant calls.** A loop already running in the calling thread — an async
+framework calling a ``*_sync`` helper, or a coroutine running on ``L`` itself
+that calls back into sync code — splits into two cases:
+
+* **A foreign loop** (any loop that is not ``L``): the coroutine is submitted to
+  the persistent loop like any other sync call. Blocking the calling thread is
+  inherent to calling sync-from-async — every strategy blocks that thread for
+  the call's duration, freezing the caller's loop meanwhile — and ``L`` runs on
+  its own thread, so the wait is bounded by the call, not a deadlock. Routing
+  here (rather than a fresh loop per call) is what keeps a *concurrent*
+  reentrant fan-out from re-creating the multi-loop regime above, and it keeps
+  the persistent-loop guarantees: cancel-on-timeout and the shared per-provider
+  concurrency cap.
+* **``L`` itself** (a coroutine on ``L`` calls back into sync code): blocking
+  ``L``'s thread on ``L`` would deadlock, so the coroutine is offloaded to a
+  one-shot worker thread with its own fresh loop (:func:`_run_and_drain`), which
+  drains LiteLLM's logging before closing that loop. This is the **only**
+  remaining fresh-loop path, and it cannot run concurrently with itself — the
+  call blocks ``L``'s thread, so no other coroutine on ``L`` can enter it, and
+  ``_fallback_lock`` pins that at-most-one-fresh-loop invariant mechanically —
+  which keeps LiteLLM's worker in the *sequential* rebind regime it tolerates.
+  This path keeps the old fresh-loop semantics — including the documented "a
+  timed-out worker keeps running" caveat — and because it runs on a non-main
+  worker thread it can never be interrupted by a signal mid-call.
 
 **Context propagation.** Submitting to ``L`` crosses a thread boundary, so the
 caller's :mod:`contextvars` context is captured and the coroutine runs inside a
@@ -67,6 +80,13 @@ logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
+
+# Serializes the loop-on-loop fallback's fresh-loop lifecycle: at most one fresh
+# loop may ever exist at a time, so LiteLLM's logging worker only ever rebinds
+# *sequentially* (the regime it tolerates), never across concurrent loops. The
+# path is naturally serial today — the fallback blocks the persistent loop's own
+# thread — but that invariant lives far from this code, so it is pinned here.
+_fallback_lock = threading.Lock()
 
 
 def _loop_main(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
@@ -186,11 +206,14 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
 def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | None) -> T:
     """Run *coro* on a fresh loop in *this* (worker) thread, then drain stragglers.
 
-    The fresh-loop path retained **only** for the reentrant fallback in
-    :func:`run_sync` — when the calling thread already has a running loop, so the
-    coroutine cannot be driven on the persistent loop or in-thread. Runs on a
-    one-shot worker thread, never the main thread, so it cannot be interrupted by
-    a signal mid-call (which is why no KeyboardInterrupt settling is needed here).
+    The fresh-loop path retained **only** for the loop-on-loop fallback in
+    :func:`run_sync` — when the *persistent loop itself* is running in the
+    calling thread, so the coroutine can be driven neither on the persistent
+    loop nor in-thread. Runs on a one-shot worker thread, never the main thread,
+    so it cannot be interrupted by a signal mid-call (which is why no
+    KeyboardInterrupt settling is needed here). The whole fresh-loop lifecycle
+    holds ``_fallback_lock``, so two fresh loops can never coexist and race
+    LiteLLM's logging worker.
 
     A plain :func:`asyncio.run` would close its loop the instant the driving
     coroutine returns, but LiteLLM logs without awaiting inline: it eagerly
@@ -214,28 +237,29 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
     """
     from llmkit import _litellm
 
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
+    with _fallback_lock:
+        loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(coro)
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                # Drain pending LiteLLM logging whether the call succeeded or
+                # raised — an undrained coroutine/task is otherwise destroyed
+                # (and warned about) at ``loop.close()``.
+                loop.run_until_complete(_litellm.drain_async_logging(timeout=timeout))
+                _drain_pending(loop, timeout=timeout)
         finally:
-            # Drain pending LiteLLM logging whether the call succeeded or raised —
-            # an undrained coroutine/task is otherwise destroyed (and warned
-            # about) at ``loop.close()``.
-            loop.run_until_complete(_litellm.drain_async_logging(timeout=timeout))
-            _drain_pending(loop, timeout=timeout)
-    finally:
-        try:
-            # Asyncgen finalizers may schedule one last off-loop log write
-            # (``record_call_async``), so the executor drain must come after
-            # them — and before ``close``, so no llmkit log write is ever
-            # abandoned in a worker thread of a closed loop.
-            loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.run_until_complete(loop.shutdown_default_executor())
-        finally:
-            asyncio.set_event_loop(None)
-            loop.close()
+            try:
+                # Asyncgen finalizers may schedule one last off-loop log write
+                # (``record_call_async``), so the executor drain must come after
+                # them — and before ``close``, so no llmkit log write is ever
+                # abandoned in a worker thread of a closed loop.
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
 
 
 def _drain_pending(loop: asyncio.AbstractEventLoop, *, timeout: float | None) -> None:
@@ -278,11 +302,23 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     concurrent sync fan-out (flood + an occasional ~600 s hang). See the module
     docstring.
 
-    If an event loop is **already running in the calling thread** (an async
-    framework calling a ``*_sync`` helper, or a coroutine on the persistent loop
-    calling back into sync code), the coroutine cannot be driven here without
-    freezing that loop or deadlocking, so it is offloaded to a one-shot worker
-    thread with its own fresh loop (:func:`_run_and_drain`).
+    If an event loop is **already running in the calling thread**, what happens
+    depends on *which* loop it is:
+
+    * **Any loop other than the persistent one** (an async framework calling a
+      ``*_sync`` helper): the call is submitted to the persistent loop exactly
+      like the common path. The calling thread blocks for the call's duration —
+      freezing the caller's own loop meanwhile, which is inherent to calling a
+      sync helper from async code under *any* strategy — but keeps every
+      persistent-loop guarantee: one loop for LiteLLM's logging worker even
+      under a concurrent reentrant fan-out, cancel-on-timeout, and the shared
+      per-provider concurrency cap. (Prefer the ``a``-prefixed async variants
+      from async code; this path exists so a sync helper reached through an
+      async host is *safe*, not to make it a good idea.)
+    * **The persistent loop itself** (a coroutine on it calls back into sync
+      code): blocking its own thread would deadlock, so the coroutine is
+      offloaded to a one-shot worker thread with its own fresh loop
+      (:func:`_run_and_drain`), serialized so fresh loops never coexist.
 
     ``timeout`` bounds the **wait** and defaults to **600 seconds** (10 minutes),
     not a few seconds: structured generations routinely run tens of seconds and a
@@ -293,31 +329,48 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     provider. Pass ``None`` to wait unbounded (relying on LiteLLM's own request
     timeout).
 
-    On the persistent-loop path a timeout (or a :class:`KeyboardInterrupt` in the
-    calling thread) **cancels** the coroutine on the loop — tearing down the
-    in-flight provider request — before the exception propagates, so a timed-out
-    call does not leak. On the reentrant worker-thread fallback that cancellation
-    is not possible (a coroutine driven by another thread's loop can't be
-    cancelled from here):
+    On the persistent-loop path — including reentrant calls from a foreign
+    loop — a timeout (or a :class:`KeyboardInterrupt` in the calling thread)
+    **cancels** the coroutine on the loop — tearing down the in-flight provider
+    request — before the exception propagates, so a timed-out call does not
+    leak. Only on the loop-on-loop worker-thread fallback is that cancellation
+    not possible (a coroutine driven by another thread's loop can't be cancelled
+    from here):
 
     .. warning::
-       On the **worker-thread fallback**, a :class:`concurrent.futures.TimeoutError`
-       only abandons the *wait* — the worker thread keeps executing the coroutine
-       (and its in-flight provider request) to completion. A timed-out reentrant
-       call therefore leaks one thread and one request until they finish on their
-       own. This is why the default is generous: timing out is a last-resort
-       signal that something is wrong, not a routine control-flow path.
+       On the **loop-on-loop worker-thread fallback** (a coroutine on the
+       persistent loop calling back into sync code), a
+       :class:`concurrent.futures.TimeoutError` only abandons the *wait* — the
+       worker thread keeps executing the coroutine (and its in-flight provider
+       request) to completion. A timed-out call on this path therefore leaks one
+       thread and one request until they finish on their own — and, because
+       fresh-loop workers are serialized, a *subsequent* fallback call waits for
+       the abandoned worker to finish before starting. This is why the default
+       is generous: timing out is a last-resort signal that something is wrong,
+       not a routine control-flow path.
     """
     try:
-        _ = asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
         # No loop running in this thread: the common path → the persistent loop.
         return _submit_to_loop(coro, timeout=timeout)
 
-    # A loop is already running in this thread → reentrant fallback. Run the
-    # worker inside a *copy* of the caller's context so the context-scoped state
-    # the call layer relies on crosses into the worker thread (a bare
-    # ``executor.submit`` would not propagate ``contextvars``).
+    # A stale read of ``_loop`` (no lock) is benign here: if the persistent loop
+    # was never started or was concurrently shut down, ``running`` is a foreign
+    # loop and ``_submit_to_loop`` (re)starts a persistent loop as usual. Only a
+    # coroutine literally executing on the persistent loop can observe identity.
+    if running is not _loop:
+        # Foreign-loop reentrancy (an async host calling a ``*_sync`` helper):
+        # the persistent loop is free, so submit there like any other sync call.
+        # Blocking this thread is what the old fresh-loop fallback did anyway —
+        # and routing here keeps LiteLLM's logging worker on one loop even when
+        # many reentrant calls overlap.
+        return _submit_to_loop(coro, timeout=timeout)
+
+    # The persistent loop itself is running in this thread → loop-on-loop
+    # fallback. Run the worker inside a *copy* of the caller's context so the
+    # context-scoped state the call layer relies on crosses into the worker
+    # thread (a bare ``executor.submit`` would not propagate ``contextvars``).
     ctx = contextvars.copy_context()
 
     def _drive() -> T:

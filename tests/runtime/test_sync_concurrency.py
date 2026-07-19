@@ -9,8 +9,13 @@ pending``, ``<Queue …> is bound to a different event loop``, ``coroutine '…'
 never awaited``) and occasionally wedging a teardown ``flush()`` on an orphaned
 queue until LiteLLM's ~600 s request timeout fires.
 
-Routing every call onto one persistent loop removes the bug class. Two
-regressions pin that:
+Routing every call onto one persistent loop removes the bug class. The same
+regime used to survive through the back door: a *reentrant* call (an async host
+invoking a ``*_sync`` helper) spun an unserialized fresh loop per call, so a
+concurrent reentrant fan-out was exactly the multi-loop race again. Reentrant
+calls from foreign loops now ride the persistent loop too.
+
+The regressions pin, for both the plain and the reentrant fan-out:
 
 * **One loop.** ≥16 parallel ``run_sync`` calls all observe the *same* running
   loop — the strong, deterministic discriminator (a fresh-loop bridge shows 16
@@ -131,3 +136,112 @@ def test_concurrent_sync_fanout_no_flood_or_hang() -> None:
     assert "never awaited" not in proc.stderr, proc.stderr
     assert "bound to a different event loop" not in proc.stderr, proc.stderr
     assert elapsed < 30.0, f"concurrent sync fan-out took {elapsed:.1f}s (possible queue.join hang)"
+
+
+def test_concurrent_reentrant_calls_share_the_persistent_loop() -> None:
+    """≥16 parallel *reentrant* ``run_sync`` calls all execute on one loop.
+
+    Each thread is an async host (its own ``asyncio.run`` loop) whose coroutine
+    calls ``run_sync`` — the reentrant path. The old worker-thread fallback gave
+    each such call an unserialized fresh loop, re-creating the exact concurrent
+    multi-loop regime the persistent loop exists to avoid; routed onto the
+    persistent loop, all ``_N`` calls observe one shared loop, distinct from
+    every host loop.
+    """
+    host_ids: list[int] = []
+    reentrant_ids: list[int] = []
+    lock = threading.Lock()
+
+    async def _probe() -> int:
+        await asyncio.sleep(0.01)  # ensure genuine overlap across the threads
+        return id(asyncio.get_running_loop())
+
+    def _call() -> None:
+        async def _outer() -> tuple[int, int]:
+            return id(asyncio.get_running_loop()), run_sync(_probe())
+
+        host_id, reentrant_id = asyncio.run(_outer())
+        with lock:
+            host_ids.append(host_id)
+            reentrant_ids.append(reentrant_id)
+
+    threads = [threading.Thread(target=_call) for _ in range(_N)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10.0)
+
+    assert len(reentrant_ids) == _N, "not every concurrent reentrant call completed"
+    assert len(set(reentrant_ids)) == 1, (
+        f"expected one shared persistent loop, saw {len(set(reentrant_ids))} distinct loops"
+    )
+    assert set(reentrant_ids).isdisjoint(host_ids), "a reentrant call ran on its host's loop"
+
+
+# The reentrant flavor of the fan-out flood script: each thread is an async host
+# (asyncio.run) whose coroutine drives a run_sync that enqueues a LiteLLM-style
+# success-logging coroutine. On the old per-call fresh-loop fallback this is the
+# unserialized multi-loop regime; routed onto the persistent loop it must exit
+# cleanly with no teardown noise.
+_REENTRANT_SCRIPT = textwrap.dedent(
+    """
+    import asyncio
+    import threading
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from llmkit.sync import run_sync
+
+    def call(i):
+        async def _c():
+            async def handler():
+                return None
+
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(handler())
+            return i
+
+        async def _outer():
+            return run_sync(_c())
+
+        return asyncio.run(_outer())
+
+    results = []
+    lock = threading.Lock()
+
+    def worker(i):
+        r = call(i)
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    print("COUNT", len(results), "DISTINCT", len(set(results)))
+    """
+)
+
+
+def test_concurrent_reentrant_fanout_no_flood_or_hang() -> None:
+    """≥16 parallel reentrant sync calls finish cleanly: no flood, no stall.
+
+    The reentrant twin of the plain fan-out test above — the scenario the audit
+    flagged as re-creating the fresh-loop race through the fallback. All 16
+    calls complete, the subprocess exits 0 with no cross-loop teardown warnings,
+    and it finishes far inside the wall-clock budget.
+    """
+    start = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", _REENTRANT_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    elapsed = time.monotonic() - start
+
+    assert proc.returncode == 0, proc.stderr
+    assert "COUNT 16 DISTINCT 16" in proc.stdout, proc.stdout
+    assert "never awaited" not in proc.stderr, proc.stderr
+    assert "bound to a different event loop" not in proc.stderr, proc.stderr
+    assert elapsed < 30.0, f"reentrant sync fan-out took {elapsed:.1f}s (possible queue.join hang)"
