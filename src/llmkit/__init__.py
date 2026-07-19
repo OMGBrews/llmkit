@@ -55,6 +55,7 @@ from llmkit.logging import (
     LocalYamlLogSink,
     LogSink,
     configure_llm_logging,
+    default_log_dir,
 )
 from llmkit.options import (
     DEFAULT_TEMPERATURE,
@@ -119,6 +120,7 @@ __all__ = [
     "LogSink",
     "LocalYamlLogSink",
     "configure_llm_logging",
+    "default_log_dir",
     # Rate limiting
     "configure_rate_limit",
     "get_rate_limit_config",

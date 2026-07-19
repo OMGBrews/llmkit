@@ -1,9 +1,10 @@
 """Per-call record/log-path capture, and the record sink seam.
 
 The call functions in :mod:`llmkit.structured_output` funnel every built
-:class:`~llmkit.logging.LLMCallRecord` through :func:`record_call`, the single
-seam that writes the configured sink and feeds the two opt-in capture context
-managers:
+:class:`~llmkit.logging.LLMCallRecord` through :func:`record_call` — the
+single seam that writes the configured sink and feeds the two opt-in capture
+context managers — usually via :func:`record_call_async`, which runs that
+same seam on a worker thread so sink I/O never blocks the event loop:
 
 * :func:`capture_llm_records` — yields the full per-call records
   (``approximate_cost``, resolved ``model``/``provider``, ``duration_ms``,
@@ -18,6 +19,7 @@ This module owns capture + the record seam only; the option merge lives in
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 from collections.abc import Generator
@@ -58,6 +60,35 @@ def record_call(record: LLMCallRecord) -> Path | None:
     if captured_paths is not None and path is not None:
         captured_paths.append(path)
     return path
+
+
+async def record_call_async(record: LLMCallRecord) -> Path | None:
+    """:func:`record_call`, offloaded so sink I/O never blocks the event loop.
+
+    The default sink's write is real blocking work — ``mkdir``, a
+    full-payload ``yaml.dump``, two file writes, retention housekeeping —
+    which :func:`asyncio.to_thread` moves onto a worker thread.
+    ``to_thread`` runs the seam inside a *copy* of the caller's context, and
+    the capture ContextVars hold shared list objects, so capture appends made
+    in the worker are visible to the caller exactly as on the sync path; the
+    thread completes even if the awaiting task is cancelled mid-write, so
+    the record (and its captured path) still lands.
+
+    Falls back to the synchronous seam when the offload itself is impossible
+    (``RuntimeError``: no running loop, or the loop's default executor was
+    already shut down by a late teardown write) — logging must never break
+    the call, and a blocking write in a dying process beats a lost record.
+
+    Deliberately additive: the sync :func:`record_call` stays, both because
+    it is an importable seam and because the abandoned-stream path *must*
+    write synchronously (suspending while ``GeneratorExit`` unwinds risks
+    losing the record — see ``_stream_once``).
+    """
+    try:
+        return await asyncio.to_thread(record_call, record)
+    except RuntimeError:
+        logger.debug("Log-write offload unavailable; writing synchronously", exc_info=True)
+        return record_call(record)
 
 
 def resolve_model_and_provider(

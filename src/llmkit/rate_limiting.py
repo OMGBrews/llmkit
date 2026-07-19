@@ -573,6 +573,15 @@ _backpressure_callback: ContextVar[BackpressureCallback | None] = ContextVar(
     "_backpressure_callback", default=None
 )
 
+# The most recent completed acquire's queue wait in *this context*, in
+# milliseconds. Stamped by ``GlobalRateLimiter.acquire_async`` (0.0 when the
+# limiter is disabled), reset to None by the call layer before each attempt
+# and copied onto that attempt's LLMCallRecord — so the log can separate time
+# queued behind llmkit's own limiter from true provider latency. ``None``
+# means the attempt never completed an acquire (it failed before or during
+# the gate phase).
+_queue_wait_ms: ContextVar[float | None] = ContextVar("_llmkit_queue_wait_ms", default=None)
+
 
 def _emit_backpressure(event: BackpressureEvent | None) -> None:
     """Fire the installed backpressure callback for *event* (a no-op if ``None``).
@@ -1472,6 +1481,7 @@ class GlobalRateLimiter:
         # entered context always pairs its acquire with a release on the locally
         # snapshotted gate below, so no slot can leak across the swap.
         if not cls._enabled:
+            _ = _queue_wait_ms.set(0.0)
             yield RateLimitSlot()
             return
         provider_key = _normalize_key(provider_key)
@@ -1500,6 +1510,7 @@ class GlobalRateLimiter:
         # that caused the cancellation. A probe cancelled here never ran, so it
         # is a probe failure: release the claim and re-open (no wedged breaker).
         rpm_debited = False
+        wait_start = _now()
         try:
             if rpm_bucket is not None:
                 await rpm_bucket.acquire_async(1.0)
@@ -1513,6 +1524,9 @@ class GlobalRateLimiter:
             if is_probe and breaker is not None:
                 _emit_backpressure(breaker.on_probe_failure())
             raise
+        # Slot acquired: stamp how long this caller queued behind the RPM /
+        # TPM / concurrency gates, for the call layer's log record.
+        _ = _queue_wait_ms.set((_now() - wait_start) * 1000.0)
         # Slot held: classify the outcome for AIMD and the breaker (the exception,
         # if any, propagates back into this context manager at the ``yield``), then
         # always release the slot. ``_record_gate_outcome`` is the single shared

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 import warnings
 from collections.abc import AsyncGenerator, Callable
 from contextlib import aclosing
@@ -32,11 +33,14 @@ from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
-from llmkit.capture import record_call, resolve_model_and_provider
+from llmkit.capture import record_call, record_call_async, resolve_model_and_provider
 from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
+from llmkit.rate_limiting import (
+    _queue_wait_ms,  # pyright: ignore[reportPrivateUsage]  # shared intra-package state
+)
 from llmkit.retry import (
     RetryPolicy,
     _retry_active,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
@@ -215,12 +219,27 @@ async def structured_llm_call[T: BaseModel](
     # instance (no rebuild) and the per-attempt log reads its model/name
     # from it rather than constructing a second one.
     provider = _build_call_provider(resolved.provider)
+    # One id per *logical* call; every retry attempt shares it and numbers
+    # itself via the closure counter, so the N records of one call join on
+    # ``call_id`` instead of feature + timestamp proximity. Deliberately
+    # closure state, not a ContextVar: this coroutine runs entirely inside
+    # one task, and closures cannot leak into a consumer's context the way
+    # generator-set ContextVars do (see ``_retry_active`` in the stream path).
+    call_id = uuid.uuid4().hex
+    attempt_count = 0
 
     async def _attempt() -> T:
         # Deferred import so test patches on ``llmkit._litellm``
         # call functions resolve at call time.
         from llmkit import _litellm
 
+        nonlocal attempt_count
+        attempt_count += 1
+        attempt = attempt_count
+        # Reset before the transport runs: a stale stamp from a previous
+        # attempt (or an unrelated earlier call in this context) must never
+        # be attributed to an attempt that failed before acquiring.
+        _ = _queue_wait_ms.set(None)
         started_at = datetime.now(UTC)
         start_t = time.monotonic()
         response: T | None = None
@@ -267,7 +286,7 @@ async def structured_llm_call[T: BaseModel](
                         label,
                         exc_info=True,
                     )
-            _ = record_call(
+            _ = await record_call_async(
                 LLMCallRecord(
                     started_at=started_at,
                     feature=feature,
@@ -283,6 +302,9 @@ async def structured_llm_call[T: BaseModel](
                     approximate_cost=cost,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
+                    call_id=call_id,
+                    attempt=attempt,
+                    queue_wait_ms=_queue_wait_ms.get(),
                 )
             )
 
@@ -436,10 +458,18 @@ async def text_llm_call(
     # instance (no rebuild) and the per-attempt log reads its model/name
     # from it rather than constructing a second one.
     provider = _build_call_provider(resolved.provider)
+    # Per-logical-call correlation, mirroring ``structured_llm_call`` (see
+    # the comment there for why closure state, not a ContextVar).
+    call_id = uuid.uuid4().hex
+    attempt_count = 0
 
     async def _attempt() -> str:
         from llmkit import _litellm
 
+        nonlocal attempt_count
+        attempt_count += 1
+        attempt = attempt_count
+        _ = _queue_wait_ms.set(None)
         started_at = datetime.now(UTC)
         start_t = time.monotonic()
         # None until the transport returns: a failed attempt logs
@@ -467,21 +497,25 @@ async def text_llm_call(
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            _log_text_call(
-                started_at=started_at,
-                feature=feature,
-                label=label,
-                prompt=prompt,
-                text=text,
-                start_t=start_t,
-                temperature=temperature,
-                model=model,
-                provider=provider,
-                error=error,
-                approximate_cost=cost,
-                schema="text",
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
+            _ = await record_call_async(
+                _build_text_record(
+                    started_at=started_at,
+                    feature=feature,
+                    label=label,
+                    prompt=prompt,
+                    text=text,
+                    start_t=start_t,
+                    temperature=temperature,
+                    model=model,
+                    provider=provider,
+                    error=error,
+                    approximate_cost=cost,
+                    schema="text",
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    call_id=call_id,
+                    attempt=attempt,
+                )
             )
 
     return await with_retries(
@@ -606,6 +640,13 @@ async def stream_text_with_log(
     # rather than constructing a second one.
     provider = _build_call_provider(resolved.provider)
     tag = label or feature
+    # Per-logical-call correlation id shared by every streaming attempt.
+    # Passed to ``_stream_once`` as a plain parameter — NEVER a ContextVar: an
+    # async generator's body runs in its *consumer's* context, so a
+    # ContextVar set here would leak the stream's identity into the
+    # consumer's own llmkit calls between chunks (the exact hazard the
+    # ``_retry_active`` reset-around-every-yield dance below exists to solve).
+    call_id = uuid.uuid4().hex
 
     # Nested-retry guard, mirroring ``with_retries``: when an outer llmkit
     # retry loop is already active (the documented composable path — a host
@@ -631,6 +672,8 @@ async def stream_text_with_log(
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
                     provider=provider,
+                    call_id=call_id,
+                    attempt=1,
                 )
             ) as attempt_stream:
                 async for chunk in attempt_stream:
@@ -680,6 +723,8 @@ async def stream_text_with_log(
                         max_tokens=max_tokens,
                         reasoning_effort=reasoning_effort,
                         provider=provider,
+                        call_id=call_id,
+                        attempt=attempt,
                     )
                 ) as attempt_stream:
                     async for chunk in attempt_stream:
@@ -733,6 +778,8 @@ async def _stream_once(
     max_tokens: int | None,
     reasoning_effort: str | None,
     provider: LLMProviderInterface | None,
+    call_id: str,
+    attempt: int,
 ) -> AsyncGenerator[str]:
     """One streaming attempt: yield each chunk, log the transcript on close.
 
@@ -742,12 +789,20 @@ async def _stream_once(
     record is honest about *how* the stream ended: a provider error logs
     that error, and a consumer that abandons the stream mid-flight (close /
     cancellation) logs :data:`STREAM_ABANDONED_ERROR` — never a clean ``ok``
-    over a truncated transcript.
+    over a truncated transcript. ``call_id``/``attempt`` arrive as plain
+    parameters (this is a module-level generator with no enclosing closure,
+    and ContextVars set in a generator body leak into the consumer's
+    context — see the caller).
     """
     from llmkit import _litellm
 
     started_at = datetime.now(UTC)
     start_t = time.monotonic()
+    # The limiter stamp for THIS attempt: reset before the transport
+    # acquires. This runs at first ``__anext__`` — consumer context, like
+    # every other line of this generator body — which is exactly where the
+    # transport's acquire will stamp it, so reset/stamp/read stay coherent.
+    _ = _queue_wait_ms.set(None)
     accumulated: list[str] = []
     error: str | None = None
     try:
@@ -777,13 +832,12 @@ async def _stream_once(
         error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        full_text = "".join(accumulated)
-        _log_text_call(
+        record = _build_text_record(
             started_at=started_at,
             feature=feature,
             label=label,
             prompt=prompt,
-            text=full_text,
+            text="".join(accumulated),
             start_t=start_t,
             temperature=temperature,
             model=model,
@@ -793,10 +847,24 @@ async def _stream_once(
             schema="stream",
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
+            call_id=call_id,
+            attempt=attempt,
         )
+        if error == STREAM_ABANDONED_ERROR:
+            # Abandonment unwinds via GeneratorExit / a re-deliverable
+            # CancelledError: suspending again here (an await) risks a second
+            # cancellation landing mid-await and losing this record — the one
+            # honest witness that the transcript is truncated. Abandonment is
+            # rare and terminal, so one blocking write is the safe trade.
+            _ = record_call(record)
+        else:
+            # Clean finish or provider error: normal unwinding, safe to
+            # await — and streams carry the largest payloads, so this is the
+            # off-loop offload that matters most.
+            _ = await record_call_async(record)
 
 
-def _log_text_call(
+def _build_text_record(
     *,
     started_at: datetime,
     feature: str,
@@ -812,8 +880,10 @@ def _log_text_call(
     schema: str = "text",
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
-) -> None:
-    """Build and record an ``LLMCallRecord`` for a plain-text/stream call.
+    call_id: str | None = None,
+    attempt: int | None = None,
+) -> LLMCallRecord:
+    """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
     Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
     ``schema`` distinguishes the two surfaces in the log — ``"text"`` for a
@@ -828,26 +898,31 @@ def _log_text_call(
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the
-    record). Routes through :func:`record_call` so both capture primitives
-    (records and file paths) see the call, exactly like the structured path.
+    record).
+
+    Building is separate from recording on purpose: the buffered path hands
+    the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
+    while the abandoned-stream path must record *synchronously* — so the
+    shared part is the build, and each caller picks its record step.
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
-    _ = record_call(
-        LLMCallRecord(
-            started_at=started_at,
-            feature=feature,
-            label=label,
-            model=resolved_model,
-            provider=resolved_provider,
-            temperature=temperature,
-            duration_ms=duration_ms,
-            schema=schema,
-            prompt=prompt,
-            response=text,
-            error=error,
-            approximate_cost=approximate_cost,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-        )
+    return LLMCallRecord(
+        started_at=started_at,
+        feature=feature,
+        label=label,
+        model=resolved_model,
+        provider=resolved_provider,
+        temperature=temperature,
+        duration_ms=duration_ms,
+        schema=schema,
+        prompt=prompt,
+        response=text,
+        error=error,
+        approximate_cost=approximate_cost,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        call_id=call_id,
+        attempt=attempt,
+        queue_wait_ms=_queue_wait_ms.get(),
     )
