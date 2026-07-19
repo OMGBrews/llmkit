@@ -30,7 +30,20 @@ construct, rather than silently producing a wrong model:
 * ``array`` (``items``), including arrays of objects
 * ``enum`` (on a scalar field)
 * nested objects, inline or via local ``$defs`` / ``$ref`` references
-  (``#/$defs/Name`` or the legacy ``#/definitions/Name``)
+  (``#/$defs/Name`` or the legacy ``#/definitions/Name``). A ``$ref`` may carry
+  siblings: metadata and value bounds (``description``, ``title``, ``default``,
+  the numeric/length bounds) merge over the target with the outer value winning,
+  so ``{"$ref": "#/$defs/Count", "minimum": 5}`` keeps the bound and a
+  nullable-wrapped ``$ref`` inherits the target's ``description``. A *structural*
+  sibling (``type`` / ``enum`` / ``items`` / ``properties`` / ``required`` /
+  ``additionalProperties`` / ``anyOf`` / ``oneOf``) is a JSON-Schema conjunction
+  a merge cannot express, so it is rejected unless it restates the target's own
+  value — a ``$ref``-sibling ``enum`` is a clear error, never a silently-widened
+  field
+* ``object`` with ``properties``; a propertyless object (``properties`` absent
+  *or* an explicit empty ``{}``) is rejected unless it opts into open-ended keys
+  with ``additionalProperties: true`` — otherwise it would build a zero-field
+  model that rejects every real response
 * ``additionalProperties``: ``true`` (an open object — extra keys are accepted
   and kept) or ``false`` / absent (strict ``extra="forbid"``, the default); a
   *typed* ``additionalProperties`` map is rejected
@@ -209,6 +222,45 @@ class _FieldConstraints(NamedTuple):
     lt: float | None = None
     min_length: int | None = None
     max_length: int | None = None
+
+
+# JSON-schema keywords that define a schema's *structure* (its type and shape),
+# as opposed to metadata or value bounds. When one of these sits beside a
+# ``$ref``, it cannot be folded into the referenced target without changing what
+# the target validates: Draft 2020-12 applies such a sibling as a *conjunction*
+# (an intersection with the target), which a last-writer-wins merge cannot
+# express. So a structural sibling is honoured only when it restates the
+# target's own value verbatim (a redundant no-op some generators emit) and
+# otherwise fails loud — never silently widening or replacing the reference.
+# Everything else beside a ``$ref`` (``description``, ``title``, ``default``,
+# the numeric/length bounds, unknown keywords) is non-structural and merges over
+# the target with the outer, property-level value winning.
+_STRUCTURAL_REF_SIBLINGS: frozenset[str] = frozenset(
+    {"type", "enum", "items", "properties", "required", "additionalProperties", "anyOf", "oneOf"}
+)
+
+
+class _ResolvedField(NamedTuple):
+    """A property schema with its ``$ref`` chain and nullable wrappers stripped.
+
+    ``schema`` is the effective node: every ``$ref`` on the chain resolved and
+    its siblings folded in (outer-wins for metadata and bounds; structural
+    siblings validated, never merged — see :data:`_STRUCTURAL_REF_SIBLINGS`),
+    and every nullable wrapper unwrapped. ``nullable`` is the nullability
+    accumulated across the chain, and ``ref_name`` is the last ``$ref`` name
+    resolved — the object-class cache identity — or ``None`` for a schema that
+    never went through a ``$ref``.
+
+    Resolving once into this carrier is what lets the annotation, the
+    description, and the value bounds all read a single, consistently-resolved
+    node instead of each re-walking the chain with its own sibling rule (the
+    divergence that silently dropped a ``$ref``-sibling ``enum`` while merging a
+    ``$ref``-sibling bound).
+    """
+
+    schema: JsonDict
+    nullable: bool
+    ref_name: str | None
 
 
 # Serialization-context key carrying the None-dropping directive from the dump
@@ -502,21 +554,28 @@ class _Converter:
 
         return schema, False
 
-    def _field_type(self, schema: JsonDict, field_path: str) -> tuple[object, bool]:
-        """Resolve (annotation, is_nullable) for one property schema.
+    def _resolve_field(self, schema: JsonDict, field_path: str) -> _ResolvedField:
+        """Resolve a property schema's ``$ref`` chain and nullable wrappers once.
 
-        ``is_nullable`` is threaded back out so the caller can union the
-        annotation with ``None`` for a REQUIRED-but-nullable field too — a
-        ``{"type": ["string", "null"]}`` (or ``anyOf`` + null branch) that is
-        also listed in ``required`` must accept the provider's ``null``, not
-        reject it.
+        A property may chain ``$ref`` -> nullable-wrapper -> ``$ref`` -> ... to
+        arbitrary (acyclic) depth. This walks that chain to a fixed point and
+        returns the effective node (with siblings folded in and nullability
+        accumulated), so the annotation, description, and value-bound consumers
+        all read one consistently-resolved schema instead of each re-walking the
+        chain with a divergent sibling rule.
+
+        ``$ref`` sibling handling follows Draft 2020-12: keywords beside a
+        ``$ref`` apply *together* with the target's. Non-structural keywords
+        (metadata, value bounds) merge with the outer, property-level value
+        winning on conflict — so ``{"$ref": "#/$defs/Count", "minimum": 5}``
+        carries the bound, and a nullable-wrapped ``$ref`` inherits the target's
+        ``description``. A structural sibling is a conjunction a merge cannot
+        honour and is validated instead (see :meth:`_reject_structural_ref_siblings`).
+
+        A ``$ref`` name seen twice on one chain is a pure-``$ref`` cycle: fail
+        loud naming it (object-level recursion is caught separately by
+        ``_in_progress`` in :meth:`_build_object`).
         """
-        # A property may chain $ref -> nullable-wrapper -> $ref -> ... to
-        # arbitrary (acyclic) depth, so resolve $refs and unwrap nullability in
-        # a loop until neither applies, accumulating nullability. A $ref name
-        # seen twice on one chain is a pure-$ref cycle: fail loud naming it
-        # (object-level recursion is caught separately by ``_in_progress`` in
-        # ``_build_object``, which this never reaches).
         ref_name: str | None = None
         nullable = False
         seen_refs: set[str] = set()
@@ -531,14 +590,56 @@ class _Converter:
                         + "(self-referential / cyclic schemas are not supported)."
                     )
                 seen_refs.add(resolved_name)
-                ref_name, inner = resolved_name, target
+                siblings = {k: v for k, v in inner.items() if k != "$ref"}
+                self._reject_structural_ref_siblings(siblings, target, field_path)
+                # Draft 2020-12: siblings apply together with the target's
+                # keywords; outer (property-level) keys win on conflict, matching
+                # the nullable-merge precedence in ``_unwrap_nullable``.
+                ref_name, inner = resolved_name, {**target, **siblings}
                 continue
             unwrapped, inner_nullable = self._unwrap_nullable(inner, field_path)
             nullable = nullable or inner_nullable
             if unwrapped is inner:
                 break
             inner = unwrapped
+        return _ResolvedField(inner, nullable, ref_name)
 
+    def _reject_structural_ref_siblings(
+        self, siblings: JsonDict, target: JsonDict, field_path: str
+    ) -> None:
+        """Fail loud if a structural keyword beside a ``$ref`` would redefine the target.
+
+        A structural sibling (``type`` / ``enum`` / ``items`` / ``properties`` /
+        ...) is a Draft 2020-12 *conjunction* with the referenced schema, not an
+        override: folding it in last-writer-wins would silently *replace* the
+        target's structure — most visibly, a ``$ref``-sibling ``enum`` would
+        widen the field to an unconstrained scalar by discarding the referenced
+        member set. That silent widening is the defect this rejects. The sibling
+        is allowed only when it restates the target's own value for that keyword
+        (a redundant no-op some generators emit); anything else must move into
+        the referenced ``$def`` or inline the schema.
+        """
+        for key, value in siblings.items():
+            if key in _STRUCTURAL_REF_SIBLINGS and value != target.get(key):
+                raise ValueError(
+                    f"Unsupported $ref sibling {key!r} at {field_path!r}: a {key!r} "
+                    + "keyword beside a '$ref' would redefine the referenced schema's "
+                    + "structure, which is not supported (JSON Schema applies it as an "
+                    + "intersection, not an override, so merging it would silently drop "
+                    + f"or widen the reference). Move {key!r} into the referenced $def, "
+                    + "or inline the schema instead of referencing it."
+                )
+
+    def _annotation_from_resolved(self, resolved: _ResolvedField, field_path: str) -> object:
+        """Build a field's Python annotation from an already-resolved schema node.
+
+        The ``$ref`` / nullable resolution happened once in :meth:`_resolve_field`;
+        this dispatches on the effective node's ``enum`` / ``type``. Nullability
+        rides on :class:`_ResolvedField` so a REQUIRED-but-nullable field (a
+        ``{"type": ["string", "null"]}`` also listed in ``required``) is unioned
+        with ``None`` by the caller rather than rejecting the provider's ``null``.
+        """
+        inner = resolved.schema
         if "enum" in inner:
             # The canonical nullable-enum spelling carries ``null`` as an enum
             # member (``{"type": ["string", "null"], "enum": ["a", null]}``) —
@@ -547,7 +648,7 @@ class _Converter:
             # drop the ``null`` member before building the Enum. A ``null``
             # member on a NON-nullable field is left in place so ``_build_enum``
             # still rejects the contradiction loudly.
-            if nullable and isinstance(inner["enum"], list):
+            if resolved.nullable and isinstance(inner["enum"], list):
                 non_null_members: list[JsonValue] = [v for v in inner["enum"] if v is not None]
                 if not non_null_members:
                     # Stripping would leave a member-less Enum; name the actual
@@ -557,7 +658,7 @@ class _Converter:
                         + "at least one non-null member — 'enum' contains only null."
                     )
                 inner = {**inner, "enum": cast("JsonValue", non_null_members)}
-            return self._build_enum(inner, field_path), nullable
+            return self._build_enum(inner, field_path)
 
         jtype = inner.get("type")
         if jtype is None:
@@ -567,7 +668,7 @@ class _Converter:
             )
 
         if jtype == "object":
-            return self._build_object(inner, field_path, ref_name=ref_name), nullable
+            return self._build_object(inner, field_path, ref_name=resolved.ref_name)
         if jtype == "array":
             items = inner.get("items")
             if not isinstance(items, dict):
@@ -575,31 +676,31 @@ class _Converter:
                     f"Unsupported array at {field_path!r}: 'items' must be a single "
                     + "schema object (tuple/heterogeneous arrays are not supported)."
                 )
-            items_schema = cast("JsonDict", items)
-            element, element_nullable = self._field_type(items_schema, f"{field_path}[]")
+            item_resolved = self._resolve_field(cast("JsonDict", items), f"{field_path}[]")
+            element = self._annotation_from_resolved(item_resolved, f"{field_path}[]")
             # Per-element bounds (e.g. ``minLength`` on the items schema) ride
             # on the element annotation — the list field's own ``Field`` only
             # carries ``minItems``/``maxItems``. Wrap BEFORE the nullable
             # union so a ``null`` element still passes unbounded.
             element = _with_constraints(
-                element, self._field_constraints(items_schema, f"{field_path}[]")
+                element, self._constraints_from_resolved(item_resolved.schema)
             )
-            if element_nullable:
+            if item_resolved.nullable:
                 element = _nullable(element)
-            return _as_list(element), nullable
+            return _as_list(element)
         if isinstance(jtype, str) and jtype in _SCALAR_TYPES:
-            return _SCALAR_TYPES[jtype], nullable
+            return _SCALAR_TYPES[jtype]
         raise ValueError(f"Unsupported JSON-schema type {jtype!r} at {field_path!r}.")
 
-    def _field_constraints(self, schema: JsonDict, field_path: str) -> _FieldConstraints:
-        """Pull the supported per-field bounds off one property schema.
+    def _constraints_from_resolved(self, resolved: JsonDict) -> _FieldConstraints:
+        """Pull the supported per-field bounds off an already-resolved schema node.
 
-        Mirrors :meth:`_field_type`'s ``$ref`` / nullable unwrapping so a
-        bound declared on the inner schema (e.g. on the non-null branch of an
-        ``anyOf``, or inside a referenced ``$def``) is still found. Returns a
-        :class:`_FieldConstraints` carrying the resolved Pydantic ``Field``
-        bounds (``ge`` / ``le`` / ``gt`` / ``lt`` / ``min_length`` /
-        ``max_length``).
+        The ``$ref`` / nullable resolution happens once in :meth:`_resolve_field`,
+        so this is a pure extractor over the effective node — a bound declared on
+        the non-null branch of an ``anyOf`` or inside a referenced ``$def`` has
+        already been folded in. Returns a :class:`_FieldConstraints` carrying the
+        resolved Pydantic ``Field`` bounds (``ge`` / ``le`` / ``gt`` / ``lt`` /
+        ``min_length`` / ``max_length``).
 
         Constraints outside the supported set (see the module docstring and the
         ``_FieldConstraints`` fields) are silently dropped — no partial
@@ -615,37 +716,7 @@ class _Converter:
         crash on the first response. Gating by type keeps the drop-the-
         unsupported promise instead of crashing.
         """
-        # Draft 2020-12 applies keywords that sit ALONGSIDE a ``$ref`` together
-        # with the target's, so merge rather than replace — outer keys win on
-        # conflict, matching the nullable-merge precedence above. Without the
-        # merge, ``{"$ref": "#/$defs/Count", "minimum": 5}`` would silently
-        # drop the bound. Like :meth:`_field_type`, resolve $refs and unwrap
-        # nullability in a loop to arbitrary (acyclic) depth, so a bound at the
-        # end of a long chain — or behind a nullable wrapper mid-chain — is
-        # still found rather than silently dropped. ``_field_type`` runs first
-        # on every property and already rejects $ref cycles; ``seen_refs`` here
-        # is the same guard, kept so this loop can never spin on its own.
-        seen_refs: set[str] = set()
-        inner = schema
-        while True:
-            if "$ref" in inner:
-                ref_name, target = self._resolve_ref(cast("str", inner["$ref"]))
-                if ref_name in seen_refs:
-                    raise ValueError(
-                        f"Unsupported recursive schema at {field_path!r}: $ref "
-                        + f"'#/$defs/{ref_name}' forms a reference cycle "
-                        + "(self-referential / cyclic schemas are not supported)."
-                    )
-                seen_refs.add(ref_name)
-                siblings = {k: v for k, v in inner.items() if k != "$ref"}
-                inner = {**target, **siblings}
-                continue
-            unwrapped, _ = self._unwrap_nullable(inner, field_path)
-            if unwrapped is inner:
-                break
-            inner = unwrapped
-
-        raw_type = inner.get("type")
+        raw_type = resolved.get("type")
         types: set[str] = (
             {raw_type}
             if isinstance(raw_type, str)
@@ -660,7 +731,7 @@ class _Converter:
         sized_field = bool(types & {"string", "array"})
 
         def _number(key: str) -> float | None:
-            value = inner.get(key)
+            value = resolved.get(key)
             # ``bool`` is an ``int`` subclass — exclude it. A non-numeric (or
             # missing) bound silently drops, matching the drop-the-unsupported
             # contract rather than erroring.
@@ -669,7 +740,7 @@ class _Converter:
             return None
 
         def _length(key: str) -> int | None:
-            value = inner.get(key)
+            value = resolved.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
             return None
@@ -683,12 +754,12 @@ class _Converter:
             # at most one is present for a given field, so the ``or`` picks the
             # one that applies without conflict.
             min_length=(
-                (_length("minLength") if "minLength" in inner else _length("minItems"))
+                (_length("minLength") if "minLength" in resolved else _length("minItems"))
                 if sized_field
                 else None
             ),
             max_length=(
-                (_length("maxLength") if "maxLength" in inner else _length("maxItems"))
+                (_length("maxLength") if "maxLength" in resolved else _length("maxItems"))
                 if sized_field
                 else None
             ),
@@ -800,20 +871,22 @@ class _Converter:
                 f"Unsupported 'additionalProperties' at {field_path!r}: typed "
                 + "additionalProperties maps are not supported (only true/false or absent)."
             )
+        props: JsonDict = cast("JsonDict", properties) if isinstance(properties, dict) else {}
         # A propertyless ``type: "object"`` would build a zero-field
         # ``extra="forbid"`` model that validates only ``{}`` and rejects every
         # real response — the silent-wrong-model failure this module refuses.
-        # Only ``additionalProperties: true`` (an intentionally free-form
-        # object, the ``extra="allow"`` base) makes a propertyless object
-        # meaningful, so everything else fails loud.
-        if properties is None and additional is not True:
+        # Test emptiness, not just a *missing* key: an explicit ``properties: {}``
+        # is equally propertyless and must fail the same way rather than slipping
+        # past to build the reject-everything model. Only ``additionalProperties:
+        # true`` (an intentionally free-form object, the ``extra="allow"`` base)
+        # makes a propertyless object meaningful, so everything else fails loud.
+        if not props and additional is not True:
             raise ValueError(
-                f"Unsupported object at {field_path!r}: 'type' is 'object' but there is "
-                + "no 'properties' — this would build a zero-field model that rejects "
-                + "every real response. Declare 'properties', or set "
-                + "'additionalProperties': true for an intentionally free-form object."
+                f"Unsupported object at {field_path!r}: 'type' is 'object' but there are "
+                + "no properties (a missing or empty 'properties') — this would build a "
+                + "zero-field model that rejects every real response. Declare 'properties', "
+                + "or set 'additionalProperties': true for an intentionally free-form object."
             )
-        props: JsonDict = cast("JsonDict", properties) if isinstance(properties, dict) else {}
         required_raw = schema.get("required")
         if required_raw is None:
             required_list: list[JsonValue] = []
@@ -885,21 +958,21 @@ class _Converter:
                     + "must be a schema object."
                 )
             prop = cast("JsonDict", prop_schema)
-            annotation, is_nullable = self._field_type(prop, f"{field_path}.{prop_name}")
-            description = prop.get("description")
-            if description is None and "$ref" in prop:
-                # A bare ``$ref`` property carries its ``description`` on the
-                # referenced target, not inline. Fall back to it so a
-                # ``$ref``-ed field still surfaces its guidance to the model —
-                # mirroring how :meth:`_field_constraints` unwraps the ref for
-                # bounds. The outer property still wins when it sets its own
-                # ``description`` (the documented outer-wins precedence).
-                _, target = self._resolve_ref(cast("str", prop["$ref"]))
-                description = target.get("description")
+            prop_path = f"{field_path}.{prop_name}"
+            # Resolve the property's ``$ref`` chain and nullable wrappers ONCE;
+            # the annotation, description, and value bounds all read the same
+            # effective node. A ``$ref`` target's ``description`` is folded in by
+            # the resolution (outer-wins), so a bare ``$ref``, a nullable-wrapped
+            # ``$ref``, and a multi-hop chain all surface the target's guidance —
+            # no separate description rescue, and no double resolution.
+            resolved = self._resolve_field(prop, prop_path)
+            annotation = self._annotation_from_resolved(resolved, prop_path)
+            is_nullable = resolved.nullable
+            description = resolved.schema.get("description")
             desc = description if isinstance(description, str) else None
             # Per-field value bounds (ge/le/gt/lt/min_length/max_length). Only
             # the supported keywords cross over; everything else is dropped.
-            c = self._field_constraints(prop, f"{field_path}.{prop_name}")
+            c = self._constraints_from_resolved(resolved.schema)
             optional = prop_name not in required
             if optional:
                 optional_fields.add(prop_name)

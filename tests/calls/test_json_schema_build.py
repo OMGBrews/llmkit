@@ -305,8 +305,40 @@ def test_propertyless_nested_object_raises_naming_field_path() -> None:
         "properties": {"meta": {"type": "object"}},
         "required": ["meta"],
     }
-    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no 'properties'"):
+    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no properties"):
         _ = model_from_json_schema(schema)
+
+
+def test_empty_properties_object_root_raises_clear_value_error() -> None:
+    """An explicit ``properties: {}`` is as propertyless as an absent key and must
+    fail loud at translation time — pre-fix it slipped past the ``is None`` guard
+    and built the same zero-field ``extra='forbid'`` model that rejects every real
+    response, surfacing only as a confusing per-response validation error."""
+    with pytest.raises(
+        ValueError, match=r"Unsupported object at '\$'.*no properties.*'additionalProperties': true"
+    ):
+        _ = model_from_json_schema({"type": "object", "properties": {}})
+
+
+def test_empty_properties_nested_object_raises_naming_field_path() -> None:
+    """The explicit-empty case nested as a field names the field's path, not the root."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"meta": {"type": "object", "properties": {}}},
+        "required": ["meta"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no properties"):
+        _ = model_from_json_schema(schema)
+
+
+def test_empty_properties_with_additional_properties_true_builds_open() -> None:
+    """``additionalProperties: true`` still rescues an *explicitly* empty
+    ``properties`` map into a meaningful free-form object, exactly as it does for
+    an absent ``properties`` key — the guard keys off open-endedness, not spelling."""
+    model = model_from_json_schema(
+        {"type": "object", "properties": {}, "additionalProperties": True}
+    )
+    assert model.model_validate({"anything": 1}).model_dump() == {"anything": 1}
 
 
 def test_propertyless_object_with_additional_properties_true_builds_open() -> None:
