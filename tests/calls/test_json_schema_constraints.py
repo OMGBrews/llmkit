@@ -430,6 +430,229 @@ def test_description_on_referenced_def_is_found() -> None:
     assert model.model_fields["m"].description == "Outer wins."
 
 
+def test_nullable_ref_property_inherits_target_description() -> None:
+    """A nullable-wrapped ``$ref`` surfaces the target's ``description`` just as a
+    bare ``$ref`` does — pre-fix the description rescue only understood a bare
+    top-level ``$ref``, so wrapping it in ``anyOf``+null silently dropped the
+    model-facing guidance (degrading instructor's prompt for the field)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"anyOf": [{"$ref": "#/$defs/Bounded"}, {"type": "null"}]}},
+        "required": ["n"],
+        "$defs": {"Bounded": {"type": "integer", "minimum": 0, "description": "From the def."}},
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["n"].description == "From the def."
+    # The bound behind the nullable ref still rides through too (regression).
+    with pytest.raises(ValidationError):
+        _ = model(n=-1)
+
+
+def test_nullable_ref_property_outer_description_wins() -> None:
+    """An outer ``description`` on the nullable-wrapping property beats the
+    target's — the same outer-wins precedence a bare ``$ref`` sibling follows."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "n": {
+                "anyOf": [{"$ref": "#/$defs/Bounded"}, {"type": "null"}],
+                "description": "Outer wins.",
+            }
+        },
+        "required": ["n"],
+        "$defs": {"Bounded": {"type": "integer", "description": "From the def."}},
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["n"].description == "Outer wins."
+
+
+def test_ref_chain_description_nearest_hop_wins() -> None:
+    """On a multi-hop ``$ref`` chain where more than one hop declares a
+    ``description``, the hop NEAREST the property wins — outer-wins applied at
+    every hop, so guidance closest to the field takes precedence over a deeper
+    def's."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/A"}},
+        "required": ["n"],
+        "$defs": {
+            "A": {"$ref": "#/$defs/B", "description": "A (near) wins."},
+            "B": {"type": "integer", "description": "B (far)."},
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert model.model_fields["n"].description == "A (near) wins."
+
+
+def test_ref_sibling_enum_raises_clear_value_error() -> None:
+    """An ``enum`` beside a ``$ref`` is a structural conjunction a merge cannot
+    honour — pre-fix it was silently dropped on the annotation path, widening the
+    field to an unconstrained scalar. It must now fail loud, naming the keyword."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Color", "enum": ["red"]}},
+        "required": ["c"],
+        "$defs": {"Color": {"type": "string", "enum": ["red", "green", "blue"]}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'enum' at '\$\.c'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_enum_on_targetless_key_raises_clear_value_error() -> None:
+    """A structural sibling absent from the target still raises: a target that
+    does not declare the keyword cannot be "restating" it, so the sibling would
+    redefine (here, newly constrain) the reference — exactly the silent widening
+    the guard exists to reject, in the opposite direction."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Plain", "enum": ["red"]}},
+        "required": ["c"],
+        "$defs": {"Plain": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'enum'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_conflicting_type_raises_clear_value_error() -> None:
+    """A ``type`` beside a ``$ref`` that disagrees with the target raises."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/Count", "type": "string"}},
+        "required": ["n"],
+        "$defs": {"Count": {"type": "integer"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'type' at '\$\.n'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_items_raises_clear_value_error() -> None:
+    """An ``items`` beside a ``$ref`` (redefining the referenced array's element
+    schema) raises rather than silently overriding the reference."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"xs": {"$ref": "#/$defs/Ints", "items": {"type": "string"}}},
+        "required": ["xs"],
+        "$defs": {"Ints": {"type": "array", "items": {"type": "integer"}}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'items' at '\$\.xs'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_properties_raises_clear_value_error() -> None:
+    """A ``properties`` beside a ``$ref`` raises. This also protects the
+    object-class cache (keyed by ``$ref`` name): were the sibling merged, two
+    references to the same def with different sibling ``properties`` would want
+    two different classes under one cache key — a silent wrong-model hazard the
+    reject-or-restate rule removes by construction."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"o": {"$ref": "#/$defs/Obj", "properties": {"x": {"type": "string"}}}},
+        "required": ["o"],
+        "$defs": {
+            "Obj": {"type": "object", "properties": {"y": {"type": "integer"}}, "required": ["y"]}
+        },
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'properties' at '\$\.o'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_allof_raises_clear_value_error() -> None:
+    """An ``allOf`` (or any subschema applicator) beside a ``$ref`` is a
+    conjunction the converter cannot express, so it raises rather than merging and
+    silently dropping the restriction — the same rule as a type/enum sibling, and
+    symmetric with a bare ``allOf`` property (which already fails loud)."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Color", "allOf": [{"enum": ["red"]}]}},
+        "required": ["c"],
+        "$defs": {"Color": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'allOf' at '\$\.c'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_not_raises_clear_value_error() -> None:
+    """A ``not`` applicator beside a ``$ref`` raises too — the applicator set is
+    covered, not just ``allOf``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Color", "not": {"enum": ["red"]}}},
+        "required": ["c"],
+        "$defs": {"Color": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'not' at '\$\.c'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_title_raises_clear_value_error() -> None:
+    """A ``title`` beside a ``$ref`` raises: the referenced model's class is cached
+    and shared by ``$ref`` name, so a per-site title would rename it for every
+    other reference site. The title belongs on the ``$def``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"o": {"$ref": "#/$defs/Obj", "title": "Renamed"}},
+        "required": ["o"],
+        "$defs": {
+            "Obj": {"type": "object", "properties": {"y": {"type": "integer"}}, "title": "Obj"}
+        },
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'title' at '\$\.o'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_root_ref_structural_sibling_raises_clear_value_error() -> None:
+    """A structural sibling on a *root* ``$ref`` is rejected too — the guard is at
+    the root entrypoint, not only on nested fields, so an ``additionalProperties``
+    that would redefine a (possibly shared) referenced root is not silently
+    dropped."""
+    schema: dict[str, object] = {
+        "$ref": "#/$defs/Root",
+        "additionalProperties": True,
+        "$defs": {
+            "Root": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        },
+    }
+    with pytest.raises(
+        ValueError, match=r"Unsupported \$ref sibling 'additionalProperties' at '\$'"
+    ):
+        _ = model_from_json_schema(schema)
+
+
+def test_root_ref_without_siblings_still_builds() -> None:
+    """Regression: a bare root ``$ref`` (no siblings) resolves and builds as before."""
+    schema: dict[str, object] = {
+        "$ref": "#/$defs/Root",
+        "$defs": {
+            "Root": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(id="x"), "id") == "x"
+    with pytest.raises(ValidationError):
+        _ = model()
+
+
+def test_ref_sibling_restating_target_structural_key_is_accepted() -> None:
+    """A structural sibling that restates the target's own value verbatim is a
+    harmless no-op (some generators emit a redundant ``type`` beside a ``$ref``)
+    and must build, not raise — only a *redefining* sibling is rejected."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/Count", "type": "integer", "minimum": 5}},
+        "required": ["n"],
+        "$defs": {"Count": {"type": "integer"}},
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(n=5), "n") == 5
+    # The non-structural sibling bound still rides through alongside.
+    with pytest.raises(ValidationError):
+        _ = model(n=4)
+
+
 def test_bound_on_nullable_branch_is_found() -> None:
     """A bound on the non-null branch of a nullable field is applied; ``null``
     still passes (the bound only gates non-null values)."""

@@ -170,7 +170,7 @@ result = await structured_llm_call(
 )
 ```
 
-**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An explicit `"type": "object"` with **no `properties`** raises rather than silently building a zero-field model that rejects every real response — set `"additionalProperties": true` for an intentionally free-form object.
+**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An `"type": "object"` with **no properties** — `properties` absent *or* an explicit empty `{}` — raises rather than silently building a zero-field model that rejects every real response; set `"additionalProperties": true` for an intentionally free-form object.
 
 **Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the optional-`None` drop above, so the dict matches the schema:
 
@@ -214,7 +214,27 @@ Score(score=6)   # raises pydantic.ValidationError
 Bounds are resolved through `$ref` chains of any depth and through nullable
 wrappers, so a constraint declared inside a `$def` (even several `$ref` hops
 deep) or on the non-null branch of a nullable field is still enforced (and
-`null` itself still passes for a nullable field).
+`null` itself still passes for a nullable field). The same resolution carries a
+`$def`'s **`description`** through, including behind a nullable wrapper — a
+nullable `$ref` field surfaces the target's model-facing guidance just like a
+bare `$ref` does.
+
+Keywords that sit **beside** a `$ref` are handled by kind. Metadata and the
+bounds above merge with the referenced schema, the outer (property-level) value
+winning on conflict — so `{"$ref": "#/$defs/Count", "minimum": 5}` keeps the
+bound. A keyword that would redefine the reference's *structure* (`type`,
+`enum`, `items`, `properties`, `required`, `additionalProperties`, `anyOf`,
+`oneOf`) is a JSON-Schema conjunction a merge cannot express, so it is
+**rejected** unless it restates the target's own value — an `enum` beside a
+`$ref` raises a clear `ValueError` rather than silently widening the field to an
+unconstrained scalar. Move such a keyword into the referenced `$def`, or inline
+the schema.
+
+A propertyless object is rejected the same way: `{"type": "object"}` with no
+`properties` — or an explicit empty `{"properties": {}}` — raises at translation
+time (it would otherwise build a zero-field model that rejects every real
+response), unless it opts into open-ended keys with `"additionalProperties":
+true`.
 
 One form caveat: `exclusiveMinimum` / `exclusiveMaximum` are recognised in
 their **numeric** (Draft 2020-12) form only. The Draft-4 / OpenAPI-3.0
@@ -471,14 +491,45 @@ An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit
 class LLMClientConfig:
     provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX
     model: str | None = None         # None -> the provider's own default model
-    api_key: str | None = None
-    base_url: str | None = None      # endpoint override (forwarded as api_base); unused by Bedrock/Vertex
+    api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
+    base_url: str | None = None      # endpoint override (forwarded as api_base); not accepted by Bedrock/Vertex
     reasoning_effort: ReasoningEffort | None = None  # "disable" | "low" | "medium" | "high", or any provider value
-    aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
-    vertex_project: str | None = None    # Vertex AI GCP project; unused by every other provider
-    vertex_location: str | None = None   # Vertex AI region (data residency); unused by every other provider
-    gemini_structured_output: Literal["schema", "json"] = "schema"  # Gemini strategy; unused by every other provider
+    aws_region_name: str | None = None   # AWS Bedrock region; not accepted by any other provider
+    vertex_project: str | None = None    # Vertex AI GCP project; not accepted by any other provider
+    vertex_location: str | None = None   # Vertex AI region (data residency); not accepted by any other provider
+    gemini_structured_output: Literal["schema", "json"] = "schema"  # Gemini strategy; a non-default value is not accepted by any other provider
 ```
+
+**Populating a knob the selected provider does not read is rejected, not
+ignored.** Each provider declares which provider-shaped fields it honours, and
+`build_provider` / `make_provider` raise a clear `ValueError` if the config
+carries any other populated one — an `api_key` for Bedrock/Vertex, a `base_url`
+for a fixed-endpoint provider, a non-default `gemini_structured_output` for a
+non-Gemini provider. Populate only the fields the active provider uses. (This
+closes a silent-misconfiguration footgun: a config generically filled from a
+settings object no longer *looks* like it pinned a credential or endpoint that
+was in fact dropped.)
+
+**`api_key` is masked in the config's `repr`.** A set key renders as
+`api_key=<redacted>`, so a stray `print(config)`, log line, or traceback never
+leaks the credential; its presence still shows for debugging.
+
+**Bearer-key resolution is explicit.** The five key-authenticated providers
+resolve their key from `api_key` if set, else the provider's own environment
+variable, else they raise at construction naming the variable — no silent
+fallback to an ambient key:
+
+| Provider | Environment variable |
+|----------|----------------------|
+| `OPENROUTER` | `OPENROUTER_API_KEY` |
+| `ANTHROPIC` | `ANTHROPIC_API_KEY` |
+| `OPENAI` | `OPENAI_API_KEY` |
+| `DEEPSEEK` | `DEEPSEEK_API_KEY` |
+| `GOOGLE` (AI Studio) | `GEMINI_API_KEY` |
+
+`OLLAMA` needs no key; `BEDROCK` and `VERTEX` authenticate through their ambient
+AWS / Google credential chains (below), so none of the three accepts an
+`api_key`.
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
 
@@ -488,7 +539,7 @@ pip install "omg-llmkit[bedrock]"
 
 The default model is Claude Haiku 4.5 via its **cross-region inference profile** id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on Bedrock are typically reached through inference profiles rather than plain on-demand ids. Pass a different profile- or partition-prefixed id as `model` (e.g. `eu.anthropic.claude-...`) when your account routes elsewhere.
 
-`vertex_project` and `vertex_location` are the Vertex AI analog and are unused by every other provider. Vertex reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Vertex routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
+`vertex_project` and `vertex_location` are the Vertex AI analog and are not accepted by any other provider. Vertex reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Vertex routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
 
 ```bash
 pip install "omg-llmkit[vertex]"
@@ -498,7 +549,7 @@ pip install "omg-llmkit[vertex]"
 
 > **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host every model — including the `gemini-2.5-flash-lite` default. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a `model` the region actually serves (e.g. some regions offer `gemini-2.5-flash` but not `-flash-lite`). Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
 
-**`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); every other provider ignores it. `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
+**`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
 
 ```python
 configure_llm_client(lambda: LLMClientConfig(
@@ -534,13 +585,14 @@ result = structured_llm_call_sync(
 )
 ```
 
-`make_provider` accepts the knobs each provider actually reads —
-`api_key`, `model`, `base_url`, `reasoning_effort`, `aws_region_name`,
-`vertex_project`, `vertex_location` — and ignores the ones a given provider
-doesn't use (e.g. `base_url` for Bedrock/Vertex, whose endpoints derive from
-region/location, or `api_key` for Ollama or Bedrock, which signs via the
-ambient AWS credential chain, or for Vertex, which signs via Google ADC). Leave `model` unset to inherit the provider's own default; the
-assembled LiteLLM id is always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
+`make_provider` takes the same knobs as `LLMClientConfig`, and — like
+`build_provider` — **rejects** any that the selected provider does not read
+rather than silently dropping them: `base_url` for Bedrock/Vertex (whose
+endpoints derive from region/location), `api_key` for Ollama or Bedrock/Vertex
+(which authenticate via their ambient AWS/Google chains), `aws_region_name` for
+anything but Bedrock, and so on. Pass only the fields the provider uses. Leave
+`model` unset to inherit the provider's own default; the assembled LiteLLM id is
+always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
 
 **A fully per-call host needs no global config at all.** If you pass `provider=`
 on *every* call, you don't have to call `configure_llm_client(...)` — there is no

@@ -33,11 +33,12 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from enum import StrEnum
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, cast, override, runtime_checkable
 
 import instructor
 
@@ -165,6 +166,38 @@ def resolve_gemini_structured_output(strategy: str) -> instructor.Mode:
         ) from None
 
 
+def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str) -> str:
+    """Resolve a bearer provider's API key: explicit config, then env var, else raise.
+
+    The five key-authenticated providers (OpenRouter, Anthropic, OpenAI,
+    DeepSeek, Google AI Studio) previously coerced a missing ``api_key`` to
+    ``""`` and handed that to LiteLLM, which then *silently* fell back to the
+    provider's ambient environment key (``ANTHROPIC_API_KEY`` and friends). A
+    caller who believed they were pinning credentials explicitly could bill or
+    authenticate as a different identity than intended — an undocumented,
+    invisible swap (and, because importing LiteLLM runs ``load_dotenv()``, even
+    a stray ``.env`` could inject that key).
+
+    This makes the same env-var fallback an *explicit, documented, tested*
+    library step instead: the configured value wins when set; otherwise the
+    provider's own environment variable is consulted (the first-party-SDK idiom
+    each bearer provider already follows); and when neither is present the
+    provider fails loud at construction, naming exactly what to set — never an
+    empty key wandering into the transport to fail (or silently succeed) at call
+    time. An empty string is treated as unset, matching the falsy-``model``
+    convention on :class:`LLMClientConfig`.
+    """
+    if configured:
+        return configured
+    from_env = os.environ.get(env_var)
+    if from_env:
+        return from_env
+    raise ValueError(
+        f"{provider_name} requires an API key and none is configured: set "
+        + f"LLMClientConfig.api_key (or the {env_var} environment variable)."
+    )
+
+
 class Provider(StrEnum):
     """LLM providers the library can route to.
 
@@ -181,7 +214,7 @@ class Provider(StrEnum):
     VERTEX = "vertex"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class LLMClientConfig:
     """Provider selection + credentials for the active LLM provider.
 
@@ -190,14 +223,21 @@ class LLMClientConfig:
     via :func:`configure_llm_client`, so the library never imports the
     host's config module.
 
-    Only the *active* provider's fields need be populated. ``api_key`` is
-    unused by Ollama (which talks to a local endpoint). ``base_url``
-    overrides the endpoint (forwarded to LiteLLM as ``api_base``) for every
-    key-authenticated provider — OpenRouter, Ollama, OpenAI, Anthropic,
-    Google, DeepSeek — with each provider's own default endpoint standing
-    when it is unset; it is unused only by Bedrock and Vertex, whose
-    endpoints derive from ``aws_region_name`` / ``vertex_location`` instead.
-    Per-call
+    Only the *active* provider's fields need be populated — and populating a
+    provider-shaped field the selected provider does **not** read is rejected at
+    :func:`~llmkit.providers.build_provider`, not silently ignored (each provider
+    declares the knobs it honours; see ``_accepted_config_fields``). ``api_key``
+    is a bearer credential for the five key-authenticated providers (OpenRouter,
+    OpenAI, Anthropic, Google, DeepSeek); it resolves from this value, else the
+    provider's environment variable (``ANTHROPIC_API_KEY`` and friends), else the
+    provider raises at construction. It is not accepted by Ollama (local) or
+    Bedrock/Vertex (ambient AWS/Google chains). The credential is masked in this
+    config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray
+    ``print`` or traceback never leaks it. ``base_url`` overrides the endpoint
+    (forwarded to LiteLLM as ``api_base``) for the five key-authenticated
+    providers and Ollama, with each provider's own default endpoint standing when
+    it is unset; it is not accepted by Bedrock or Vertex, whose endpoints derive
+    from ``aws_region_name`` / ``vertex_location`` instead. Per-call
     ``model`` overrides (e.g. the strong/small roles the host resolves)
     are passed at call time and are not part of this config — this carries
     only the provider's *default* model.
@@ -217,7 +257,7 @@ class LLMClientConfig:
     against ``max_tokens`` and can truncate small-capped structured output.
 
     ``aws_region_name`` carries the AWS region for the Bedrock provider and
-    is unused by every other provider (which authenticate with ``api_key`` /
+    is not accepted by any other provider (which authenticate with ``api_key`` /
     ``base_url``). It is the *only* AWS-shaped field on this config on
     purpose: Bedrock's secrets (access key / secret / session token, or
     instance-role credentials) resolve from the **ambient AWS credential
@@ -226,7 +266,7 @@ class LLMClientConfig:
     resolve from the chain too (``AWS_REGION_NAME`` / ``AWS_REGION``).
 
     ``vertex_project`` and ``vertex_location`` are the Vertex AI analog of
-    ``aws_region_name`` and are unused by every other provider. They are the
+    ``aws_region_name`` and are not accepted by any other provider. They are the
     only Vertex-shaped fields on purpose: like Bedrock, the Vertex provider
     carries **no secret** here — Google credentials resolve from **Application
     Default Credentials** (``gcloud auth application-default login``,
@@ -241,8 +281,9 @@ class LLMClientConfig:
     Google's default region.
 
     ``gemini_structured_output`` selects the structured-output *strategy* for
-    the two Gemini providers (Vertex, Google AI Studio) and is ignored by every
-    other provider. ``"schema"`` (the default) preserves the pre-existing wire
+    the two Gemini providers (Vertex, Google AI Studio); a non-default value is
+    not accepted by any other provider (the default ``"schema"`` is always
+    allowed). ``"schema"`` (the default) preserves the pre-existing wire
     behavior exactly — Gemini's native JSON-schema constrained decoding
     (``responseSchema`` / ``instructor.Mode.JSON_SCHEMA``), with server-side
     schema enforcement. ``"json"`` switches to JSON-mime-type-only output
@@ -264,6 +305,32 @@ class LLMClientConfig:
     vertex_project: str | None = None
     vertex_location: str | None = None
     gemini_structured_output: Literal["schema", "json"] = "schema"
+
+    @override
+    def __repr__(self) -> str:
+        # The generated dataclass repr renders ``api_key='sk-...'`` verbatim,
+        # so any host-side ``print(config)``, log line, or exception reporter's
+        # locals capture would exfiltrate the credential. Mask it: a *set* key
+        # shows ``api_key=<redacted>`` (presence stays debuggable, the value
+        # never prints), while an empty ``""`` stays visible as itself since it
+        # is not a secret and an accidental empty key is worth seeing.
+        #
+        # Only fields that differ from their default are shown — the same
+        # signal-over-noise choice ``LLMCallOptions.__repr__`` makes; ``provider``
+        # has no default, so it always prints. ``field(repr=False)`` on ``api_key``
+        # alone was rejected for the reason ``options.py`` documents: it would drop
+        # the field entirely, hiding whether a key is set at all.
+        parts: list[str] = []
+        for f in fields(self):
+            value = cast("object", getattr(self, f.name))
+            default = cast("object", f.default)
+            if default is not MISSING and value == default:
+                continue
+            shown = repr(value)
+            if f.name == "api_key" and value:
+                shown = "<redacted>"
+            parts.append(f"{f.name}={shown}")
+        return f"{type(self).__name__}({', '.join(parts)})"
 
 
 # Module-level config source, registered once by the host application at a
@@ -340,6 +407,23 @@ class LLMProviderInterface(Protocol):
         ...
 
 
+#: The provider-shaped :class:`LLMClientConfig` knobs — the ones a given provider
+#: may or may not read, as opposed to ``provider`` / ``model`` /
+#: ``reasoning_effort``, which every provider reads. Each provider declares the
+#: subset it honours in ``_accepted_config_fields``; the rest are rejected by
+#: :meth:`BaseProvider.reject_unread_config_fields`.
+_PROVIDER_SHAPED_FIELDS: frozenset[str] = frozenset(
+    {
+        "api_key",
+        "base_url",
+        "aws_region_name",
+        "vertex_project",
+        "vertex_location",
+        "gemini_structured_output",
+    }
+)
+
+
 class BaseProvider(ABC):
     """Base class for LLM providers.
 
@@ -395,6 +479,17 @@ class BaseProvider(ABC):
     #: The routing-contract hooks validated for every concrete subclass.
     _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")
 
+    #: The provider-shaped :class:`LLMClientConfig` knobs this provider actually
+    #: reads in ``build`` (from :data:`_PROVIDER_SHAPED_FIELDS`). Declared per
+    #: provider so :func:`reject_unread_config_fields` can turn "passed a knob the
+    #: provider silently ignores" into a loud error — a new provider *cannot*
+    #: forget to declare it (``__init_subclass__`` enforces its presence). It is
+    #: annotation-only here (no value), so a concrete subclass that omits it trips
+    #: that check; a provider reading none of the six may declare an empty
+    #: frozenset. ``provider`` / ``model`` / ``reasoning_effort`` are universal
+    #: and never listed.
+    _accepted_config_fields: ClassVar[frozenset[str]]
+
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Reject a concrete provider that omits a routing-contract hook.
 
@@ -419,6 +514,18 @@ class BaseProvider(ABC):
                 + "provider, instructor mode, and default model so structured-output routing, "
                 + "rate-limit keying, and the assembled LiteLLM id are explicit — never "
                 + "inherited from a silent class-level default."
+            )
+        # ``_accepted_config_fields`` is checked for *presence*, not truthiness:
+        # an empty frozenset (a provider reading none of the provider-shaped
+        # knobs) is a legitimate declaration, so ``not getattr(...)`` would wrongly
+        # reject it. Annotation-only on the base means an omitting subclass reads
+        # back the sentinel ``None`` here.
+        if getattr(cls, "_accepted_config_fields", None) is None:
+            raise TypeError(
+                f"{cls.__name__} is an incomplete provider: it must set "
+                + "_accepted_config_fields — the frozenset of LLMClientConfig knobs it "
+                + "reads — so build_provider can reject a config field the provider would "
+                + "silently ignore. Declare it (a frozenset of field names, possibly empty)."
             )
 
     def __init__(
@@ -484,6 +591,66 @@ class BaseProvider(ABC):
         the string credential kwargs.
         """
         ...
+
+    @classmethod
+    @abstractmethod
+    def build(cls, config: LLMClientConfig) -> BaseProvider:
+        """Construct this provider from an :class:`LLMClientConfig`.
+
+        The package-internal *construct-from-config* hook (see the class
+        docstring): each provider maps the flat config onto its own constructor,
+        applying its credential/endpoint defaults. Declared abstract so a new
+        provider cannot forget it, and so :func:`~llmkit.providers.build_provider`
+        can invoke it through the base type. It is deliberately **not** part of
+        :class:`LLMProviderInterface`, the surface consumers type against.
+        """
+        ...
+
+    @classmethod
+    def reject_unread_config_fields(cls, config: LLMClientConfig) -> None:
+        """Reject a populated config knob this provider will not read.
+
+        Every provider reads ``provider`` / ``model`` / ``reasoning_effort``, but
+        the six provider-shaped knobs (:data:`_PROVIDER_SHAPED_FIELDS`) are
+        provider-specific. Passing one to a provider that never reads it — an
+        ``api_key`` to Bedrock or Vertex (which authenticate via their ambient
+        AWS/Google credential chains), a ``base_url`` to a fixed-endpoint
+        provider, a non-default ``gemini_structured_output`` to a non-Gemini
+        provider — used to be a silent no-op. That silence is a footgun: a host
+        that populates a config generically believes it pinned a credential or
+        endpoint that is in fact ignored.
+
+        A knob counts as *populated* when it differs from its dataclass default
+        (so an untouched field never trips this). Anything populated beyond this
+        provider's ``_accepted_config_fields`` fails loud. Called from
+        :func:`~llmkit.providers.build_provider` — the single seam ``make_provider``,
+        the ``configure_llm_client`` source, and a direct ``build_provider(config)``
+        all flow through — so a directly-built config is checked too.
+        """
+        accepted = cls._accepted_config_fields
+        offenders: list[str] = []
+        for f in fields(config):
+            if f.name not in _PROVIDER_SHAPED_FIELDS or f.name in accepted:
+                continue
+            value = cast("object", getattr(config, f.name))
+            default = cast("object", f.default)
+            # A knob is "populated" when it differs from its default AND is not an
+            # empty string. Empty is unset everywhere else in the library (the
+            # bearer key resolver and each ``build`` treat ``""`` as no value), so
+            # a generically-built config that fills an unused field with ``""``
+            # (e.g. ``os.getenv("KEY", "")`` for a Bedrock deployment) must not
+            # trip this — only a real value the provider would ignore does.
+            if value != default and value != "":
+                offenders.append(f.name)
+        if not offenders:
+            return
+        reads = ", ".join(sorted(accepted)) if accepted else "none of the provider-shaped fields"
+        raise ValueError(
+            f"{cls._provider_name} does not read the config field(s) {sorted(offenders)}: it "
+            + "would silently ignore them, which llmkit refuses. Populate only the fields the "
+            + f"selected provider uses — {cls._provider_name} reads: {reads} (every provider "
+            + "also reads 'model' and 'reasoning_effort')."
+        )
 
 
 @dataclass

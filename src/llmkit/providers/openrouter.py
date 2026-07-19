@@ -7,7 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
-from llmkit.providers.base import BaseProvider, LLMClientConfig
+from llmkit.providers.base import BaseProvider, LLMClientConfig, resolve_api_key
 
 #: OpenRouter's public API endpoint — the fallback when no ``base_url`` is
 #: configured. Defined once so the ctor default and :meth:`build` agree.
@@ -69,6 +69,8 @@ class OpenRouterProvider(BaseProvider):
     #: retirement fails the release gate instead of shipping.
     _default_model: ClassVar[str] = "google/gemini-2.5-flash-lite"
     _strict_json_schema: ClassVar[bool] = True
+    _api_key_env_var: ClassVar[str] = "OPENROUTER_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})
 
     def __init__(
         self,
@@ -94,15 +96,20 @@ class OpenRouterProvider(BaseProvider):
             kwargs["extra_body"] = {"provider": {"require_parameters": True}}
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OpenRouterProvider:
         """Construct from an :class:`LLMClientConfig` (OpenRouter endpoint default).
 
+        ``api_key`` resolves from the config, else the ``OPENROUTER_API_KEY``
+        environment variable, else raises (see :func:`resolve_api_key`).
         ``require_parameters`` stays on (schema-honoring routing); construct the
         provider directly to opt out.
         """
         return cls(
-            api_key=config.api_key or "",
+            api_key=resolve_api_key(
+                config.api_key, env_var=cls._api_key_env_var, provider_name=cls._provider_name
+            ),
             model=config.model,
             base_url=config.base_url or _DEFAULT_BASE_URL,
             reasoning_effort=config.reasoning_effort,

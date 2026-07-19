@@ -71,6 +71,7 @@ class BedrockProvider(BaseProvider):
     _model_prefix: ClassVar[str] = "bedrock/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"aws_region_name"})
 
     def __init__(
         self,
@@ -92,6 +93,7 @@ class BedrockProvider(BaseProvider):
         """
         return {"aws_region_name": self._aws_region_name} if self._aws_region_name else {}
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> BedrockProvider:
         """Construct from an :class:`LLMClientConfig` (region only; no secrets)."""

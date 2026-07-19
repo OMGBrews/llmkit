@@ -40,6 +40,40 @@ from llmkit.providers.openrouter import OpenRouterProvider
 from llmkit.providers.vertex import VertexProvider
 
 
+def _provider_class(provider: Provider) -> type[BaseProvider]:
+    """Map a :class:`Provider` to its concrete provider class.
+
+    The single dispatch switch — resolving the *class* (rather than a built
+    instance) lets :func:`build_provider` validate the config against the
+    provider's contract before constructing it. The ``match`` has no catch-all,
+    so a new enum member left unwired is caught three ways (see the module
+    docstring): a basedpyright non-exhaustive-match error, an ``assert_never``
+    at runtime, and the exhaustiveness unit test.
+    """
+    match provider:
+        case Provider.OPENROUTER:
+            return OpenRouterProvider
+        case Provider.OLLAMA:
+            return OllamaProvider
+        case Provider.GOOGLE:
+            return GoogleProvider
+        case Provider.ANTHROPIC:
+            return AnthropicProvider
+        case Provider.OPENAI:
+            return OpenAIProvider
+        case Provider.DEEPSEEK:
+            return DeepSeekProvider
+        case Provider.BEDROCK:
+            return BedrockProvider
+        case Provider.VERTEX:
+            return VertexProvider
+    # Every Provider member is handled above, so the subject narrows to Never
+    # here. assert_never makes that a *static* guarantee: basedpyright reports
+    # a type error if a newly-added Provider member is missing its case, and it
+    # raises loudly at runtime for any unwired value — never a silent fallback.
+    assert_never(provider)
+
+
 def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
     """Construct an LLM provider instance from a config.
 
@@ -47,6 +81,13 @@ def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
     ``make_*`` name construction; ``get_*`` is reserved for *reading*
     effective state (see :func:`describe_llm`,
     :func:`llmkit.get_rate_limit_config`).
+
+    This is the single seam every construction path flows through
+    (``make_provider``, the :func:`configure_llm_client` source, and a direct
+    ``build_provider(config)``), so it is where the config is validated against
+    the selected provider's contract: a populated knob the provider will not read
+    is rejected here (:func:`~llmkit.providers.base.reject_unread_config_fields`),
+    not silently ignored.
 
     Args:
         config: Explicit config to build from. When ``None``, the source
@@ -57,34 +98,19 @@ def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
         ``config.model`` resolves to the provider's own default model.
 
     Raises:
+        ValueError: If the config populates a provider-shaped knob the selected
+            provider does not read (e.g. an ``api_key`` for Bedrock/Vertex, a
+            ``base_url`` for a fixed-endpoint provider), or if a bearer provider
+            has no key configured and no matching environment variable.
         AssertionError: If ``config.provider`` is not wired to a provider
             here (an unwired enum member). See :func:`typing.assert_never`.
     """
     if config is None:
         config = active_config()
 
-    match config.provider:
-        case Provider.OPENROUTER:
-            return OpenRouterProvider.build(config)
-        case Provider.OLLAMA:
-            return OllamaProvider.build(config)
-        case Provider.GOOGLE:
-            return GoogleProvider.build(config)
-        case Provider.ANTHROPIC:
-            return AnthropicProvider.build(config)
-        case Provider.OPENAI:
-            return OpenAIProvider.build(config)
-        case Provider.DEEPSEEK:
-            return DeepSeekProvider.build(config)
-        case Provider.BEDROCK:
-            return BedrockProvider.build(config)
-        case Provider.VERTEX:
-            return VertexProvider.build(config)
-    # Every Provider member is handled above, so the subject narrows to Never
-    # here. assert_never makes that a *static* guarantee: basedpyright reports
-    # a type error if a newly-added Provider member is missing its case, and it
-    # raises loudly at runtime for any unwired value — never a silent fallback.
-    assert_never(config.provider)
+    cls = _provider_class(config.provider)
+    cls.reject_unread_config_fields(config)
+    return cls.build(config)
 
 
 def make_provider(
@@ -114,36 +140,41 @@ def make_provider(
     provider *name*, so calls sharing a provider share its budget (llmkit is
     single-tenant by design — see :mod:`llmkit.rate_limiting`).
 
-    The accepted knobs mirror the fields each concrete provider reads;
-    irrelevant ones are simply ignored (e.g. ``base_url`` for Bedrock/Vertex,
-    ``api_key`` for Ollama/Bedrock/Vertex, ``aws_region_name`` for
-    everything but Bedrock, ``vertex_project`` / ``vertex_location`` for
-    everything but Vertex). A falsy ``model`` resolves to the provider's own
+    This function's keywords are the fields of :class:`LLMClientConfig`, but a
+    knob the selected provider does not read is **rejected**, not silently
+    ignored: passing ``api_key`` to Ollama/Bedrock/Vertex, ``base_url`` to
+    Bedrock/Vertex, ``aws_region_name`` to anything but Bedrock, ``vertex_*`` to
+    anything but Vertex, or a non-default ``gemini_structured_output`` to a
+    non-Gemini provider raises ``ValueError``. Populate only the fields the
+    selected provider uses. A falsy ``model`` resolves to the provider's own
     default, so the assembled LiteLLM id is always well-formed.
 
     Args:
         provider: Which provider to construct.
-        api_key: Bearer credential (unused by Ollama; Bedrock signs via the
-            ambient AWS credential chain).
+        api_key: Bearer credential for the five key-authenticated providers;
+            resolves from this value, else the provider's environment variable,
+            else raises. Not accepted by Ollama (local) or Bedrock/Vertex (which
+            sign via their ambient AWS/Google credential chains).
         model: Default model for this provider; ``None`` uses the provider's
             built-in default.
         base_url: Endpoint override forwarded to LiteLLM as ``api_base``
             (gateways, proxies, compatible endpoints) for every
-            key-authenticated provider; ignored by Bedrock/Vertex, whose
-            endpoints derive from region/location.
+            key-authenticated provider and Ollama; not accepted by
+            Bedrock/Vertex, whose endpoints derive from region/location.
         reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
             ``None`` leaves the provider default in place.
-        aws_region_name: AWS region for Bedrock; ignored by every other
+        aws_region_name: AWS region for Bedrock; not accepted by any other
             provider.
-        vertex_project: GCP project id for Vertex AI; ignored by every other
+        vertex_project: GCP project id for Vertex AI; not accepted by any other
             provider. ``None`` resolves from the environment / ADC.
-        vertex_location: Vertex AI region — the data-residency control;
-            ignored by every other provider. ``None`` resolves from the
+        vertex_location: Vertex AI region — the data-residency control; not
+            accepted by any other provider. ``None`` resolves from the
             environment, else Google's default region.
         gemini_structured_output: Structured-output strategy for the Gemini
-            providers (Vertex, Google AI Studio); ignored by every other
-            provider. ``"schema"`` (default) keeps Gemini's native JSON-schema
-            constrained decoding; ``"json"`` switches to JSON-mime-type output
+            providers (Vertex, Google AI Studio); a non-default value is not
+            accepted by any other provider. ``"schema"`` (default) keeps Gemini's
+            native JSON-schema constrained decoding; ``"json"`` switches to
+            JSON-mime-type output
             with client-side validation to escape the constrained-decoding
             repetition-loop trap (see the Gemini provider docstrings).
 
@@ -151,15 +182,17 @@ def make_provider(
         A constructed provider, ready to pass as a per-call ``provider=``.
 
     Raises:
+        ValueError: If a passed knob is not read by ``provider`` (see above), or
+            if a bearer provider has no ``api_key`` and no matching environment
+            variable.
         AssertionError: If ``provider`` is not wired here (an unwired enum
             member). See :func:`typing.assert_never`.
     """
-    # This function's keyword params *are* the fields of LLMClientConfig, and
-    # each provider's build() already applies the same per-arm normalization
-    # (api_key or "", base_url or "<endpoint default>") this dispatch used to
-    # repeat. So synthesize a config and delegate to the single dispatch switch
-    # in build_provider — there is no second, parallel match to keep in sync,
-    # and the endpoint-default literals live only in each provider.
+    # This function's keyword params *are* the fields of LLMClientConfig, so
+    # synthesize a config and delegate to the single seam in build_provider —
+    # which resolves the provider class, rejects any knob the provider does not
+    # read, and builds. There is no second, parallel match to keep in sync, and
+    # the endpoint-default literals live only in each provider.
     config = LLMClientConfig(
         provider=provider,
         model=model,

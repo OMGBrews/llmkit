@@ -7,7 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
-from llmkit.providers.base import BaseProvider, LLMClientConfig
+from llmkit.providers.base import BaseProvider, LLMClientConfig, resolve_api_key
 
 
 class OpenAIProvider(BaseProvider):
@@ -35,6 +35,8 @@ class OpenAIProvider(BaseProvider):
     _model_prefix: ClassVar[str] = "openai/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
+    _api_key_env_var: ClassVar[str] = "OPENAI_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})
 
     def __init__(
         self,
@@ -54,11 +56,19 @@ class OpenAIProvider(BaseProvider):
             kwargs["api_base"] = self._base_url
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OpenAIProvider:
-        """Construct from an :class:`LLMClientConfig` (``base_url`` passed through)."""
+        """Construct from an :class:`LLMClientConfig`.
+
+        ``api_key`` resolves from the config, else the ``OPENAI_API_KEY``
+        environment variable, else raises (see :func:`resolve_api_key`);
+        ``base_url`` is passed through.
+        """
         return cls(
-            api_key=config.api_key or "",
+            api_key=resolve_api_key(
+                config.api_key, env_var=cls._api_key_env_var, provider_name=cls._provider_name
+            ),
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,

@@ -54,15 +54,25 @@ _SHIPPED_PROVIDERS = [
 def _define_provider(name: str, bases: tuple[type, ...], **hooks: object) -> type[BaseProvider]:
     """Define a *concrete* ``BaseProvider`` subclass with ``hooks`` as class attrs.
 
-    Supplies ``completion_kwargs`` so the class is concrete (the guard exempts
-    abstract classes), then sets whatever hooks the caller passes — so a caller
-    can omit one to exercise the loud failure.
+    Supplies the two abstract methods (``completion_kwargs`` and ``build``) so the
+    class is concrete (the guard exempts abstract classes), plus an
+    ``_accepted_config_fields`` default so the knob-contract check is satisfied —
+    then sets whatever hooks the caller passes (which override these defaults), so
+    a caller can omit exactly the one hook whose loud failure it is exercising.
     """
 
     def _completion_kwargs(_self: BaseProvider) -> dict[str, object]:
         return {}
 
-    namespace: dict[str, object] = {"completion_kwargs": _completion_kwargs, **hooks}
+    def _build(cls: type[BaseProvider], _config: object) -> BaseProvider:
+        return cls()
+
+    namespace: dict[str, object] = {
+        "completion_kwargs": _completion_kwargs,
+        "build": classmethod(_build),
+        "_accepted_config_fields": frozenset(),
+        **hooks,
+    }
     return cast(type[BaseProvider], type(name, bases, namespace))
 
 
@@ -116,6 +126,50 @@ def test_all_missing_hooks_are_named() -> None:
     assert "_default_model" in message
 
 
+def test_missing_accepted_config_fields_fails_loudly() -> None:
+    """A concrete provider that omits ``_accepted_config_fields`` fails at definition.
+
+    The knob-acceptance contract is enforced the same way as the routing hooks:
+    a provider must declare which ``LLMClientConfig`` knobs it reads so
+    ``build_provider`` can reject a field it would silently ignore. Built here via
+    a raw ``type(...)`` (not ``_define_provider``, which supplies the default) so
+    the omission is genuine. A falsy *value* (the empty frozenset) is legal, so
+    only true absence is tested."""
+
+    def _completion_kwargs(_self: BaseProvider) -> dict[str, object]:
+        return {}
+
+    def _build(cls: type[BaseProvider], _config: object) -> BaseProvider:
+        return cls()
+
+    with pytest.raises(TypeError, match=r"_Incomplete.*_accepted_config_fields"):
+        _ = type(
+            "_Incomplete",
+            (BaseProvider,),
+            {
+                "completion_kwargs": _completion_kwargs,
+                "build": classmethod(_build),
+                "_provider_name": "X",
+                "_mode": instructor.Mode.JSON_SCHEMA,
+                "_default_model": "m",
+            },
+        )
+
+
+def test_empty_accepted_config_fields_is_a_legal_declaration() -> None:
+    """An empty ``frozenset()`` is a valid declaration (a provider reading none of
+    the provider-shaped knobs) — the contract checks *presence*, not truthiness."""
+    concrete = _define_provider(
+        "_NoKnobProvider",
+        (BaseProvider,),
+        _provider_name="NoKnob",
+        _mode=instructor.Mode.JSON_SCHEMA,
+        _default_model="m",
+        _accepted_config_fields=frozenset[str](),
+    )
+    assert concrete._accepted_config_fields == frozenset()
+
+
 def test_intermediate_abstract_base_is_exempt() -> None:
     """An intermediate ABC that omits the hooks is not falsely rejected.
 
@@ -144,6 +198,34 @@ def test_shipped_providers_satisfy_the_contract(provider_cls: type[BaseProvider]
     assert provider_cls._provider_name
     assert provider_cls._default_model
     assert isinstance(provider_cls._mode, instructor.Mode)
+
+
+# The provider-shaped LLMClientConfig knobs (mirrors ``base._PROVIDER_SHAPED_FIELDS``,
+# restated here to keep the test off a module-private import).
+_PROVIDER_SHAPED_KNOBS = frozenset(
+    {
+        "api_key",
+        "base_url",
+        "aws_region_name",
+        "vertex_project",
+        "vertex_location",
+        "gemini_structured_output",
+    }
+)
+
+
+@pytest.mark.parametrize("provider_cls", _SHIPPED_PROVIDERS)
+def test_shipped_provider_declares_valid_accepted_config_fields(
+    provider_cls: type[BaseProvider],
+) -> None:
+    """Every shipped provider declares ``_accepted_config_fields`` as a subset of
+    the provider-shaped knobs — so ``build_provider`` can reject anything else."""
+    accepted = provider_cls._accepted_config_fields
+    assert isinstance(accepted, frozenset)
+    assert accepted <= _PROVIDER_SHAPED_KNOBS, (
+        f"{provider_cls.__name__} lists a non-provider-shaped field: "
+        f"{accepted - _PROVIDER_SHAPED_KNOBS}"
+    )
 
 
 @pytest.mark.parametrize("provider_cls", _SHIPPED_PROVIDERS)

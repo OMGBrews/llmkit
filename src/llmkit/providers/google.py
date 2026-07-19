@@ -10,6 +10,7 @@ from llmkit._types import ReasoningEffort
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
+    resolve_api_key,
     resolve_gemini_structured_output,
 )
 
@@ -59,6 +60,10 @@ class GoogleProvider(BaseProvider):
     # (see the Vertex provider for the same pattern and why the ClassVar stays).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
+    _api_key_env_var: ClassVar[str] = "GEMINI_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset(
+        {"api_key", "base_url", "gemini_structured_output"}
+    )
 
     def __init__(
         self,
@@ -92,11 +97,19 @@ class GoogleProvider(BaseProvider):
             kwargs["api_base"] = self._base_url
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> GoogleProvider:
-        """Construct from an :class:`LLMClientConfig` (``base_url`` passed through)."""
+        """Construct from an :class:`LLMClientConfig`.
+
+        ``api_key`` resolves from the config, else the ``GEMINI_API_KEY``
+        environment variable, else raises (see :func:`resolve_api_key`);
+        ``base_url`` is passed through.
+        """
         return cls(
-            api_key=config.api_key or "",
+            api_key=resolve_api_key(
+                config.api_key, env_var=cls._api_key_env_var, provider_name=cls._provider_name
+            ),
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,

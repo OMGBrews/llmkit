@@ -107,6 +107,9 @@ class VertexProvider(BaseProvider):
     # ``_mode`` → ``instructor_mode`` pattern for the other six providers).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset(
+        {"vertex_project", "vertex_location", "gemini_structured_output"}
+    )
 
     def __init__(
         self,
@@ -151,6 +154,7 @@ class VertexProvider(BaseProvider):
             kwargs["vertex_location"] = self._vertex_location
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> VertexProvider:
         """Construct from an :class:`LLMClientConfig` (project/location only; no secrets)."""
