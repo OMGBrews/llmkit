@@ -113,7 +113,75 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   public surface (2026-07-14). Callers who pass an explicit `model` were never
   affected.
 
+### Added
+
+- **New logging surface, all additive:** `default_log_dir()` (top-level
+  export) and the `LLMKIT_LOG_DIR` env override;
+  `LocalYamlLogSink(retention_days=..., max_index_bytes=...)`; and three
+  defaulted `LLMCallRecord` fields — `call_id`, `attempt`, `queue_wait_ms` —
+  so every existing direct constructor and custom sink keeps working
+  unchanged.
+
 ### Changed
+
+- **⚠️ Log retention is on by default: the sink now deletes old logs.** The
+  default `LocalYamlLogSink` prunes per-call YAML files older than **30 days**
+  and rotates `index.jsonl` past **50 MiB** to a date-stamped generation that
+  ages out under the same policy (housekeeping is hourly-throttled, on a
+  worker thread, and rotation is an atomic rename that loses no lines). The
+  first successful write announces the directory *and* the policy at INFO —
+  before anything is ever deleted. Opt out with
+  `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
+  your logs are an archive rather than a debugging aid.
+- **⚠️ The default log directory moved for processes not launched from a
+  project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
+  else `data/llm-logs/` under the nearest ancestor with a
+  `pyproject.toml`/`.git` (nearest wins; seeded with a `.gitignore` when the
+  sink creates it), else a per-user state dir
+  (`$XDG_STATE_HOME/llmkit/llm-logs`, `~/Library/Logs/llmkit`,
+  `%LOCALAPPDATA%\llmkit\logs`) — and frozen, so a mid-run `chdir` can't split
+  one process's logs. Launches from a repo root keep byte-identical paths;
+  launches from a repo *subdirectory* consolidate to the repo root (previously
+  they sprayed `subdir/data/llm-logs`); only processes outside any project
+  move to the private state dir, announced by the first-write INFO. The
+  `DEFAULT_LOG_DIR` constant is **removed** — use `default_log_dir()` or pass
+  an explicit `log_dir`.
+- **⚠️ Log files are private by default on POSIX.** A sink-created directory
+  is `0o700` and log files `0o600`. Multi-reader deployments should pre-create
+  the log directory with their desired mode — the sink never re-chmods a
+  directory it didn't create.
+- **The per-call YAML, `index.jsonl`, and header line 2 carry three new
+  fields** (`call_id`, `attempt`, `queue_wait_ms`; header line 2 gains a
+  `call=<id[:8]> attempt=<n>` suffix). Header line 1 — the `head -1` triage
+  shape — is byte-identical. A strict index parser must accept the three new
+  keys.
+- **A persistently broken sink warns once, not once per call.** The first
+  failure (and any *new* failure signature — different exception type or
+  errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
+  latch re-arms on success and on `configure_llm_logging`.
+
+### Fixed
+
+- **Sink I/O no longer blocks the event loop.** Every log write — `mkdir`,
+  the full-payload `yaml.dump`, both file writes, retention housekeeping —
+  runs via `asyncio.to_thread`, for the structured, buffered-text, and
+  cleanly-finished stream paths (a stream abandoned mid-flight deliberately
+  writes synchronously so its truncation-witness record can't be lost while
+  the generator unwinds; a write that can't be offloaded — executor already
+  shut down at teardown — degrades to blocking rather than lost). The
+  documented capture contracts are unchanged: the record and written path are
+  captured before the call returns, and both sync-bridge teardown paths drain
+  the executor so a clean exit never abandons a final write.
+- **Log records from retries of one call are now joinable.** Each logical
+  call mints one `call_id` (uuid4 hex) and numbers attempts 1-based across
+  all three call surfaces and the sync bridge — no more joining retry records
+  by feature + timestamp proximity, which broke under concurrent same-feature
+  fan-out.
+- **`duration_ms` no longer silently conflates limiter queue time with
+  provider latency.** New `queue_wait_ms` records time queued behind llmkit's
+  own rate limiter (`0.0` when disabled, `None` when the attempt failed
+  before acquiring); `duration_ms` keeps its meaning, so provider latency ≈
+  `duration_ms - queue_wait_ms`.
 
 - **The live smoke suite now exercises each OpenRouter path that can rot
   independently.** It previously always overrode the model, which is why a dead

@@ -344,14 +344,14 @@ for internal use).
 
 ## Logging: agent-readable by default
 
-`LocalYamlLogSink` (the default) writes **two** things to `data/llm-logs/`:
+`LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
-1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run. Small metadata is next; the large `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
-2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, duration, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
+1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call are joinable from the file heads alone). Small metadata is next; the large `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
+2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, call_id, attempt, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
 ```
 # ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 1840ms | $0.0007
-# 2026-06-05T14:22:31.004512
+# 2026-06-05T14:22:31.004512 | call=9f3c21ab attempt=1
 
 timestamp: '2026-06-05T14:22:31.004512'
 feature: reports
@@ -359,15 +359,43 @@ label: exec_summary
 model: google/gemini-2.5-flash
 provider: openrouter
 schema: Summary
+call_id: 9f3c21ab54d64f1f8f2c14febc03a7d1
+attempt: 1
 temperature: 0.0
+max_tokens: null
+reasoning_effort: null
 duration_ms: 1840.2
+queue_wait_ms: 0.4
 approximate_cost: 0.0007
 error: null
 response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls).
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`).
+
+### Where the logs go
+
+The default directory is resolved **lazily at the first write** and then frozen for the sink's lifetime (a mid-run `chdir` can't split logs):
+
+1. `LLMKIT_LOG_DIR`, when set;
+2. `data/llm-logs/` under the nearest ancestor directory carrying a `pyproject.toml` or `.git` (nearest wins) — and when the sink creates that directory it also seeds a `.gitignore`, so prompt logs never land in your repository's history;
+3. otherwise a per-user state directory (`$XDG_STATE_HOME/llmkit/llm-logs` on Linux, `~/Library/Logs/llmkit` on macOS, `%LOCALAPPDATA%\llmkit\logs` on Windows) — never a CWD-relative path.
+
+The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=...)` is always used as-is. Pass `configure_llm_logging(None)` to disable logging entirely.
+
+On POSIX, a sink-created directory is `0o700` and log files are `0o600` — prompt data is owner-only by default. A pre-existing directory is never re-chmodded: pre-create the directory yourself to share logs with other readers.
+
+### Retention: bounded by default
+
+Long-running services no longer accumulate unbounded prompt data. By default the sink prunes per-call YAML files older than **30 days** and rotates `index.jsonl` past **50 MiB** to a date-stamped sibling (which ages out under the same policy). Housekeeping runs on the write path, throttled to once per hour, off the event loop.
+
+```python
+LocalYamlLogSink(retention_days=None)                  # keep everything forever
+LocalYamlLogSink(retention_days=7, max_index_bytes=None)  # tighter age bound, no rotation
+```
+
+Sink I/O never runs on the event loop: writes are offloaded to a worker thread (the one deliberate exception is a stream abandoned mid-flight, whose record is written synchronously so it can't be lost while the generator unwinds).
 
 ### Capturing call records
 
