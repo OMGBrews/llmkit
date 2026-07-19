@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields
@@ -163,6 +164,38 @@ def resolve_gemini_structured_output(strategy: str) -> instructor.Mode:
             f"Unknown Gemini structured-output strategy {strategy!r}; "
             + f"valid values are {valid}."
         ) from None
+
+
+def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str) -> str:
+    """Resolve a bearer provider's API key: explicit config, then env var, else raise.
+
+    The five key-authenticated providers (OpenRouter, Anthropic, OpenAI,
+    DeepSeek, Google AI Studio) previously coerced a missing ``api_key`` to
+    ``""`` and handed that to LiteLLM, which then *silently* fell back to the
+    provider's ambient environment key (``ANTHROPIC_API_KEY`` and friends). A
+    caller who believed they were pinning credentials explicitly could bill or
+    authenticate as a different identity than intended — an undocumented,
+    invisible swap (and, because importing LiteLLM runs ``load_dotenv()``, even
+    a stray ``.env`` could inject that key).
+
+    This makes the same env-var fallback an *explicit, documented, tested*
+    library step instead: the configured value wins when set; otherwise the
+    provider's own environment variable is consulted (the first-party-SDK idiom
+    each bearer provider already follows); and when neither is present the
+    provider fails loud at construction, naming exactly what to set — never an
+    empty key wandering into the transport to fail (or silently succeed) at call
+    time. An empty string is treated as unset, matching the falsy-``model``
+    convention on :class:`LLMClientConfig`.
+    """
+    if configured:
+        return configured
+    from_env = os.environ.get(env_var)
+    if from_env:
+        return from_env
+    raise ValueError(
+        f"{provider_name} requires an API key and none is configured: set "
+        + f"LLMClientConfig.api_key (or the {env_var} environment variable)."
+    )
 
 
 class Provider(StrEnum):
