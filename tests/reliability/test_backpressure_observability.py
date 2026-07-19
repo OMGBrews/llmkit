@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterator
 
 import httpx
 import openai
@@ -36,15 +35,6 @@ from llmkit import (
 )
 from llmkit.rate_limiting import GlobalRateLimiter, _backpressure_callback
 from llmkit.sync import run_sync
-
-
-@pytest.fixture(autouse=True)
-def reset_rate_limiter() -> Iterator[None]:
-    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
-    try:
-        yield
-    finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
 
 
 def _wrapped(status: int) -> InstructorRetryException:

@@ -2,7 +2,7 @@
 
 A feature module builds one :class:`LLMCallOptions` and passes it as
 ``options=`` to every call function (:func:`~llmkit.structured_llm_call`,
-:func:`~llmkit.text_llm_call`, :func:`~llmkit.stream_text_with_log`, and the
+:func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`, and the
 sync wrappers) instead of repeating the same per-call keyword block at each
 site. This module owns only the *merge*: collapsing the three precedence
 layers — the configured client, a shared ``LLMCallOptions``, and the explicit
@@ -68,7 +68,7 @@ class LLMCallOptions:
     Opt-in ergonomics for the call functions
     (:func:`structured_llm_call`, :func:`structured_llm_call_sync`,
     :func:`text_llm_call`, :func:`text_llm_call_sync`, and
-    :func:`stream_text_with_log`): a feature module builds one
+    :func:`text_llm_call_stream`): a feature module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
     instead of repeating the same nine-keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.

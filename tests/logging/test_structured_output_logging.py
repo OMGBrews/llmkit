@@ -319,7 +319,7 @@ def test_mid_stream_failure_still_logs_partial_transcript() -> None:
             chunks: list[str] = []
             with capture_llm_records() as records:
                 with pytest.raises(RuntimeError, match="stream died"):
-                    async for chunk in structured_output.stream_text_with_log(
+                    async for chunk in structured_output.text_llm_call_stream(
                         "hi", feature="summary"
                     ):
                         chunks.append(chunk)
@@ -361,7 +361,7 @@ def test_abandoned_stream_logs_abandonment_marker_not_ok(tmp_path: Path) -> None
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                stream = structured_output.stream_text_with_log("hi", feature="summary")
+                stream = structured_output.text_llm_call_stream("hi", feature="summary")
                 async for _chunk in stream:
                     break  # abandon after the first chunk
                 await stream.aclose()

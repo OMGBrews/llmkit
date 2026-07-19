@@ -19,7 +19,7 @@ Layout: `src/llmkit/` is the package; `tests/` is the offline suite;
 ## Setup
 
 ```bash
-uv sync --extra dev            # add --extra bedrock to work on the Bedrock path
+uv sync            # installs the dev group; the [bedrock]/[vertex] extras come with it
 ```
 
 ## Gates — all four must pass before a PR

@@ -1,0 +1,11 @@
+# Dependabot keeps the SHA-pinned GitHub Actions in ci.yml / publish.yml
+# updatable: the workflow actions are pinned to full commit SHAs (supply-chain
+# hardening — the publish job holds `id-token: write`), and Dependabot bumps
+# each pin by rewriting the `# vX.Y.Z` comment beside it, so the pins stay
+# current instead of fossilizing.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

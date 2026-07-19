@@ -107,9 +107,9 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             # Clean finish → off-loop write.
-            _ = [c async for c in structured_output.stream_text_with_log("hi", feature="test")]
+            _ = [c async for c in structured_output.text_llm_call_stream("hi", feature="test")]
             # Abandonment → synchronous write on this (the consumer's) thread.
-            stream = structured_output.stream_text_with_log("hi", feature="test")
+            stream = structured_output.text_llm_call_stream("hi", feature="test")
             async for _chunk in stream:
                 break
             await stream.aclose()

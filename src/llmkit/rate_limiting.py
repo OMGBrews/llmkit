@@ -44,7 +44,14 @@ and one per-provider :class:`_CircuitBreaker`, so a throttle observed on either
 path lowers the limit the *other* then honours, and an open breaker fast-fails
 on both. That is same-semantics-per-population, not one merged cap: the sync
 in-flight count is its own population (threads), but the *limit* it enforces and
-the breaker it consults are shared. RPM/TPM are likewise unaffected by
+the breaker it consults are shared. And AIMD *saturation* — the judgment that
+decides whether a throttle should halve the limit — is measured on the
+provider-wide **aggregate** in-flight (the sum across every async gate and the
+sync gate, tracked on the shared :class:`_AdaptiveState`), not any one gate's
+local count: a self-inflicted 429 while the populations *together* sit at the
+shared limit therefore triggers a decrease even when no single gate is itself at
+the cap. Admission stays per-population (the capacity caveat above); only the
+saturation judgment aggregates. RPM/TPM are likewise unaffected by
 population: those buckets are keyed by name and shared across every loop and
 thread.
 
@@ -638,10 +645,24 @@ class _AdaptiveState:
     per-(provider, loop) :class:`_AdaptiveGate`s read :meth:`limit` live on each
     admit and feed outcomes back via :meth:`on_throttle` / :meth:`on_success`.
 
+    **Saturation is judged on the provider-wide aggregate.** Every gate — each
+    per-loop :class:`_AdaptiveGate` and the one per-provider
+    :class:`_SyncAdaptiveGate` — mirrors its in-flight count into
+    ``_total_in_flight`` here via :meth:`note_acquire` / :meth:`note_release`, so
+    :meth:`on_throttle` decides "were we at the shared limit?" against the sum
+    across *all* populations, not one gate's local count. That is what lets a
+    self-inflicted 429 in the multi-population regime (a host's own loop and the
+    persistent sync loop both holding slots) trigger a decrease when no single
+    gate is itself at the limit. Admission is unaffected — each gate still caps
+    its own count independently (the per-population capacity model); only the
+    saturation *judgment* aggregates.
+
     State is guarded by a plain :class:`threading.Lock` (shared safely across the
     async loops and sync threads, exactly like :class:`_RateBucket`), held only
-    for the O(1) arithmetic and **never across an await**. Each mutator returns
-    the :class:`BackpressureEvent` to emit (or ``None``) so the caller can fire the
+    for the O(1) arithmetic and **never across an await**. Because the aggregate
+    counter lives under this same lock, read-aggregate + judge + cooldown + halve
+    is one atomic critical section. Each mutator returns the
+    :class:`BackpressureEvent` to emit (or ``None``) so the caller can fire the
     observability callback *outside* the lock.
     """
 
@@ -649,6 +670,10 @@ class _AdaptiveState:
         self._provider: str = provider
         self._ceiling: int = ceiling
         self._limit: int = ceiling
+        # Provider-wide in-flight aggregate across every gate (all async gates +
+        # the sync gate), mirrored by note_acquire/note_release. Read under the
+        # lock to judge saturation on the shared limit, not one gate's local count.
+        self._total_in_flight: int = 0
         self._lock: threading.Lock = threading.Lock()
         # Recovery is paced from this anchor; a decrease resets it (so a throttle
         # delays recovery) and each applied step advances it by one interval.
@@ -662,21 +687,47 @@ class _AdaptiveState:
         with self._lock:
             return self._limit
 
-    def on_throttle(self, *, saturated: bool) -> BackpressureEvent | None:
+    def note_acquire(self) -> None:
+        """Count one slot grant into the provider-wide in-flight aggregate.
+
+        Called by every gate (async and sync) the instant it increments its own
+        ``_in_flight``, so :meth:`on_throttle` judges saturation on the sum across
+        all populations. O(1) under the state lock.
+        """
+        with self._lock:
+            self._total_in_flight += 1
+
+    def note_release(self) -> None:
+        """Count one slot release out of the provider-wide in-flight aggregate.
+
+        The mirror of :meth:`note_acquire`; every gate calls it the instant it
+        decrements its own ``_in_flight`` (including the async abandoned-grant
+        rollback). A missed decrement would bias saturation permanently high and
+        over-halve the limit.
+        """
+        with self._lock:
+            self._total_in_flight -= 1
+
+    def on_throttle(self) -> BackpressureEvent | None:
         """Account a provider overload signal; halve the limit if appropriate.
 
-        Decreases only when *saturated* (the gate was at its limit when the
-        throttle arrived) — a throttle received while running below the limit is
-        provider-global noise, not evidence this client's concurrency is the
-        problem, so halving then would be a pure self-inflicted regression. At
-        most one decrease per ``_AIMD_DECREASE_COOLDOWN``, so a fan-out's
-        correlated burst of throttles collapses to a single halving instead of
-        crashing to the floor. Returns the event to emit, or ``None`` when nothing
-        changed.
+        Decreases only when the provider's aggregate in-flight — across every
+        async gate and the sync gate — was at or above the shared limit when the
+        throttle arrived; a throttle received while the aggregate is below the
+        limit is provider-global noise, not evidence this client's concurrency is
+        the problem, so halving then would be a pure self-inflicted regression.
+        Judging on the aggregate (rather than one gate's local count) is what lets
+        a self-inflicted 429 trigger a decrease even when the throttled call sat
+        on a gate that was not itself at the limit. At most one decrease per
+        ``_AIMD_DECREASE_COOLDOWN``, so a fan-out's correlated burst of throttles
+        collapses to a single halving instead of crashing to the floor. The
+        aggregate read, the saturation judgment, the cooldown check, and the
+        halving are one atomic critical section under the state lock. Returns the
+        event to emit, or ``None`` when nothing changed.
         """
-        if not saturated:
-            return None
         with self._lock:
+            if self._total_in_flight < self._limit:
+                return None
             now = _now()
             if now - self._last_decrease < _AIMD_DECREASE_COOLDOWN:
                 return None
@@ -732,7 +783,9 @@ class _AdaptiveGate:
 
     All mutation runs on the gate's single event loop (asyncio is
     single-threaded), so no lock guards ``in_flight`` / ``_waiters``; the only lock
-    is inside ``_state`` for the cross-loop limit.
+    is inside ``_state`` — for the cross-loop limit and the provider-wide in-flight
+    aggregate this gate mirrors into (via ``_grant`` / ``_ungrant``) so saturation
+    is judged across every population, not this gate alone.
     """
 
     def __init__(self, state: _AdaptiveState) -> None:
@@ -740,11 +793,25 @@ class _AdaptiveGate:
         self._in_flight: int = 0
         self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
 
+    def _grant(self) -> None:
+        # The single place the async gate increments its in-flight count: bump the
+        # local count and mirror it into the shared aggregate so saturation is
+        # judged across all populations. Runs on the gate's loop (no gate lock);
+        # ``note_acquire`` takes only the state lock (gate loop -> state lock,
+        # never the reverse, so no lock inversion).
+        self._in_flight += 1
+        self._state.note_acquire()
+
+    def _ungrant(self) -> None:
+        # The mirror of ``_grant`` — the single place the async gate decrements.
+        self._in_flight -= 1
+        self._state.note_release()
+
     async def acquire(self) -> None:
         """Admit one call, blocking in FIFO order until a slot is free."""
         # Fast path: capacity available and nobody ahead of us — claim a slot.
         if not self._waiters and self._in_flight < self._state.limit():
-            self._in_flight += 1
+            self._grant()
             return
         # Otherwise queue. ``_admit_next`` grants head-first, incrementing
         # ``in_flight`` *before* resolving our future, so on wake the slot is ours.
@@ -760,13 +827,13 @@ class _AdaptiveGate:
             if fut.done() and not fut.cancelled():
                 # Granted a slot (``in_flight`` already bumped for us) but
                 # abandoning it — hand it to the next waiter.
-                self._in_flight -= 1
+                self._ungrant()
                 self._admit_next()
             raise
 
     def release(self) -> None:
         """Release a held slot and admit the next waiter(s) per the live limit."""
-        self._in_flight -= 1
+        self._ungrant()
         self._admit_next()
 
     def _admit_next(self) -> None:
@@ -776,16 +843,13 @@ class _AdaptiveGate:
             fut = self._waiters.popleft()
             if fut.cancelled():
                 continue  # waiter already gone; don't spend a slot on it
-            self._in_flight += 1
+            self._grant()
             fut.set_result(None)
 
-    def is_saturated(self) -> bool:
-        """Whether the gate is at its limit right now (this holder included)."""
-        return self._in_flight >= self._state.limit()
-
     def on_throttle(self) -> BackpressureEvent | None:
-        """Feed a throttle outcome to the shared state (gated on saturation)."""
-        return self._state.on_throttle(saturated=self.is_saturated())
+        """Feed a throttle outcome to the shared state (saturation is judged
+        there, on the provider-wide aggregate this gate mirrors into)."""
+        return self._state.on_throttle()
 
     def on_success(self) -> BackpressureEvent | None:
         """Feed a success outcome to the shared state (drives recovery)."""
@@ -827,10 +891,13 @@ class _SyncAdaptiveGate:
     decrease/release is still honoured immediately.
 
     State (``_in_flight`` + the waiter deque) is guarded by a plain
-    :class:`threading.Lock`, held only for O(1) bookkeeping, never across a wait.
-    Exposes the same :meth:`is_saturated` / :meth:`on_throttle` / :meth:`on_success`
-    surface :class:`_AdaptiveGate` does, so the shared outcome-classification
-    helper (:func:`_record_gate_outcome`) drives both paths identically.
+    :class:`threading.Lock`, held only for O(1) bookkeeping, never across a wait;
+    each grant/release also mirrors into the shared :class:`_AdaptiveState`
+    aggregate (gate lock -> state lock, never reversed — the same order the
+    acquire path already uses reading ``self._state.limit()`` under the gate
+    lock). Exposes the same :meth:`on_throttle` / :meth:`on_success` surface
+    :class:`_AdaptiveGate` does, so the shared outcome-classification helper
+    (:func:`_record_gate_outcome`) drives both paths identically.
     """
 
     def __init__(self, state: _AdaptiveState) -> None:
@@ -838,6 +905,20 @@ class _SyncAdaptiveGate:
         self._in_flight: int = 0
         self._waiters: collections.deque[threading.Event] = collections.deque()
         self._lock: threading.Lock = threading.Lock()
+
+    def _grant(self) -> None:
+        # Caller holds ``self._lock``. Bump the local count and mirror into the
+        # shared aggregate. ``note_acquire`` takes the state lock: ordering is
+        # gate lock -> state lock (the same order the acquire fast path uses when
+        # it reads ``self._state.limit()`` under ``self._lock``), never reversed,
+        # and the state lock is a leaf held only for O(1) arithmetic.
+        self._in_flight += 1
+        self._state.note_acquire()
+
+    def _ungrant(self) -> None:
+        # Caller holds ``self._lock``. The mirror of ``_grant``.
+        self._in_flight -= 1
+        self._state.note_release()
 
     def acquire(self) -> None:
         """Admit one call, blocking in FIFO order until a slot is free.
@@ -852,7 +933,7 @@ class _SyncAdaptiveGate:
             with self._lock:
                 # Fast path: nobody ahead of us and capacity free — take a slot.
                 if not self._waiters and self._in_flight < self._state.limit():
-                    self._in_flight += 1
+                    self._grant()
                     slot_held = True
                     return
                 self._waiters.append(ticket)
@@ -868,12 +949,13 @@ class _SyncAdaptiveGate:
                         and self._in_flight < self._state.limit()
                     ):
                         # Commit. Dequeue and wake the next head (idempotent calls)
-                        # first; the adjacent ``_in_flight += 1``/``slot_held``
-                        # stores are the atomic grant with no call between them.
+                        # first; the adjacent ``_grant()``/``slot_held`` stores are
+                        # the atomic grant (``_grant`` mirrors into the shared
+                        # aggregate under the state leaf-lock — no await, no yield).
                         _ = self._waiters.popleft()
                         if self._waiters:
                             self._waiters[0].set()
-                        self._in_flight += 1
+                        self._grant()
                         slot_held = True
                         return
                     # Woken but cannot commit yet — a head roused with no capacity
@@ -906,18 +988,14 @@ class _SyncAdaptiveGate:
     def release(self) -> None:
         """Release a held slot and wake the head to claim the freed capacity."""
         with self._lock:
-            self._in_flight -= 1
+            self._ungrant()
             if self._waiters:
                 self._waiters[0].set()
 
-    def is_saturated(self) -> bool:
-        """Whether the gate is at its limit right now (this holder included)."""
-        with self._lock:
-            return self._in_flight >= self._state.limit()
-
     def on_throttle(self) -> BackpressureEvent | None:
-        """Feed a throttle outcome to the shared state (gated on saturation)."""
-        return self._state.on_throttle(saturated=self.is_saturated())
+        """Feed a throttle outcome to the shared state (saturation is judged
+        there, on the provider-wide aggregate this gate mirrors into)."""
+        return self._state.on_throttle()
 
     def on_success(self) -> BackpressureEvent | None:
         """Feed a success outcome to the shared state (drives recovery)."""
@@ -1076,10 +1154,10 @@ class _ConcurrencyGate(Protocol):
     Both :class:`_AdaptiveGate` (async) and :class:`_SyncAdaptiveGate` (sync)
     implement it, so :func:`_record_gate_outcome` can drive either path through
     the *same* classification code — the parity is one implementation, not two
-    parallel copies.
+    parallel copies. Saturation is no longer part of this surface: it is judged
+    inside :meth:`_AdaptiveState.on_throttle` on the provider-wide aggregate.
     """
 
-    def is_saturated(self) -> bool: ...
     def on_throttle(self) -> BackpressureEvent | None: ...
     def on_success(self) -> BackpressureEvent | None: ...
 

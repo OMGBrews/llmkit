@@ -1,6 +1,6 @@
 """Tests for the streaming nested-retry guard.
 
-``stream_text_with_log`` participates in the same ``_retry_active`` guard as
+``text_llm_call_stream`` participates in the same ``_retry_active`` guard as
 :func:`with_retries`, so a host wrapping stream consumption in an outer llmkit
 retry loop (the documented composable path, since mid-stream errors propagate
 unretried) does not multiply the two budgets. These pin:
@@ -55,7 +55,7 @@ async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
 
     async def _wrapped() -> list[str]:
         return await _drain(
-            structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         )
 
     with (
@@ -86,7 +86,7 @@ async def test_no_retry_inner_under_outer_wrapper_stays_silent() -> None:
 
     async def _wrapped() -> list[str]:
         return await _drain(
-            structured_output.stream_text_with_log("hi", feature="test", retry=NO_RETRY)
+            structured_output.text_llm_call_stream("hi", feature="test", retry=NO_RETRY)
         )
 
     with warnings.catch_warnings():
@@ -116,7 +116,7 @@ async def test_mid_stream_failure_under_outer_wrapper_does_not_warn() -> None:
 
     async def _wrapped() -> list[str]:
         return await _drain(
-            structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         )
 
     with warnings.catch_warnings():
@@ -154,7 +154,7 @@ async def test_stream_retries_normally_without_outer_loop() -> None:
         warnings.simplefilter("error", RuntimeWarning)
         with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
             chunks = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
 
     assert chunks == ["he", "llo"]
@@ -181,7 +181,7 @@ async def test_stream_exhausts_full_budget_without_outer_loop() -> None:
         pytest.raises(TimeoutError, match="always"),
     ):
         _ = await _drain(
-            structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         )
 
     assert calls[0] == 3
@@ -203,7 +203,7 @@ async def test_guard_flag_not_visible_to_consumer_between_chunks() -> None:
 
     seen_between_chunks: list[bool] = []
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
-        async for _chunk in structured_output.stream_text_with_log(
+        async for _chunk in structured_output.text_llm_call_stream(
             "hi", feature="test", retry=_NO_BACKOFF
         ):
             seen_between_chunks.append(_retry_active.get())
@@ -224,7 +224,7 @@ async def test_guard_flag_clear_after_early_break() -> None:
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
         # The public annotation is AsyncGenerator, so aclose() — the
         # early-abandonment path under test — is on the surface directly.
-        stream = structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+        stream = structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         async for _chunk in stream:
             break
         assert _retry_active.get() is False

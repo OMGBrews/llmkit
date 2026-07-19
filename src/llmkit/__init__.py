@@ -96,6 +96,7 @@ from llmkit.structured_output import (
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
+    text_llm_call_stream,
     text_llm_call_sync,
 )
 
@@ -144,6 +145,8 @@ __all__ = [
     "structured_llm_call_sync",
     "text_llm_call",
     "text_llm_call_sync",
+    "text_llm_call_stream",
+    # Deprecated pre-1.0 alias for ``text_llm_call_stream`` (removed at 1.0).
     "stream_text_with_log",
     "STREAM_ABANDONED_ERROR",
     "capture_llm_log_paths",

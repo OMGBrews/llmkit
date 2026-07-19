@@ -139,7 +139,7 @@ async def test_stream_retry_shares_call_id_across_attempts() -> None:
     ):
         chunks = [
             chunk
-            async for chunk in structured_output.stream_text_with_log(
+            async for chunk in structured_output.text_llm_call_stream(
                 "hi", feature="test", retry=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0)
             )
         ]

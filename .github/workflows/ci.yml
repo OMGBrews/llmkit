@@ -21,32 +21,45 @@ on:
 
 jobs:
   check:
-    # Newest compatible resolution (uv's default). The full gate: lint, format,
-    # types, and tests.
-    runs-on: ubuntu-latest
+    # Newest compatible resolution (uv's default). The full gate — lint, format,
+    # types, and tests — run in every matrix cell. The matrix backs the support
+    # claims: the 3.12 floor, 3.13, and 3.14 on ubuntu, plus one macOS and one
+    # Windows cell so the `OS Independent` classifier is actually exercised.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - { os: macos-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.13" }
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install uv
-        # Exact pin, unlike the actions/* above: setup-uv stopped publishing
-        # floating major tags at v8 as supply-chain hardening, so `@v8` does
-        # not resolve — only immutable release tags do.
-        uses: astral-sh/setup-uv@v8.3.2
+        # Every action here is pinned to a full commit SHA (Dependabot bumps them
+        # via the trailing `# vX.Y.Z` comment). setup-uv also stopped publishing
+        # floating major tags at v8 as supply-chain hardening, so its comment
+        # tracks a full patch release, not a major.
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           # uv.lock is gitignored (a library doesn't commit its lock), so the
           # default `**/uv.lock` key matches nothing in a fresh checkout and the
           # cache never invalidates. pyproject.toml is what declares the deps.
           cache-dependency-glob: pyproject.toml
-          # Keep this job's cache distinct from the floors job's — same
-          # pyproject.toml, different resolution, different installed set.
-          cache-suffix: highest
+          # Keep each cell's cache distinct — same pyproject.toml, different OS
+          # and Python (and distinct from the floors job's resolution).
+          cache-suffix: highest-${{ matrix.os }}-${{ matrix.python-version }}
 
       - name: Set up Python
-        run: uv python install 3.13
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        # `uv sync` installs the `dev` dependency group by default (uv's
+        # default-groups), so no `--extra dev` is needed.
+        run: uv sync
 
       - name: Ruff (lint)
         run: uv run ruff check .
@@ -76,20 +89,26 @@ jobs:
     # format are dependency-independent and already covered by `check`.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.2
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: pyproject.toml
           cache-suffix: lowest-direct
 
       - name: Set up Python
-        run: uv python install 3.13
+        # Floors run on the 3.12 floor Python — the conventional lowest-Python
+        # pairing. 3.14 is impossible here: litellm's floor 1.87.1 caps <3.14 and
+        # pydantic 2.8.0 ships no cp314 wheel; the `check` job's 3.14 cell covers
+        # the highest resolution instead.
+        run: uv python install 3.12
 
       - name: Install dependencies at their declared floors
-        run: uv sync --resolution lowest-direct --extra dev
+        # `uv sync` pulls the default `dev` group; `--resolution lowest-direct`
+        # applies to groups too.
+        run: uv sync --resolution lowest-direct
 
       - name: Tests
         run: uv run pytest
@@ -102,10 +121,10 @@ jobs:
     # already on its way to.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.2
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           # This job builds and installs into a throwaway venv; there is no
           # project sync worth caching, and the default key would tie to a
@@ -113,14 +132,14 @@ jobs:
           enable-cache: false
 
       - name: Set up Python
-        run: uv python install 3.13
+        run: uv python install 3.12
 
       - name: Build sdist and wheel
         run: uv build
 
       - name: Install the built wheel into a clean environment
         run: |
-          uv venv --python 3.13 /tmp/smoke
+          uv venv --python 3.12 /tmp/smoke
           uv pip install --python /tmp/smoke/bin/python dist/*.whl
 
       - name: Smoke-test the installed package

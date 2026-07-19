@@ -27,7 +27,7 @@ is deterministic and nothing sleeps for real.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from unittest.mock import patch
 
 import httpx
@@ -56,16 +56,6 @@ from llmkit.retry import RetryPolicy, with_retries
 from tests._support import OkSchema, quiet_logging
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
-
-
-@pytest.fixture(autouse=True)
-def reset_rate_limiter() -> Iterator[None]:
-    """Restore the shipped default (cap 8, enabled, adaptive, breaker OFF)."""
-    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
-    try:
-        yield
-    finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
 
 
 def _status_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
@@ -496,7 +486,7 @@ async def test_streaming_call_does_not_retry_circuit_open_error() -> None:
         with pytest.raises(CircuitOpenError):
             _ = [
                 chunk
-                async for chunk in structured_output.stream_text_with_log(
+                async for chunk in structured_output.text_llm_call_stream(
                     "hi", feature="test", retry=_NO_BACKOFF
                 )
             ]

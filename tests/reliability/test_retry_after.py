@@ -329,7 +329,7 @@ async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``stream_text_with_log`` honours a ``Retry-After`` on a pre-first-chunk
+    """``text_llm_call_stream`` honours a ``Retry-After`` on a pre-first-chunk
     failure: the retry waits the server value before delivering the stream."""
     slept: list[float] = []
 
@@ -350,7 +350,7 @@ async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyP
             yield delta
 
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
-        chunks = await _drain(structured_output.stream_text_with_log("hi", feature="test"))
+        chunks = await _drain(structured_output.text_llm_call_stream("hi", feature="test"))
 
     assert chunks == ["he", "llo"]
     assert calls[0] == 2

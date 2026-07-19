@@ -66,8 +66,9 @@ Bedrock is the one deliberate exception to "every live test must pass under
 dependency, which ships only with the ``omg-llmkit[bedrock]`` extra. Its test
 is therefore gated with ``pytest.importorskip("boto3")`` — a *structural*
 skip (the dependency isn't installed), not the env-driven mode switch this
-module otherwise forbids. Install the extra (``uv sync --extra dev --extra
-bedrock``) and export ``AWS_REGION_NAME`` plus ambient AWS credentials to run
+module otherwise forbids. ``uv sync`` installs boto3 (the ``dev`` dependency
+group pulls the ``[bedrock]`` extra); export ``AWS_REGION_NAME`` plus ambient
+AWS credentials to run
 it; once boto3 is present, a missing region/credential is a hard failure like
 every other provider, not a skip. Secrets come from the AWS chain — they are
 never passed through ``LLMClientConfig``.
@@ -75,7 +76,7 @@ never passed through ``LLMClientConfig``.
 Vertex AI is the same kind of structural exception. It needs both a GCP project
 *and* the optional ``google-auth`` dependency (``omg-llmkit[vertex]``), so its
 test is gated with ``pytest.importorskip("google.auth")``. Install the extra
-(``uv sync --extra dev`` already pulls it) and export ``VERTEXAI_PROJECT`` /
+(``uv sync`` already pulls it) and export ``VERTEXAI_PROJECT`` /
 ``VERTEXAI_LOCATION`` plus resolvable Application Default Credentials
 (``gcloud auth application-default login``) to run it; once google-auth is
 present, a missing project/location/credential is a hard failure like every
