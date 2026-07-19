@@ -634,7 +634,13 @@ class BaseProvider(ABC):
                 continue
             value = cast("object", getattr(config, f.name))
             default = cast("object", f.default)
-            if value != default:
+            # A knob is "populated" when it differs from its default AND is not an
+            # empty string. Empty is unset everywhere else in the library (the
+            # bearer key resolver and each ``build`` treat ``""`` as no value), so
+            # a generically-built config that fills an unused field with ``""``
+            # (e.g. ``os.getenv("KEY", "")`` for a Bedrock deployment) must not
+            # trip this — only a real value the provider would ignore does.
+            if value != default and value != "":
                 offenders.append(f.name)
         if not offenders:
             return

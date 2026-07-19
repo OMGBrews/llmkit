@@ -559,6 +559,82 @@ def test_ref_sibling_properties_raises_clear_value_error() -> None:
         _ = model_from_json_schema(schema)
 
 
+def test_ref_sibling_allof_raises_clear_value_error() -> None:
+    """An ``allOf`` (or any subschema applicator) beside a ``$ref`` is a
+    conjunction the converter cannot express, so it raises rather than merging and
+    silently dropping the restriction — the same rule as a type/enum sibling, and
+    symmetric with a bare ``allOf`` property (which already fails loud)."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Color", "allOf": [{"enum": ["red"]}]}},
+        "required": ["c"],
+        "$defs": {"Color": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'allOf' at '\$\.c'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_not_raises_clear_value_error() -> None:
+    """A ``not`` applicator beside a ``$ref`` raises too — the applicator set is
+    covered, not just ``allOf``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"c": {"$ref": "#/$defs/Color", "not": {"enum": ["red"]}}},
+        "required": ["c"],
+        "$defs": {"Color": {"type": "string"}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'not' at '\$\.c'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_ref_sibling_title_raises_clear_value_error() -> None:
+    """A ``title`` beside a ``$ref`` raises: the referenced model's class is cached
+    and shared by ``$ref`` name, so a per-site title would rename it for every
+    other reference site. The title belongs on the ``$def``."""
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"o": {"$ref": "#/$defs/Obj", "title": "Renamed"}},
+        "required": ["o"],
+        "$defs": {
+            "Obj": {"type": "object", "properties": {"y": {"type": "integer"}}, "title": "Obj"}
+        },
+    }
+    with pytest.raises(ValueError, match=r"Unsupported \$ref sibling 'title' at '\$\.o'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_root_ref_structural_sibling_raises_clear_value_error() -> None:
+    """A structural sibling on a *root* ``$ref`` is rejected too — the guard is at
+    the root entrypoint, not only on nested fields, so an ``additionalProperties``
+    that would redefine a (possibly shared) referenced root is not silently
+    dropped."""
+    schema: dict[str, object] = {
+        "$ref": "#/$defs/Root",
+        "additionalProperties": True,
+        "$defs": {
+            "Root": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        },
+    }
+    with pytest.raises(
+        ValueError, match=r"Unsupported \$ref sibling 'additionalProperties' at '\$'"
+    ):
+        _ = model_from_json_schema(schema)
+
+
+def test_root_ref_without_siblings_still_builds() -> None:
+    """Regression: a bare root ``$ref`` (no siblings) resolves and builds as before."""
+    schema: dict[str, object] = {
+        "$ref": "#/$defs/Root",
+        "$defs": {
+            "Root": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+        },
+    }
+    model = model_from_json_schema(schema)
+    assert _attr(model(id="x"), "id") == "x"
+    with pytest.raises(ValidationError):
+        _ = model()
+
+
 def test_ref_sibling_restating_target_structural_key_is_accepted() -> None:
     """A structural sibling that restates the target's own value verbatim is a
     harmless no-op (some generators emit a redundant ``type`` beside a ``$ref``)

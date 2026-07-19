@@ -232,6 +232,27 @@ def test_build_provider_direct_config_with_unread_knob_raises() -> None:
         _ = build_provider(LLMClientConfig(provider=Provider.BEDROCK, api_key="k"))
 
 
+@pytest.mark.parametrize(
+    ("provider", "field"),
+    [
+        (Provider.BEDROCK, "api_key"),
+        (Provider.VERTEX, "api_key"),
+        (Provider.OLLAMA, "api_key"),
+        (Provider.BEDROCK, "base_url"),
+    ],
+)
+def test_build_provider_empty_string_unread_knob_is_not_rejected(
+    provider: Provider, field: str
+) -> None:
+    """An empty-string value in an unread knob is treated as unset, not populated,
+    so it is not rejected — matching how ``""`` is unset everywhere else in the
+    library. A config filled generically with ``os.getenv("KEY", "")`` for an
+    ambient-auth provider must still build."""
+    config = LLMClientConfig(provider=provider, **{field: ""})  # pyright: ignore[reportArgumentType]  # dynamic field for the parametrization
+    provider_obj = build_provider(config)
+    assert provider_obj.name
+
+
 def test_make_provider_unread_knob_error_names_offenders_and_accepted_set() -> None:
     """The message names the offending field(s) and what the provider does read,
     so the fix is obvious from the error alone."""

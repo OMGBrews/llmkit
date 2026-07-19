@@ -31,15 +31,16 @@ construct, rather than silently producing a wrong model:
 * ``enum`` (on a scalar field)
 * nested objects, inline or via local ``$defs`` / ``$ref`` references
   (``#/$defs/Name`` or the legacy ``#/definitions/Name``). A ``$ref`` may carry
-  siblings: metadata and value bounds (``description``, ``title``, ``default``,
-  the numeric/length bounds) merge over the target with the outer value winning,
+  siblings: metadata and value bounds (``description``, ``default``, the
+  numeric/length bounds) merge over the target with the outer value winning,
   so ``{"$ref": "#/$defs/Count", "minimum": 5}`` keeps the bound and a
   nullable-wrapped ``$ref`` inherits the target's ``description``. A *structural*
-  sibling (``type`` / ``enum`` / ``items`` / ``properties`` / ``required`` /
-  ``additionalProperties`` / ``anyOf`` / ``oneOf``) is a JSON-Schema conjunction
-  a merge cannot express, so it is rejected unless it restates the target's own
-  value — a ``$ref``-sibling ``enum`` is a clear error, never a silently-widened
-  field
+  sibling — a type/shape keyword (``type`` / ``enum`` / ``items`` /
+  ``properties`` / ``required`` / ``additionalProperties`` / ``title``) or any
+  subschema applicator (``anyOf`` / ``oneOf`` / ``allOf`` / ``not`` / ``if`` /
+  ``then`` / ``else`` / …) — is a JSON-Schema conjunction a merge cannot express,
+  so it is rejected unless it restates the target's own value: a ``$ref``-sibling
+  ``enum`` or ``allOf`` is a clear error, never a silently-widened field
 * ``object`` with ``properties``; a propertyless object (``properties`` absent
   *or* an explicit empty ``{}``) is rejected unless it opts into open-ended keys
   with ``additionalProperties: true`` — otherwise it would build a zero-field
@@ -232,11 +233,48 @@ class _FieldConstraints(NamedTuple):
 # express. So a structural sibling is honoured only when it restates the
 # target's own value verbatim (a redundant no-op some generators emit) and
 # otherwise fails loud — never silently widening or replacing the reference.
-# Everything else beside a ``$ref`` (``description``, ``title``, ``default``,
-# the numeric/length bounds, unknown keywords) is non-structural and merges over
-# the target with the outer, property-level value winning.
+# Everything else beside a ``$ref`` (``description``, ``default``, the
+# numeric/length bounds, benign annotations, unknown keywords) is non-structural
+# and merges over the target with the outer, property-level value winning.
+#
+# The set is the union of three groups the converter treats as structure-bearing:
+#   - the type/shape keywords it dispatches on (``type`` / ``enum`` / ``items`` /
+#     ``properties`` / ``required`` / ``additionalProperties``);
+#   - every subschema *applicator* — a bare one of these already fails loud as an
+#     unsupported construct, so it must fail loud beside a ``$ref`` too rather
+#     than merge-and-drop (``anyOf`` / ``oneOf`` / ``allOf`` / ``not`` /
+#     ``if`` / ``then`` / ``else`` / ``dependentSchemas`` / ``dependentRequired`` /
+#     ``propertyNames`` / ``patternProperties`` / ``prefixItems`` / ``contains`` /
+#     ``unevaluatedProperties`` / ``unevaluatedItems``);
+#   - ``title``, because the object-class cache is keyed by the ``$ref`` name and
+#     names the class from ``title``, so a per-site sibling ``title`` would rename
+#     the *shared* referenced class for every other reference site. It belongs on
+#     the ``$def``, not a use site.
 _STRUCTURAL_REF_SIBLINGS: frozenset[str] = frozenset(
-    {"type", "enum", "items", "properties", "required", "additionalProperties", "anyOf", "oneOf"}
+    {
+        "type",
+        "enum",
+        "items",
+        "properties",
+        "required",
+        "additionalProperties",
+        "title",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependentRequired",
+        "propertyNames",
+        "patternProperties",
+        "prefixItems",
+        "contains",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    }
 )
 
 
@@ -1030,9 +1068,17 @@ class _Converter:
     def convert(self, name: str | None) -> type[BaseModel]:
         root = self._root
         root_ref: str | None = None
-        # Resolve a top-level $ref so the root can be a bare reference.
+        # Resolve a top-level $ref so the root can be a bare reference. Siblings
+        # on the root $ref get the same treatment as anywhere else: a structural
+        # one is rejected (it cannot redefine a referenced — and possibly shared,
+        # cached — schema), and the rest merge over the target, outer-wins. Only
+        # ``$ref`` is dropped from the siblings; ``$defs`` and other metadata ride
+        # along harmlessly.
         if "$ref" in root:
-            root_ref, root = self._resolve_ref(cast("str", root["$ref"]))
+            siblings = {k: v for k, v in root.items() if k != "$ref"}
+            root_ref, target = self._resolve_ref(cast("str", root["$ref"]))
+            self._reject_structural_ref_siblings(siblings, target, "$")
+            root = {**target, **siblings}
         jtype = root.get("type")
         if jtype not in (None, "object"):
             raise ValueError(

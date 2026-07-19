@@ -55,7 +55,10 @@ def test_build_provider_wires_reasoning_effort() -> None:
     """The config value reaches the constructed provider's property."""
     provider = build_provider(
         LLMClientConfig(
-            provider=Provider.GOOGLE, model="gemini-2.5-flash", reasoning_effort="disable"
+            provider=Provider.GOOGLE,
+            model="gemini-2.5-flash",
+            api_key="k",  # bearer provider: a key is required at build, so pin one for hermeticity
+            reasoning_effort="disable",
         )
     )
     assert isinstance(provider, GoogleProvider)
