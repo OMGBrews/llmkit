@@ -33,7 +33,7 @@ from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
-from llmkit.capture import record_call, resolve_model_and_provider
+from llmkit.capture import record_call, record_call_async, resolve_model_and_provider
 from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
@@ -286,7 +286,7 @@ async def structured_llm_call[T: BaseModel](
                         label,
                         exc_info=True,
                     )
-            _ = record_call(
+            _ = await record_call_async(
                 LLMCallRecord(
                     started_at=started_at,
                     feature=feature,
@@ -497,23 +497,25 @@ async def text_llm_call(
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            _log_text_call(
-                started_at=started_at,
-                feature=feature,
-                label=label,
-                prompt=prompt,
-                text=text,
-                start_t=start_t,
-                temperature=temperature,
-                model=model,
-                provider=provider,
-                error=error,
-                approximate_cost=cost,
-                schema="text",
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
-                call_id=call_id,
-                attempt=attempt,
+            _ = await record_call_async(
+                _build_text_record(
+                    started_at=started_at,
+                    feature=feature,
+                    label=label,
+                    prompt=prompt,
+                    text=text,
+                    start_t=start_t,
+                    temperature=temperature,
+                    model=model,
+                    provider=provider,
+                    error=error,
+                    approximate_cost=cost,
+                    schema="text",
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    call_id=call_id,
+                    attempt=attempt,
+                )
             )
 
     return await with_retries(
@@ -830,13 +832,12 @@ async def _stream_once(
         error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        full_text = "".join(accumulated)
-        _log_text_call(
+        record = _build_text_record(
             started_at=started_at,
             feature=feature,
             label=label,
             prompt=prompt,
-            text=full_text,
+            text="".join(accumulated),
             start_t=start_t,
             temperature=temperature,
             model=model,
@@ -849,9 +850,21 @@ async def _stream_once(
             call_id=call_id,
             attempt=attempt,
         )
+        if error == STREAM_ABANDONED_ERROR:
+            # Abandonment unwinds via GeneratorExit / a re-deliverable
+            # CancelledError: suspending again here (an await) risks a second
+            # cancellation landing mid-await and losing this record — the one
+            # honest witness that the transcript is truncated. Abandonment is
+            # rare and terminal, so one blocking write is the safe trade.
+            _ = record_call(record)
+        else:
+            # Clean finish or provider error: normal unwinding, safe to
+            # await — and streams carry the largest payloads, so this is the
+            # off-loop offload that matters most.
+            _ = await record_call_async(record)
 
 
-def _log_text_call(
+def _build_text_record(
     *,
     started_at: datetime,
     feature: str,
@@ -869,8 +882,8 @@ def _log_text_call(
     reasoning_effort: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
-) -> None:
-    """Build and record an ``LLMCallRecord`` for a plain-text/stream call.
+) -> LLMCallRecord:
+    """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
     Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
     ``schema`` distinguishes the two surfaces in the log — ``"text"`` for a
@@ -885,29 +898,31 @@ def _log_text_call(
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the
-    record). Routes through :func:`record_call` so both capture primitives
-    (records and file paths) see the call, exactly like the structured path.
+    record).
+
+    Building is separate from recording on purpose: the buffered path hands
+    the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
+    while the abandoned-stream path must record *synchronously* — so the
+    shared part is the build, and each caller picks its record step.
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
-    _ = record_call(
-        LLMCallRecord(
-            started_at=started_at,
-            feature=feature,
-            label=label,
-            model=resolved_model,
-            provider=resolved_provider,
-            temperature=temperature,
-            duration_ms=duration_ms,
-            schema=schema,
-            prompt=prompt,
-            response=text,
-            error=error,
-            approximate_cost=approximate_cost,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            call_id=call_id,
-            attempt=attempt,
-            queue_wait_ms=_queue_wait_ms.get(),
-        )
+    return LLMCallRecord(
+        started_at=started_at,
+        feature=feature,
+        label=label,
+        model=resolved_model,
+        provider=resolved_provider,
+        temperature=temperature,
+        duration_ms=duration_ms,
+        schema=schema,
+        prompt=prompt,
+        response=text,
+        error=error,
+        approximate_cost=approximate_cost,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        call_id=call_id,
+        attempt=attempt,
+        queue_wait_ms=_queue_wait_ms.get(),
     )

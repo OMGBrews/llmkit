@@ -227,7 +227,12 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
             _drain_pending(loop, timeout=timeout)
     finally:
         try:
+            # Asyncgen finalizers may schedule one last off-loop log write
+            # (``record_call_async``), so the executor drain must come after
+            # them — and before ``close``, so no llmkit log write is ever
+            # abandoned in a worker thread of a closed loop.
             loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -349,6 +354,11 @@ async def _drain_and_close(timeout: float | None) -> None:
         _ = task.cancel()
     if pending:
         _ = await asyncio.gather(*pending, return_exceptions=True)
+    # Join any in-flight ``to_thread`` offloads — llmkit's own log writes run
+    # there (``record_call_async``) — so a clean process exit never drops the
+    # final call's record. Bounded overall by the ``shutdown()`` caller's
+    # timeout on this whole coroutine.
+    await asyncio.get_running_loop().shutdown_default_executor()
 
 
 def shutdown(*, timeout: float | None = 10.0) -> None:
