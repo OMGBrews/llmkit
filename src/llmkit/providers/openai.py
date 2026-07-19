@@ -36,6 +36,7 @@ class OpenAIProvider(BaseProvider):
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
     _api_key_env_var: ClassVar[str] = "OPENAI_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})
 
     def __init__(
         self,
@@ -55,6 +56,7 @@ class OpenAIProvider(BaseProvider):
             kwargs["api_base"] = self._base_url
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OpenAIProvider:
         """Construct from an :class:`LLMClientConfig`.

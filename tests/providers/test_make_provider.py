@@ -74,7 +74,7 @@ def test_make_provider_openrouter_endpoint_default() -> None:
 
 
 def test_make_provider_ollama_local_endpoint_default() -> None:
-    """Ollama ignores ``api_key`` and defaults to the local endpoint."""
+    """Ollama needs no key and defaults to the local endpoint."""
     provider = make_provider(Provider.OLLAMA, model="llama3.2")
     assert isinstance(provider, OllamaProvider)
     assert provider.completion_kwargs() == {"api_base": "http://localhost:11434"}
@@ -176,26 +176,71 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "expected_prefix", "expected_model"),
+    ("provider", "expected_prefix", "expected_model", "key"),
     [
-        (Provider.OPENROUTER, "openrouter/", "google/gemini-2.5-flash-lite"),
-        (Provider.OLLAMA, "ollama_chat/", "llama3.2"),
-        (Provider.GOOGLE, "gemini/", "gemini-2.5-flash-lite"),
-        (Provider.ANTHROPIC, "anthropic/", "claude-sonnet-4-6"),
-        (Provider.OPENAI, "openai/", "gpt-4.1-mini"),
-        (Provider.DEEPSEEK, "deepseek/", "deepseek-chat"),
-        (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        (Provider.VERTEX, "vertex_ai/", "gemini-2.5-flash-lite"),
+        (Provider.OPENROUTER, "openrouter/", "google/gemini-2.5-flash-lite", "k"),
+        (Provider.OLLAMA, "ollama_chat/", "llama3.2", None),
+        (Provider.GOOGLE, "gemini/", "gemini-2.5-flash-lite", "k"),
+        (Provider.ANTHROPIC, "anthropic/", "claude-sonnet-4-6", "k"),
+        (Provider.OPENAI, "openai/", "gpt-4.1-mini", "k"),
+        (Provider.DEEPSEEK, "deepseek/", "deepseek-chat", "k"),
+        (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0", None),
+        (Provider.VERTEX, "vertex_ai/", "gemini-2.5-flash-lite", None),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(
-    provider: Provider, expected_prefix: str, expected_model: str
+    provider: Provider, expected_prefix: str, expected_model: str, key: str | None
 ) -> None:
-    """A ``None`` model resolves to the provider default — never ``"<prefix>/"``."""
-    built = make_provider(provider, api_key="k", model=None)
+    """A ``None`` model resolves to the provider default — never ``"<prefix>/"``.
+
+    Each provider gets only the knobs it reads (a bearer key where required,
+    ``None`` for the ambient/local providers), since a knob a provider ignores now
+    raises.
+    """
+    built = make_provider(provider, model=None, api_key=key)
     litellm_model = built.litellm_model()
     assert litellm_model == f"{expected_prefix}{expected_model}"
     assert not litellm_model.endswith("/"), "dangling prefix means the model id is broken"
+
+
+@pytest.mark.parametrize(
+    ("provider", "kwargs", "offender"),
+    [
+        (Provider.OLLAMA, {"api_key": "k"}, "api_key"),
+        (Provider.BEDROCK, {"api_key": "k"}, "api_key"),
+        (Provider.VERTEX, {"api_key": "k"}, "api_key"),
+        (Provider.VERTEX, {"base_url": "https://x"}, "base_url"),
+        (Provider.BEDROCK, {"base_url": "https://x"}, "base_url"),
+        (Provider.OPENAI, {"aws_region_name": "us-east-1"}, "aws_region_name"),
+        (Provider.OPENAI, {"gemini_structured_output": "json"}, "gemini_structured_output"),
+        (Provider.ANTHROPIC, {"vertex_project": "p"}, "vertex_project"),
+    ],
+)
+def test_make_provider_unread_knob_raises_naming_the_field(
+    provider: Provider, kwargs: dict[str, str], offender: str
+) -> None:
+    """Passing a knob the selected provider does not read raises, naming the field —
+    it is no longer silently dropped (the audit's ``make_provider`` footgun)."""
+    with pytest.raises(ValueError, match=rf"does not read the config field.*{offender}"):
+        _ = make_provider(provider, **kwargs)  # pyright: ignore[reportArgumentType]  # test feeds a deliberately-wrong knob
+
+
+def test_build_provider_direct_config_with_unread_knob_raises() -> None:
+    """The rejection lives at ``build_provider``, so a directly-constructed config
+    (bypassing ``make_provider``) is validated too — the seam has no hole."""
+    with pytest.raises(ValueError, match=r"AWS Bedrock does not read.*api_key"):
+        _ = build_provider(LLMClientConfig(provider=Provider.BEDROCK, api_key="k"))
+
+
+def test_make_provider_unread_knob_error_names_offenders_and_accepted_set() -> None:
+    """The message names the offending field(s) and what the provider does read,
+    so the fix is obvious from the error alone."""
+    with pytest.raises(ValueError) as excinfo:
+        _ = make_provider(Provider.OLLAMA, api_key="k")
+    message = str(excinfo.value)
+    assert "api_key" in message
+    assert "Ollama reads" in message
+    assert "base_url" in message
 
 
 @pytest.mark.parametrize("falsy_model", [None, ""])

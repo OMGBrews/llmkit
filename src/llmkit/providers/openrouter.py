@@ -70,6 +70,7 @@ class OpenRouterProvider(BaseProvider):
     _default_model: ClassVar[str] = "google/gemini-2.5-flash-lite"
     _strict_json_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "OPENROUTER_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})
 
     def __init__(
         self,
@@ -95,6 +96,7 @@ class OpenRouterProvider(BaseProvider):
             kwargs["extra_body"] = {"provider": {"require_parameters": True}}
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OpenRouterProvider:
         """Construct from an :class:`LLMClientConfig` (OpenRouter endpoint default).

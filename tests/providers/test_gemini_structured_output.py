@@ -178,24 +178,27 @@ def test_gemini_json_mode_constructs_an_instructor_client(provider: BaseProvider
     assert isinstance(client, instructor.AsyncInstructor)
 
 
-# --- non-Gemini providers ignore the field ---------------------------------
+# --- non-Gemini providers reject a non-default value -----------------------
 
 
-def test_non_gemini_provider_ignores_the_field() -> None:
-    """A non-Gemini provider keeps its own pinned mode regardless of the field.
-
-    DeepSeek pins ``Mode.JSON`` for its own (documented) reason; the point is
-    that ``gemini_structured_output`` never touches it — the field is read only
-    by the two Gemini providers' ``build``.
-    """
+def test_non_gemini_provider_allows_the_default_strategy() -> None:
+    """The default ``"schema"`` is untouched noise on a non-Gemini provider and is
+    accepted — an unpopulated field never trips knob rejection."""
     schema = build_provider(
         LLMClientConfig(provider=Provider.DEEPSEEK, api_key="k", gemini_structured_output="schema")
     )
-    json = build_provider(
-        LLMClientConfig(provider=Provider.DEEPSEEK, api_key="k", gemini_structured_output="json")
-    )
     assert isinstance(schema, DeepSeekProvider)
-    assert isinstance(json, DeepSeekProvider)
-    # DeepSeek's mode is its own pin, unaffected by the Gemini field either way.
+    # DeepSeek's mode is its own pin, unaffected by the (defaulted) Gemini field.
     assert schema.instructor_mode is instructor.Mode.JSON
-    assert json.instructor_mode is instructor.Mode.JSON
+
+
+def test_non_gemini_provider_rejects_a_non_default_strategy() -> None:
+    """A *non-default* ``gemini_structured_output`` on a non-Gemini provider is
+    rejected rather than silently ignored: the field is read only by the two
+    Gemini providers, so setting ``"json"`` on DeepSeek is a mistake to surface."""
+    with pytest.raises(ValueError, match=r"DeepSeek does not read.*gemini_structured_output"):
+        _ = build_provider(
+            LLMClientConfig(
+                provider=Provider.DEEPSEEK, api_key="k", gemini_structured_output="json"
+            )
+        )

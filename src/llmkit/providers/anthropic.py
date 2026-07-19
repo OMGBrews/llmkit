@@ -47,6 +47,7 @@ class AnthropicProvider(BaseProvider):
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "claude-sonnet-4-6"
     _api_key_env_var: ClassVar[str] = "ANTHROPIC_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})
 
     def __init__(
         self,
@@ -66,6 +67,7 @@ class AnthropicProvider(BaseProvider):
             kwargs["api_base"] = self._base_url
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> AnthropicProvider:
         """Construct from an :class:`LLMClientConfig`.

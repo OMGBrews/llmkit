@@ -26,6 +26,7 @@ class OllamaProvider(BaseProvider):
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "llama3.2"
     is_local: ClassVar[bool] = True
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"base_url"})
 
     def __init__(
         self,
@@ -40,6 +41,7 @@ class OllamaProvider(BaseProvider):
     def completion_kwargs(self) -> dict[str, object]:
         return {"api_base": self._base_url}
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OllamaProvider:
         """Construct from an :class:`LLMClientConfig` (local endpoint default)."""

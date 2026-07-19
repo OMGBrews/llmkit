@@ -61,6 +61,9 @@ class GoogleProvider(BaseProvider):
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
     _api_key_env_var: ClassVar[str] = "GEMINI_API_KEY"
+    _accepted_config_fields: ClassVar[frozenset[str]] = frozenset(
+        {"api_key", "base_url", "gemini_structured_output"}
+    )
 
     def __init__(
         self,
@@ -94,6 +97,7 @@ class GoogleProvider(BaseProvider):
             kwargs["api_base"] = self._base_url
         return kwargs
 
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> GoogleProvider:
         """Construct from an :class:`LLMClientConfig`.
