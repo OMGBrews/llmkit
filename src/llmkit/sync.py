@@ -152,8 +152,13 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
     to **cancel** on the loop rather than leaked — cancelling the in-flight
     provider request too — and the original exception propagates. The call's own
     result or exception always propagates ahead of any straggler outcome.
+
+    Obtaining the loop and submitting to it are made atomic against
+    :func:`shutdown` via ``_lock``: a caller that races shutdown retries onto a
+    freshly restarted persistent loop instead of enqueueing a callback onto a
+    stopped-but-not-closed loop (which would hang for the full ``timeout`` with
+    the coroutine leaked) or a closed one (which would raise ``RuntimeError``).
     """
-    loop = _ensure_loop()
     ctx = contextvars.copy_context()
     result: concurrent.futures.Future[T] = concurrent.futures.Future()
     task_box: list[asyncio.Task[T]] = []
@@ -195,11 +200,34 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
         if task_box:
             _ = task_box[0].cancel()
 
-    _ = loop.call_soon_threadsafe(_schedule)
+    # Obtain the loop and submit to it atomically against ``shutdown()``. The
+    # identity check ``_loop is loop`` under ``_lock`` is the generation check:
+    # ``shutdown`` clears ``_loop`` under ``_lock`` *before* it stops or closes
+    # the loop, and only ``_ensure_loop`` sets it (always to a brand-new object,
+    # so no ABA). Under the lock the identity therefore implies the loop is live
+    # and our ``_schedule`` is enqueued ahead of any subsequent ``loop.stop``
+    # (FIFO) — so a racing caller is either swept as an in-flight call (prompt
+    # ``CancelledError``) or retried onto a fresh loop, never left to hang or
+    # raise. One uncontended lock acquire per call; no retry cap is needed
+    # because livelock would require an adversarial ``shutdown()`` every
+    # iteration.
+    while True:
+        loop = _ensure_loop()
+        with _lock:
+            if _loop is loop:
+                _ = loop.call_soon_threadsafe(_schedule)
+                break
+        # shutdown() claimed the loop between obtaining and submitting: retry —
+        # _ensure_loop lazily starts a fresh persistent loop.
     try:
         return result.result(timeout)
     except BaseException:
-        _ = loop.call_soon_threadsafe(_cancel)
+        # If ``shutdown()`` closed the loop between the submit and here, the task
+        # was already cancelled by shutdown's sweep, so suppressing the resulting
+        # ``RuntimeError("Event loop is closed")`` loses nothing and stops it from
+        # masking the real exception being propagated.
+        with contextlib.suppress(RuntimeError):
+            _ = loop.call_soon_threadsafe(_cancel)
         raise
 
 
@@ -300,7 +328,9 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     process-global logging worker bound to a single loop — eliminating the
     cross-loop logging race a fresh-loop-per-call strategy triggers under a
     concurrent sync fan-out (flood + an occasional ~600 s hang). See the module
-    docstring.
+    docstring. A caller that races :func:`shutdown` — obtaining the loop just as
+    it is torn down — transparently lands on a lazily restarted persistent loop
+    rather than hanging or raising.
 
     If an event loop is **already running in the calling thread**, what happens
     depends on *which* loop it is:

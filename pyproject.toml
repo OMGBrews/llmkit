@@ -7,7 +7,7 @@ name = "omg-llmkit"
 version = "0.7.0"
 description = "A thin, opinionated, local-first structured-output + logging layer over LiteLLM"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "OMGBrews" }]
@@ -16,7 +16,10 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    # 3.14 is exercised by the CI `check` matrix; add its classifier once that
+    # cell is confirmed green (never claim a platform CI hasn't proven).
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
@@ -36,7 +39,8 @@ dependencies = [
     "pydantic>=2.8.0",
     # 6.0.0/6.0.1 ship no cp313 wheel and their sdist fails to build on 3.13
     # (their pinned Cython predates the 3.13 C API); 6.0.2 is the first release
-    # with a 3.13 wheel, so it is the true floor under `requires-python >=3.13`.
+    # with a 3.13 wheel, so 6.0.2 is the floor that installs on every supported
+    # Python (the range must resolve on 3.13/3.14 too, not just the 3.12 floor).
     "pyyaml>=6.0.2",
     "httpx>=0.28.0",
     # Imported directly (the per-call AsyncRetrying fed to instructor's
@@ -69,22 +73,6 @@ bedrock = [
 vertex = [
     "google-auth>=2.0",
 ]
-dev = [
-    "pytest>=8.0.0",
-    # 0.23.0–0.23.4 mis-collect package-scoped async tests on pytest 8
-    # ('Package' object has no attribute 'obj' / zero tests collected);
-    # 0.23.5 is the first release that collects and runs the suite.
-    "pytest-asyncio>=0.23.5",
-    "ruff==0.15.0",
-    "basedpyright>=1.39",
-    # The offline test suite imports the Bedrock and Vertex providers and
-    # exercises their construction, which eagerly checks for boto3 (Bedrock)
-    # and google-auth (Vertex). Pull in both extras so every provider's
-    # construction dependency is present for dev/CI and `uv sync --extra dev`
-    # yields a fully green suite.
-    "omg-llmkit[bedrock]",
-    "omg-llmkit[vertex]",
-]
 # Convenience: pull in every optional provider dependency at once, so a host
 # that wants the full provider surface can `pip install 'omg-llmkit[all]'`
 # instead of enumerating extras.
@@ -99,6 +87,35 @@ Repository = "https://github.com/OMGBrews/llmkit"
 Issues = "https://github.com/OMGBrews/llmkit/issues"
 Changelog = "https://github.com/OMGBrews/llmkit/blob/main/CHANGELOG.md"
 
+# Maintainer tooling: the offline test + typecheck toolchain, as a PEP 735
+# dependency group — NOT a public extra. Hatchling ignores [dependency-groups],
+# so nothing here lands in the wheel/sdist metadata (no `Provides-Extra: dev`),
+# keeping dev tooling off the published install surface. `uv sync` installs this
+# group by default (uv's default-groups), so no `--extra dev`/`--group dev` flag
+# is needed anywhere.
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    # 0.23.0–0.23.4 mis-collect package-scoped async tests on pytest 8
+    # ('Package' object has no attribute 'obj' / zero tests collected);
+    # 0.23.5 is the first release that collects and runs the suite.
+    "pytest-asyncio>=0.23.5",
+    # Exact pin, deliberately: `ruff format --check` output is version-sensitive,
+    # so the format gate is only reproducible against one ruff. An exact pin in a
+    # non-published group is conventional — the audit's objection was the pin on
+    # the *public* surface, which the group migration removes, not the pin itself.
+    "ruff==0.15.0",
+    "basedpyright>=1.39",
+    # The offline suite imports the Bedrock and Vertex providers and exercises
+    # their construction, which eagerly checks for boto3 (Bedrock) and
+    # google-auth (Vertex). uv resolves this project's own name to the workspace
+    # source, so these self-referential extras pull the local package's extras (a
+    # non-uv `pip install --group dev` would fetch omg-llmkit from PyPI instead —
+    # acceptable for a maintainer-only group).
+    "omg-llmkit[bedrock]",
+    "omg-llmkit[vertex]",
+]
+
 [tool.hatch.build.targets.wheel]
 # ``omg_llmkit`` is a one-line import shim: the distribution installs as
 # ``omg-llmkit`` but is imported as ``llmkit``; the shim turns a mistaken
@@ -109,7 +126,7 @@ packages = ["src/llmkit", "src/omg_llmkit"]
 # --- Ruff (linter + formatter) ------------------------------------------
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py312"
 line-length = 100
 
 [tool.ruff.format]

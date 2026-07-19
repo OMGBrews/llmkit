@@ -175,7 +175,7 @@ class RetryPolicy:
 
     Realizes the "transient retries are on by default" opinion: the call
     functions (:func:`~llmkit.structured_llm_call`,
-    :func:`~llmkit.text_llm_call`, :func:`~llmkit.stream_text_with_log`,
+    :func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`,
     and the sync wrapper) retry the ``retry_on`` / ``validation_retry_on``
     errors with bounded full-jitter backoff, without the caller wrapping
     every call.
@@ -427,7 +427,7 @@ async def with_retries[T](
     .. warning::
 
         The call functions (:func:`~llmkit.structured_llm_call`,
-        :func:`~llmkit.text_llm_call`, :func:`~llmkit.stream_text_with_log`,
+        :func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`,
         and the sync wrapper) **already retry internally** by default. Wrapping
         one of them in :func:`with_retries` would otherwise multiply the two
         budgets (the ``3 x 3 = 9`` trap). To prevent that, :func:`with_retries`

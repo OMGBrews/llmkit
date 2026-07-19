@@ -1,7 +1,7 @@
 """The structured / plain-text / streaming LLM call functions.
 
 Every call to :func:`structured_llm_call`, :func:`text_llm_call`, and
-:func:`stream_text_with_log` builds an
+:func:`text_llm_call_stream` builds an
 :class:`~llmkit.logging.LLMCallRecord` (prompt, schema, response,
 duration, resolved model/provider, approximate cost, any provider error)
 and hands it to the configured log sink (see :mod:`llmkit.logging`).
@@ -577,7 +577,7 @@ def text_llm_call_sync(
     )
 
 
-async def stream_text_with_log(
+async def text_llm_call_stream(
     prompt: str | list[Message],
     *,
     feature: str,
@@ -694,7 +694,7 @@ async def stream_text_with_log(
             )
             if would_have_retried:
                 warnings.warn(
-                    f"stream_text_with_log({tag!r}) is nested inside an already-retrying "
+                    f"text_llm_call_stream({tag!r}) is nested inside an already-retrying "
                     + "llmkit retry loop; this inner layer ran a single pass to avoid "
                     + "multiplying retry budgets (the outer loop owns the retries). To "
                     + "drive retries from an outer wrapper around a call function, opt "
@@ -774,6 +774,47 @@ async def stream_text_with_log(
         _retry_active.reset(token)
 
 
+def stream_text_with_log(
+    prompt: str | list[Message],
+    *,
+    feature: str,
+    label: str | None = None,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+) -> AsyncGenerator[str]:
+    """Deprecated alias for :func:`text_llm_call_stream`; removed in llmkit 1.0.
+
+    A plain ``def`` (not ``async def``): ``text_llm_call_stream`` is an
+    async-generator function, so *calling* it returns the async generator
+    without awaiting — a plain ``def`` wrapper therefore preserves
+    ``async for chunk in stream_text_with_log(...)`` exactly, and warns
+    **eagerly at call time** rather than deferring to first iteration.
+    """
+    warnings.warn(
+        "stream_text_with_log() is deprecated; use text_llm_call_stream(). "
+        + "The alias will be removed in llmkit 1.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return text_llm_call_stream(
+        prompt,
+        feature=feature,
+        label=label,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        provider=provider,
+        retry=retry,
+        options=options,
+    )
+
+
 async def _stream_once(
     prompt: str | list[Message],
     *,
@@ -789,7 +830,7 @@ async def _stream_once(
 ) -> AsyncGenerator[str]:
     """One streaming attempt: yield each chunk, log the transcript on close.
 
-    The single-attempt core of :func:`stream_text_with_log` — the retry
+    The single-attempt core of :func:`text_llm_call_stream` — the retry
     loop there wraps this so each attempt writes its own log record (the
     one-attempt-one-log contract `capture_llm_log_paths` relies on). The
     record is honest about *how* the stream ended: a provider error logs
@@ -891,7 +932,7 @@ def _build_text_record(
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
-    Shared by :func:`text_llm_call` and :func:`stream_text_with_log`: the
+    Shared by :func:`text_llm_call` and :func:`text_llm_call_stream`: the
     ``schema`` distinguishes the two surfaces in the log — ``"text"`` for a
     buffered plain-text call, ``"stream"`` for a streamed one — and
     ``response`` is the accumulated text rather than a Pydantic dump

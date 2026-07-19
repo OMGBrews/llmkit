@@ -1,7 +1,7 @@
 """Tests for default-on transient-error retries in the call functions.
 
 The call functions (:func:`structured_llm_call`, :func:`text_llm_call`,
-:func:`stream_text_with_log`) now retry *transient* provider errors on
+:func:`text_llm_call_stream`) now retry *transient* provider errors on
 their own, without the caller wrapping every call. These tests pin that
 contract end-to-end over the patched transport seam:
 
@@ -233,7 +233,7 @@ async def test_text_no_retry_opt_out_runs_single_attempt() -> None:
     assert calls[0] == 1
 
 
-# --- stream_text_with_log ------------------------------------------------
+# --- text_llm_call_stream ------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -256,7 +256,7 @@ async def test_stream_failure_before_first_chunk_is_retried() -> None:
     try:
         with patch("llmkit._litellm.astream_text", _transport):
             chunks = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -290,7 +290,7 @@ async def test_stream_each_attempt_is_its_own_logged_call(tmp_path: Path) -> Non
             capture_llm_log_paths() as paths,
         ):
             chunks = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=_NO_BACKOFF)
+                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -319,7 +319,7 @@ async def test_stream_failure_after_first_chunk_is_not_retried() -> None:
             patch("llmkit._litellm.astream_text", _transport),
             pytest.raises(TimeoutError, match="mid-stream"),
         ):
-            async for chunk in structured_output.stream_text_with_log(
+            async for chunk in structured_output.text_llm_call_stream(
                 "hi", feature="test", retry=_NO_BACKOFF
             ):
                 delivered.append(chunk)
@@ -350,7 +350,7 @@ async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
             pytest.raises(TimeoutError, match="transient"),
         ):
             _ = await _drain(
-                structured_output.stream_text_with_log("hi", feature="test", retry=NO_RETRY)
+                structured_output.text_llm_call_stream("hi", feature="test", retry=NO_RETRY)
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())

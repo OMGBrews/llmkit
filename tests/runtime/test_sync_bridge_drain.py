@@ -291,3 +291,78 @@ def test_shutdown_is_idempotent_and_loop_restarts() -> None:
     sync.shutdown()  # idempotent: must not raise on an already-closed loop
     # The bridge lazily starts a new persistent loop for the next call.
     assert run_sync(_echo(2)) == 2
+
+
+def test_run_sync_racing_shutdown_lands_on_a_fresh_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that races ``shutdown()`` retries onto a fresh persistent loop.
+
+    ``_ensure_loop`` is wrapped so its first call — from inside
+    ``_submit_to_loop``, right after the loop is obtained — triggers
+    ``shutdown()``, reproducing the obtain-then-torn-down race deterministically.
+    With the fix the identity check under ``_lock`` fails, so the caller retries
+    onto a lazily restarted loop and the call completes promptly. Pre-fix it fails
+    fast with ``RuntimeError: Event loop is closed`` (the submit lands on the
+    joined/closed loop); the stopped-but-not-closed 600 s flavour is unreachable
+    deterministically through public seams, and the identity-check design kills
+    both by one mechanism, so this plus the wall-clock bound is the right offline
+    regression.
+    """
+    sync.shutdown()  # start from a known clean slate
+    real_ensure_loop = sync._ensure_loop
+    triggered = {"done": False}
+
+    def _racing_ensure_loop() -> asyncio.AbstractEventLoop:
+        loop = real_ensure_loop()
+        if not triggered["done"]:
+            triggered["done"] = True
+            sync.shutdown()  # race: tear the just-obtained loop down before submit
+        return loop
+
+    monkeypatch.setattr(sync, "_ensure_loop", _racing_ensure_loop)
+
+    async def _ok() -> int:
+        return 42
+
+    start = time.monotonic()
+    assert run_sync(_ok(), timeout=30) == 42
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, f"racing caller took {elapsed:.2f}s — did not restart promptly"
+    sync.shutdown()  # leave the bridge cleanly shut down (restarts lazily)
+
+
+def test_shutdown_cancels_in_flight_call_and_caller_error_is_not_masked() -> None:
+    """A call in flight when ``shutdown()`` runs gets a prompt ``CancelledError``,
+    not a secondary ``RuntimeError`` from the cancel path masking it.
+
+    The caller parks in ``run_sync`` on a long sleep; ``shutdown()`` cancels the
+    task via its drain-and-close sweep. The caller must observe
+    ``asyncio.CancelledError`` — the *type* is the assertion: without the
+    ``contextlib.suppress(RuntimeError)`` hardening on the cancel path, the
+    closed-loop ``call_soon_threadsafe(_cancel)`` raises and masks the real error.
+    """
+    sync.shutdown()  # clean slate
+    started = threading.Event()
+    observed: list[BaseException] = []
+
+    async def _park() -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    def _caller() -> None:
+        try:
+            _ = run_sync(_park(), timeout=30)
+        except BaseException as exc:  # capture the exact type the caller observed
+            observed.append(exc)
+
+    caller = threading.Thread(target=_caller)
+    caller.start()
+    assert started.wait(timeout=2.0), "call never entered the loop"
+    sync.shutdown()
+    caller.join(timeout=5.0)
+    assert not caller.is_alive(), "caller did not unblock after shutdown"
+    assert len(observed) == 1, observed
+    assert isinstance(observed[0], asyncio.CancelledError), (
+        f"expected CancelledError, got {type(observed[0]).__name__}: {observed[0]}"
+    )

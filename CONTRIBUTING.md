@@ -9,7 +9,7 @@ a big change.
 ## Development setup
 
 ```bash
-uv sync --extra dev
+uv sync
 ```
 
 ## Checks must pass
@@ -85,10 +85,11 @@ key: it authenticates through the ambient **AWS credential chain** and needs the
 present, the usual hard-fail rule applies: a missing region
 (`AWS_REGION_NAME`/`AWS_REGION`) or an unresolvable credential chain **fails**
 the test under `--run-live`, exactly like a missing key for any other provider.
-To run it, install the extra and provide AWS credentials plus a region:
+To run it, provide AWS credentials plus a region (`uv sync` already installs the
+`[bedrock]` extra via the `dev` dependency group):
 
 ```bash
-uv sync --extra dev --extra bedrock
+uv sync
 export AWS_REGION_NAME=us-east-1   # plus credentials via the standard AWS chain
 uv run pytest tests/integration --run-live -k bedrock
 ```
@@ -103,7 +104,7 @@ selects the data-residency region, and this test is where the Vertex
 `Mode.JSON_SCHEMA` pin is *measured*:
 
 ```bash
-uv sync --extra dev          # already pulls [vertex]
+uv sync                      # the dev group already pulls [vertex]
 gcloud auth application-default login          # resolvable ADC
 export VERTEXAI_PROJECT=my-gcp-project VERTEXAI_LOCATION=europe-west4
 uv run pytest tests/integration --run-live -k vertex

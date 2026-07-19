@@ -20,8 +20,9 @@ The RPM/TPM tests freeze the monotonic clock (monkeypatching
 ``rate_limiting._now``) so token-bucket refill is deterministic and nothing
 sleeps for real.
 
-The limiter is a process-global; the ``reset_rate_limiter`` autouse fixture
-restores a known default state around every test so nothing leaks.
+The limiter is a process-global; the shared ``reset_rate_limiter`` autouse
+fixture in ``conftest.py`` restores a known default state around every test so
+nothing leaks.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import collections
 import contextlib
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from typing import override
 from unittest.mock import MagicMock, patch
 
@@ -53,21 +54,6 @@ from llmkit.rate_limiting import (
     rate_limit_acquire_sync,
 )
 from tests._support import quiet_logging
-
-
-@pytest.fixture(autouse=True)
-def reset_rate_limiter() -> Iterator[None]:
-    """Reset the process-global limiter to its shipped default around each test.
-
-    The default state is on-by-default with a per-provider cap of 8.
-    ``configure`` also clears the semaphore registries, so no semaphore
-    constructed in one test can leak into the next.
-    """
-    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
-    try:
-        yield
-    finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
 
 
 class _ConcurrencyProbe:
@@ -547,6 +533,47 @@ def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
     assert asyncio.run(_async_peak_under_shared_limit()) == 1
 
 
+def test_cross_population_saturated_throttle_decreases_shared_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-bearing cross-population regression: a background thread holds one
+    *sync* slot while an *async* call throttles. The async gate's own count is
+    1 < 2, but the provider-wide aggregate (sync 1 + async 1) is 2 == the limit,
+    so the shared AIMD limit must drop 2 -> 1. Fails pre-fix, where saturation was
+    judged per gate and the async gate's local 1 < 2 classified the 429 as noise.
+    """
+    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no recovery
+    configure_rate_limit(max_concurrent=2)
+    key = "google"
+    holder_in = threading.Event()
+    release_holder = threading.Event()
+
+    def holder() -> None:
+        with rate_limit_acquire_sync(key):
+            holder_in.set()
+            _ = release_holder.wait(timeout=2.0)
+
+    hthread = threading.Thread(target=holder)
+    hthread.start()
+    assert holder_in.wait(timeout=1.0)  # sync gate in_flight == 1, aggregate == 1
+
+    # An async acquire whose body raises a wrapped 429. Its async gate holds only
+    # 1 (< the limit of 2), but the aggregate is 2 == the limit, so the saturation
+    # judgment fires and halves the SHARED per-provider limit.
+    async def _throttled_async_call() -> None:
+        async with GlobalRateLimiter.acquire_async(key):
+            raise _wrapped_throttle(429)
+
+    with pytest.raises(InstructorRetryException):
+        asyncio.run(_throttled_async_call())
+
+    assert GlobalRateLimiter._adaptive_states[key].limit() == 1
+
+    release_holder.set()
+    hthread.join(timeout=1.0)
+    assert GlobalRateLimiter._get_sync_gate(key)._in_flight == 0
+
+
 def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """A sync acquire that fails *after* the RPM token is deducted but *before* the
     slot is granted refunds the token — the bucket level is restored, mirroring the
@@ -743,14 +770,28 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     configure_rate_limit(max_concurrent=2)
     lock = threading.Lock()
     state: dict[str, int] = {"current": 0, "peak": 0}
+    # A deterministic rendezvous replaces a wall-clock sleep: the first caller
+    # into the transport parks until a *second* is concurrently in flight
+    # (``current == 2``) and sets this event. All fakes share the one persistent
+    # loop, so this asyncio primitive works across them (it binds to that loop on
+    # first use).
+    both_in = asyncio.Event()
 
     async def _fake_acompletion(**_kwargs: object) -> MagicMock:
-        """One faked in-flight provider call: count in, sleep, count out."""
+        """One faked in-flight provider call: count in, rendezvous, count out."""
         with lock:
             state["current"] += 1
             state["peak"] = max(state["peak"], state["current"])
+            if state["current"] == 2:
+                both_in.set()
         try:
-            await asyncio.sleep(0.15)
+            # With cap 2 two callers must overlap, so the first waits here until
+            # the second arrives — making ``peak == 2`` exact-and-safe and faster
+            # than a real sleep. A cap regression to 1 never reaches two in flight,
+            # so ``both_in`` is never set and this ``wait_for`` times out, failing
+            # the test loudly (the bare ``<= 2`` a relaxation would leave also
+            # passes when the fan-out never overlapped — the flaw this avoids).
+            _ = await asyncio.wait_for(both_in.wait(), timeout=5)
         finally:
             with lock:
                 state["current"] -= 1

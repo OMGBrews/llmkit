@@ -112,7 +112,7 @@ def test_text_default_path_builds_provider_once() -> None:
 
 def test_stream_default_path_builds_provider_once() -> None:
     async def _drive() -> list[str]:
-        return [chunk async for chunk in structured_output.stream_text_with_log("hi", feature="x")]
+        return [chunk async for chunk in structured_output.text_llm_call_stream("hi", feature="x")]
 
     with _count_builds() as build, _patch_stream_seam():
         chunks = asyncio.run(_drive())

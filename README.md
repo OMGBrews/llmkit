@@ -91,7 +91,11 @@ The public call surface:
 | `structured_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `text_llm_call_sync(...)` | Synchronous wrapper around the above |
-| `stream_text_with_log(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
+| `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
+
+> **Deprecated alias.** `stream_text_with_log` is the old name for
+> `text_llm_call_stream`; it still works (same signature and behaviour) but
+> warns `DeprecationWarning` and is removed in 1.0. Switch the call.
 
 > **Two defaults worth knowing up front.**
 > - **`temperature` defaults to `0.2`** — biased toward deterministic output. A *creative* caller must override it explicitly (e.g. `temperature=1.0`); it is otherwise quietly conservative.
@@ -99,7 +103,7 @@ The public call surface:
 
 ### Reusing call options
 
-The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `stream_text_with_log`) take up to nine keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
+The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) take up to nine keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
 from llmkit import LLMCallOptions, structured_llm_call
@@ -419,7 +423,7 @@ Sink I/O never runs on the event loop: writes are offloaded to a worker thread (
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `stream_text_with_log`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
 **`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
 
@@ -662,7 +666,7 @@ Routing stays on for the config-driven path (`configure_llm_client` /
 
 Two retry layers, kept deliberately separate:
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `stream_text_with_log`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
   - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
   - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget — never retried**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, so the fix is legible from the error alone: `completion_tokens` at a cap you set means *raise the cap*; a huge count under no cap means *the prompt induces runaway output*. A caller that genuinely wants the resample can opt back in by listing `OutputLimitError` explicitly in `retry_on`.
@@ -693,7 +697,7 @@ Two retry layers, kept deliberately separate:
   )
   ```
 
-  **Streaming caveat:** `stream_text_with_log` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
+  **Streaming caveat:** `text_llm_call_stream` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
 
   **`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**); the previously-deprecated `max_retries` alias has been removed outright, so passing it now raises `TypeError`. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
 
@@ -743,7 +747,7 @@ The re-roll is charged against the **validation budget** (`RetryPolicy.validatio
 ## Development
 
 ```bash
-uv sync --extra dev
+uv sync
 uv run ruff check . && uv run ruff format --check .
 uv run basedpyright          # recommended tier; clean with no baseline
 uv run pytest

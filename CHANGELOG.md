@@ -46,6 +46,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `properties` (both would build a zero-field model that rejects every
   response), unless `additionalProperties: true` is set.
 
+- **`stream_text_with_log` is renamed to `text_llm_call_stream`.** The streaming
+  call function now matches the `<shape>_llm_call[_sync|_stream]` grammar the
+  other call functions follow (so `grep -r llm_call` finds the whole call
+  surface); its old `with_log` suffix was noise (every call function logs). The
+  old name stays as a deprecated alias through the pre-1.0 window (see
+  **Deprecated**). **Migration:** rename `stream_text_with_log(...)` →
+  `text_llm_call_stream(...)` — identical signature and behaviour.
+
+- **The Python floor is lowered to 3.12, and the tested-platform surface is
+  widened.** `requires-python` is now `>=3.12` (was `>=3.13`): every idiom the
+  library uses — PEP 695 generics, `StrEnum`, `match`/`assert_never` — is fully
+  available on 3.12, so the floor now sits at the lowest version that supports
+  them, verified by CI. CI runs a matrix (3.12/3.13/3.14 on Linux plus one macOS
+  and one Windows cell) so the `OS Independent` classifier is actually exercised,
+  not just claimed. **Migration:** none — a strict superset of previously
+  supported environments.
+
+- **The public `dev` extra is removed; dev tooling is now a PEP 735 dependency
+  group.** The maintainer toolchain (pytest, ruff, basedpyright) no longer ships
+  as a public `omg-llmkit[dev]` extra — it moved to a `[dependency-groups]` entry
+  that never lands in the wheel/sdist metadata, taking it off the published
+  install surface. `uv sync` installs it by default. **Migration:** `pip install
+  'omg-llmkit[dev]'` no longer resolves the tooling (it warns and installs core
+  only); contributors use `uv sync`.
+
+- **AIMD saturation is judged on the provider-wide in-flight aggregate, not one
+  gate's local count.** The adaptive rate limiter decides whether a 429/503/529
+  should halve a provider's concurrency limit by asking "were we at the shared
+  limit?" — now measured across *every* population (each per-loop async gate plus
+  the sync gate) rather than the single gate the throttled call sat on. A
+  self-inflicted throttle in the multi-population regime (e.g. a host's own loop
+  and llmkit's persistent sync loop together over the limit) now triggers a
+  decrease it previously missed. Single-population workloads are byte-identical
+  and admission caps are unchanged (still per-population); multi-population
+  workloads may see legitimate `"throttle"` backpressure events they never got
+  before, still bounded to one halving per cooldown.
+
+### Deprecated
+
+- **`stream_text_with_log` is a deprecated alias for `text_llm_call_stream`,
+  removed in 1.0.** Calling it warns `DeprecationWarning` (eagerly, at call time)
+  and otherwise behaves identically — same signature, same streamed chunks.
+  Switch the call; the alias exists only to spare a hard break mid-cycle.
+
 ### Security
 
 - **`LLMClientConfig` no longer leaks `api_key` in its `repr`.** The frozen
@@ -81,6 +125,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default *and* setting the same field on `options` previously got the options
   value; they now get their explicit keyword. Code introspecting call-function
   signatures sees `float | Unset = UNSET`-style defaults.
+
+- **A `run_sync` caller racing `shutdown()` no longer hangs or raises.** When a
+  sync call obtained the persistent event loop just as `shutdown()` tore it down,
+  the submit could land on a stopped loop (the caller blocked for the full
+  timeout — 600 s by default — with the coroutine leaked) or a closed one (a
+  spurious `RuntimeError`). Obtaining the loop and submitting to it are now atomic
+  against `shutdown()`, so a racing caller transparently retries onto a lazily
+  restarted loop; a call genuinely in flight at shutdown still gets a prompt
+  `asyncio.CancelledError`, no longer maskable by a secondary `RuntimeError` from
+  the cancel path.
 
 ### Added
 

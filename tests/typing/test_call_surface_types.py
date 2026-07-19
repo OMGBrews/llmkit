@@ -26,10 +26,10 @@ import llmkit
 from llmkit import (
     Message,
     ReasoningEffort,
-    stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
+    text_llm_call_stream,
     text_llm_call_sync,
 )
 
@@ -70,7 +70,7 @@ async def _typecheck_prompt_accepts_valid_shapes() -> None:
     _ = await text_llm_call(multimodal, feature="t")
 
     # Streaming takes the same prompt shapes and keeps its generator return type.
-    _ = assert_type(stream_text_with_log(msgs, feature="t"), AsyncGenerator[str])
+    _ = assert_type(text_llm_call_stream(msgs, feature="t"), AsyncGenerator[str])
 
 
 async def _typecheck_reasoning_effort_accepts_values() -> None:
