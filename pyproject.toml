@@ -18,8 +18,7 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    # 3.14 is exercised by the CI `check` matrix; add its classifier once that
-    # cell is confirmed green (never claim a platform CI hasn't proven).
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
