@@ -14,17 +14,21 @@ Two budgets, kept separate: *transport* failures (rate limits, transient
 *schema-validation* failures get the lower
 :attr:`RetryPolicy.validation_max_attempts` budget, so a deterministic schema
 failure can't burn the full transport budget on doomed re-asks. A third class
-gets **zero budget**: an output-limit truncation
-(:class:`~llmkit.exceptions.OutputLimitError`) propagates immediately under
-every configuration — including ``retry_on=None`` — because a re-ask with an
-identical token budget can only truncate again; only a ``retry_on`` that
-explicitly lists the type opts back in.
+gets **zero budget** under every configuration — including ``retry_on=None``:
+an open circuit (:class:`~llmkit.exceptions.CircuitOpenError`) must never be
+re-asked, because the breaker already knows the provider is down, and an
+output-limit truncation (:class:`~llmkit.exceptions.OutputLimitError`) re-asked
+with an identical token budget can only truncate again; only a ``retry_on``
+that explicitly lists the type opts back in.
 
 Composing :func:`with_retries` around a call function that *already* retries
 (every call function does, by default) would otherwise multiply the budgets
-(the ``3 x 3 = 9`` trap). A context variable marks an active llmkit retry
-loop, so the outer :func:`with_retries` detects the inner policy and runs a
-single pass instead of multiplying — see :func:`with_retries`.
+(the ``3 x 3 = 9`` trap). A context variable marks the active llmkit retry loop
+by the task that owns it, so an inner :func:`with_retries` reached in the
+*same* task detects the outer policy and runs a single pass instead of
+multiplying — while a *distinct* call in its own task (spawned via
+``create_task`` or driven across the sync bridge) keeps its own budget. See
+:func:`with_retries`.
 """
 
 import asyncio
@@ -37,11 +41,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, cast
+from typing import Protocol, cast, final
 
 import httpx
 
 from llmkit.exceptions import (
+    LLM_BACKPRESSURE_ERRORS,
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
@@ -169,6 +174,16 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
 _SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = REPAIRABLE_PARSE_ERRORS
 
 
+# Zero-budget fail-fast signals: retried on neither budget under every
+# configuration, including retry_on=None. Backpressure (an open circuit must
+# never be re-asked) and output-limit truncation (an identical token budget
+# can only truncate again). An explicit retry_on listing the type opts back in.
+_ZERO_BUDGET_ERRORS: tuple[type[Exception], ...] = (
+    *LLM_OUTPUT_LIMIT_ERRORS,
+    *LLM_BACKPRESSURE_ERRORS,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """The transient-error retry budget a call function applies by default.
@@ -193,12 +208,15 @@ class RetryPolicy:
     whichever budget matches its class, and the call stops when *that*
     budget is spent.
 
-    **One class gets zero budget.** An output-limit truncation
+    **Two classes get zero budget.** An output-limit truncation
     (:class:`~llmkit.exceptions.OutputLimitError`, ``finish_reason='length'``)
-    is retried on *neither* budget and propagates immediately: a re-ask with
-    an identical token budget can only truncate again, so neither a fresh
-    connection nor a schema repair can help. Listing the type explicitly in
-    ``retry_on`` opts back in.
+    and an open-circuit backpressure signal
+    (:class:`~llmkit.exceptions.CircuitOpenError`) are retried on *neither*
+    budget and propagate immediately, under every configuration including
+    ``retry_on=None``: a re-ask with an identical token budget can only
+    truncate again, and the breaker already knows the provider is down, so
+    neither a fresh connection nor a schema repair can help. Listing the type
+    explicitly in ``retry_on`` opts back in.
 
     This layer is kept deliberately separate from instructor's in-call
     schema-repair budget (two attempts total, i.e. one schema-repair re-ask
@@ -293,14 +311,47 @@ DEFAULT_RETRY_POLICY = RetryPolicy()
 NO_RETRY = RetryPolicy(max_attempts=1, validation_max_attempts=1)
 
 
-#: Marks "an llmkit retry loop is active in this dynamic scope." Set by
-#: :func:`with_retries` while it runs, so a *nested* :func:`with_retries`
-#: (the classic case: a host wrapping a call function that already retries)
-#: detects the active inner policy and runs a single pass instead of
-#: multiplying the budgets (the ``3 x 3 = 9`` trap).
-_retry_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_llmkit_retry_active", default=False
+@final
+class _RetryScope:
+    """Identity of one running llmkit retry loop: the task that owns it.
+
+    :func:`with_retries` (and the streaming loop in
+    :mod:`llmkit.structured_output`) installs one of these while it runs, so a
+    *nested* retry loop reached **in the same task** — the classic ``3 x 3 = 9``
+    trap of a host wrapping a call function that already retries — detects the
+    active policy and runs a single pass. Binding the scope to
+    :func:`asyncio.current_task` is what keeps a *distinct* call that merely
+    inherited the context across a task boundary (``create_task`` copies it; the
+    sync bridge captures ``copy_context()`` onto a new task) from wrongly
+    collapsing: it runs in its own task, so it keeps its own retry budget.
+    """
+
+    __slots__ = ("task",)
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task[object] | None = asyncio.current_task()
+
+
+#: Identifies the llmkit retry loop active in this dynamic scope by the task
+#: that owns it (``None`` when no loop is active). Set by :func:`with_retries`
+#: while it runs; read through :func:`_in_active_retry_scope` so the collapse
+#: only fires for a nested loop in the *owning* task, not an unrelated call that
+#: inherited the context across a task boundary (the ``3 x 3 = 9`` trap guard).
+_retry_scope: contextvars.ContextVar[_RetryScope | None] = contextvars.ContextVar(
+    "_llmkit_retry_scope", default=None
 )
+
+
+def _in_active_retry_scope() -> bool:
+    """True when an llmkit retry loop is active in this scope AND owned by the
+    current task.
+
+    A scope inherited across a task boundary (``create_task`` / the sync bridge
+    copy the context into a NEW task) does not count: a distinct call in its own
+    task keeps its own retries. Only meaningful when called from a running loop.
+    """
+    scope = _retry_scope.get()
+    return scope is not None and scope.task is asyncio.current_task()
 
 
 class RetryProgressCallback(Protocol):
@@ -481,7 +532,11 @@ async def with_retries[T](
             (:class:`~llmkit.exceptions.OutputLimitError`) likewise propagates
             immediately even with ``retry_on=None`` — an identical token
             budget can only truncate again — unless ``retry_on`` explicitly
-            lists the type.
+            lists the type. A bare
+            :class:`~llmkit.exceptions.CircuitOpenError` fails fast the same
+            way under every configuration — the breaker already knows the
+            provider is down, so re-asking an open circuit is pointless —
+            unless ``retry_on`` explicitly lists the type.
         validation_max_attempts: Total number of *schema-validation*
             attempts (1 = no retry). When set together with
             ``validation_retry_on``, failures matching that tuple are charged
@@ -506,12 +561,23 @@ async def with_retries[T](
     tag = label or "retry"
 
     # Nested-retry guard: if an llmkit retry loop is already active in this
-    # dynamic scope (the classic case: a host wrapped a call function that
-    # already retries internally), this inner layer collapses to a single pass
-    # so the two budgets don't multiply (the 3 x 3 = 9 trap). The outer,
-    # already-running loop owns the retries. The accidental double-wrap warns
-    # (deduped by the default warning filter); an explicit NO_RETRY inner does not.
-    if _retry_active.get():
+    # task (the classic case: a host wrapped a call function that already
+    # retries internally, awaited inline in the same task), this inner layer
+    # collapses to a single pass so the two budgets don't multiply (the
+    # 3 x 3 = 9 trap). The outer, already-running loop owns the retries. The
+    # scope is keyed on the owning task, so a *distinct* call that only
+    # inherited the context across a task boundary (create_task / the sync
+    # bridge, each copying the context into a NEW task) is NOT collapsed — it
+    # keeps its own retry budget. Accepted, documented edges of the
+    # task-identity check: a distinct call *directly awaited in the same task*
+    # inside ``fn`` still collapses (its exception genuinely propagates to this
+    # outer loop, so un-collapsing would recreate real multiplication — the
+    # RuntimeWarning signals it and NO_RETRY is the escape); an
+    # ``asyncio.current_task()`` of None in an exotic harness reproduces today's
+    # collapse; and a same-task ``copy_context().run(...)`` still collapses. The
+    # accidental double-wrap warns (deduped by the default warning filter); an
+    # explicit NO_RETRY inner does not.
+    if _in_active_retry_scope():
         # Only the *accidental* double-wrap is worth warning about: an inner
         # layer that would itself have retried (budget > 1). When the inner is
         # already a single pass — e.g. retry=NO_RETRY, the documented way to
@@ -539,7 +605,7 @@ async def with_retries[T](
     transport_attempt = 0
     validation_attempt = 0
 
-    token = _retry_active.set(True)
+    token = _retry_scope.set(_RetryScope())
     try:
         while True:
             try:
@@ -553,18 +619,22 @@ async def with_retries[T](
                 # wrapped schema failure (or an inner error in neither set)
                 # still falls through to the validation budget below.
                 cause = underlying_provider_error(e)
-                # Output-limit truncations are permanent under every
+                # Zero-budget fail-fast signals are permanent under every
                 # configuration, including retry_on=None ("retry on any
-                # Exception"): a truncated generation retried with an identical
-                # token budget can only truncate again, so without this guard
-                # the bare OutputLimitError would fall into the retry-anything
-                # branch below and burn the full transport budget on doomed
-                # re-asks. Checked on the unwrapped cause for defense in depth
-                # (the transport raises it bare today; a wrapped form would
-                # also fail fast via wraps_permanent_cause below). A retry_on
-                # that explicitly lists the type still wins, matching the
-                # wraps_permanent_cause escape.
-                if isinstance(cause, LLM_OUTPUT_LIMIT_ERRORS) and (
+                # Exception"): an open circuit
+                # (:class:`~llmkit.exceptions.CircuitOpenError`) must never be
+                # re-asked — the breaker already knows the provider is down —
+                # and an output-limit truncation retried with an identical
+                # token budget can only truncate again. Without this guard the
+                # bare CircuitOpenError / OutputLimitError would fall into the
+                # retry-anything branch below and burn the full transport
+                # budget on doomed re-asks. Checked on the unwrapped cause for
+                # defense in depth (the transport raises them bare today; a
+                # wrapped form would also fail fast via wraps_permanent_cause
+                # below — the wrapped CircuitOpenError is already caught there).
+                # A retry_on that explicitly lists the type still wins, matching
+                # the wraps_permanent_cause escape.
+                if isinstance(cause, _ZERO_BUDGET_ERRORS) and (
                     retry_on is None or not isinstance(e, retry_on)
                 ):
                     raise
@@ -628,4 +698,4 @@ async def with_retries[T](
                     logger.error("%s: all %d attempts failed: %s", tag, budget, e)
                     raise
     finally:
-        _retry_active.reset(token)
+        _retry_scope.reset(token)

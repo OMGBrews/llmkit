@@ -68,7 +68,7 @@ from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
 )
 from llmkit.retry import with_retries
-from tests._support import OkSchema, capture_structured_provider_kwargs
+from tests._support import OkSchema, capture_structured_provider_kwargs, quiet_logging
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
 
@@ -588,6 +588,126 @@ async def test_with_retries_around_bare_awaitable_still_retries() -> None:
 
     assert result == "ok"
     assert calls[0] == 3
+
+
+# --- nested-retry guard is tied to the owning task ------------------------
+
+
+@pytest.mark.asyncio
+async def test_task_spawned_inside_attempt_keeps_its_own_retries() -> None:
+    """A distinct call spawned via ``create_task`` from inside a retry attempt
+    keeps its own full retry budget. ``create_task`` copies the context into a
+    *new* task, so the inherited retry scope — keyed on the owning task — no
+    longer collapses the spawned call. Its exceptions settle on the spawned task
+    (never reaching the outer ``except``), so there is nothing to multiply and
+    no ``RuntimeWarning`` fires. Fails pre-fix: the inherited bare flag forced a
+    single inner pass (which then warned and lost its retries)."""
+    inner_calls = [0]
+    outer_calls = [0]
+
+    async def _inner() -> str:
+        inner_calls[0] += 1
+        if inner_calls[0] < 3:
+            raise TimeoutError("transient")
+        return "ok"
+
+    async def _outer() -> str:
+        outer_calls[0] += 1
+        task = asyncio.create_task(with_retries(_inner, max_attempts=3, retry_on=(TimeoutError,)))
+        return await task
+
+    with warnings.catch_warnings():
+        # A spurious nested-guard RuntimeWarning on this path would fail the test.
+        warnings.simplefilter("error", RuntimeWarning)
+        result = await with_retries(_outer, max_attempts=2, retry_on=(TimeoutError,))
+
+    assert result == "ok"
+    assert inner_calls[0] == 3  # inner kept its own budget, not collapsed to 1
+    assert outer_calls[0] == 1  # outer succeeded on its first pass
+
+
+@pytest.mark.asyncio
+async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() -> None:
+    """A sync-bridge call from inside an ``on_result`` hook keeps its own retry
+    budget. The hook runs synchronously inside the outer attempt, but
+    ``text_llm_call_sync`` drives its coroutine on llmkit's *persistent* loop —
+    a distinct task — so the inherited scope no longer collapses it. Pre-fix the
+    inherited flag forced a single inner pass, whose transient failure then
+    burned the *outer* loop's budget, re-running the expensive main call until
+    the inner happened to succeed (``outer_calls == 3``) and warning each time.
+    Post-fix the outer call runs exactly once, the inner keeps its full
+    transport budget, and the nested-retry guard never fires.
+
+    Warnings are recorded rather than raised-as-errors here on purpose: the
+    warn happens on the persistent loop's daemon thread, and letting it raise
+    would abort the very first outer pass (masking the ``outer_calls == 3``
+    discriminator). ``outer_calls`` is the discriminating assertion; the
+    recorded-warning check is the direct read of "no nested-retry warning"."""
+    outer_calls = [0]
+    inner_calls = [0]
+
+    async def _outer_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+        outer_calls[0] += 1
+        return OkSchema(ok=True), None
+
+    async def _inner_transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+        inner_calls[0] += 1
+        if inner_calls[0] < 3:
+            raise TimeoutError("transient")
+        return "done", None
+
+    def hook(_result: OkSchema) -> None:
+        _ = structured_output.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with (
+            quiet_logging(),
+            patch("llmkit._litellm.acompletion_structured", side_effect=_outer_transport),
+            patch("llmkit._litellm.acompletion_text", side_effect=_inner_transport),
+        ):
+            result = await structured_output.structured_llm_call(
+                "hi", OkSchema, feature="outer", retry=_NO_BACKOFF, on_result=hook
+            )
+
+    assert result.ok is True
+    assert outer_calls[0] == 1  # the discriminating assertion (pre-fix: 3, outer budget burned)
+    assert inner_calls[0] == 3  # inner kept its own transport budget
+    nested = [
+        w for w in caught if issubclass(w.category, RuntimeWarning) and "nested" in str(w.message)
+    ]
+    assert nested == []  # the guard never collapsed the distinct cross-bridge call
+
+
+@pytest.mark.asyncio
+async def test_directly_awaited_nested_with_retries_still_collapses_same_task() -> None:
+    """The deliberately-preserved edge: a nested ``with_retries`` awaited *inline
+    in the same task* still collapses to a single pass and warns — its failure
+    genuinely propagates to the outer loop, so un-collapsing would recreate the
+    real 3 x 3 multiplication. This is the accepted same-task boundary of the
+    task-identity guard, unchanged by the fix."""
+    inner_calls = [0]
+    outer_calls = [0]
+
+    async def _inner() -> str:
+        inner_calls[0] += 1
+        raise TimeoutError("always")
+
+    async def _outer() -> str:
+        outer_calls[0] += 1
+        # Directly awaited in the same task: the guard collapses it to one pass.
+        return await with_retries(_inner, max_attempts=3, retry_on=(TimeoutError,))
+
+    with (
+        pytest.warns(RuntimeWarning, match="nested"),
+        pytest.raises(TimeoutError, match="always"),
+    ):
+        _ = await with_retries(_outer, max_attempts=2, retry_on=(TimeoutError,))
+
+    # Inner collapsed to one pass per outer attempt; outer budget 2 -> 2 total,
+    # NOT 6 (2 x 3). The same-task collapse is preserved.
+    assert inner_calls[0] == 2
+    assert outer_calls[0] == 2
 
 
 # --- validation split: lower budget for schema-validation failures --------

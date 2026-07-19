@@ -102,6 +102,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`with_retries` no longer re-asks an open circuit under its default
+  `retry_on=None`.** A bare `CircuitOpenError` (raised by the opt-in circuit
+  breaker) fell through the "retry on any Exception" default and was charged
+  the full transport budget — violating the documented "never re-ask a circuit
+  the breaker already knows is open" contract (harmless in load terms, since
+  the breaker rejects each retry locally, but a contract break). It is now a
+  zero-budget fail-fast signal alongside `OutputLimitError`: never retried
+  under any configuration, unless a caller explicitly lists the type in
+  `retry_on` (an explicit opt-in still wins). Only direct `with_retries`
+  callers using the `retry_on=None` default were affected; the call functions
+  (`RetryPolicy.retry_on` is never `None`) already failed fast. The wrapped
+  form (`InstructorRetryException(CircuitOpenError)`) already failed fast and
+  is unchanged.
+
+- **A distinct llmkit call reached across a task boundary from inside a retry
+  attempt now keeps its own retry budget.** The nested-retry guard (which
+  collapses the `3 x 3 = 9` double-wrap trap to a single pass) was a bare
+  context-variable flag, and context variables are copied into new tasks and
+  across the sync bridge — so an `on_result` hook calling `text_llm_call_sync`,
+  or a task spawned via `asyncio.create_task` from inside an attempt, silently
+  lost its retries and fired a spurious `RuntimeWarning`. In the hook case that
+  inherited single pass then burned the *outer* loop's budget, re-running the
+  expensive main call. The guard is now keyed on the owning `asyncio` task, so
+  a distinct call in its own task keeps its full budget and warns no more;
+  same-task nesting (a call directly awaited inside the wrapped function) still
+  collapses and warns exactly as before. **Compatibility note:** hosts that
+  relied on the collapsed behaviour of such cross-task calls may now see more
+  real attempts — the documented per-call retry contract restored.
+
 - **A `$def`'s `description` now survives a nullable-wrapped or chained `$ref`.**
   `model_from_json_schema` rescued a `$ref` target's model-facing `description`
   only for a bare top-level `$ref`, so wrapping it in `anyOf`+`null` (a nullable

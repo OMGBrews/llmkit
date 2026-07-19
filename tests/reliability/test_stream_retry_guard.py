@@ -1,6 +1,6 @@
 """Tests for the streaming nested-retry guard.
 
-``text_llm_call_stream`` participates in the same ``_retry_active`` guard as
+``text_llm_call_stream`` participates in the same ``_retry_scope`` guard as
 :func:`with_retries`, so a host wrapping stream consumption in an outer llmkit
 retry loop (the documented composable path, since mid-stream errors propagate
 unretried) does not multiply the two budgets. These pin:
@@ -24,7 +24,7 @@ from unittest.mock import patch
 import pytest
 
 from llmkit import NO_RETRY, RetryPolicy, structured_output
-from llmkit.retry import _retry_active, with_retries
+from llmkit.retry import _retry_scope, _RetryScope, with_retries
 from tests._support import quiet_logging
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
@@ -160,7 +160,7 @@ async def test_stream_retries_normally_without_outer_loop() -> None:
     assert chunks == ["he", "llo"]
     assert calls[0] == 2
     # The loop's own guard flag was reset on completion.
-    assert _retry_active.get() is False
+    assert _retry_scope.get() is None
 
 
 @pytest.mark.asyncio
@@ -185,7 +185,7 @@ async def test_stream_exhausts_full_budget_without_outer_loop() -> None:
         )
 
     assert calls[0] == 3
-    assert _retry_active.get() is False
+    assert _retry_scope.get() is None
 
 
 # --- the guard flag never leaks into the consumer's context ----------------
@@ -201,15 +201,15 @@ async def test_guard_flag_not_visible_to_consumer_between_chunks() -> None:
         for delta in ("he", "llo"):
             yield delta
 
-    seen_between_chunks: list[bool] = []
+    seen_between_chunks: list[_RetryScope | None] = []
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
         async for _chunk in structured_output.text_llm_call_stream(
             "hi", feature="test", retry=_NO_BACKOFF
         ):
-            seen_between_chunks.append(_retry_active.get())
+            seen_between_chunks.append(_retry_scope.get())
 
-    assert seen_between_chunks == [False, False]
-    assert _retry_active.get() is False
+    assert seen_between_chunks == [None, None]
+    assert _retry_scope.get() is None
 
 
 @pytest.mark.asyncio
@@ -227,7 +227,7 @@ async def test_guard_flag_clear_after_early_break() -> None:
         stream = structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         async for _chunk in stream:
             break
-        assert _retry_active.get() is False
+        assert _retry_scope.get() is None
         await stream.aclose()
 
-    assert _retry_active.get() is False
+    assert _retry_scope.get() is None

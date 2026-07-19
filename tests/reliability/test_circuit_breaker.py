@@ -17,8 +17,10 @@ work when a provider is *down* — the ``0.4.0`` follow-on to adaptive concurren
   reverts to OPEN and refunds its RPM token, so the breaker never wedges;
 * per-provider isolation, the breaker being one object shared across event loops
   (single process-wide probe), and ``breaker=False`` being a complete no-op;
-* ``CircuitOpenError`` is **not** retried by ``with_retries``, the structured
-  call function, or the streaming loop.
+* ``CircuitOpenError`` is **not** retried by ``with_retries`` — not even under
+  its ``retry_on=None`` default, whether the error arrives bare or wrapped in
+  ``InstructorRetryException`` — the structured call function, or the streaming
+  loop; an explicit ``retry_on`` listing the type still opts back in.
 
 Clock-driven state reads ``rate_limiting._now`` (monkeypatched) so the cooldown
 is deterministic and nothing sleeps for real.
@@ -447,6 +449,59 @@ async def test_circuit_open_error_not_retried_by_with_retries() -> None:
             validation_max_attempts=2,
             validation_retry_on=LLM_SCHEMA_ERRORS,
         )
+    assert calls[0] == 1
+
+
+async def test_with_retries_retry_on_none_does_not_retry_circuit_open_error() -> None:
+    """The regression test for the bare-``CircuitOpenError`` hole: with the
+    documented default ``retry_on=None`` ("retry on any Exception"),
+    ``with_retries`` must still fail fast on a bare ``CircuitOpenError`` —
+    re-asking a circuit the breaker already knows is open would defeat its
+    purpose. Fails pre-fix with ``calls[0] == 3`` (charged to the transport
+    budget); passes with the zero-budget carve-out."""
+    calls = [0]
+
+    async def fn() -> None:
+        calls[0] += 1
+        raise CircuitOpenError("openai")
+
+    with pytest.raises(CircuitOpenError):
+        _ = await with_retries(fn, max_attempts=3)
+    assert calls[0] == 1
+
+
+async def test_with_retries_explicit_opt_in_still_retries_circuit_open_error() -> None:
+    """A caller that explicitly lists the type in ``retry_on`` gets its retries:
+    the fail-fast is a default, not a prohibition (the ``OutputLimitError``
+    precedent). ``max_attempts=2`` -> two attempts."""
+    calls = [0]
+
+    async def fn() -> None:
+        calls[0] += 1
+        raise CircuitOpenError("openai")
+
+    with pytest.raises(CircuitOpenError):
+        _ = await with_retries(fn, max_attempts=2, retry_on=(CircuitOpenError,))
+    assert calls[0] == 2
+
+
+async def test_with_retries_retry_on_none_wrapped_circuit_open_fails_fast() -> None:
+    """A ``CircuitOpenError`` wrapped in ``InstructorRetryException`` fails fast
+    under ``retry_on=None`` — one attempt. This pins the *wrapped form's*
+    fail-fast behaviour, not which guard owns it: both the zero-budget carve-out
+    and the pre-existing ``wraps_permanent_cause`` guard (a wrapped cause that is
+    neither transport- nor schema-shaped) catch it, so it passed before this
+    change too and stays green as a regression guard on the wrapped path. The
+    *bare*-``CircuitOpenError`` test above is the discriminating regression for
+    the new carve-out (it fails pre-fix with ``calls == 3``)."""
+    calls = [0]
+
+    async def fn() -> None:
+        calls[0] += 1
+        raise InstructorRetryException(CircuitOpenError("openai"), n_attempts=1, total_usage=0)
+
+    with pytest.raises(InstructorRetryException):
+        _ = await with_retries(fn, max_attempts=3, retry_on=None, validation_max_attempts=2)
     assert calls[0] == 1
 
 
