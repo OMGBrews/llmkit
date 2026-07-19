@@ -44,7 +44,9 @@ from llmkit.rate_limiting import (
 )
 from llmkit.retry import (
     RetryPolicy,
-    _retry_active,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
+    _in_active_retry_scope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
+    _retry_scope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
+    _RetryScope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
     handle_retry_failure,
     with_retries,
 )
@@ -228,7 +230,7 @@ async def structured_llm_call[T: BaseModel](
     # ``call_id`` instead of feature + timestamp proximity. Deliberately
     # closure state, not a ContextVar: this coroutine runs entirely inside
     # one task, and closures cannot leak into a consumer's context the way
-    # generator-set ContextVars do (see ``_retry_active`` in the stream path).
+    # generator-set ContextVars do (see ``_retry_scope`` in the stream path).
     call_id = uuid.uuid4().hex
     attempt_count = 0
 
@@ -651,7 +653,7 @@ async def text_llm_call_stream(
     # async generator's body runs in its *consumer's* context, so a
     # ContextVar set here would leak the stream's identity into the
     # consumer's own llmkit calls between chunks (the exact hazard the
-    # ``_retry_active`` reset-around-every-yield dance below exists to solve).
+    # ``_retry_scope`` reset-around-every-yield dance below exists to solve).
     call_id = uuid.uuid4().hex
 
     # Nested-retry guard, mirroring ``with_retries``: when an outer llmkit
@@ -660,8 +662,10 @@ async def text_llm_call_stream(
     # unretried), this loop collapses to a single pass so the budgets don't
     # multiply (the 3 x 3 = 9 trap). The accidental double-wrap — a failure
     # this policy *would* have retried — warns; an explicit NO_RETRY inner
-    # stays silent.
-    if _retry_active.get():
+    # stays silent. Keyed on the owning task (see ``_in_active_retry_scope``):
+    # a distinct call that only inherited the context across a task boundary is
+    # not collapsed.
+    if _in_active_retry_scope():
         yielded_any = False
         try:
             # ``aclosing`` so an abandoning consumer's close propagates to the
@@ -704,13 +708,16 @@ async def text_llm_call_stream(
                 )
             raise
 
-    # Mark this loop active so a nested llmkit retry layer collapses to a
-    # single pass, exactly as ``with_retries`` does. An async generator body
-    # runs in its *consumer's* context, so the flag is released around each
-    # ``yield`` (and re-armed on resume): holding it across a suspension would
-    # leak it into the consumer's own llmkit calls between chunks — and, on an
-    # early break, leave it set in their context for good.
-    token = _retry_active.set(True)
+    # Mark this loop active (keyed on the owning task) so a nested llmkit retry
+    # layer in the same task collapses to a single pass, exactly as
+    # ``with_retries`` does. An async generator body runs in its *consumer's*
+    # context, so the scope is released around each ``yield`` (and re-armed on
+    # resume): holding it across a suspension would leak it into the consumer's
+    # own llmkit calls between chunks — and, on an early break, leave it set in
+    # their context for good. A generator can resume in a *different* task than
+    # the one it suspended in, so each re-arm installs a fresh ``_RetryScope``
+    # bound to the task resuming it.
+    token = _retry_scope.set(_RetryScope())
     try:
         for attempt in range(1, retry.max_attempts + 1):
             yielded_any = False
@@ -735,11 +742,11 @@ async def text_llm_call_stream(
                 ) as attempt_stream:
                     async for chunk in attempt_stream:
                         yielded_any = True
-                        _retry_active.reset(token)
+                        _retry_scope.reset(token)
                         try:
                             yield chunk
                         finally:
-                            token = _retry_active.set(True)
+                            token = _retry_scope.set(_RetryScope())
                 return
             except Exception as exc:
                 # A partially-consumed stream can't be restarted, and only the
@@ -771,7 +778,7 @@ async def text_llm_call_stream(
                     retry_after_cap=retry.retry_after_cap,
                 )
     finally:
-        _retry_active.reset(token)
+        _retry_scope.reset(token)
 
 
 def stream_text_with_log(

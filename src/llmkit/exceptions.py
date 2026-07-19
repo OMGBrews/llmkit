@@ -32,9 +32,12 @@ The recoverable set is split into four subsets the retry layer budgets
   breaker while it is open). It is recoverable in the catch-set sense — a host
   that degrades on ``LLM_RECOVERABLE_ERRORS`` keeps catching it (a fast
   fallback) instead of crashing on a new uncaught type — but it is deliberately
-  **not** retried: it lives outside the transport set, so ``with_retries`` and
-  the streaming loop (which key off the transport/schema subsets, never the
-  union) never re-ask a circuit the breaker already knows is open.
+  **not** retried under any configuration: it lives outside the transport set,
+  and ``with_retries`` additionally carves it out as a zero-budget fail-fast
+  signal, so neither ``with_retries`` (even on its ``retry_on=None`` default)
+  nor the streaming loop (which keys off the transport/schema subsets, never
+  the union) ever re-asks a circuit the breaker already knows is open — unless
+  a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
   (:class:`OutputLimitError`, raised when a structured completion is cut off
   by the output-token limit). Recoverable in the same catch-set sense as the
@@ -311,7 +314,12 @@ class CircuitOpenError(Exception):
     Deliberately a **distinct, fail-fast** type, kept **out** of
     :data:`LLM_TRANSPORT_ERRORS` (and so out of the default ``retry_on``):
     retrying a circuit the breaker already knows is open would defeat its
-    purpose. It *is* a member of :data:`LLM_BACKPRESSURE_ERRORS` and therefore of
+    purpose. :func:`~llmkit.retry.with_retries` treats it as a zero-budget
+    fail-fast signal, so it is never re-asked under *any* configuration —
+    including the ``retry_on=None`` ("retry on any Exception") default of a
+    direct caller — unless that caller explicitly lists the type in ``retry_on``
+    (an explicit opt-in wins, matching :class:`OutputLimitError`). It *is* a
+    member of :data:`LLM_BACKPRESSURE_ERRORS` and therefore of
     :data:`LLM_RECOVERABLE_ERRORS`, so a host that already writes
     ``except LLM_RECOVERABLE_ERRORS`` to degrade on a 503 keeps catching this
     (and falls back fast) rather than crashing on a new uncaught type.
