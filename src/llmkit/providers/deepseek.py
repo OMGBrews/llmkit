@@ -6,6 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
 
@@ -48,7 +49,7 @@ class DeepSeekProvider(BaseProvider):
         api_key: str,
         model: str | None = None,
         base_url: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key

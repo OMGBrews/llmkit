@@ -23,6 +23,7 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from typing import override
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers import LLMProviderInterface
 from llmkit.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
@@ -109,7 +110,7 @@ class LLMCallOptions:
     temperature: float | Unset = UNSET
     model: str | None | Unset = UNSET
     max_tokens: int | None | Unset = UNSET
-    reasoning_effort: str | None | Unset = UNSET
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET
     retry: RetryPolicy | Unset = UNSET
     provider: LLMProviderInterface | None | Unset = UNSET
 
@@ -140,7 +141,7 @@ class _ResolvedCallArgs:
     temperature: float
     model: str | None
     max_tokens: int | None
-    reasoning_effort: str | None
+    reasoning_effort: ReasoningEffort | None
     retry: RetryPolicy
     provider: LLMProviderInterface | None
 
@@ -151,7 +152,7 @@ def resolve_call_args(
     temperature: float | Unset,
     model: str | None | Unset,
     max_tokens: int | None | Unset,
-    reasoning_effort: str | None | Unset,
+    reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
     provider: LLMProviderInterface | None | Unset,
 ) -> _ResolvedCallArgs:

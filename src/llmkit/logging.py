@@ -31,6 +31,8 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 import yaml
 
+from llmkit._types import Message, ReasoningEffort
+
 logger = logging.getLogger(__name__)
 
 #: Environment variable overriding the default log directory. Read lazily at
@@ -312,12 +314,12 @@ class LLMCallRecord:
     temperature: float
     duration_ms: float
     schema: str
-    prompt: str | list[dict[str, str]]
+    prompt: str | list[Message]
     response: Any  # pyright: ignore[reportExplicitAny]  # raw-llm — Pydantic dump or accumulated text
     error: str | None
     approximate_cost: float | None = None
     max_tokens: int | None = None
-    reasoning_effort: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
     call_id: str | None = None
     attempt: int | None = None
     queue_wait_ms: float | None = None

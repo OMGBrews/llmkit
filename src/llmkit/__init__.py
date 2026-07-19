@@ -34,6 +34,7 @@ the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
+from llmkit._types import Message, ReasoningEffort
 from llmkit.capture import (
     capture_llm_log_paths,
     capture_llm_records,
@@ -151,6 +152,8 @@ __all__ = [
     "Unset",
     "UNSET",
     "DEFAULT_TEMPERATURE",
+    "Message",
+    "ReasoningEffort",
     # JSON-schema-dict structured output (build-once-reuse helper)
     "model_from_json_schema",
     # Exception handling

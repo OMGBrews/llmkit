@@ -473,7 +473,7 @@ class LLMClientConfig:
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None
     base_url: str | None = None      # endpoint override (forwarded as api_base); unused by Bedrock/Vertex
-    reasoning_effort: str | None = None  # "disable" | "low" | "medium" | "high"
+    reasoning_effort: ReasoningEffort | None = None  # "disable" | "low" | "medium" | "high", or any provider value
     aws_region_name: str | None = None   # AWS Bedrock region; unused by every other provider
     vertex_project: str | None = None    # Vertex AI GCP project; unused by every other provider
     vertex_location: str | None = None   # Vertex AI region (data residency); unused by every other provider

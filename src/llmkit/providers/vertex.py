@@ -6,6 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -112,7 +113,7 @@ class VertexProvider(BaseProvider):
         model: str | None = None,
         vertex_project: str | None = None,
         vertex_location: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         structured_output: str = "schema",
     ):
         require_google_auth_sdk(self._provider_name)

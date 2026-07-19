@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Literal, assert_never
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.anthropic import AnthropicProvider
 from llmkit.providers.base import (
     BaseProvider,
@@ -92,7 +93,7 @@ def make_provider(
     api_key: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
-    reasoning_effort: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     aws_region_name: str | None = None,
     vertex_project: str | None = None,
     vertex_location: str | None = None,

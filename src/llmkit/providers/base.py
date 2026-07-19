@@ -41,6 +41,8 @@ from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import instructor
 
+from llmkit._types import ReasoningEffort
+
 logger = logging.getLogger(__name__)
 
 
@@ -257,7 +259,7 @@ class LLMClientConfig:
     model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
-    reasoning_effort: str | None = None
+    reasoning_effort: ReasoningEffort | None = None
     aws_region_name: str | None = None
     vertex_project: str | None = None
     vertex_location: str | None = None
@@ -318,7 +320,7 @@ class LLMProviderInterface(Protocol):
         ...
 
     @property
-    def reasoning_effort(self) -> str | None:
+    def reasoning_effort(self) -> ReasoningEffort | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default."""
         ...
 
@@ -419,7 +421,9 @@ class BaseProvider(ABC):
                 + "inherited from a silent class-level default."
             )
 
-    def __init__(self, model: str | None = None, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self, model: str | None = None, reasoning_effort: ReasoningEffort | None = None
+    ) -> None:
         # A falsy model (None or "") falls back to the provider's own default
         # so the LiteLLM id assembled by ``litellm_model`` is always well-formed
         # (``<prefix><model>``) and never a dangling ``"<prefix>/"``. The
@@ -427,7 +431,7 @@ class BaseProvider(ABC):
         # non-empty value every concrete provider set, so this fallback is
         # well-formed by construction, not merely by convention.
         self._model: str = model or self._default_model
-        self._reasoning_effort: str | None = reasoning_effort
+        self._reasoning_effort: ReasoningEffort | None = reasoning_effort
 
     @property
     def name(self) -> str:
@@ -454,7 +458,7 @@ class BaseProvider(ABC):
         return self._strict_json_schema
 
     @property
-    def reasoning_effort(self) -> str | None:
+    def reasoning_effort(self) -> ReasoningEffort | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default.
 
         Forwarded to LiteLLM as ``reasoning_effort`` when set (see

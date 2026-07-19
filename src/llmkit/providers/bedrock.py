@@ -6,6 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -75,7 +76,7 @@ class BedrockProvider(BaseProvider):
         self,
         model: str | None = None,
         aws_region_name: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ):
         require_boto3_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)

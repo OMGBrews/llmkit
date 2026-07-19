@@ -36,6 +36,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `LLMCallOptions`' repr now prints only the fields actually set —
   `LLMCallOptions(temperature=0.9)`, not six `=UNSET` entries.
 
+- **`llmkit.Message` and `llmkit.ReasoningEffort` are public, and a prompt's
+  message `content` may now be multimodal.** The call functions' `prompt`
+  parameter was typed `str | list[dict[str, str]]` — the one place the
+  transport's raw wire format leaked through an otherwise fully-typed surface,
+  and wrong in both directions: a key typo (`{"roel": ...}`) type-checked, and
+  the multimodal content-parts form LiteLLM accepts (a `content` that is a list
+  of part dicts) was *rejected*. Prompts are now `str | list[Message]`, where
+  `Message` is a `TypedDict` (`role: Literal["system", "user", "assistant"]`,
+  `content: str | list[dict[str, object]]`): unknown keys and mistyped roles
+  are type errors, and multimodal content type-checks. `reasoning_effort` is
+  now the exported `ReasoningEffort` alias (`Literal["disable", "low",
+  "medium", "high"] | str`) everywhere it was a bare `str`. Both types are
+  exported so a caller can annotate their own prompt builders and effort
+  constants. **`ReasoningEffort` is advisory, not enforcing:** under the type
+  checker `Literal[...] | str` widens to `str`, so it documents the canonical
+  set and drives editor autocomplete but does not statically reject a typo —
+  the open `| str` arm is deliberate, since llmkit forwards the value verbatim
+  to LiteLLM and providers accept values outside the set (e.g. OpenAI's
+  `"minimal"`). Runtime is unchanged (a `TypedDict` is a plain dict; the alias
+  is a `str`). **Compatibility note:** a caller passing a variable annotated
+  `list[dict[str, str]]` as `prompt` now gets a type error — annotate it
+  `list[Message]` (inline message-dict literals keep type-checking unchanged).
+
 - **`except LLM_RECOVERABLE_ERRORS:` now actually catches a litellm-native
   503.** The litellm 503 entry in `LLM_TRANSPORT_ERRORS` matched only via a
   lazy `isinstance` hook (the metaclass stand-in that keeps `import llmkit`
