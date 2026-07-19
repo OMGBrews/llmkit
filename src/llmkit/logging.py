@@ -2,8 +2,10 @@
 
 Every LLM round-trip is recorded as an :class:`LLMCallRecord` and handed
 to the configured :class:`LogSink`. The default sink writes one YAML file
-per call to a directory (``data/llm-logs/`` by default), preserving the
-historical log shape so existing analysis tooling keeps working.
+per call to a directory resolved lazily at first write (see
+:func:`default_log_dir`: ``LLMKIT_LOG_DIR``, else ``data/llm-logs/`` under
+the enclosing project root, else a per-user state directory), preserving
+the historical log shape so existing analysis tooling keeps working.
 
 Logging is unconditional and best-effort — a sink that raises is swallowed
 so the LLM call itself never breaks because logging did. The host
@@ -19,9 +21,11 @@ import json
 import logging
 import os
 import re
+import sys
+import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -29,7 +33,135 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOG_DIR = Path("data/llm-logs")
+#: Environment variable overriding the default log directory. Read lazily at
+#: the sink's first write (never at import), so setting it after ``import
+#: llmkit`` still takes effect.
+LOG_DIR_ENV_VAR = "LLMKIT_LOG_DIR"
+
+#: Default age bound for the per-call YAML files (and rotated index
+#: generations): files older than this many days are pruned. ``None`` on the
+#: sink keeps everything forever.
+DEFAULT_RETENTION_DAYS = 30
+
+#: Default size bound for the active ``index.jsonl``: past this many bytes it
+#: is rotated to a date-stamped sibling (which then ages out under the same
+#: retention policy). ``None`` on the sink disables rotation.
+DEFAULT_MAX_INDEX_BYTES = 50 * 2**20
+
+# Retention housekeeping runs at most this often per sink instance, so the
+# per-write cost of a bounded log dir stays one monotonic-clock read.
+_PRUNE_INTERVAL_SECONDS = 3600.0
+
+#: Marker files whose presence makes a directory a "project root" for
+#: :func:`default_log_dir`'s upward walk.
+_PROJECT_ROOT_MARKERS = ("pyproject.toml", ".git")
+
+
+def _find_project_root(start: Path) -> Path | None:
+    """The nearest ancestor of *start* (inclusive) carrying a project marker.
+
+    Walks upward from *start* and returns the first directory containing one
+    of :data:`_PROJECT_ROOT_MARKERS` — nearest wins, so a nested project logs
+    under its own root, not the enclosing monorepo's. ``None`` when no marker
+    exists anywhere up the tree (the process is not running inside a project).
+    """
+    for candidate in (start, *start.parents):
+        if any((candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS):
+            return candidate
+    return None
+
+
+def _user_state_log_dir() -> Path:
+    """The per-user state directory for llmkit logs on this platform.
+
+    Logs are *state* (regenerable, machine-local), so the Linux bucket is
+    ``$XDG_STATE_HOME`` (default ``~/.local/state``), not the data dir. macOS
+    and Windows use their platform log locations.
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "llmkit"
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+        return base / "llmkit" / "logs"
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return base / "llmkit" / "llm-logs"
+
+
+def _resolve_default_log_dir() -> tuple[Path, bool]:
+    """Resolve the default log directory; the bool marks the project-root case.
+
+    Resolution order: :data:`LOG_DIR_ENV_VAR` if set, else ``data/llm-logs``
+    under the nearest project root above the current directory, else the
+    per-user state directory. Only the project-root case (the one where a
+    repository could accidentally swallow prompt logs) returns ``True``, which
+    makes the sink seed a ``.gitignore`` when it creates that directory.
+    """
+    env_dir = os.environ.get(LOG_DIR_ENV_VAR)
+    if env_dir:
+        return Path(env_dir), False
+    root = _find_project_root(Path.cwd())
+    if root is not None:
+        return root / "data" / "llm-logs", True
+    return _user_state_log_dir(), False
+
+
+def default_log_dir() -> Path:
+    """Compute where :class:`LocalYamlLogSink` writes when no ``log_dir`` is given.
+
+    ``LLMKIT_LOG_DIR`` wins when set; otherwise ``data/llm-logs/`` under the
+    nearest ancestor directory carrying a ``pyproject.toml`` or ``.git``
+    (nearest wins); otherwise a per-user state directory
+    (``$XDG_STATE_HOME/llmkit/llm-logs`` on Linux, ``~/Library/Logs/llmkit``
+    on macOS, ``%LOCALAPPDATA%\\llmkit\\logs`` on Windows). Computed from the
+    *current* environment and working directory on every call; the default
+    sink calls it once at first write and freezes the answer, so a later
+    ``chdir`` cannot split one process's logs across directories.
+    """
+    return _resolve_default_log_dir()[0]
+
+
+def _open_private(path: str, flags: int) -> int:
+    """``opener=`` hook: create files ``0o600`` (owner-only) instead of umask-default.
+
+    The per-call YAML and the index carry full prompts and responses, which
+    ``SECURITY.md`` promises are not world-readable on a multi-user host. The
+    mode only applies at creation — POSIX ``open`` ignores it for an existing
+    file — and is inert on Windows.
+    """
+    return os.open(path, flags, 0o600)
+
+
+class _OnceLatch:
+    """Warn-once state for one failure site: WARNING on a new failure
+    signature, DEBUG on repeats, re-armed by success.
+
+    A permanently broken sink (unwritable directory, full disk) would
+    otherwise emit a warning **with traceback** on every call — flooding
+    stderr at exactly the moment the application is busiest. The signature is
+    ``(type, errno)``, so a *different* failure (disk full after permission
+    denied) still warns loudly instead of hiding behind the first one.
+    Instances are per-site and unlocked: a race between two writers costs at
+    most one duplicate warning, which is not worth a lock on the hot path.
+    """
+
+    def __init__(self) -> None:
+        self._signature: tuple[type[BaseException], int | None] | None = None
+
+    def should_warn(self, exc: BaseException) -> bool:
+        """Record a failure; ``True`` when it deserves a full WARNING."""
+        errno_value: object = getattr(exc, "errno", None)
+        signature = (type(exc), errno_value if isinstance(errno_value, int) else None)
+        if signature == self._signature:
+            return False
+        self._signature = signature
+        return True
+
+    def succeeded(self) -> None:
+        """Re-arm: the site recovered, so the next failure warns again."""
+        self._signature = None
+
 
 # Bounded retry budget for the exclusive-create filename loop: a uuid4 suffix
 # collision is astronomically unlikely, so a handful of attempts is plenty
@@ -232,10 +364,100 @@ class LocalYamlLogSink:
     are a single small scan instead of globbing and parsing every YAML. The
     index is deliberately compact: per-call request knobs (temperature,
     max_tokens, reasoning_effort) live only in the per-call YAML.
+
+    ``log_dir=None`` (the default) resolves via :func:`default_log_dir` at
+    the first write and freezes the answer for the sink's lifetime, so a
+    mid-run ``chdir`` cannot split logs across directories; an explicit path
+    is used as-is. The first successful write emits one INFO naming the
+    absolute directory and the retention policy — before anything is ever
+    pruned. When the sink itself creates the directory it is ``0o700`` and
+    files are ``0o600`` (a pre-existing directory is never re-chmodded —
+    pre-create it to share logs with other readers), and the project-root
+    default location is seeded with a ``.gitignore`` so prompt logs cannot
+    land in the enclosing repository's history.
+
+    Growth is bounded by default: per-call YAML files older than
+    ``retention_days`` (default 30; ``None`` keeps forever) are pruned, and
+    an ``index.jsonl`` past ``max_index_bytes`` (default 50 MiB; ``None``
+    never rotates) is rotated to a date-stamped sibling that ages out under
+    the same policy. Housekeeping runs at most hourly, on the write path.
     """
 
-    def __init__(self, log_dir: Path = DEFAULT_LOG_DIR) -> None:
-        self.log_dir: Path = log_dir
+    def __init__(
+        self,
+        log_dir: Path | None = None,
+        *,
+        retention_days: int | None = DEFAULT_RETENTION_DAYS,
+        max_index_bytes: int | None = DEFAULT_MAX_INDEX_BYTES,
+    ) -> None:
+        self._log_dir: Path | None = log_dir
+        self.retention_days: int | None = retention_days
+        self.max_index_bytes: int | None = max_index_bytes
+        # True once the default resolution chose the project-root location —
+        # the one case where the sink seeds a .gitignore on dir creation.
+        self._seed_gitignore: bool = False
+        self._announced: bool = False
+        self._last_prune: float | None = None
+        self._yaml_latch: _OnceLatch = _OnceLatch()
+        self._index_latch: _OnceLatch = _OnceLatch()
+        self._prune_latch: _OnceLatch = _OnceLatch()
+
+    @property
+    def log_dir(self) -> Path:
+        """The directory this sink writes to.
+
+        A sink constructed without an explicit ``log_dir`` resolves
+        :func:`default_log_dir` on first access and freezes the result, so
+        every write (and every reader of this property) sees one stable
+        directory regardless of later ``chdir`` or environment changes.
+        """
+        if self._log_dir is None:
+            self._log_dir, self._seed_gitignore = _resolve_default_log_dir()
+        return self._log_dir
+
+    def _ensure_log_dir(self) -> None:
+        """Create ``log_dir`` (``0o700``) if absent; seed ``.gitignore`` when owed.
+
+        Creation is detected via the ``FileExistsError`` branch rather than
+        ``exist_ok=True`` so a pre-existing (possibly user-shared) directory
+        is never re-chmodded and never seeded. Only the leaf gets ``0o700``;
+        the ``.gitignore`` seed applies only to the project-root *default*
+        location — an explicit path or env override is the caller's choice,
+        and the state-dir fallback is never inside a repository.
+        """
+        try:
+            self.log_dir.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            return
+        if self._seed_gitignore:
+            try:
+                with open(self.log_dir / ".gitignore", "x", encoding="utf-8") as f:
+                    _ = f.write("*\n")
+            except Exception:
+                # Best-effort: an unseedable .gitignore must not break the
+                # write that triggered the mkdir.
+                logger.debug("Could not seed .gitignore in %s", self.log_dir, exc_info=True)
+
+    def _announce_once(self) -> None:
+        """One INFO after the first successful write: where the logs are.
+
+        Persistence is on by default, so the location (and the retention
+        policy, *before* the first prune could ever delete anything) must be
+        discoverable without reading the docs.
+        """
+        if self._announced:
+            return
+        self._announced = True
+        retention = (
+            f"{self.retention_days}-day retention"
+            if self.retention_days is not None
+            else "no retention (files kept forever)"
+        )
+        logger.info(
+            "llmkit is logging LLM calls to %s (%s; configure_llm_logging(None) disables)",
+            self.log_dir.resolve(),
+            retention,
+        )
 
     def write(self, record: LLMCallRecord) -> None:
         """Persist *record* as a YAML file (the :class:`LogSink` contract).
@@ -272,7 +494,7 @@ class LocalYamlLogSink:
         partial YAML.
         """
         try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._ensure_log_dir()
             ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
             safe_feature = _safe_path_component(record.feature)
             safe_label = _safe_path_component(record.label or "unlabeled")
@@ -310,7 +532,7 @@ class LocalYamlLogSink:
                     self.log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
                 )
                 try:
-                    with open(candidate, "x", encoding="utf-8") as f:
+                    with open(candidate, "x", encoding="utf-8", opener=_open_private) as f:
                         _ = f.write(header)
                         # _LogSafeDumper keeps the file safe_load-able: only
                         # plain YAML tags, never ``!!python/object`` (Enum
@@ -349,22 +571,36 @@ class LocalYamlLogSink:
                 raise OSError(
                     f"could not allocate a unique log filename after {_MAX_FILENAME_ATTEMPTS} attempts"
                 )
-        except Exception:
+        except Exception as exc:
             # Best-effort by contract: *any* failure (not just the common
             # OSError/YAMLError/UnicodeError cases) degrades to a warning so
             # logging can never break the LLM call. Never BaseException —
-            # KeyboardInterrupt/SystemExit must propagate.
-            logger.warning(
-                "Failed to write LLM invocation log for %s/%s",
-                record.feature,
-                record.label,
-                exc_info=True,
-            )
+            # KeyboardInterrupt/SystemExit must propagate. The latch keeps a
+            # *persistently* broken sink from flooding stderr with one
+            # traceback per call: the first failure (and any new failure
+            # signature) warns, repeats drop to DEBUG.
+            if self._yaml_latch.should_warn(exc):
+                logger.warning(
+                    "Failed to write LLM invocation log for %s/%s (repeats logged at DEBUG)",
+                    record.feature,
+                    record.label,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "Failed to write LLM invocation log for %s/%s",
+                    record.feature,
+                    record.label,
+                    exc_info=True,
+                )
             return None
 
+        self._yaml_latch.succeeded()
+        self._announce_once()
         # Best-effort index append, kept separate so an index failure can
         # never lose the per-call record that was just written successfully.
         self._append_index(record, filepath)
+        self._maybe_prune()
         return filepath
 
     @staticmethod
@@ -426,30 +662,109 @@ class LocalYamlLogSink:
             # Serialize before opening so a serialization failure can't even
             # create/touch the index file.
             payload = json.dumps(line, ensure_ascii=False) + "\n"
-            with open(self.log_dir / INDEX_FILENAME, "a", encoding="utf-8") as f:
+            with open(
+                self.log_dir / INDEX_FILENAME, "a", encoding="utf-8", opener=_open_private
+            ) as f:
                 _ = f.write(payload)
-        except Exception:
-            logger.warning(
-                "Failed to append LLM log index for %s/%s",
-                record.feature,
-                record.label,
-                exc_info=True,
-            )
+        except Exception as exc:
+            if self._index_latch.should_warn(exc):
+                logger.warning(
+                    "Failed to append LLM log index for %s/%s (repeats logged at DEBUG)",
+                    record.feature,
+                    record.label,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "Failed to append LLM log index for %s/%s",
+                    record.feature,
+                    record.label,
+                    exc_info=True,
+                )
+        else:
+            self._index_latch.succeeded()
+
+    def _maybe_prune(self) -> None:
+        """Run retention housekeeping, throttled to once per hour per sink.
+
+        Called from the write path (so a long-running service is bounded, not
+        just a restarting one) but rate-limited to a monotonic-clock check so
+        the steady-state per-write cost is nil. Best-effort like everything
+        else here: a prune failure warns (latched) and never breaks the call.
+        """
+        if self.retention_days is None and self.max_index_bytes is None:
+            return
+        now = time.monotonic()
+        if self._last_prune is not None and now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune = now
+        try:
+            self._prune()
+        except Exception as exc:
+            if self._prune_latch.should_warn(exc):
+                logger.warning(
+                    "Failed to prune LLM log dir %s (further identical failures logged at DEBUG)",
+                    self.log_dir,
+                    exc_info=True,
+                )
+            else:
+                logger.debug("Failed to prune LLM log dir %s", self.log_dir, exc_info=True)
+        else:
+            self._prune_latch.succeeded()
+
+    def _prune(self) -> None:
+        """Apply the retention policy: age out YAMLs, rotate an oversized index.
+
+        Age pruning covers the per-call ``*.yaml`` files and previously
+        rotated ``index-*.jsonl`` generations, keyed on file mtime so tests
+        (and operators) can reason about it with ``touch``. Rotation renames
+        the active index with :func:`os.replace` — atomic on POSIX, and a
+        concurrent writer holding the old file descriptor simply finishes its
+        ``O_APPEND`` line into the rotated file, so no index line is ever
+        torn or lost. A file vanishing mid-scan (a concurrent prune, a manual
+        cleanup) is skipped, not an error.
+        """
+        if self.retention_days is not None:
+            cutoff = time.time() - self.retention_days * 86400
+            for pattern in ("*.yaml", "index-*.jsonl"):
+                for stale in self.log_dir.glob(pattern):
+                    try:
+                        if stale.stat().st_mtime < cutoff:
+                            stale.unlink(missing_ok=True)
+                    except OSError:
+                        continue
+        if self.max_index_bytes is not None:
+            index = self.log_dir / INDEX_FILENAME
+            try:
+                size = index.stat().st_size
+            except OSError:
+                return
+            if size > self.max_index_bytes:
+                stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")
+                os.replace(index, self.log_dir / f"index-{stamp}.jsonl")
 
 
 # Module-level configured sink, defaulting to the local-YAML sink at the
-# default directory. The host overrides it once at startup; tests typically
-# point it at a tmp directory.
+# default directory (resolved lazily at first write). The host overrides it
+# once at startup; tests typically point it at a tmp directory.
 _sink: LogSink | None = LocalYamlLogSink()
+
+# Warn-once latch for a *configured* sink that raises out of ``write`` — the
+# custom-sink counterpart of LocalYamlLogSink's internal latches, so a
+# permanently broken third-party sink can't flood stderr either.
+_sink_latch = _OnceLatch()
 
 
 def configure_llm_logging(sink: LogSink | None) -> None:
     """Set the sink that receives every :class:`LLMCallRecord`.
 
     Pass ``None`` to disable logging entirely (writes become no-ops).
+    Re-arms the warn-once latch on sink failures, so a newly configured sink
+    gets a fresh loud first warning if it too turns out to be broken.
     """
     global _sink
     _sink = sink
+    _sink_latch.succeeded()
 
 
 def write_llm_log(record: LLMCallRecord) -> Path | None:
@@ -473,9 +788,22 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
         return None
     try:
         if isinstance(_sink, _PathReturningLogSink):
-            return _sink.write_returning_path(record)
-        _sink.write(record)
+            path = _sink.write_returning_path(record)
+        else:
+            _sink.write(record)
+            path = None
+    except Exception as exc:
+        if _sink_latch.should_warn(exc):
+            logger.warning(
+                "LLM log sink raised for %s/%s (further identical failures logged at DEBUG)",
+                record.feature,
+                record.label,
+                exc_info=True,
+            )
+        else:
+            logger.debug(
+                "LLM log sink raised for %s/%s", record.feature, record.label, exc_info=True
+            )
         return None
-    except Exception:
-        logger.warning("LLM log sink raised for %s/%s", record.feature, record.label, exc_info=True)
-        return None
+    _sink_latch.succeeded()
+    return path
