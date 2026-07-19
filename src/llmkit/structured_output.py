@@ -33,6 +33,7 @@ from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
+from llmkit._types import Message, ReasoningEffort
 from llmkit.capture import record_call, record_call_async, resolve_model_and_provider
 from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
@@ -103,7 +104,7 @@ STREAM_ABANDONED_ERROR = "Abandoned: stream closed by consumer before completion
 
 
 async def structured_llm_call[T: BaseModel](
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     output_schema: type[T],
     *,
     feature: str,
@@ -111,7 +112,7 @@ async def structured_llm_call[T: BaseModel](
     temperature: float | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
-    reasoning_effort: str | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
@@ -120,8 +121,11 @@ async def structured_llm_call[T: BaseModel](
     """Call LLM with structured output parsing.
 
     Args:
-        prompt: Either a plain string (sent as-is) or a list of message
-            dicts (``[{"role": "system", "content": "..."}, ...]``).
+        prompt: Either a plain string (sent as-is) or a list of
+            :class:`~llmkit.Message` dicts
+            (``[{"role": "system", "content": "..."}, ...]``); a message's
+            ``content`` may be a plain string or a list of content-part dicts
+            for multimodal input.
         output_schema: Pydantic model class the LLM response is parsed
             into, via ``instructor`` pinned to the provider's native
             JSON-schema mode.
@@ -322,7 +326,7 @@ async def structured_llm_call[T: BaseModel](
 
 
 def structured_llm_call_sync[T: BaseModel](
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     output_schema: type[T],
     *,
     feature: str,
@@ -330,7 +334,7 @@ def structured_llm_call_sync[T: BaseModel](
     temperature: float | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
-    reasoning_effort: str | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
@@ -377,14 +381,14 @@ def structured_llm_call_sync[T: BaseModel](
 
 
 async def text_llm_call(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     feature: str,
     label: str | None = None,
     temperature: float | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
-    reasoning_effort: str | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
@@ -397,8 +401,10 @@ async def text_llm_call(
     parse it themselves, e.g. as JSON) use this.
 
     Args:
-        prompt: Either a plain string or a list of message dicts
-            (``[{"role": "system", "content": "..."}, ...]``).
+        prompt: Either a plain string or a list of :class:`~llmkit.Message`
+            dicts (``[{"role": "system", "content": "..."}, ...]``); a
+            message's ``content`` may be a plain string or a list of
+            content-part dicts for multimodal input.
         feature: Caller feature name; embedded in the log filename/body.
             Required as a telemetry forcing function (see
             :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
@@ -532,14 +538,14 @@ async def text_llm_call(
 
 
 def text_llm_call_sync(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     feature: str,
     label: str | None = None,
     temperature: float | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
-    reasoning_effort: str | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
@@ -572,14 +578,14 @@ def text_llm_call_sync(
 
 
 async def stream_text_with_log(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     feature: str,
     label: str | None = None,
     temperature: float | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
-    reasoning_effort: str | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -769,14 +775,14 @@ async def stream_text_with_log(
 
 
 async def _stream_once(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     feature: str,
     label: str | None,
     temperature: float,
     model: str | None,
     max_tokens: int | None,
-    reasoning_effort: str | None,
+    reasoning_effort: ReasoningEffort | None,
     provider: LLMProviderInterface | None,
     call_id: str,
     attempt: int,
@@ -869,7 +875,7 @@ def _build_text_record(
     started_at: datetime,
     feature: str,
     label: str | None,
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     text: str | None,
     start_t: float,
     temperature: float,
@@ -879,7 +885,7 @@ def _build_text_record(
     approximate_cost: float | None,
     schema: str = "text",
     max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
 ) -> LLMCallRecord:

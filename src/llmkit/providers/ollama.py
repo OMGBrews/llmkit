@@ -6,6 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
 #: Default local Ollama endpoint — the fallback when no ``base_url`` is
@@ -30,7 +31,7 @@ class OllamaProvider(BaseProvider):
         self,
         base_url: str = _DEFAULT_BASE_URL,
         model: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ):
         super().__init__(model, reasoning_effort)
         self._base_url: str = base_url

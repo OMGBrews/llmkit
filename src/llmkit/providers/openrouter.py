@@ -6,6 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
+from llmkit._types import ReasoningEffort
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
 #: OpenRouter's public API endpoint — the fallback when no ``base_url`` is
@@ -74,7 +75,7 @@ class OpenRouterProvider(BaseProvider):
         api_key: str,
         model: str | None = None,
         base_url: str = _DEFAULT_BASE_URL,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         require_parameters: bool = True,
     ):
         super().__init__(model, reasoning_effort)

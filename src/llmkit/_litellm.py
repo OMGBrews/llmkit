@@ -13,7 +13,7 @@ run over a faked provider response (see ``tests/_support`` ``patch_llm``).
 
 LiteLLM's ``acompletion`` and instructor's ``create_with_completion`` carry
 very strict, heavily-overloaded type stubs that reject this module's generic
-``**credential-kwargs`` and ``list[dict[str, str]]`` message shapes. Those
+``**credential-kwargs`` and ``list[Message]`` message shapes. Those
 call expressions therefore carry a single ``reportArgumentType`` suppression
 each, tagged ``raw-llm`` — the boundary where our thin wrapper meets the
 provider SDK's exhaustive parameter surface.
@@ -34,6 +34,7 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
+from llmkit._types import Message, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitError,
@@ -149,12 +150,14 @@ async def drain_async_logging(*, timeout: float | None) -> None:
         logger.debug("LiteLLM async-logging drain failed", exc_info=True)
 
 
-def _messages(prompt: str | list[dict[str, str]]) -> list[dict[str, str]]:
+def _messages(prompt: str | list[Message]) -> list[Message]:
     """Normalise a prompt into LiteLLM's message-list shape."""
     return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
 
 
-def _resolve_reasoning_effort(override: str | None, provider: LLMProviderInterface) -> str | None:
+def _resolve_reasoning_effort(
+    override: ReasoningEffort | None, provider: LLMProviderInterface
+) -> ReasoningEffort | None:
     """Resolve the effective reasoning effort for a call.
 
     A per-call ``override`` wins when set; otherwise the provider's
@@ -332,13 +335,13 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
 
 
 async def acompletion_structured[T: BaseModel](
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     output_schema: type[T],
     *,
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> tuple[T, float | None]:
     """Structured completion via instructor pinned to the provider's mode.
@@ -438,12 +441,12 @@ async def acompletion_structured[T: BaseModel](
 
 
 async def acompletion_text(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> tuple[str, float | None]:
     """Plain-text completion via LiteLLM.
@@ -489,12 +492,12 @@ async def acompletion_text(
 
 
 async def astream_text(
-    prompt: str | list[dict[str, str]],
+    prompt: str | list[Message],
     *,
     temperature: float,
     model: str | None,
     max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
 ) -> AsyncIterator[str]:
     """Stream plain-text deltas via LiteLLM.
