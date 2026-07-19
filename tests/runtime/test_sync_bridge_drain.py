@@ -17,9 +17,11 @@ drains that queue before closing the loop.
 
 These tests pin: the leak is gone at interpreter shutdown; the call's result and
 errors propagate; a timeout cancels the abandoned coroutine *on the loop*; a
-reentrant call (made from inside a running loop) is served by the worker-thread
-fallback without deadlock; and explicit :func:`~llmkit.sync.shutdown` is
-idempotent and lets the loop restart lazily.
+reentrant call from a *foreign* loop (an async host) is routed onto the
+persistent loop — no fresh loop, cancellation still works; a call from the
+persistent loop itself falls back to the worker-thread fresh loop without
+deadlock and still drains LiteLLM's queued logging; and explicit
+:func:`~llmkit.sync.shutdown` is idempotent and lets the loop restart lazily.
 """
 
 from __future__ import annotations
@@ -150,36 +152,50 @@ def test_timeout_cancels_the_abandoned_task_on_the_loop() -> None:
     assert cancelled.wait(timeout=2.0), "timed-out task was not cancelled on the loop"
 
 
-def test_reentrant_call_from_running_loop_returns_result() -> None:
-    """A ``run_sync`` made from inside a running loop is served, not deadlocked.
+def test_reentrant_foreign_loop_call_runs_on_the_persistent_loop() -> None:
+    """A ``run_sync`` from inside a *foreign* running loop rides the persistent loop.
 
-    When the calling thread already has a running loop (an async framework, or a
-    coroutine that calls back into sync code), the bridge cannot block that
-    thread on the persistent loop, so it offloads to a one-shot worker thread
-    with its own fresh loop. The call must still complete and return its value.
+    An async host calling a ``*_sync`` helper used to get a fresh loop on a
+    worker thread — the path that, under a concurrent reentrant fan-out,
+    re-created the multi-loop regime the persistent loop exists to avoid. The
+    bridge now submits the coroutine to the persistent loop instead: same
+    blocking semantics for the caller, no fresh loop. The strong discriminator:
+    the reentrant call observes the *persistent* loop, not the caller's and not
+    a fresh one.
     """
 
-    async def _inner(value: int) -> int:
-        return value
+    async def _probe() -> int:
+        return id(asyncio.get_running_loop())
 
-    async def _outer() -> int:
-        # run_sync detects the running loop and uses the worker-thread fallback.
-        return run_sync(_inner(11))
+    persistent_id = run_sync(_probe())
 
-    assert asyncio.run(_outer()) == 11
+    async def _outer() -> tuple[int, int]:
+        # run_sync detects a running loop that is not the persistent one and
+        # submits to the persistent loop, blocking this (the host's) thread.
+        return id(asyncio.get_running_loop()), run_sync(_probe())
+
+    caller_id, reentrant_id = asyncio.run(_outer())
+    assert reentrant_id == persistent_id, "reentrant call did not run on the persistent loop"
+    assert reentrant_id != caller_id
 
 
-def test_reentrant_timeout_releases_caller_promptly() -> None:
-    """On the worker-thread fallback a timeout unblocks the caller at the deadline.
+def test_reentrant_foreign_loop_timeout_cancels_and_releases_promptly() -> None:
+    """A reentrant timeout releases the caller at the deadline *and* cancels the task.
 
-    The reentrant fallback drives the coroutine on another thread, which cannot
-    be cancelled from here — so a timeout abandons only the *wait*. It must still
-    release the caller near the deadline (the executor is torn down with
-    ``wait=False``), not after the slow call finishes.
+    Because foreign-loop reentrant calls now ride the persistent loop, they gain
+    the persistent-loop timeout contract: past the deadline the caller gets
+    :class:`TimeoutError` promptly and the abandoned coroutine is cancelled *on
+    the loop* — unlike the old worker-thread fallback, which leaked a running
+    thread and request.
     """
+    cancelled = threading.Event()
 
     async def _slow(value: int) -> int:
-        await asyncio.sleep(1.5)  # comfortably past the timeout below
+        try:
+            await asyncio.sleep(1.5)  # comfortably past the timeout below
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return value
 
     async def _outer() -> None:
@@ -190,6 +206,73 @@ def test_reentrant_timeout_releases_caller_promptly() -> None:
         assert elapsed < 1.0, f"timeout took {elapsed:.2f}s — caller not released at the deadline"
 
     asyncio.run(_outer())
+    assert cancelled.wait(timeout=2.0), "timed-out reentrant task was not cancelled on the loop"
+
+
+def test_loop_on_loop_call_falls_back_to_a_fresh_loop_without_deadlock() -> None:
+    """A ``run_sync`` from a coroutine *on the persistent loop* is served, not deadlocked.
+
+    This is the one reentrant case that cannot ride the persistent loop —
+    blocking the loop's own thread on itself would deadlock — so it offloads to
+    a one-shot worker thread with its own fresh loop. The call must complete,
+    return its value, and demonstrably run on a *different* loop than the
+    (blocked) persistent one.
+    """
+
+    async def _inner() -> int:
+        return id(asyncio.get_running_loop())
+
+    async def _outer() -> tuple[int, int]:
+        # get_running_loop() here *is* the persistent loop → worker fallback.
+        return id(asyncio.get_running_loop()), run_sync(_inner(), timeout=30)
+
+    outer_id, inner_id = run_sync(_outer(), timeout=30)
+    assert inner_id != outer_id, "loop-on-loop call did not get its own fresh loop"
+
+
+# A self-contained script exercising the loop-on-loop fallback's logging drain:
+# the inner call runs on the fallback's fresh loop and enqueues a LiteLLM-style
+# success-logging coroutine there, which _run_and_drain must flush before that
+# loop closes. Run under -W error::RuntimeWarning so a dropped drain surfaces as
+# "never awaited" on stderr (mutation testing showed the drain was previously
+# deletable without any test noticing).
+_FALLBACK_DRAIN_SCRIPT = textwrap.dedent(
+    """
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from llmkit.sync import run_sync
+
+    async def inner():
+        async def async_success_handler():
+            return None
+
+        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_success_handler())
+        return 5
+
+    async def outer():
+        return run_sync(inner())
+
+    print("RESULT", run_sync(outer()))
+    """
+)
+
+
+def test_loop_on_loop_fallback_drains_queued_logging() -> None:
+    """The fallback's fresh loop flushes LiteLLM's queued logging before closing.
+
+    Deleting the ``drain_async_logging`` step in ``_run_and_drain`` must fail
+    this test: the enqueued handler coroutine would be orphaned when the fresh
+    loop closes and surface as ``coroutine '…' was never awaited``.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", "-c", _FALLBACK_DRAIN_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "RESULT 5" in proc.stdout
+    assert "never awaited" not in proc.stderr, proc.stderr
 
 
 def test_shutdown_is_idempotent_and_loop_restarts() -> None:
