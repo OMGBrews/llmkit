@@ -35,10 +35,9 @@ from pydantic import BaseModel, JsonValue
 from llmkit.capture import record_call, resolve_model_and_provider
 from llmkit.exceptions import ResultValidationError
 from llmkit.logging import LLMCallRecord
-from llmkit.options import DEFAULT_TEMPERATURE, LLMCallOptions, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
 from llmkit.retry import (
-    DEFAULT_RETRY_POLICY,
     RetryPolicy,
     _retry_active,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
     handle_retry_failure,
@@ -105,12 +104,12 @@ async def structured_llm_call[T: BaseModel](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: str | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -131,30 +130,35 @@ async def structured_llm_call[T: BaseModel](
         label: Optional finer-grained identifier (e.g. ``"risk_register"``);
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
-        model: Optional model override (provider default when ``None``).
-            *Dual-homed* — also settable on
+            Resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when
+            neither this keyword nor ``options`` supplies a value.
+        model: Optional model override (provider default when it resolves to
+            ``None``). *Dual-homed* — also settable on
             :class:`~llmkit.LLMClientConfig`; this per-call value overrides
             the config (with ``options`` sitting between, see ``options``).
         max_tokens: Optional cap on the completion length, forwarded to the
-            provider when set (no cap when ``None`` — byte-identical to the
-            prior request). Parity with :func:`text_llm_call`.
+            provider when set (no cap when it resolves to ``None`` —
+            byte-identical to the prior request). Parity with
+            :func:`text_llm_call`.
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort (``"disable" | "low" | "medium" |
-            "high"``). ``None`` (the default) defers to the value configured
-            on :class:`~llmkit.LLMClientConfig`; an explicit value wins for
-            this call. ``"disable"`` turns Gemini thinking off so it doesn't
-            consume the ``max_tokens`` budget. *Dual-homed* like ``model``:
-            per-call overrides ``options`` overrides config.
-        provider: Optional provider override for THIS call only. ``None``
-            (the default) uses the globally-configured provider — so every
+            "high"``). Unset defers to ``options``, then to the value
+            configured on :class:`~llmkit.LLMClientConfig`; an explicit
+            value wins for this call. ``"disable"`` turns Gemini thinking
+            off so it doesn't consume the ``max_tokens`` budget.
+            *Dual-homed* like ``model``: per-call overrides ``options``
+            overrides config.
+        provider: Optional provider override for THIS call only. Unset (the
+            default) uses the globally-configured provider — so every
             existing caller is unchanged. Pass an explicit provider (e.g. an
             :class:`~llmkit.OpenRouterProvider` built from credentials) to
             route a single call through a different provider family without
             touching the app-wide :func:`~llmkit.configure_llm_client`
             registration. The log records the provider that actually ran.
-        retry: Transient-error retry budget applied to this call. Defaults
+        retry: Transient-error retry budget applied to this call. Resolves
             to :data:`~llmkit.DEFAULT_RETRY_POLICY` (retry the curated
-            ``LLM_RECOVERABLE_ERRORS`` with full-jitter backoff). Pass
+            ``LLM_RECOVERABLE_ERRORS`` with full-jitter backoff) when
+            neither this keyword nor ``options`` supplies one. Pass
             :data:`~llmkit.NO_RETRY` to opt out, or a custom
             :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
             its own logged call; this layer stays separate from instructor's
@@ -175,10 +179,13 @@ async def structured_llm_call[T: BaseModel](
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
             ``retry``/``provider`` once for reuse across many calls.
-            Precedence is **config < options < explicit keyword**: a keyword
-            you pass here overrides the matching ``options`` field, an
-            unset ``options`` field defers to the config, and ``options=None``
-            (the default) leaves the flat-keyword path unchanged.
+            Precedence is **config < options < explicit keyword**, exactly:
+            every mergeable keyword above defaults to :data:`~llmkit.UNSET`,
+            so any keyword you pass — including ``None``, including a value
+            equal to the documented default — overrides the matching
+            ``options`` field. An unset ``options`` field defers to the
+            config, and ``options=None`` (the default) leaves the
+            flat-keyword path unchanged.
 
     Returns:
         An instance of *output_schema* populated by the LLM.
@@ -298,12 +305,12 @@ def structured_llm_call_sync[T: BaseModel](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: str | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -318,8 +325,8 @@ def structured_llm_call_sync[T: BaseModel](
     per-(provider, loop) async concurrency semaphore is genuinely shared and
     bounds sync fan-out across threads, with no separate calling-thread
     semaphore. ``max_tokens`` caps the completion length when set (parity with
-    :func:`text_llm_call`); ``None`` leaves it uncapped. ``reasoning_effort`` is
-    forwarded identically (``None`` defers to the configured
+    :func:`text_llm_call`); unset leaves it uncapped. ``reasoning_effort`` is
+    forwarded identically (unset defers to the configured
     :class:`~llmkit.LLMClientConfig` value). ``retry`` is the transient-error
     budget, inherited from the async path (default-on; pass
     :data:`~llmkit.NO_RETRY` to opt out). ``on_result`` is the same
@@ -352,12 +359,12 @@ async def text_llm_call(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: str | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
@@ -374,18 +381,21 @@ async def text_llm_call(
             Required as a telemetry forcing function (see
             :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
         label: Optional finer-grained identifier for the log filename.
-        temperature: Sampling temperature passed to the provider.
-        model: Optional model override (provider default when ``None``).
-            *Dual-homed* with :class:`~llmkit.LLMClientConfig`: per-call
-            overrides ``options`` overrides config.
+        temperature: Sampling temperature passed to the provider. Resolves
+            to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when neither
+            this keyword nor ``options`` supplies a value.
+        model: Optional model override (provider default when it resolves
+            to ``None``). *Dual-homed* with
+            :class:`~llmkit.LLMClientConfig`: per-call overrides
+            ``options`` overrides config.
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set (e.g. the readiness healthcheck uses
             ``max_tokens=1`` to keep its ping cheap).
         reasoning_effort: Optional per-call override of the provider's
-            reasoning/thinking effort; ``None`` defers to the configured
-            :class:`~llmkit.LLMClientConfig` value. *Dual-homed* like
-            ``model``.
-        provider: Optional provider override for THIS call only (``None``
+            reasoning/thinking effort; unset defers to ``options``, then to
+            the configured :class:`~llmkit.LLMClientConfig` value.
+            *Dual-homed* like ``model``.
+        provider: Optional provider override for THIS call only (unset
             uses the globally-configured provider).
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
@@ -492,12 +502,12 @@ def text_llm_call_sync(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: str | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
@@ -532,12 +542,12 @@ async def stream_text_with_log(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    model: str | None = None,
-    max_tokens: int | None = None,
-    reasoning_effort: str | None = None,
-    provider: LLMProviderInterface | None = None,
-    retry: RetryPolicy = DEFAULT_RETRY_POLICY,
+    temperature: float | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: str | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
@@ -555,9 +565,10 @@ async def stream_text_with_log(
     ``max_tokens`` caps the streamed completion length and
     ``reasoning_effort`` controls provider thinking tokens — parity with
     :func:`text_llm_call` and :func:`structured_llm_call`. Each is forwarded
-    to the provider only when set (``reasoning_effort`` resolved against the
-    configured :class:`~llmkit.LLMClientConfig` value when ``None``) and is
-    recorded on the call's :class:`~llmkit.logging.LLMCallRecord`.
+    to the provider only when it resolves to a value (``reasoning_effort``
+    resolved against the configured :class:`~llmkit.LLMClientConfig` value
+    when ``None``) and is recorded on the call's
+    :class:`~llmkit.logging.LLMCallRecord`.
 
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. Streamed responses

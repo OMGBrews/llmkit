@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Explicit per-call keywords now beat `options` even at default-equal
+  values.** The documented precedence (**config < options < explicit
+  keyword**) detected an "explicit" keyword by comparing its value against the
+  signature default, so `structured_llm_call(..., temperature=0.2,
+  options=LLMCallOptions(temperature=0.9))` silently ran at `0.9`, and an
+  explicit `model=None` / `retry=DEFAULT_RETRY_POLICY` could never override an
+  options field. The mergeable keywords (`temperature`, `model`, `max_tokens`,
+  `reasoning_effort`, `retry`, `provider`) on all five call functions now
+  default to the **`UNSET`** sentinel — "was it passed" is structural, and any
+  passed value (including `None`) wins, exactly as the README promises. True
+  defaults are applied in one place (`resolve_call_args`); behavior without
+  `options`, or with disjoint keyword/options fields, is unchanged.
+  **Compatibility note:** callers passing a keyword whose value equals the old
+  default *and* setting the same field on `options` previously got the options
+  value; they now get their explicit keyword. Code introspecting call-function
+  signatures sees `float | Unset = UNSET`-style defaults.
+
+### Added
+
+- **`llmkit.Unset` / `llmkit.UNSET` / `llmkit.DEFAULT_TEMPERATURE` are
+  public.** The not-passed sentinel that already appeared in
+  `LLMCallOptions`' annotations is now a deliberate part of the typed surface
+  (the openai-python `NotGiven`/`NOT_GIVEN` pattern) instead of a leaked
+  private type: a caller's typed wrapper can declare `temperature: float |
+  Unset = UNSET` and forward unconditionally. `repr(UNSET)` reads `UNSET`,
+  and `LLMCallOptions`' repr now prints only the fields actually set —
+  `LLMCallOptions(temperature=0.9)`, not six `=UNSET` entries.
+
 - **`except LLM_RECOVERABLE_ERRORS:` now actually catches a litellm-native
   503.** The litellm 503 entry in `LLM_TRANSPORT_ERRORS` matched only via a
   lazy `isinstance` hook (the metaclass stand-in that keeps `import llmkit`

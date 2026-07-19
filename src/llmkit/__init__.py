@@ -56,7 +56,12 @@ from llmkit.logging import (
     LogSink,
     configure_llm_logging,
 )
-from llmkit.options import LLMCallOptions
+from llmkit.options import (
+    DEFAULT_TEMPERATURE,
+    UNSET,
+    LLMCallOptions,
+    Unset,
+)
 from llmkit.providers import (
     LLMClientConfig,
     LLMProviderInterface,
@@ -141,6 +146,9 @@ __all__ = [
     "capture_llm_log_paths",
     "capture_llm_records",
     "LLMCallOptions",
+    "Unset",
+    "UNSET",
+    "DEFAULT_TEMPERATURE",
     # JSON-schema-dict structured output (build-once-reuse helper)
     "model_from_json_schema",
     # Exception handling
