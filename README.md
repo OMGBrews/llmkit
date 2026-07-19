@@ -130,7 +130,9 @@ The flat-keyword path is unchanged — pass no `options` and nothing about exist
 
 **config < `options` < explicit per-call keyword**
 
-So a value passed directly as a keyword wins; an `LLMCallOptions` field sits between the keyword and the config; and when neither the keyword nor `options` supplies a value, the configured `LLMClientConfig` default applies (e.g. `model=None` defers to the provider/config default). An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
+So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
+
+`Unset` (the type) and `UNSET` (the value) are exported for one idiom: your own typed wrapper can declare `temperature: float | Unset = UNSET` and forward it unconditionally, letting llmkit resolve "not passed" instead of re-inventing the sentinel. Compare with `is`/`is not` only — never truthiness.
 
 ### Contracts as JSON-schema dicts
 

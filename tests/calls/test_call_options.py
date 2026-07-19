@@ -5,8 +5,10 @@ A feature module builds one :class:`LLMCallOptions` and passes it as
 These tests pin the three-layer precedence the audit made explicit —
 **config < options < explicit per-call keyword** — by patching the
 transport seam and asserting what each call forwards: an ``LLMCallOptions``
-reused across calls, an explicit keyword overriding a field set in options,
-and an unset options field falling through (``model=None``) to the config.
+reused across calls, an explicit keyword overriding a field set in options
+(including one whose value equals the old signature default — detection is
+the ``UNSET`` sentinel, never value equality), and an unset options field
+falling through to the config.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ from unittest.mock import patch
 
 from llmkit import (
     DEFAULT_RETRY_POLICY,
+    DEFAULT_TEMPERATURE,
     NO_RETRY,
+    UNSET,
     LLMCallOptions,
     structured_output,
 )
@@ -100,15 +104,16 @@ def test_explicit_keyword_overrides_options_field() -> None:
     assert calls[0]["temperature"] == 0.9
 
 
-def test_explicit_keyword_equal_to_default_defers_to_options() -> None:
-    """The documented merge edge: a per-call keyword left *at its default* is
-    indistinguishable from "not passed", so a set options field still wins.
+def test_explicit_keyword_equal_to_old_default_overrides_options() -> None:
+    """Regression for the audit's precedence bug: an explicitly-passed keyword
+    wins over ``options`` even when its value equals the old signature default.
 
-    Passing ``max_tokens=None`` (the keyword default) does NOT override an
-    options value — it defers to it. This is the footgun the precedence rule
-    accepts on purpose so a shared ``LLMCallOptions`` can supply the value."""
+    Detection is structural (the ``UNSET`` sentinel), not value equality, so
+    ``max_tokens=None`` and ``temperature=0.2`` — both former signature
+    defaults — override the matching options fields, exactly as the README's
+    **config < options < explicit keyword** promises."""
     fake, calls = _structured_recorder()
-    options = LLMCallOptions(max_tokens=512)
+    options = LLMCallOptions(max_tokens=512, temperature=0.9, model="options-model")
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
@@ -119,13 +124,17 @@ def test_explicit_keyword_equal_to_default_defers_to_options() -> None:
                 "hi",
                 OkSchema,
                 feature="extraction",
-                max_tokens=None,  # equals the default -> yields to options
+                max_tokens=None,  # explicit -> wins despite equalling the old default
+                temperature=DEFAULT_TEMPERATURE,  # explicit 0.2 -> wins over 0.9
+                model=None,  # explicit None -> provider default, not options-model
                 options=options,
             )
 
         asyncio.run(_run())
 
-    assert calls[0]["max_tokens"] == 512
+    assert calls[0]["max_tokens"] is None
+    assert calls[0]["temperature"] == DEFAULT_TEMPERATURE
+    assert calls[0]["model"] is None
 
 
 def test_unset_options_field_falls_through_to_config() -> None:
@@ -154,7 +163,8 @@ def test_unset_options_field_falls_through_to_config() -> None:
 
 
 def test_no_options_leaves_flat_kwargs_unchanged() -> None:
-    """With ``options=None`` the flat-keyword path is byte-for-byte unchanged."""
+    """With ``options=None`` the flat-keyword path forwards the same values
+    as ever: passed keywords as given, unset ones at their true defaults."""
     fake, calls = _structured_recorder()
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
@@ -174,21 +184,53 @@ def test_no_options_leaves_flat_kwargs_unchanged() -> None:
     assert calls[0]["max_tokens"] is None
 
 
-def test_options_retry_applied_when_keyword_default() -> None:
-    """A ``retry`` set on options is honored when the keyword is left default;
+def test_options_retry_applied_when_keyword_unset() -> None:
+    """A ``retry`` set on options is honored when the keyword is not passed;
     proves the budget field merges like the rest."""
     options = LLMCallOptions(retry=NO_RETRY)
     resolved = resolve_call_args(
         options,
-        temperature=0.2,
-        model=None,
-        max_tokens=None,
-        reasoning_effort=None,
-        retry=DEFAULT_RETRY_POLICY,
-        provider=None,
+        temperature=UNSET,
+        model=UNSET,
+        max_tokens=UNSET,
+        reasoning_effort=UNSET,
+        retry=UNSET,
+        provider=UNSET,
     )
 
     assert resolved.retry is NO_RETRY
+
+
+def test_all_unset_resolves_to_true_defaults() -> None:
+    """Nothing passed anywhere resolves to the documented defaults — applied
+    in ``resolve_call_args``, the single definition site, not in signatures."""
+    resolved = resolve_call_args(
+        None,
+        temperature=UNSET,
+        model=UNSET,
+        max_tokens=UNSET,
+        reasoning_effort=UNSET,
+        retry=UNSET,
+        provider=UNSET,
+    )
+
+    assert resolved.temperature == DEFAULT_TEMPERATURE
+    assert resolved.model is None
+    assert resolved.max_tokens is None
+    assert resolved.reasoning_effort is None
+    assert resolved.retry is DEFAULT_RETRY_POLICY
+    assert resolved.provider is None
+
+
+def test_repr_shows_only_set_fields_and_sentinel_reads_clean() -> None:
+    """``LLMCallOptions`` repr prints only the fields actually set, and the
+    sentinel itself reprs as ``UNSET`` — no internal enum-member noise in
+    debug output or ``help()`` signatures."""
+    assert repr(UNSET) == "UNSET"
+    assert repr(LLMCallOptions()) == "LLMCallOptions()"
+    assert repr(LLMCallOptions(temperature=0.9)) == "LLMCallOptions(temperature=0.9)"
+    # An explicit None is a *set* field (distinct from unset) and shows up.
+    assert repr(LLMCallOptions(model=None)) == "LLMCallOptions(model=None)"
 
 
 def test_options_threads_through_text_and_sync() -> None:
