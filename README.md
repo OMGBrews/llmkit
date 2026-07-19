@@ -40,6 +40,7 @@ dependencies behind opt-in extras so hosts pay only for what they call:
 ```bash
 pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (boto3 for SigV4 signing)
 pip install "omg-llmkit[vertex]"     # Gemini via Google Cloud Vertex AI
+pip install "omg-llmkit[all]"        # both of the above
 ```
 
 Bedrock's `[bedrock]` extra pulls only `boto3` (LiteLLM signs Bedrock requests
@@ -103,7 +104,7 @@ The public call surface:
 
 ### Reusing call options
 
-The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) take up to nine keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
+The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
 from llmkit import LLMCallOptions, structured_llm_call

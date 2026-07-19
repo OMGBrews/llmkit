@@ -23,6 +23,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-Gemini provider now raises instead of being dropped. (The config docstring
   always said only the active provider's fields need be populated; this enforces
   it.)
+
 - **Bearer providers resolve their API key explicitly: config, then the
   provider's environment variable, else raise.** The five key-authenticated
   providers (OpenRouter, Anthropic, OpenAI, DeepSeek, Google AI Studio) coerced
@@ -36,6 +37,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   env-var-based setups keep working unchanged; a provider built with neither a
   configured key nor its env var now fails loudly at construction instead of at
   call time (or silently succeeding off an ambient key).
+
 - **`$ref` structural siblings and empty `properties` now raise in
   `model_from_json_schema`.** A structural keyword beside a `$ref` (`type`,
   `enum`, `items`, `properties`, …) that differs from the referenced schema was
@@ -82,6 +84,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and admission caps are unchanged (still per-population); multi-population
   workloads may see legitimate `"throttle"` backpressure events they never got
   before, still bounded to one halving per cooldown.
+
+- **⚠️ Log retention is on by default: the sink now deletes old logs.** The
+  default `LocalYamlLogSink` prunes per-call YAML files older than **30 days**
+  and rotates `index.jsonl` past **50 MiB** to a date-stamped generation that
+  ages out under the same policy (housekeeping is hourly-throttled, on a
+  worker thread, and rotation is an atomic rename that loses no lines). The
+  first successful write announces the directory *and* the policy at INFO —
+  before anything is ever deleted. Opt out with
+  `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
+  your logs are an archive rather than a debugging aid.
+
+- **⚠️ The default log directory moved for processes not launched from a
+  project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
+  else `data/llm-logs/` under the nearest ancestor with a
+  `pyproject.toml`/`.git` (nearest wins; seeded with a `.gitignore` when the
+  sink creates it), else a per-user state dir
+  (`$XDG_STATE_HOME/llmkit/llm-logs`, `~/Library/Logs/llmkit`,
+  `%LOCALAPPDATA%\llmkit\logs`) — and frozen, so a mid-run `chdir` can't split
+  one process's logs. Launches from a repo root keep byte-identical paths;
+  launches from a repo *subdirectory* consolidate to the repo root (previously
+  they sprayed `subdir/data/llm-logs`); only processes outside any project
+  move to the private state dir, announced by the first-write INFO. The
+  `DEFAULT_LOG_DIR` constant is **removed** — use `default_log_dir()` or pass
+  an explicit `log_dir`.
+
+- **⚠️ Log files are private by default on POSIX.** A sink-created directory
+  is `0o700` and log files `0o600`. Multi-reader deployments should pre-create
+  the log directory with their desired mode — the sink never re-chmods a
+  directory it didn't create.
+
+- **The per-call YAML, `index.jsonl`, and header line 2 carry three new
+  fields** (`call_id`, `attempt`, `queue_wait_ms`; header line 2 gains a
+  `call=<id[:8]> attempt=<n>` suffix). Header line 1 — the `head -1` triage
+  shape — is byte-identical. A strict index parser must accept the three new
+  keys.
+
+- **A persistently broken sink warns once, not once per call.** The first
+  failure (and any *new* failure signature — different exception type or
+  errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
+  latch re-arms on success and on `configure_llm_logging`.
 
 ### Deprecated
 
@@ -165,6 +207,67 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `asyncio.CancelledError`, no longer maskable by a secondary `RuntimeError` from
   the cancel path.
 
+- **Structured-path transport errors are no longer double-sent inside the
+  rate-limiter slot.** instructor's in-call re-ask (the loop llmkit feeds its
+  `max_retries`) previously retried *every* failure except length truncation —
+  so a 429/5xx/network or a permanent 401/400/403 was re-sent immediately, with
+  no backoff and ignoring `Retry-After`, inside the single per-provider
+  concurrency slot: one request became two, invisible to the outer retry layer.
+  The in-call re-ask is now restricted to genuine parse failures (malformed
+  JSON / `ValidationError`), matching instructor's own default. A transient
+  error now makes **one** request per outer attempt (not two) and is retried by
+  the outer layer with the full transport budget and `Retry-After` honored; a
+  permanent error fails fast with no in-call duplicate. Every genuine parse
+  failure still gets its one repair re-ask and is retried on the (lower)
+  validation budget — this now correctly includes instructor's own
+  `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response) and
+  `AsyncValidationError` (a failing async field validator), which previously
+  failed fast; length truncation still fails fast as `OutputLimitError`.
+
+- **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
+  was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
+  gone from its catalog entirely, so *every* call that relied on the default
+  (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
+  naming a model) failed with `NotFoundError: "No endpoints found for
+  google/gemini-2.0-flash-001"`. The default is now
+  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
+  model the `GOOGLE` and `VERTEX` providers already default to, and measured
+  live at 10/10 valid strict-`json_schema` structured round-trips through the
+  public surface (2026-07-14). Callers who pass an explicit `model` were never
+  affected.
+
+- **Sink I/O no longer blocks the event loop.** Every log write — `mkdir`,
+  the full-payload `yaml.dump`, both file writes, retention housekeeping —
+  runs via `asyncio.to_thread`, for the structured, buffered-text, and
+  cleanly-finished stream paths (a stream abandoned mid-flight deliberately
+  writes synchronously so its truncation-witness record can't be lost while
+  the generator unwinds; a write that can't be offloaded — executor already
+  shut down at teardown — degrades to blocking rather than lost). The
+  documented capture contracts are unchanged: the record and written path are
+  captured before the call returns, and both sync-bridge teardown paths drain
+  the executor so a clean exit never abandons a final write.
+
+- **Log records from retries of one call are now joinable.** Each logical
+  call mints one `call_id` (uuid4 hex) and numbers attempts 1-based across
+  all three call surfaces and the sync bridge — no more joining retry records
+  by feature + timestamp proximity, which broke under concurrent same-feature
+  fan-out.
+
+- **`duration_ms` no longer silently conflates limiter queue time with
+  provider latency.** New `queue_wait_ms` records time queued behind llmkit's
+  own rate limiter (`0.0` when disabled, `None` when the attempt failed
+  before acquiring); `duration_ms` keeps its meaning, so provider latency ≈
+  `duration_ms - queue_wait_ms`.
+
+- **The live smoke suite now exercises each OpenRouter path that can rot
+  independently.** It previously always overrode the model, which is why a dead
+  default shipped through a green release gate. There are now two OpenRouter
+  live tests: one drives the provider's *own default* with no `model=` and no
+  env override (so a retired default fails the gate instead of shipping), and
+  the existing one keeps pinning the strict-`json_schema` wire shape against
+  `mistralai/mistral-nemo`, the model measured to echo the schema back when the
+  `response_format` is sent non-strict.
+
 ### Added
 
 - **`llmkit.Unset` / `llmkit.UNSET` / `llmkit.DEFAULT_TEMPERATURE` are
@@ -220,12 +323,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `isinstance` checks, so a host's own litellm call wrapped in `with_retries`
   retries its 503s exactly as before.
 
-### Added
-
 - **`llmkit.__version__`.** The package now exposes its version, resolved from
   installed distribution metadata (`omg-llmkit`) so it can never drift from
   what pip installed. A source tree without dist metadata reports
   `"0.0.0+unknown"` rather than raising at import.
+
 - **A host can pick Gemini's structured-output strategy.**
   `LLMClientConfig.gemini_structured_output` (`"schema"` | `"json"`, default
   `"schema"`) selects the instructor `Mode` for the two Gemini providers (Vertex,
@@ -246,114 +348,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unrecognized value fails loudly at provider construction rather than silently
   falling back.
 
-### Fixed
-
-- **Structured-path transport errors are no longer double-sent inside the
-  rate-limiter slot.** instructor's in-call re-ask (the loop llmkit feeds its
-  `max_retries`) previously retried *every* failure except length truncation —
-  so a 429/5xx/network or a permanent 401/400/403 was re-sent immediately, with
-  no backoff and ignoring `Retry-After`, inside the single per-provider
-  concurrency slot: one request became two, invisible to the outer retry layer.
-  The in-call re-ask is now restricted to genuine parse failures (malformed
-  JSON / `ValidationError`), matching instructor's own default. A transient
-  error now makes **one** request per outer attempt (not two) and is retried by
-  the outer layer with the full transport budget and `Retry-After` honored; a
-  permanent error fails fast with no in-call duplicate. Every genuine parse
-  failure still gets its one repair re-ask and is retried on the (lower)
-  validation budget — this now correctly includes instructor's own
-  `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response) and
-  `AsyncValidationError` (a failing async field validator), which previously
-  failed fast; length truncation still fails fast as `OutputLimitError`.
-- **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
-  was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
-  gone from its catalog entirely, so *every* call that relied on the default
-  (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
-  naming a model) failed with `NotFoundError: "No endpoints found for
-  google/gemini-2.0-flash-001"`. The default is now
-  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
-  model the `GOOGLE` and `VERTEX` providers already default to, and measured
-  live at 10/10 valid strict-`json_schema` structured round-trips through the
-  public surface (2026-07-14). Callers who pass an explicit `model` were never
-  affected.
-
-### Added
-
 - **New logging surface, all additive:** `default_log_dir()` (top-level
   export) and the `LLMKIT_LOG_DIR` env override;
   `LocalYamlLogSink(retention_days=..., max_index_bytes=...)`; and three
   defaulted `LLMCallRecord` fields — `call_id`, `attempt`, `queue_wait_ms` —
   so every existing direct constructor and custom sink keeps working
   unchanged.
-
-### Changed
-
-- **⚠️ Log retention is on by default: the sink now deletes old logs.** The
-  default `LocalYamlLogSink` prunes per-call YAML files older than **30 days**
-  and rotates `index.jsonl` past **50 MiB** to a date-stamped generation that
-  ages out under the same policy (housekeeping is hourly-throttled, on a
-  worker thread, and rotation is an atomic rename that loses no lines). The
-  first successful write announces the directory *and* the policy at INFO —
-  before anything is ever deleted. Opt out with
-  `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
-  your logs are an archive rather than a debugging aid.
-- **⚠️ The default log directory moved for processes not launched from a
-  project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
-  else `data/llm-logs/` under the nearest ancestor with a
-  `pyproject.toml`/`.git` (nearest wins; seeded with a `.gitignore` when the
-  sink creates it), else a per-user state dir
-  (`$XDG_STATE_HOME/llmkit/llm-logs`, `~/Library/Logs/llmkit`,
-  `%LOCALAPPDATA%\llmkit\logs`) — and frozen, so a mid-run `chdir` can't split
-  one process's logs. Launches from a repo root keep byte-identical paths;
-  launches from a repo *subdirectory* consolidate to the repo root (previously
-  they sprayed `subdir/data/llm-logs`); only processes outside any project
-  move to the private state dir, announced by the first-write INFO. The
-  `DEFAULT_LOG_DIR` constant is **removed** — use `default_log_dir()` or pass
-  an explicit `log_dir`.
-- **⚠️ Log files are private by default on POSIX.** A sink-created directory
-  is `0o700` and log files `0o600`. Multi-reader deployments should pre-create
-  the log directory with their desired mode — the sink never re-chmods a
-  directory it didn't create.
-- **The per-call YAML, `index.jsonl`, and header line 2 carry three new
-  fields** (`call_id`, `attempt`, `queue_wait_ms`; header line 2 gains a
-  `call=<id[:8]> attempt=<n>` suffix). Header line 1 — the `head -1` triage
-  shape — is byte-identical. A strict index parser must accept the three new
-  keys.
-- **A persistently broken sink warns once, not once per call.** The first
-  failure (and any *new* failure signature — different exception type or
-  errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
-  latch re-arms on success and on `configure_llm_logging`.
-
-### Fixed
-
-- **Sink I/O no longer blocks the event loop.** Every log write — `mkdir`,
-  the full-payload `yaml.dump`, both file writes, retention housekeeping —
-  runs via `asyncio.to_thread`, for the structured, buffered-text, and
-  cleanly-finished stream paths (a stream abandoned mid-flight deliberately
-  writes synchronously so its truncation-witness record can't be lost while
-  the generator unwinds; a write that can't be offloaded — executor already
-  shut down at teardown — degrades to blocking rather than lost). The
-  documented capture contracts are unchanged: the record and written path are
-  captured before the call returns, and both sync-bridge teardown paths drain
-  the executor so a clean exit never abandons a final write.
-- **Log records from retries of one call are now joinable.** Each logical
-  call mints one `call_id` (uuid4 hex) and numbers attempts 1-based across
-  all three call surfaces and the sync bridge — no more joining retry records
-  by feature + timestamp proximity, which broke under concurrent same-feature
-  fan-out.
-- **`duration_ms` no longer silently conflates limiter queue time with
-  provider latency.** New `queue_wait_ms` records time queued behind llmkit's
-  own rate limiter (`0.0` when disabled, `None` when the attempt failed
-  before acquiring); `duration_ms` keeps its meaning, so provider latency ≈
-  `duration_ms - queue_wait_ms`.
-
-- **The live smoke suite now exercises each OpenRouter path that can rot
-  independently.** It previously always overrode the model, which is why a dead
-  default shipped through a green release gate. There are now two OpenRouter
-  live tests: one drives the provider's *own default* with no `model=` and no
-  env override (so a retired default fails the gate instead of shipping), and
-  the existing one keeps pinning the strict-`json_schema` wire shape against
-  `mistralai/mistral-nemo`, the model measured to echo the schema back when the
-  `response_format` is sent non-strict.
 
 ## [0.7.0] — 2026-07-14
 

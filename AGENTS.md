@@ -24,8 +24,10 @@ uv sync            # installs the dev group; the [bedrock]/[vertex] extras come 
 
 ## Gates — all four must pass before a PR
 
-CI runs exactly these on every push and pull request
-([CONTRIBUTING.md](CONTRIBUTING.md) has the full context):
+CI runs these four gates on every push and pull request — the ones to run
+before opening a PR (it also runs a lowest-versions resolution job, a wheel
+smoke test, and a weekly unlocked-resolution run that rarely concern a PR
+author; [CONTRIBUTING.md](CONTRIBUTING.md) has the full context):
 
 ```bash
 uv run ruff check .

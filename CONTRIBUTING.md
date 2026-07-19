@@ -23,6 +23,11 @@ uv run basedpyright          # recommended tier, clean with no baseline
 uv run pytest
 ```
 
+CI additionally runs a lowest-versions resolution job (`--resolution
+lowest-direct`), a wheel smoke test, and a weekly unlocked-resolution cron —
+those rarely concern a PR author, so the four gates above are what to run before
+opening a PR.
+
 basedpyright runs in its `recommended` tier (stricter than the `standard`
 default, and at least as strict as the editor extension's defaults) and is clean
 at **0 errors, 0 warnings with no baseline** — there is no `.basedpyright/baseline.json`,
