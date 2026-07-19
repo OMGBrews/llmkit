@@ -486,10 +486,14 @@ async def test_with_retries_explicit_opt_in_still_retries_circuit_open_error() -
 
 
 async def test_with_retries_retry_on_none_wrapped_circuit_open_fails_fast() -> None:
-    """A ``CircuitOpenError`` wrapped in ``InstructorRetryException`` still fails
-    fast under ``retry_on=None``: the layer unwraps the cause and the zero-budget
-    carve-out owns it (the wrapped form was already caught by the permanent-cause
-    guard — this pins that the new carve-out now handles it first). One attempt."""
+    """A ``CircuitOpenError`` wrapped in ``InstructorRetryException`` fails fast
+    under ``retry_on=None`` — one attempt. This pins the *wrapped form's*
+    fail-fast behaviour, not which guard owns it: both the zero-budget carve-out
+    and the pre-existing ``wraps_permanent_cause`` guard (a wrapped cause that is
+    neither transport- nor schema-shaped) catch it, so it passed before this
+    change too and stays green as a regression guard on the wrapped path. The
+    *bare*-``CircuitOpenError`` test above is the discriminating regression for
+    the new carve-out (it fails pre-fix with ``calls == 3``)."""
     calls = [0]
 
     async def fn() -> None:

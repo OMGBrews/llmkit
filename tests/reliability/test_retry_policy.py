@@ -633,8 +633,16 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
     ``text_llm_call_sync`` drives its coroutine on llmkit's *persistent* loop —
     a distinct task — so the inherited scope no longer collapses it. Pre-fix the
     inherited flag forced a single inner pass, whose transient failure then
-    re-ran the expensive outer call (``outer_calls == 3``); post-fix the outer
-    call runs exactly once while the inner keeps its full transport budget."""
+    burned the *outer* loop's budget, re-running the expensive main call until
+    the inner happened to succeed (``outer_calls == 3``) and warning each time.
+    Post-fix the outer call runs exactly once, the inner keeps its full
+    transport budget, and the nested-retry guard never fires.
+
+    Warnings are recorded rather than raised-as-errors here on purpose: the
+    warn happens on the persistent loop's daemon thread, and letting it raise
+    would abort the very first outer pass (masking the ``outer_calls == 3``
+    discriminator). ``outer_calls`` is the discriminating assertion; the
+    recorded-warning check is the direct read of "no nested-retry warning"."""
     outer_calls = [0]
     inner_calls = [0]
 
@@ -651,8 +659,8 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
     def hook(_result: OkSchema) -> None:
         _ = structured_output.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         with (
             quiet_logging(),
             patch("llmkit._litellm.acompletion_structured", side_effect=_outer_transport),
@@ -663,8 +671,12 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
             )
 
     assert result.ok is True
-    assert outer_calls[0] == 1  # the discriminating assertion (pre-fix: 3)
+    assert outer_calls[0] == 1  # the discriminating assertion (pre-fix: 3, outer budget burned)
     assert inner_calls[0] == 3  # inner kept its own transport budget
+    nested = [
+        w for w in caught if issubclass(w.category, RuntimeWarning) and "nested" in str(w.message)
+    ]
+    assert nested == []  # the guard never collapsed the distinct cross-bridge call
 
 
 @pytest.mark.asyncio
