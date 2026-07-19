@@ -293,6 +293,15 @@ class LLMCallRecord:
     visibility — NOT a billing figure. It is sourced from LiteLLM's
     per-response cost (no local price table) and is ``None`` when the
     provider does not report it (e.g. streamed calls).
+
+    ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
+    1-based attempt number within it, so the N records a retried call
+    produces join on ``call_id`` instead of feature + timestamp proximity
+    (which breaks under concurrent same-feature fan-out). ``queue_wait_ms``
+    is the time this attempt spent queued behind llmkit's own rate limiter
+    — ``duration_ms`` includes it, so provider latency is approximately
+    ``duration_ms - queue_wait_ms``. All three default ``None`` for
+    directly-constructed records.
     """
 
     started_at: datetime
@@ -309,6 +318,9 @@ class LLMCallRecord:
     approximate_cost: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    call_id: str | None = None
+    attempt: int | None = None
+    queue_wait_ms: float | None = None
 
 
 class LogSink(Protocol):
@@ -510,10 +522,15 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "call_id": record.call_id,
+                "attempt": record.attempt,
                 "temperature": record.temperature,
                 "max_tokens": record.max_tokens,
                 "reasoning_effort": record.reasoning_effort,
                 "duration_ms": round(record.duration_ms, 1),
+                "queue_wait_ms": (
+                    round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
+                ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
                 "response": cast("object", record.response),
@@ -614,8 +631,11 @@ class LocalYamlLogSink:
         Every caller-derived field (feature, label, model, schema) is passed
         through :func:`_oneline` so a value containing a newline cannot forge
         a second ``# ok | ...`` verdict line and corrupt that triage. The
-        second line is the ISO ``started_at`` stamp, which is machine-built
-        and contains no newlines.
+        second line is the ISO ``started_at`` stamp — machine-built, no
+        newlines — plus, when the record carries correlation fields, a
+        ``call=<id[:8]> attempt=<n>`` suffix so retries of one logical call
+        are joinable from the file heads alone. The first line's shape is
+        pinned (``head -1`` tooling greps it); only line 2 gains the suffix.
         """
         status = "ERROR" if record.error else "ok"
         cost = f"${record.approximate_cost:.3g}" if record.approximate_cost is not None else "$?"
@@ -623,11 +643,16 @@ class LocalYamlLogSink:
         label = _oneline(record.label or "unlabeled")
         model = _oneline(record.model or "?")
         schema = _oneline(record.schema)
+        correlation = ""
+        if record.call_id is not None:
+            correlation = f" | call={_oneline(record.call_id)[:8]}"
+            if record.attempt is not None:
+                correlation += f" attempt={record.attempt}"
         return (
             f"# {status} | {feature}/{label} | "
             f"{model} | {schema} | "
             f"{round(record.duration_ms)}ms | {cost}\n"
-            f"# {record.started_at.isoformat()}\n\n"
+            f"# {record.started_at.isoformat()}{correlation}\n\n"
         )
 
     def _append_index(self, record: LLMCallRecord, filepath: Path) -> None:
@@ -655,7 +680,12 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "call_id": record.call_id,
+                "attempt": record.attempt,
                 "duration_ms": round(record.duration_ms, 1),
+                "queue_wait_ms": (
+                    round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
+                ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
             }
