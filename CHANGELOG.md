@@ -6,268 +6,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- **A config knob the selected provider does not read is now rejected, not
-  silently ignored.** `LLMClientConfig` / `make_provider` accepted every
-  provider-shaped field for every provider and each provider used only the ones
-  it needed, dropping the rest — so a config populated generically (all fields
-  filled from a settings object) *looked* like it pinned a credential or
-  endpoint that was in fact ignored. `build_provider` — the single seam
-  `make_provider`, `configure_llm_client`, and a direct `build_provider(config)`
-  all flow through — now raises a `ValueError` naming the offending field(s) and
-  what the provider does read. Each provider declares its accepted knobs
-  (`_accepted_config_fields`), enforced at import. **Migration:** populate only
-  the active provider's fields — an `api_key` on Bedrock/Vertex, a `base_url` on
-  a fixed-endpoint provider, or a non-default `gemini_structured_output` on a
-  non-Gemini provider now raises instead of being dropped. (The config docstring
-  always said only the active provider's fields need be populated; this enforces
-  it.)
-
-- **Bearer providers resolve their API key explicitly: config, then the
-  provider's environment variable, else raise.** The five key-authenticated
-  providers (OpenRouter, Anthropic, OpenAI, DeepSeek, Google AI Studio) coerced
-  a missing `api_key` to `""` and handed it to LiteLLM, which *silently* fell
-  back to the ambient provider env key — an invisible identity/billing swap
-  (reachable even from a stray `.env`, since importing LiteLLM runs
-  `load_dotenv()`). Resolution is now explicit and documented: the configured
-  key wins; else the provider's own variable (`ANTHROPIC_API_KEY`,
-  `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`);
-  else a `ValueError` at construction naming the variable. **Migration:**
-  env-var-based setups keep working unchanged; a provider built with neither a
-  configured key nor its env var now fails loudly at construction instead of at
-  call time (or silently succeeding off an ambient key).
-
-- **`$ref` structural siblings and empty `properties` now raise in
-  `model_from_json_schema`.** A structural keyword beside a `$ref` (`type`,
-  `enum`, `items`, `properties`, …) that differs from the referenced schema was
-  silently dropped on the annotation path — most visibly a `$ref`-sibling
-  `enum`, which widened the field to an unconstrained scalar. It now raises
-  unless it restates the target's value (metadata and bounds still merge,
-  outer-wins). An explicit empty `{"properties": {}}` now raises like an absent
-  `properties` (both would build a zero-field model that rejects every
-  response), unless `additionalProperties: true` is set.
-
-- **`stream_text_with_log` is renamed to `text_llm_call_stream`.** The streaming
-  call function now matches the `<shape>_llm_call[_sync|_stream]` grammar the
-  other call functions follow (so `grep -r llm_call` finds the whole call
-  surface); its old `with_log` suffix was noise (every call function logs). The
-  old name stays as a deprecated alias through the pre-1.0 window (see
-  **Deprecated**). **Migration:** rename `stream_text_with_log(...)` →
-  `text_llm_call_stream(...)` — identical signature and behaviour.
-
-- **The Python floor is lowered to 3.12, and the tested-platform surface is
-  widened.** `requires-python` is now `>=3.12` (was `>=3.13`): every idiom the
-  library uses — PEP 695 generics, `StrEnum`, `match`/`assert_never` — is fully
-  available on 3.12, so the floor now sits at the lowest version that supports
-  them, verified by CI. CI runs a matrix (3.12/3.13/3.14 on Linux plus one macOS
-  and one Windows cell) so the `OS Independent` classifier is actually exercised,
-  not just claimed. **Migration:** none — a strict superset of previously
-  supported environments.
-
-- **The public `dev` extra is removed; dev tooling is now a PEP 735 dependency
-  group.** The maintainer toolchain (pytest, ruff, basedpyright) no longer ships
-  as a public `omg-llmkit[dev]` extra — it moved to a `[dependency-groups]` entry
-  that never lands in the wheel/sdist metadata, taking it off the published
-  install surface. `uv sync` installs it by default. **Migration:** `pip install
-  'omg-llmkit[dev]'` no longer resolves the tooling (it warns and installs core
-  only); contributors use `uv sync`.
-
-- **AIMD saturation is judged on the provider-wide in-flight aggregate, not one
-  gate's local count.** The adaptive rate limiter decides whether a 429/503/529
-  should halve a provider's concurrency limit by asking "were we at the shared
-  limit?" — now measured across *every* population (each per-loop async gate plus
-  the sync gate) rather than the single gate the throttled call sat on. A
-  self-inflicted throttle in the multi-population regime (e.g. a host's own loop
-  and llmkit's persistent sync loop together over the limit) now triggers a
-  decrease it previously missed. Single-population workloads are byte-identical
-  and admission caps are unchanged (still per-population); multi-population
-  workloads may see legitimate `"throttle"` backpressure events they never got
-  before, still bounded to one halving per cooldown.
-
-- **⚠️ Log retention is on by default: the sink now deletes old logs.** The
-  default `LocalYamlLogSink` prunes per-call YAML files older than **30 days**
-  and rotates `index.jsonl` past **50 MiB** to a date-stamped generation that
-  ages out under the same policy (housekeeping is hourly-throttled, on a
-  worker thread, and rotation is an atomic rename that loses no lines). The
-  first successful write announces the directory *and* the policy at INFO —
-  before anything is ever deleted. Opt out with
-  `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
-  your logs are an archive rather than a debugging aid.
-
-- **⚠️ The default log directory moved for processes not launched from a
-  project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
-  else `data/llm-logs/` under the nearest ancestor with a
-  `pyproject.toml`/`.git` (nearest wins; seeded with a `.gitignore` when the
-  sink creates it), else a per-user state dir
-  (`$XDG_STATE_HOME/llmkit/llm-logs`, `~/Library/Logs/llmkit`,
-  `%LOCALAPPDATA%\llmkit\logs`) — and frozen, so a mid-run `chdir` can't split
-  one process's logs. Launches from a repo root keep byte-identical paths;
-  launches from a repo *subdirectory* consolidate to the repo root (previously
-  they sprayed `subdir/data/llm-logs`); only processes outside any project
-  move to the private state dir, announced by the first-write INFO. The
-  `DEFAULT_LOG_DIR` constant is **removed** — use `default_log_dir()` or pass
-  an explicit `log_dir`.
-
-- **⚠️ Log files are private by default on POSIX.** A sink-created directory
-  is `0o700` and log files `0o600`. Multi-reader deployments should pre-create
-  the log directory with their desired mode — the sink never re-chmods a
-  directory it didn't create.
-
-- **The per-call YAML, `index.jsonl`, and header line 2 carry three new
-  fields** (`call_id`, `attempt`, `queue_wait_ms`; header line 2 gains a
-  `call=<id[:8]> attempt=<n>` suffix). Header line 1 — the `head -1` triage
-  shape — is byte-identical. A strict index parser must accept the three new
-  keys.
-
-- **A persistently broken sink warns once, not once per call.** The first
-  failure (and any *new* failure signature — different exception type or
-  errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
-  latch re-arms on success and on `configure_llm_logging`.
-
-### Deprecated
-
-- **`stream_text_with_log` is a deprecated alias for `text_llm_call_stream`,
-  removed in 1.0.** Calling it warns `DeprecationWarning` (eagerly, at call time)
-  and otherwise behaves identically — same signature, same streamed chunks.
-  Switch the call; the alias exists only to spare a hard break mid-cycle.
-
-### Security
-
-- **`LLMClientConfig` no longer leaks `api_key` in its `repr`.** The frozen
-  dataclass's generated repr rendered `api_key='sk-...'` verbatim, so any
-  host-side `print(config)`, log line, or exception reporter's locals capture
-  could exfiltrate the credential. A set key now renders as `api_key=<redacted>`
-  (presence stays debuggable; the value never prints), and the repr shows only
-  fields that differ from their default. **Compatibility note:** code parsing
-  the repr string will see the new format.
-
-### Fixed
-
-- **`with_retries` no longer re-asks an open circuit under its default
-  `retry_on=None`.** A bare `CircuitOpenError` (raised by the opt-in circuit
-  breaker) fell through the "retry on any Exception" default and was charged
-  the full transport budget — violating the documented "never re-ask a circuit
-  the breaker already knows is open" contract (harmless in load terms, since
-  the breaker rejects each retry locally, but a contract break). It is now a
-  zero-budget fail-fast signal alongside `OutputLimitError`: never retried
-  under any configuration, unless a caller explicitly lists the type in
-  `retry_on` (an explicit opt-in still wins). Only direct `with_retries`
-  callers using the `retry_on=None` default were affected; the call functions
-  (`RetryPolicy.retry_on` is never `None`) already failed fast. The wrapped
-  form (`InstructorRetryException(CircuitOpenError)`) already failed fast and
-  is unchanged.
-
-- **A distinct llmkit call reached across a task boundary from inside a retry
-  attempt now keeps its own retry budget.** The nested-retry guard (which
-  collapses the `3 x 3 = 9` double-wrap trap to a single pass) was a bare
-  context-variable flag, and context variables are copied into new tasks and
-  across the sync bridge — so an `on_result` hook calling `text_llm_call_sync`,
-  or a task spawned via `asyncio.create_task` from inside an attempt, silently
-  lost its retries and fired a spurious `RuntimeWarning`. In the hook case that
-  inherited single pass then burned the *outer* loop's budget, re-running the
-  expensive main call. The guard is now keyed on the owning `asyncio` task, so
-  a distinct call in its own task keeps its full budget and warns no more;
-  same-task nesting (a call directly awaited inside the wrapped function) still
-  collapses and warns exactly as before. **Compatibility note:** hosts that
-  relied on the collapsed behaviour of such cross-task calls may now see more
-  real attempts — the documented per-call retry contract restored.
-
-- **A `$def`'s `description` now survives a nullable-wrapped or chained `$ref`.**
-  `model_from_json_schema` rescued a `$ref` target's model-facing `description`
-  only for a bare top-level `$ref`, so wrapping it in `anyOf`+`null` (a nullable
-  field) dropped the guidance instructor sends to the model. Unifying `$ref` /
-  nullable resolution into one pass carries the description through for bare,
-  nullable-wrapped, and multi-hop `$ref` fields alike (nearest hop wins).
-
-- **Explicit per-call keywords now beat `options` even at default-equal
-  values.** The documented precedence (**config < options < explicit
-  keyword**) detected an "explicit" keyword by comparing its value against the
-  signature default, so `structured_llm_call(..., temperature=0.2,
-  options=LLMCallOptions(temperature=0.9))` silently ran at `0.9`, and an
-  explicit `model=None` / `retry=DEFAULT_RETRY_POLICY` could never override an
-  options field. The mergeable keywords (`temperature`, `model`, `max_tokens`,
-  `reasoning_effort`, `retry`, `provider`) on all five call functions now
-  default to the **`UNSET`** sentinel — "was it passed" is structural, and any
-  passed value (including `None`) wins, exactly as the README promises. True
-  defaults are applied in one place (`resolve_call_args`); behavior without
-  `options`, or with disjoint keyword/options fields, is unchanged.
-  **Compatibility note:** callers passing a keyword whose value equals the old
-  default *and* setting the same field on `options` previously got the options
-  value; they now get their explicit keyword. Code introspecting call-function
-  signatures sees `float | Unset = UNSET`-style defaults.
-
-- **A `run_sync` caller racing `shutdown()` no longer hangs or raises.** When a
-  sync call obtained the persistent event loop just as `shutdown()` tore it down,
-  the submit could land on a stopped loop (the caller blocked for the full
-  timeout — 600 s by default — with the coroutine leaked) or a closed one (a
-  spurious `RuntimeError`). Obtaining the loop and submitting to it are now atomic
-  against `shutdown()`, so a racing caller transparently retries onto a lazily
-  restarted loop; a call genuinely in flight at shutdown still gets a prompt
-  `asyncio.CancelledError`, no longer maskable by a secondary `RuntimeError` from
-  the cancel path.
-
-- **Structured-path transport errors are no longer double-sent inside the
-  rate-limiter slot.** instructor's in-call re-ask (the loop llmkit feeds its
-  `max_retries`) previously retried *every* failure except length truncation —
-  so a 429/5xx/network or a permanent 401/400/403 was re-sent immediately, with
-  no backoff and ignoring `Retry-After`, inside the single per-provider
-  concurrency slot: one request became two, invisible to the outer retry layer.
-  The in-call re-ask is now restricted to genuine parse failures (malformed
-  JSON / `ValidationError`), matching instructor's own default. A transient
-  error now makes **one** request per outer attempt (not two) and is retried by
-  the outer layer with the full transport budget and `Retry-After` honored; a
-  permanent error fails fast with no in-call duplicate. Every genuine parse
-  failure still gets its one repair re-ask and is retried on the (lower)
-  validation budget — this now correctly includes instructor's own
-  `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response) and
-  `AsyncValidationError` (a failing async field validator), which previously
-  failed fast; length truncation still fails fast as `OutputLimitError`.
-
-- **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
-  was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
-  gone from its catalog entirely, so *every* call that relied on the default
-  (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
-  naming a model) failed with `NotFoundError: "No endpoints found for
-  google/gemini-2.0-flash-001"`. The default is now
-  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
-  model the `GOOGLE` and `VERTEX` providers already default to, and measured
-  live at 10/10 valid strict-`json_schema` structured round-trips through the
-  public surface (2026-07-14). Callers who pass an explicit `model` were never
-  affected.
-
-- **Sink I/O no longer blocks the event loop.** Every log write — `mkdir`,
-  the full-payload `yaml.dump`, both file writes, retention housekeeping —
-  runs via `asyncio.to_thread`, for the structured, buffered-text, and
-  cleanly-finished stream paths (a stream abandoned mid-flight deliberately
-  writes synchronously so its truncation-witness record can't be lost while
-  the generator unwinds; a write that can't be offloaded — executor already
-  shut down at teardown — degrades to blocking rather than lost). The
-  documented capture contracts are unchanged: the record and written path are
-  captured before the call returns, and both sync-bridge teardown paths drain
-  the executor so a clean exit never abandons a final write.
-
-- **Log records from retries of one call are now joinable.** Each logical
-  call mints one `call_id` (uuid4 hex) and numbers attempts 1-based across
-  all three call surfaces and the sync bridge — no more joining retry records
-  by feature + timestamp proximity, which broke under concurrent same-feature
-  fan-out.
-
-- **`duration_ms` no longer silently conflates limiter queue time with
-  provider latency.** New `queue_wait_ms` records time queued behind llmkit's
-  own rate limiter (`0.0` when disabled, `None` when the attempt failed
-  before acquiring); `duration_ms` keeps its meaning, so provider latency ≈
-  `duration_ms - queue_wait_ms`.
-
-- **The live smoke suite now exercises each OpenRouter path that can rot
-  independently.** It previously always overrode the model, which is why a dead
-  default shipped through a green release gate. There are now two OpenRouter
-  live tests: one drives the provider's *own default* with no `model=` and no
-  env override (so a retired default fails the gate instead of shipping), and
-  the existing one keeps pinning the strict-`json_schema` wire shape against
-  `mistralai/mistral-nemo`, the model measured to echo the schema back when the
-  `response_format` is sent non-strict.
-
 ### Added
 
 - **`llmkit.Unset` / `llmkit.UNSET` / `llmkit.DEFAULT_TEMPERATURE` are
@@ -354,6 +92,345 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defaulted `LLMCallRecord` fields — `call_id`, `attempt`, `queue_wait_ms` —
   so every existing direct constructor and custom sink keeps working
   unchanged.
+
+### Changed
+
+- **A config knob the selected provider does not read is now rejected, not
+  silently ignored.** `LLMClientConfig` / `make_provider` accepted every
+  provider-shaped field for every provider and each provider used only the ones
+  it needed, dropping the rest — so a config populated generically (all fields
+  filled from a settings object) *looked* like it pinned a credential or
+  endpoint that was in fact ignored. `build_provider` — the single seam
+  `make_provider`, `configure_llm_client`, and a direct `build_provider(config)`
+  all flow through — now raises a `ValueError` naming the offending field(s) and
+  what the provider does read. Each provider declares its accepted knobs
+  (`_accepted_config_fields`), enforced at import. **Migration:** populate only
+  the active provider's fields — an `api_key` on Bedrock/Vertex, a `base_url` on
+  a fixed-endpoint provider, or a non-default `gemini_structured_output` on a
+  non-Gemini provider now raises instead of being dropped. (The config docstring
+  always said only the active provider's fields need be populated; this enforces
+  it.)
+
+- **Bearer providers resolve their API key explicitly: config, then the
+  provider's environment variable, else raise.** The five key-authenticated
+  providers (OpenRouter, Anthropic, OpenAI, DeepSeek, Google AI Studio) coerced
+  a missing `api_key` to `""` and handed it to LiteLLM, which *silently* fell
+  back to the ambient provider env key — an invisible identity/billing swap
+  (reachable even from a stray `.env`, since importing LiteLLM runs
+  `load_dotenv()`). Resolution is now explicit and documented: the configured
+  key wins; else the provider's own variable (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`);
+  else a `ValueError` at construction naming the variable. **Migration:**
+  env-var-based setups keep working unchanged; a provider built with neither a
+  configured key nor its env var now fails loudly at construction instead of at
+  call time (or silently succeeding off an ambient key).
+
+- **`$ref` structural siblings and empty `properties` now raise in
+  `model_from_json_schema`.** A structural keyword beside a `$ref` (`type`,
+  `enum`, `items`, `properties`, …) that differs from the referenced schema was
+  silently dropped on the annotation path — most visibly a `$ref`-sibling
+  `enum`, which widened the field to an unconstrained scalar. It now raises
+  unless it restates the target's value (metadata and bounds still merge,
+  outer-wins). An explicit empty `{"properties": {}}` now raises like an absent
+  `properties` (both would build a zero-field model that rejects every
+  response), unless `additionalProperties: true` is set.
+
+- **A negative `RetryPolicy.backoff_base_seconds` is rejected at
+  construction.** `__post_init__` validated `max_attempts`,
+  `validation_max_attempts`, `max_backoff_seconds`, and `retry_after_cap` but
+  not the backoff base, so a negative value constructed fine and then
+  *subtracted* from a server `Retry-After` — the jitter term is
+  `random.uniform(0, backoff_base_seconds)`, so a negative base shortens the
+  wait the provider asked for, to nothing once its magnitude reaches the
+  header's value. It now raises `ValueError` alongside the other four; `0`
+  stays valid as the documented way to disable computed backoff.
+  **Migration:** a host building a `RetryPolicy` from a config value that can
+  go negative now fails at construction instead of quietly retrying early —
+  clamp the value at its source.
+
+- **`stream_text_with_log` is renamed to `text_llm_call_stream`.** The streaming
+  call function now matches the `<shape>_llm_call[_sync|_stream]` grammar the
+  other call functions follow (so `grep -r llm_call` finds the whole call
+  surface); its old `with_log` suffix was noise (every call function logs). The
+  old name stays as a deprecated alias through the pre-1.0 window (see
+  **Deprecated**). **Migration:** rename `stream_text_with_log(...)` →
+  `text_llm_call_stream(...)` — identical signature and behaviour.
+
+- **The Python floor is lowered to 3.12, and the tested-platform surface is
+  widened.** `requires-python` is now `>=3.12` (was `>=3.13`): every idiom the
+  library uses — PEP 695 generics, `StrEnum`, `match`/`assert_never` — is fully
+  available on 3.12, so the floor now sits at the lowest version that supports
+  them, verified by CI. CI runs a matrix (3.12/3.13/3.14 on Linux plus one macOS
+  and one Windows cell) so the `OS Independent` classifier is actually exercised,
+  not just claimed. **Migration:** none — a strict superset of previously
+  supported environments.
+
+- **AIMD saturation is judged on the provider-wide in-flight aggregate, not one
+  gate's local count.** The adaptive rate limiter decides whether a 429/503/529
+  should halve a provider's concurrency limit by asking "were we at the shared
+  limit?" — now measured across *every* population (each per-loop async gate plus
+  the sync gate) rather than the single gate the throttled call sat on. A
+  self-inflicted throttle in the multi-population regime (e.g. a host's own loop
+  and llmkit's persistent sync loop together over the limit) now triggers a
+  decrease it previously missed. Single-population workloads are byte-identical
+  and admission caps are unchanged (still per-population); multi-population
+  workloads may see legitimate `"throttle"` backpressure events they never got
+  before, still bounded to one halving per cooldown.
+
+- **The public sync acquire path reaches full parity with the async path — and
+  can now raise `CircuitOpenError`.** `rate_limit_acquire_sync` (and
+  `GlobalRateLimiter.acquire_sync` under it) held a fixed
+  `threading.Semaphore` that consulted neither the circuit breaker nor the AIMD
+  limit and fed neither: an armed breaker was invisible to it, and a throttle
+  it observed changed nothing. It now consults the *same* per-provider breaker
+  first, before any gate — an open provider fails fast holding no slot and
+  deducting no RPM token, and a HALF_OPEN probe is tracked — then acquires an
+  adaptive concurrency gate whose capacity reads the **shared** per-provider
+  AIMD state, so a throttle observed on either path lowers the limit the other
+  honours. Two leaks close with it: a failed acquire now refunds its deducted
+  RPM token, and the concurrency permit no longer leaks on a
+  `KeyboardInterrupt` mid-acquire (the old `sem.acquire()` sat outside the
+  `try`/`finally`, and `KeyboardInterrupt` is not an `Exception`). Parity is
+  same-semantics-per-population, not one merged in-flight cap — an asyncio
+  primitive cannot span loops, and threads are a third population — so
+  admission caps stay per-population as before. (0.3.0 left this seam
+  explicitly unchanged when the async path moved to the persistent loop.)
+  **Migration:** a host calling `rate_limit_acquire_sync` with the breaker
+  armed (`configure_rate_limit(breaker=True)`, still off by default) must now
+  handle `CircuitOpenError`, which that seam structurally could not raise
+  before.
+
+- **A `*_sync` call made from inside a *foreign* running event loop now runs on
+  the persistent loop, not a fresh one.** Such a reentrant call (an async host
+  calling a `*_sync` helper) was offloaded to a one-shot worker thread with its
+  own fresh loop — which under a concurrent reentrant fan-out re-created exactly
+  the multi-loop regime the persistent-loop bridge exists to avoid (LiteLLM's
+  process-global logging worker rebinding across short-lived loops), and quietly
+  gave each such call its own loop-keyed limiter gate (async gates are keyed
+  `(provider, loop)`), bypassing the per-provider concurrency cap. It is now
+  submitted to the persistent loop like any other sync call: those calls share
+  the per-provider cap they previously bypassed, and a `timeout` **cancels** the
+  coroutine — tearing down the in-flight provider request — instead of
+  abandoning the wait while a worker thread and its request run on. The calling
+  thread blocks either way; that is inherent to calling sync from async. One
+  reentrant case still takes a fresh loop and keeps the old semantics, including
+  the documented "a timed-out worker keeps running" caveat: a coroutine running
+  on the persistent loop itself calling back into sync code, where blocking that
+  thread would deadlock. **Migration:** none — no signature changed; but a
+  reentrant fan-out that was effectively uncapped now queues behind the
+  per-provider concurrency limit.
+
+- **⚠️ Log retention is on by default: the sink now deletes old logs.** The
+  default `LocalYamlLogSink` prunes per-call YAML files older than **30 days**
+  and rotates `index.jsonl` past **50 MiB** to a date-stamped generation that
+  ages out under the same policy (housekeeping is hourly-throttled, on a
+  worker thread, and rotation is an atomic rename that loses no lines). The
+  first successful write announces the directory *and* the policy at INFO —
+  before anything is ever deleted. Opt out with
+  `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
+  your logs are an archive rather than a debugging aid.
+
+- **⚠️ The default log directory moved for processes not launched from a
+  project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
+  else `data/llm-logs/` under the nearest ancestor with a
+  `pyproject.toml`/`.git` (nearest wins; seeded with a `.gitignore` when the
+  sink creates it), else a per-user state dir
+  (`$XDG_STATE_HOME/llmkit/llm-logs`, `~/Library/Logs/llmkit`,
+  `%LOCALAPPDATA%\llmkit\logs`) — and frozen, so a mid-run `chdir` can't split
+  one process's logs. Launches from a repo root keep byte-identical paths;
+  launches from a repo *subdirectory* consolidate to the repo root (previously
+  they sprayed `subdir/data/llm-logs`); only processes outside any project
+  move to the private state dir, announced by the first-write INFO.
+
+- **⚠️ Log files are private by default on POSIX.** A sink-created directory
+  is `0o700` and log files `0o600`. Multi-reader deployments should pre-create
+  the log directory with their desired mode — the sink never re-chmods a
+  directory it didn't create.
+
+- **The per-call YAML, `index.jsonl`, and header line 2 carry three new
+  fields** (`call_id`, `attempt`, `queue_wait_ms`; header line 2 gains a
+  `call=<id[:8]> attempt=<n>` suffix). Header line 1 — the `head -1` triage
+  shape — is byte-identical. A strict index parser must accept the three new
+  keys.
+
+- **A persistently broken sink warns once, not once per call.** The first
+  failure (and any *new* failure signature — different exception type or
+  errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
+  latch re-arms on success and on `configure_llm_logging`.
+
+### Deprecated
+
+- **`stream_text_with_log` is a deprecated alias for `text_llm_call_stream`,
+  removed in 1.0.** Calling it warns `DeprecationWarning` (eagerly, at call time)
+  and otherwise behaves identically — same signature, same streamed chunks.
+  Switch the call; the alias exists only to spare a hard break mid-cycle.
+
+### Removed
+
+- **The public `dev` extra is removed; dev tooling is now a PEP 735 dependency
+  group.** The maintainer toolchain (pytest, ruff, basedpyright) no longer ships
+  as a public `omg-llmkit[dev]` extra — it moved to a `[dependency-groups]` entry
+  that never lands in the wheel/sdist metadata, taking it off the published
+  install surface. `uv sync` installs it by default. **Migration:** `pip install
+  'omg-llmkit[dev]'` no longer resolves the tooling (it warns and installs core
+  only); contributors use `uv sync`.
+
+- **The `DEFAULT_LOG_DIR` constant.** The default log directory is now resolved
+  lazily at first write and frozen, rather than fixed at import time (see
+  **Changed**), so no module-level constant can name it. **Migration:** use
+  `default_log_dir()` (exported from `llmkit`) or pass an explicit `log_dir`.
+
+### Fixed
+
+- **`with_retries` no longer re-asks an open circuit under its default
+  `retry_on=None`.** A bare `CircuitOpenError` (raised by the opt-in circuit
+  breaker) fell through the "retry on any Exception" default and was charged
+  the full transport budget — violating the documented "never re-ask a circuit
+  the breaker already knows is open" contract (harmless in load terms, since
+  the breaker rejects each retry locally, but a contract break). It is now a
+  zero-budget fail-fast signal alongside `OutputLimitError`: never retried
+  under any configuration, unless a caller explicitly lists the type in
+  `retry_on` (an explicit opt-in still wins). Only direct `with_retries`
+  callers using the `retry_on=None` default were affected; the call functions
+  (`RetryPolicy.retry_on` is never `None`) already failed fast. The wrapped
+  form (`InstructorRetryException(CircuitOpenError)`) already failed fast and
+  is unchanged.
+
+- **A distinct llmkit call reached across a task boundary from inside a retry
+  attempt now keeps its own retry budget.** The nested-retry guard (which
+  collapses the `3 x 3 = 9` double-wrap trap to a single pass) was a bare
+  context-variable flag, and context variables are copied into new tasks and
+  across the sync bridge — so an `on_result` hook calling `text_llm_call_sync`,
+  or a task spawned via `asyncio.create_task` from inside an attempt, silently
+  lost its retries and fired a spurious `RuntimeWarning`. In the hook case that
+  inherited single pass then burned the *outer* loop's budget, re-running the
+  expensive main call. The guard is now keyed on the owning `asyncio` task, so
+  a distinct call in its own task keeps its full budget and warns no more;
+  same-task nesting (a call directly awaited inside the wrapped function) still
+  collapses and warns exactly as before. **Compatibility note:** hosts that
+  relied on the collapsed behaviour of such cross-task calls may now see more
+  real attempts — the documented per-call retry contract restored.
+
+- **A `$def`'s `description` now survives a nullable-wrapped or chained `$ref`.**
+  `model_from_json_schema` rescued a `$ref` target's model-facing `description`
+  only for a bare top-level `$ref`, so wrapping it in `anyOf`+`null` (a nullable
+  field) dropped the guidance instructor sends to the model. Unifying `$ref` /
+  nullable resolution into one pass carries the description through for bare,
+  nullable-wrapped, and multi-hop `$ref` fields alike (nearest hop wins).
+
+- **Explicit per-call keywords now beat `options` even at default-equal
+  values.** The documented precedence (**config < options < explicit
+  keyword**) detected an "explicit" keyword by comparing its value against the
+  signature default, so `structured_llm_call(..., temperature=0.2,
+  options=LLMCallOptions(temperature=0.9))` silently ran at `0.9`, and an
+  explicit `model=None` / `retry=DEFAULT_RETRY_POLICY` could never override an
+  options field. The mergeable keywords (`temperature`, `model`, `max_tokens`,
+  `reasoning_effort`, `retry`, `provider`) on all five call functions now
+  default to the **`UNSET`** sentinel — "was it passed" is structural, and any
+  passed value (including `None`) wins, exactly as the README promises. True
+  defaults are applied in one place (`resolve_call_args`); behavior without
+  `options`, or with disjoint keyword/options fields, is unchanged.
+  **Compatibility note:** callers passing a keyword whose value equals the old
+  default *and* setting the same field on `options` previously got the options
+  value; they now get their explicit keyword. Code introspecting call-function
+  signatures sees `float | Unset = UNSET`-style defaults.
+
+- **A `run_sync` caller racing `shutdown()` no longer hangs or raises.** When a
+  sync call obtained the persistent event loop just as `shutdown()` tore it down,
+  the submit could land on a stopped loop (the caller blocked for the full
+  timeout — 600 s by default — with the coroutine leaked) or a closed one (a
+  spurious `RuntimeError`). Obtaining the loop and submitting to it are now atomic
+  against `shutdown()`, so a racing caller transparently retries onto a lazily
+  restarted loop; a call genuinely in flight at shutdown still gets a prompt
+  `asyncio.CancelledError`, no longer maskable by a secondary `RuntimeError` from
+  the cancel path.
+
+- **Structured-path transport errors are no longer double-sent inside the
+  rate-limiter slot.** instructor's in-call re-ask (the loop llmkit feeds its
+  `max_retries`) previously retried *every* failure except length truncation —
+  so a 429/5xx/network or a permanent 401/400/403 was re-sent immediately, with
+  no backoff and ignoring `Retry-After`, inside the single per-provider
+  concurrency slot: one request became two, invisible to the outer retry layer.
+  The in-call re-ask is now restricted to genuine parse failures (malformed
+  JSON / `ValidationError`), matching instructor's own default. A transient
+  error now makes **one** request per outer attempt (not two) and is retried by
+  the outer layer with the full transport budget and `Retry-After` honored; a
+  permanent error fails fast with no in-call duplicate. Every genuine parse
+  failure still gets its one repair re-ask and is retried on the (lower)
+  validation budget — this now correctly includes instructor's own
+  `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response) and
+  `AsyncValidationError` (a failing async field validator), which previously
+  failed fast; length truncation still fails fast as `OutputLimitError`.
+
+- **`base_url` now reaches the wire for Anthropic, Google AI Studio, and
+  DeepSeek.** `LLMClientConfig` / `make_provider` accepted `base_url` for these
+  three providers and their `build()` dropped it, so an endpoint override — a
+  gateway, an audit proxy — was silently discarded and *every* request went to
+  the provider's public endpoint. The docstrings' justification for that (these
+  endpoints are fixed) was false: LiteLLM accepts `api_base` on the
+  `anthropic/`, `gemini/`, and `deepseek/` routes. Each now forwards it as
+  `api_base` on the `OpenAIProvider` pattern — only when set, so the outbound
+  kwargs are byte-identical whenever `base_url` is unset. Bedrock and Vertex
+  remain the only providers that ignore an endpoint override (theirs derives
+  from region/location; neither accepts the field, so passing one there raises
+  — see **Changed**). **Migration:** a host that set `base_url` on any of the
+  three was talking to the public endpoint regardless and now talks to the
+  configured one — confirm the value names a live, intended endpoint before
+  upgrading.
+
+- **OpenRouter's default model works again.** `OpenRouterProvider._default_model`
+  was `google/gemini-2.0-flash-001`, which OpenRouter has retired — the slug is
+  gone from its catalog entirely, so *every* call that relied on the default
+  (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
+  naming a model) failed with `NotFoundError: "No endpoints found for
+  google/gemini-2.0-flash-001"`. The default is now
+  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
+  model the `GOOGLE` and `VERTEX` providers already default to, and measured
+  live at 10/10 valid strict-`json_schema` structured round-trips through the
+  public surface (2026-07-14). Callers who pass an explicit `model` were never
+  affected.
+
+- **Sink I/O no longer blocks the event loop.** Every log write — `mkdir`,
+  the full-payload `yaml.dump`, both file writes, retention housekeeping —
+  runs via `asyncio.to_thread`, for the structured, buffered-text, and
+  cleanly-finished stream paths (a stream abandoned mid-flight deliberately
+  writes synchronously so its truncation-witness record can't be lost while
+  the generator unwinds; a write that can't be offloaded — executor already
+  shut down at teardown — degrades to blocking rather than lost). The
+  documented capture contracts are unchanged: the record and written path are
+  captured before the call returns, and both sync-bridge teardown paths drain
+  the executor so a clean exit never abandons a final write.
+
+- **Log records from retries of one call are now joinable.** Each logical
+  call mints one `call_id` (uuid4 hex) and numbers attempts 1-based across
+  all three call surfaces and the sync bridge — no more joining retry records
+  by feature + timestamp proximity, which broke under concurrent same-feature
+  fan-out.
+
+- **`duration_ms` no longer silently conflates limiter queue time with
+  provider latency.** New `queue_wait_ms` records time queued behind llmkit's
+  own rate limiter (`0.0` when disabled, `None` when the attempt failed
+  before acquiring); `duration_ms` keeps its meaning, so provider latency ≈
+  `duration_ms - queue_wait_ms`.
+
+- **The live smoke suite now exercises each OpenRouter path that can rot
+  independently.** It previously always overrode the model, which is why a dead
+  default shipped through a green release gate. There are now two OpenRouter
+  live tests: one drives the provider's *own default* with no `model=` and no
+  env override (so a retired default fails the gate instead of shipping), and
+  the existing one keeps pinning the strict-`json_schema` wire shape against
+  `mistralai/mistral-nemo`, the model measured to echo the schema back when the
+  `response_format` is sent non-strict.
+
+### Security
+
+- **`LLMClientConfig` no longer leaks `api_key` in its `repr`.** The frozen
+  dataclass's generated repr rendered `api_key='sk-...'` verbatim, so any
+  host-side `print(config)`, log line, or exception reporter's locals capture
+  could exfiltrate the credential. A set key now renders as `api_key=<redacted>`
+  (presence stays debuggable; the value never prints), and the repr shows only
+  fields that differ from their default. **Compatibility note:** code parsing
+  the repr string will see the new format.
 
 ## [0.7.0] — 2026-07-14
 
@@ -1376,6 +1453,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.5.0

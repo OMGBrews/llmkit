@@ -31,6 +31,11 @@ post-install smoke test. A mistaken `import omg_llmkit` (the install name) raise
 a clear one-line redirect to `import llmkit`, not a bare
 `ModuleNotFoundError` that leaves you guessing.
 
+`llmkit.__version__` reports the installed version. It is read from the
+`omg-llmkit` distribution's metadata rather than hardcoded, so it cannot drift
+from what you installed; a source tree with no installed metadata reports
+`"0.0.0+unknown"` instead of raising at import.
+
 Requires Python ≥ 3.12.
 
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
@@ -93,6 +98,10 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `text_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
+
+`prompt` is typed `str | list[Message]` on all five. A plain string is sent as-is; the list form is a list of `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim. `Message` is exported so your own prompt builders can be annotated against it rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected.
+
+**Type-check migration.** `prompt` was previously `str | list[dict[str, str]]`, so a call site passing a *variable* annotated `list[dict[str, str]]` now fails the type check — re-annotate it `list[Message]`. Inline message-dict literals are unaffected, and runtime behaviour is identical either way (a `TypedDict` is a plain `dict`).
 
 > **Deprecated alias.** `stream_text_with_log` is the old name for
 > `text_llm_call_stream`; it still works (same signature and behaviour) but
@@ -397,7 +406,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`).
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly.
 
 ### Where the logs go
 
@@ -721,9 +730,9 @@ Two retry layers, kept deliberately separate:
       print(f"{label}: attempt {attempt}/{max_attempts} failed: {error}")
   ```
 
-  > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active inner llmkit retry loop and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`.
+  > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active llmkit retry loop **owned by the current `asyncio` task** and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. The task scoping bounds the guard to the pattern it warns about: a nested loop awaited inline in the same task, whose failure really does propagate out to the outer loop. A *distinct* llmkit call that merely inherited the scope across a task boundary keeps its full retry budget — an `on_result` hook calling `structured_llm_call_sync` / `text_llm_call_sync` (the sync bridge drives the coroutine as a new task on llmkit's persistent loop), or a call spawned with `asyncio.create_task` from inside an attempt. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`.
 
-- **instructor's own in-call schema repair** re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. One failure is exempt from the repair re-ask: a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError` instead. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
+- **instructor's own in-call schema repair** re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError` (a failing async field validator included), or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the cross-call layer above, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ### Re-rolling on a semantically-bad result
 
