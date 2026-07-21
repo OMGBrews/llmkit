@@ -32,12 +32,26 @@ from llmkit.providers import (
 )
 
 
-def test_make_provider_builds_from_raw_creds() -> None:
-    """``make_provider`` returns a usable provider from a bare key + model."""
+def test_make_provider_builds_from_raw_creds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``make_provider`` returns a usable provider from a bare key + model.
+
+    The OpenAI endpoint aliases are cleared first because this path is now
+    environment-sensitive by design: with no ``base_url`` configured, the
+    provider resolves its endpoint from ``OPENAI_BASE_URL`` then
+    ``OPENAI_API_BASE`` before falling back to llmkit's default. Those aliases
+    are still honoured — deliberately, and now explicitly — so a developer with
+    one exported would otherwise see a spurious failure here. This test pins the
+    *unconfigured* shape, so it clears them.
+    """
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
     provider = make_provider(Provider.OPENAI, api_key="sk-test", model="gpt-4.1")
     assert isinstance(provider, OpenAIProvider)
     assert provider.litellm_model() == "openai/gpt-4.1"
-    assert provider.completion_kwargs() == {"api_key": "sk-test"}
+    assert provider.completion_kwargs() == {
+        "api_key": "sk-test",
+        "api_base": "https://api.openai.com/v1",
+    }
 
 
 def test_make_provider_threads_optional_knobs() -> None:
@@ -80,22 +94,45 @@ def test_make_provider_ollama_local_endpoint_default() -> None:
     assert provider.completion_kwargs() == {"api_base": "http://localhost:11434"}
 
 
-def test_make_provider_openai_no_base_url_stays_none() -> None:
-    """OpenAI without a ``base_url`` injects no ``api_base`` literal.
+def test_make_provider_openai_no_base_url_uses_library_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenAI without a ``base_url`` names llmkit's own default endpoint.
 
-    The endpoint-default normalization moved from ``make_provider``'s old per-arm
-    switch into ``build()``. OpenRouter/Ollama substitute a concrete endpoint
-    literal when ``base_url`` is omitted, but OpenAI must *not*: it leaves the
-    endpoint unset so LiteLLM uses OpenAI's real default. This pins that
-    distinction — ``completion_kwargs()`` carries only ``api_key`` (no
-    ``api_base`` key at all), and the underlying ``base_url`` stays ``None``.
+    This test's premise is inverted from what it used to pin. It argued that
+    OpenRouter/Ollama substitute a concrete endpoint literal when ``base_url`` is
+    omitted but OpenAI must *not* — leaving the endpoint unset so LiteLLM's
+    internal chain picks it. That exception is gone: all six network providers
+    now name their endpoint, so OpenRouter/Ollama stopped being special. The
+    reason is *ownership and readability*, not blocking: the endpoint is llmkit's
+    decision, resolved in a documented, tested order and readable straight off
+    ``completion_kwargs()`` rather than inferred from a dependency. Sources
+    llmkit does not read can no longer choose it — the ``litellm.api_base``
+    module global re-pointed OpenAI before this change and is inert after it, as
+    would be any alias a future LiteLLM release adds.
+
+    The documented aliases (``OPENAI_BASE_URL``, then ``OPENAI_API_BASE``) are
+    still honoured, now explicitly by ``resolve_base_url`` — which is exactly why
+    they are cleared here: a developer with ``OPENAI_BASE_URL`` exported must not
+    see a spurious failure. With nothing set, the wire shape is byte-identical to
+    before.
+
+    Note ``_base_url`` holds the *configured* value and so stays ``None`` here:
+    resolution deliberately happens at the read point rather than at
+    construction, because a provider is routinely built before LiteLLM's
+    import-time ``load_dotenv()`` has populated the environment (see
+    ``tests/providers/test_base_url_resolution.py``). ``completion_kwargs()`` is
+    where the resolved endpoint appears, and it is the only place that matters.
     """
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
     provider = make_provider(Provider.OPENAI, api_key="sk-test", model="gpt-4.1")
     assert isinstance(provider, OpenAIProvider)
     assert provider._base_url is None
-    kwargs = provider.completion_kwargs()
-    assert "api_base" not in kwargs
-    assert kwargs == {"api_key": "sk-test"}
+    assert provider.completion_kwargs() == {
+        "api_key": "sk-test",
+        "api_base": "https://api.openai.com/v1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -122,18 +159,55 @@ def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) ->
 
 
 @pytest.mark.parametrize(
-    "provider_enum",
-    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK],
+    ("provider_enum", "expected_api_base", "endpoint_aliases"),
+    [
+        (
+            Provider.ANTHROPIC,
+            "https://api.anthropic.com",
+            ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"),
+        ),
+        (Provider.DEEPSEEK, "https://api.deepseek.com/beta", ("DEEPSEEK_API_BASE",)),
+    ],
 )
-def test_make_provider_no_base_url_omits_api_base(provider_enum: Provider) -> None:
-    """Without a ``base_url``, no ``api_base`` key is sent at all.
+def test_make_provider_no_base_url_uses_library_default_api_base(
+    provider_enum: Provider,
+    expected_api_base: str,
+    endpoint_aliases: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a ``base_url``, each provider sends its own default ``api_base``.
 
-    Like OpenAI (and unlike OpenRouter/Ollama, which substitute an endpoint
-    literal), these providers must leave the endpoint unset so LiteLLM uses
-    each provider's real default — the pre-existing wire shape, byte-identical.
+    This used to assert the opposite — that these providers leave the endpoint
+    unset so LiteLLM uses each provider's real default. llmkit now names that
+    same endpoint itself, measured byte-for-byte off the wire against LiteLLM
+    1.92.0, so the request is unchanged but the *choice* is owned here and
+    readable off ``completion_kwargs()`` instead of being inferred from a
+    dependency's internal chain. The practical gain is closure: a source llmkit
+    does not read — the ``litellm.api_base`` module global, a LiteLLM
+    key-management backend serving these names, an alias a future release adds —
+    can no longer select the endpoint, without llmkit maintaining a blocklist
+    against an unversioned dependency.
+
+    Each provider's documented aliases still select the endpoint when set (that
+    fallback is kept on purpose: deleting it would silently redirect hosts that
+    steer by environment variable to the public endpoint). They are cleared here
+    precisely because they remain live — a developer with ``ANTHROPIC_API_BASE``
+    exported must not see a spurious failure from a test that pins the
+    unconfigured shape.
+
+    Google is **not** parametrized here: it is the one provider with no default
+    endpoint, because its base carries a model-derived API version. It sends no
+    ``api_base`` when nothing is configured, and that exception is pinned in
+    ``tests/providers/test_base_url_resolution.py`` and
+    ``tests/providers/test_endpoint_routing.py``.
     """
+    for alias in endpoint_aliases:
+        monkeypatch.delenv(alias, raising=False)
     provider = make_provider(provider_enum, api_key="sk-test")
-    assert provider.completion_kwargs() == {"api_key": "sk-test"}
+    assert provider.completion_kwargs() == {
+        "api_key": "sk-test",
+        "api_base": expected_api_base,
+    }
 
 
 def test_make_provider_bedrock_region_only() -> None:

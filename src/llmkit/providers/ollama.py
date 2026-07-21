@@ -19,6 +19,17 @@ class OllamaProvider(BaseProvider):
 
     Talks to a locally-running Ollama instance (``ollama_chat/<model>``)
     for fully local/private LLM access. No data leaves the host.
+
+    One accepted edge, unique to this route: both Ollama dispatch arms order the
+    endpoint chain ``litellm.api_base or api_base or
+    get_secret("OLLAMA_API_BASE") or "http://localhost:11434"``
+    (``litellm/main.py`` 4072, 4112 and 6465, measured against litellm 1.92.0 on
+    2026-07-21) — **inverted** relative to every other route, where an explicit
+    ``api_base`` comes first. So for Ollama alone the ``litellm.api_base`` module
+    global outranks even the value this provider sends. That is accepted, not
+    fixed: it is a global a host must deliberately set inside its own process
+    (not ambient environment, and not a stray ``.env``), and llmkit cannot close
+    it without reaching into a dependency's globals.
     """
 
     _provider_name: ClassVar[str] = "Ollama"

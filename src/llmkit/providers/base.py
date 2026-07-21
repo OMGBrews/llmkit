@@ -38,7 +38,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields
 from enum import StrEnum
-from typing import ClassVar, Literal, Protocol, cast, override, runtime_checkable
+from typing import ClassVar, Literal, Protocol, cast, overload, override, runtime_checkable
 
 import instructor
 
@@ -198,6 +198,84 @@ def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str)
     )
 
 
+@overload
+def resolve_base_url(configured: str | None, *, env_vars: tuple[str, ...], default: str) -> str: ...
+
+
+@overload
+def resolve_base_url(
+    configured: str | None, *, env_vars: tuple[str, ...], default: None
+) -> str | None: ...
+
+
+def resolve_base_url(
+    configured: str | None, *, env_vars: tuple[str, ...], default: str | None
+) -> str | None:
+    """Resolve a provider's endpoint: explicit config, then env var(s), else our default.
+
+    The endpoint half of what :func:`resolve_api_key` did for the credential, and
+    live for the same reason. Omitting ``api_base`` hands endpoint selection to
+    LiteLLM's own chain (``api_base or litellm.api_base or
+    get_secret("OPENAI_BASE_URL") or get_secret("OPENAI_API_BASE") or
+    "https://api.openai.com/v1"``, and the per-provider equivalents), so
+    something other than the caller picks the endpoint while their *explicitly
+    pinned* ``api_key`` rides along to whatever it names. That "something" is an
+    open-ended set: an in-process module global, a configured LiteLLM
+    key-management backend (``get_secret`` consults one as well as
+    ``os.environ``), the ambient environment — reachable from a stray ``.env``
+    anywhere up the tree, since importing LiteLLM runs ``load_dotenv()`` — and
+    whatever a future release adds. Enumerating those in order to *reject* them
+    would be a blocklist against an unversioned dependency; returning a value the
+    caller's provider then always sends is closed instead, because an explicit
+    ``api_base`` outranks every other entry in the chains of the four routes this
+    serves. (Ollama's chain is inverted and is *not* one of them — see
+    :class:`~llmkit.providers.ollama.OllamaProvider`.)
+
+    Unlike the key this never raises: an endpoint has a correct publishable
+    default and a secret does not. It returns ``None`` only when ``default`` is
+    ``None`` and nothing is configured — the Gemini case below.
+
+    **Call this at the read point, not at construction.** LiteLLM consulted these
+    variables when the request was built, and importing LiteLLM runs
+    ``load_dotenv()``, so the environment a provider is *constructed* in is
+    routinely not the environment the call goes out in: ``import llmkit`` does not
+    import LiteLLM (it is deferred to first call), so a provider built at startup
+    would freeze a default and then miss the very ``.env`` value LiteLLM would
+    have honoured — silently sending the call to the public endpoint instead of
+    the host's gateway. Each provider therefore calls this from
+    ``completion_kwargs()``, which ``llmkit._litellm`` reaches only after
+    importing LiteLLM. (Measured 2026-07-21: resolving at construction re-pointed
+    a ``.env``-configured gateway to ``api.openai.com``.)
+
+    **What that does and does not close.** It removes every endpoint source
+    llmkit does not read. It deliberately does *not* remove ``env_vars``: the
+    fallback is *kept*, with llmkit reading the same names LiteLLM read, in
+    LiteLLM's own measured precedence, so a host that configures its endpoint
+    that way is not silently redirected to the public one — which would be the
+    very data-egress surprise this exists to prevent, merely aimed at different
+    users. A set variable therefore still selects the endpoint, now by llmkit's
+    documented decision and visible in ``completion_kwargs()``; the same bargain
+    :func:`resolve_api_key` struck for the credential. An empty string is treated
+    as unset, matching it too.
+
+    **A ``None`` default means "let LiteLLM derive it".** Only the Google AI
+    Studio route passes one, because its base carries an API *version* that
+    LiteLLM picks from the model (``v1alpha`` for Gemini 3 and newer,
+    ``v1beta`` otherwise — measured). Pinning a static version-bearing default
+    there would silently downgrade every Gemini 3 call, so when nothing is
+    configured that provider sends no ``api_base`` and lets LiteLLM choose the
+    version. Deriving it here instead would be endpoint *computation*, which is
+    the gateway-shaped work this library does not do.
+    """
+    if configured:
+        return configured
+    for env_var in env_vars:
+        from_env = os.environ.get(env_var)
+        if from_env:
+            return from_env
+    return default
+
+
 class Provider(StrEnum):
     """LLM providers the library can route to.
 
@@ -233,14 +311,22 @@ class LLMClientConfig:
     provider raises at construction. It is not accepted by Ollama (local) or
     Bedrock/Vertex (ambient AWS/Google chains). The credential is masked in this
     config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray
-    ``print`` or traceback never leaks it. ``base_url`` overrides the endpoint
-    (forwarded to LiteLLM as ``api_base``) for the five key-authenticated
-    providers and Ollama, with each provider's own default endpoint standing when
-    it is unset; it is not accepted by Bedrock or Vertex, whose endpoints derive
-    from ``aws_region_name`` / ``vertex_location`` instead. Per-call
-    ``model`` overrides (e.g. the strong/small roles the host resolves)
-    are passed at call time and are not part of this config — this carries
-    only the provider's *default* model.
+    ``print`` or traceback never leaks it. ``base_url`` sets the endpoint for the
+    five key-authenticated providers and Ollama: it resolves from this value,
+    else the provider's own documented endpoint variable(s) (``OPENAI_BASE_URL``
+    / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE`` and friends — still honoured,
+    now read explicitly by llmkit in a tested order), else that provider's own
+    measured default endpoint. The endpoint is therefore llmkit's decision,
+    readable from ``completion_kwargs()`` rather than inferred from LiteLLM's own
+    chain, and it is resolved per call so it reflects the environment the call
+    goes out in (see :func:`resolve_base_url`). Google AI Studio is the one
+    provider with no default — its base carries an API version LiteLLM picks from
+    the model — so with neither this field nor ``GEMINI_API_BASE`` set it sends no
+    ``api_base`` and lets LiteLLM choose. It is not accepted by
+    Bedrock or Vertex, whose endpoints derive from ``aws_region_name`` /
+    ``vertex_location`` instead. Per-call ``model`` overrides (e.g. the
+    strong/small roles the host resolves) are passed at call time and are not
+    part of this config — this carries only the provider's *default* model.
 
     ``model`` is optional: leave it ``None`` (or empty) to inherit the
     selected provider's own default model rather than naming one here. A

@@ -125,6 +125,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   configured key nor its env var now fails loudly at construction instead of at
   call time (or silently succeeding off an ambient key).
 
+- **Two undocumented ways of re-pointing OpenAI, Anthropic and DeepSeek — and
+  Google (AI Studio) once it has an endpoint configured — are no longer
+  honoured.** Because those providers now send an explicit `api_base` (see
+  **Fixed**) — and an explicit `api_base` is first in each of those four routes'
+  LiteLLM endpoint chains — llmkit's value wins over a host that steered them by
+  setting the `litellm.api_base` module global, or by serving one of the
+  endpoint names (`OPENAI_BASE_URL`, `OPENAI_API_BASE`, `ANTHROPIC_API_BASE`,
+  `ANTHROPIC_BASE_URL`, `GEMINI_API_BASE`, `DEEPSEEK_API_BASE`) from a LiteLLM
+  key-management backend rather than from the process environment. Neither path
+  was ever documented by llmkit, and those same six variables read from the
+  **process environment still work exactly as before** — llmkit reads them
+  itself now, in LiteLLM's measured precedence. Two cases stay as they were:
+  Google with neither `base_url` nor `GEMINI_API_BASE` set sends no `api_base`
+  at all (see **Fixed** for the measurement behind that), so both paths still
+  steer it there; and Ollama's dispatch arms order their chain `litellm.api_base
+  or api_base or …`, inverted relative to every other route, so the module
+  global outranks the value llmkit sends. This gets a **Changed** entry
+  and not only a **Fixed** one because it is *invisible at runtime*: nothing
+  raises and nothing warns, the call simply goes to the public endpoint instead
+  of the re-pointed one, which is precisely the failure mode a release note has
+  to catch for you. **Migration:** one line — name the endpoint explicitly, with
+  `LLMClientConfig(base_url=...)` or `make_provider(..., base_url=...)`.
+
 - **`$ref` structural siblings and empty `properties` now raise in
   `model_from_json_schema`.** A structural keyword beside a `$ref` (`type`,
   `enum`, `items`, `properties`, …) that differs from the referenced schema was
@@ -282,6 +305,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **OpenAI, Anthropic, and DeepSeek now always send an explicit `api_base`, so
+  the endpoint is llmkit's documented decision.** Those three — and Google (AI
+  Studio), which keeps the documented exception below — omitted `api_base`
+  whenever no `base_url` was configured, which handed endpoint selection to
+  LiteLLM's own resolution chain (`api_base or litellm.api_base or
+  get_secret("OPENAI_BASE_URL") or get_secret("OPENAI_API_BASE") or
+  "https://api.openai.com/v1"`, and the per-provider equivalents) — so a call
+  carrying an *explicitly pinned* `api_key` could be routed by something llmkit
+  never read. Measured on the wire against litellm 1.92.0 (2026-07-21): setting
+  the `litellm.api_base` module global re-pointed OpenAI, Anthropic, and Google
+  before this change, and is inert after it wherever llmkit sends an `api_base`
+  (DeepSeek's route never consulted that global, so it is unchanged there). Each
+  provider now resolves its endpoint through the shared `resolve_base_url`
+  helper — configured `base_url`, else the provider's own environment
+  variable(s) in LiteLLM's measured precedence, else llmkit's default (`None`
+  for Google, see below) — and sends the result, so the destination is readable
+  up front from `completion_kwargs()` instead of being inferred from a
+  dependency. Resolution
+  happens **there**, at the read point, and not at construction: `import llmkit`
+  does not import LiteLLM (that is deferred to the first call) and importing
+  LiteLLM is what runs `load_dotenv()`, so a provider built once at startup by
+  `make_provider(...)` and called later still resolves against the environment
+  the call actually goes out in rather than the one it was constructed in.
+  **Google AI Studio is the exception and owns no default endpoint**: its base
+  carries an API version LiteLLM derives *from the model* (`v1alpha` for Gemini 3
+  and newer, `v1beta` otherwise), applied only when `api_base` is absent, so a
+  static default would silently move some models to another version — measured,
+  same run: pinning a `…/v1beta` default sent `gemini-3-pro-preview` to `/v1beta`
+  where it had gone to `/v1alpha`, and pinning the bare host dropped the version
+  segment entirely. Deriving the version in llmkit would be endpoint
+  *computation*, the gateway-shaped work this library does not do. Google
+  therefore takes a configured `base_url`, else `GEMINI_API_BASE`, else sends no
+  `api_base` and lets LiteLLM pick — and in that last case alone the endpoint can
+  still come from a source llmkit does not read (notably `litellm.api_base`);
+  naming a `base_url` or `GEMINI_API_BASE` closes it. **The six documented
+  endpoint variables are still honoured**, now read by llmkit itself:
+  `OPENAI_BASE_URL` then `OPENAI_API_BASE`; `ANTHROPIC_API_BASE` then
+  `ANTHROPIC_BASE_URL`; `GEMINI_API_BASE`; `DEEPSEEK_API_BASE` — hosts that steer
+  their endpoint with those are unaffected. With nothing configured the outbound
+  request is byte-identical to before (the defaults are LiteLLM's own, measured).
+  OpenRouter and Ollama already sent `api_base` unconditionally; Bedrock and
+  Vertex accept no `base_url` at all (their endpoints derive from
+  `aws_region_name` / `vertex_location`).
+
 - **`with_retries` no longer re-asks an open circuit under its default
   `retry_on=None`.** A bare `CircuitOpenError` (raised by the opt-in circuit
   breaker) fell through the "retry on any Exception" default and was charged
@@ -370,7 +437,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoints are fixed) was false: LiteLLM accepts `api_base` on the
   `anthropic/`, `gemini/`, and `deepseek/` routes. Each now forwards it as
   `api_base` on the `OpenAIProvider` pattern — only when set, so the outbound
-  kwargs are byte-identical whenever `base_url` is unset. Bedrock and Vertex
+  kwargs are byte-identical whenever `base_url` is unset. **The "only when set"
+  half is superseded by a later change in this same release** — "OpenAI,
+  Anthropic, and DeepSeek now always send an explicit `api_base`" above:
+  Anthropic and DeepSeek forward `api_base` unconditionally now, resolved from
+  the endpoint environment variables or llmkit's default, and only Google still
+  omits the key when nothing is configured. What this entry fixes — a *set*
+  `base_url` reaching the wire on all three — is unaffected. Bedrock and Vertex
   remain the only providers that ignore an endpoint override (theirs derives
   from region/location; neither accepts the field, so passing one there raises
   — see **Changed**). **Migration:** a host that set `base_url` on any of the

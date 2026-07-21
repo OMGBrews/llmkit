@@ -157,10 +157,18 @@ def make_provider(
             sign via their ambient AWS/Google credential chains).
         model: Default model for this provider; ``None`` uses the provider's
             built-in default.
-        base_url: Endpoint override forwarded to LiteLLM as ``api_base``
-            (gateways, proxies, compatible endpoints) for every
-            key-authenticated provider and Ollama; not accepted by
-            Bedrock/Vertex, whose endpoints derive from region/location.
+        base_url: Endpoint (gateway, proxy, compatible endpoint) for every
+            key-authenticated provider and Ollama, forwarded to LiteLLM as
+            ``api_base``: it resolves from this value, else the provider's own
+            documented endpoint variable(s) (``OPENAI_BASE_URL`` and friends,
+            still honoured), else that provider's measured default — resolved
+            per call, so it reflects the environment the call goes out in. That
+            keeps a source llmkit does not read from choosing the endpoint, with
+            two documented exceptions: Google AI Studio owns no default (its base
+            carries a model-derived API version) and so sends nothing when
+            neither is set, and Ollama's LiteLLM route ranks ``litellm.api_base``
+            above the value sent. Not accepted by Bedrock/Vertex, whose endpoints
+            derive from region/location.
         reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
             ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; not accepted by any other

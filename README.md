@@ -506,7 +506,7 @@ class LLMClientConfig:
     provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
-    base_url: str | None = None      # endpoint override (forwarded as api_base); not accepted by Bedrock/Vertex
+    base_url: str | None = None      # endpoint: config, then env var, then a default (sent as api_base; see below); not accepted by Bedrock/Vertex
     reasoning_effort: ReasoningEffort | None = None  # "disable" | "low" | "medium" | "high", or any provider value
     aws_region_name: str | None = None   # AWS Bedrock region; not accepted by any other provider
     vertex_project: str | None = None    # Vertex AI GCP project; not accepted by any other provider
@@ -544,6 +544,78 @@ fallback to an ambient key:
 `OLLAMA` needs no key; `BEDROCK` and `VERTEX` authenticate through their ambient
 AWS / Google credential chains (below), so none of the three accepts an
 `api_key`.
+
+**Endpoint resolution is explicit too.** Every provider that accepts a
+`base_url` resolves its endpoint the same way — the configured `base_url` if
+set, else the first non-empty environment variable in the order below, else
+llmkit's own default — and sends the result on the wire as `api_base`. (`GOOGLE`
+is the one exception, deliberately: it owns no default, so with nothing
+configured it sends no `api_base` at all — see below.) So the endpoint is
+llmkit's decision, readable up front from the provider's
+`completion_kwargs()`, rather than something LiteLLM's internal chain resolves
+later. The resolution runs **per call**, not when the provider is constructed,
+so it reflects the environment the call actually goes out in: `import llmkit`
+does not import LiteLLM (that is deferred to the first call) and importing
+LiteLLM is what runs `load_dotenv()`, so a provider built once at startup with
+`make_provider(...)` and used later would otherwise answer from an environment
+the host's `.env` had not been read into yet.
+
+| Provider | Environment variable(s), in precedence order | Default endpoint |
+|----------|----------------------------------------------|------------------|
+| `OPENROUTER` | *(none)* | `https://openrouter.ai/api/v1` |
+| `ANTHROPIC` | `ANTHROPIC_API_BASE`, then `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
+| `OPENAI` | `OPENAI_BASE_URL`, then `OPENAI_API_BASE` | `https://api.openai.com/v1` |
+| `DEEPSEEK` | `DEEPSEEK_API_BASE` | `https://api.deepseek.com/beta` |
+| `GOOGLE` (AI Studio) | `GEMINI_API_BASE` | *(none — LiteLLM picks, see below)* |
+| `OLLAMA` | *(none)* | `http://localhost:11434` |
+
+**`GOOGLE` is the one provider with no llmkit default**, and the absence is
+deliberate: its base is the one that cannot be a constant. The AI Studio base
+carries an API *version* that LiteLLM derives **from the model** — `v1alpha` for
+Gemini 3 and newer, `v1beta` otherwise — and it applies that only when no
+`api_base` is given; a base that *is* given is used verbatim. Measured against
+litellm 1.92.0 (2026-07-21): pinning
+`https://generativelanguage.googleapis.com/v1beta` sent `gemini-3-pro-preview`
+to `/v1beta` where it had gone to `/v1alpha`, and pinning the bare host dropped
+the version segment entirely — so any static default would silently change the
+wire shape for some models, which is the one thing this resolution promises not
+to do. Deriving the version inside llmkit would be endpoint *computation*, the
+gateway-shaped work the library deliberately does not do. So for Google: a
+configured `base_url` wins, else `GEMINI_API_BASE`, else **no `api_base` is sent
+at all** and LiteLLM picks the endpoint, and with it the model's API version.
+That last case has a real, scoped cost: with neither configured, Google's
+endpoint can still come from a source llmkit does not read — notably the
+`litellm.api_base` module global. Naming a `base_url` or setting
+`GEMINI_API_BASE` closes it.
+
+**The listed variables are still honoured** — llmkit now reads them itself, in
+the order shown (LiteLLM's own measured precedence), so a host that points its
+endpoint with one of them is unaffected. What changed is the *closure*, and it
+covers `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, and a `GOOGLE` that has a `base_url`
+or `GEMINI_API_BASE`: for those, sources llmkit does not read can no longer
+choose the endpoint — the `litellm.api_base` module global, a LiteLLM
+key-management backend serving one of these names, or an alias some future
+LiteLLM release adds. That is a closed fix rather than a blocklist chasing an
+unversioned dependency, and it is the same bargain `api_key` already strikes:
+make the ambient fallback explicit, documented, and tested rather than delete
+it. With nothing configured, the outbound request is byte-identical to before.
+
+Two cases sit **outside** that closure. `GOOGLE` with neither `base_url` nor
+`GEMINI_API_BASE` set is one, per the paragraph above. `OLLAMA` is the other,
+and structurally so: both of its LiteLLM dispatch arms order the chain
+`litellm.api_base or api_base or …` — inverted relative to every other route —
+so for Ollama alone the module global outranks even the `api_base`
+llmkit sends (measured against litellm 1.92.0, 2026-07-21). That is accepted
+rather than fixed: it is a global a host has to set deliberately inside its own
+process, not something the ambient environment or a stray `.env` can reach, and
+closing it would mean reaching into a dependency's globals.
+
+`OPENROUTER` and `OLLAMA` deliberately read **no** endpoint variable: both
+already named their endpoint in every configuration (a default that is a real
+URL, overridable via `base_url`), so honouring extra variables would widen the
+ambient surface for no gain. `BEDROCK` and `VERTEX` are absent from the table
+because they reject `base_url` outright — their endpoints derive from
+`aws_region_name` and `vertex_location` respectively.
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
 
