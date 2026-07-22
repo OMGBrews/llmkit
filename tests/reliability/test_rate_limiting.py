@@ -753,6 +753,25 @@ def test_sync_gate_drop_waiter_keeps_queue_contiguous_and_advances_head() -> Non
     assert list(gate._waiters) == []
 
 
+_CAP = 2
+_FANOUT = 6  # deliberately > _CAP: the surplus is the whole point of the assertion
+
+
+def _openai_async_gates() -> list[tuple[int, int]]:
+    """``(in_flight, queued)`` for every async gate registered under ``openai``.
+
+    Read from the *calling* thread, so it snapshots ``_async_gates`` directly
+    rather than going through ``_get_async_gate`` (which needs a running loop).
+    One entry means one loop is serving every sync call — the persistent-loop
+    property itself; several entries is the fresh-loop-per-call regime.
+    """
+    return sorted(
+        (gate._in_flight, len(gate._waiters))
+        for (key, _loop), gate in list(GlobalRateLimiter._async_gates.items())
+        if key == "openai"
+    )
+
+
 def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     """N threads fanning out the sync call wrappers never exceed the provider cap.
 
@@ -762,36 +781,39 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     calls under a cap of 2). Now every sync call runs on the *one* persistent
     loop, so that async semaphore is genuinely shared and bounds cross-thread
     fan-out from *inside* the async path — no separate calling-thread semaphore.
-    Because the cap now lives inside the transport, the fake here patches
-    ``litellm.acompletion`` (deeper than the call functions) so the real
-    ``acompletion_text`` — and its ``acquire_async`` on the shared loop — runs;
-    an instrumented counter records the in-flight peak.
+
+    The fake patches ``litellm.acompletion`` (deeper than the call functions) so
+    the real ``acompletion_text`` — and its ``acquire_async`` on the shared loop
+    — runs. The discriminating check is that the limiter is *holding* the
+    surplus: with ``_FANOUT`` callers outstanding against a cap of ``_CAP``, the
+    one shared ``openai`` async gate must read ``(in_flight, queued) == (_CAP,
+    _FANOUT - _CAP)``. That target state is stable — nothing releases the
+    in-flight callers until the test thread does — so the barrier's deadline
+    bounds *arrival*, not the width of an observation window: a loaded runner
+    takes longer to converge but never converges on a different answer.
+    ``state['peak']`` backs it independently, measuring concurrency observed
+    inside the transport rather than the gate's own bookkeeping.
     """
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(max_concurrent=_CAP)
     lock = threading.Lock()
     state: dict[str, int] = {"current": 0, "peak": 0}
-    # A deterministic rendezvous replaces a wall-clock sleep: the first caller
-    # into the transport parks until a *second* is concurrently in flight
-    # (``current == 2``) and sets this event. All fakes share the one persistent
-    # loop, so this asyncio primitive works across them (it binds to that loop on
-    # first use).
-    both_in = asyncio.Event()
+    loop_box: list[asyncio.AbstractEventLoop] = []
+    # Opened by the TEST thread alone (never by a caller), so nothing inside the
+    # fan-out can impose the bound this test asserts — the flaw in the rendezvous
+    # this replaces, where the second caller released the first at exactly two.
+    release = asyncio.Event()
 
     async def _fake_acompletion(**_kwargs: object) -> MagicMock:
-        """One faked in-flight provider call: count in, rendezvous, count out."""
+        """One faked in-flight provider call: count in, park, count out."""
+        if not loop_box:
+            loop_box.append(asyncio.get_running_loop())
         with lock:
             state["current"] += 1
             state["peak"] = max(state["peak"], state["current"])
-            if state["current"] == 2:
-                both_in.set()
         try:
-            # With cap 2 two callers must overlap, so the first waits here until
-            # the second arrives — making ``peak == 2`` exact-and-safe and faster
-            # than a real sleep. A cap regression to 1 never reaches two in flight,
-            # so ``both_in`` is never set and this ``wait_for`` times out, failing
-            # the test loudly (the bare ``<= 2`` a relaxation would leave also
-            # passes when the fan-out never overlapped — the flaw this avoids).
-            _ = await asyncio.wait_for(both_in.wait(), timeout=5)
+            # A hang-guard, not a pacing device: on every path the test thread
+            # sets ``release`` in its ``finally`` long before this fires.
+            _ = await asyncio.wait_for(release.wait(), timeout=20.0)
         finally:
             with lock:
                 state["current"] -= 1
@@ -814,16 +836,28 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
         quiet_logging(),
         patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion),
     ):
-        threads = [threading.Thread(target=_text_call) for _ in range(6)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10.0)
+        threads = [threading.Thread(target=_text_call) for _ in range(_FANOUT)]
+        try:
+            for thread in threads:
+                thread.start()
+            # THE discriminating assertion: every caller is outstanding and the
+            # limiter must be holding the surplus on ONE shared gate. Stable state
+            # (nothing releases the in-flight callers until this thread does), so
+            # the deadline bounds arrival, not the width of an observation window.
+            _wait_until(
+                lambda: _openai_async_gates() == [(_CAP, _FANOUT - _CAP)],
+                timeout=5.0,
+                detail=lambda: f"openai (in_flight, queued) = {_openai_async_gates()}",
+            )
+        finally:
+            if loop_box:
+                _ = loop_box[0].call_soon_threadsafe(release.set)
+            for thread in threads:
+                thread.join(timeout=10.0)
 
-    assert state["peak"] <= 2, f"cap=2 but {state['peak']} sync calls were in flight at once"
-    # And the cap paced, not serialised, the fan-out: with six 0.15s calls and
-    # two slots, the calls genuinely overlap on the shared loop.
-    assert state["peak"] == 2
+    assert state["peak"] == _CAP, (
+        f"cap={_CAP} but {state['peak']} sync calls were in flight at once"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -889,16 +923,23 @@ def test_rate_bucket_record_drives_negative_then_recovers(
 # ---------------------------------------------------------------------------
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+def _wait_until(
+    predicate: Callable[[], bool],
+    timeout: float = 2.0,
+    detail: Callable[[], str] | None = None,
+) -> None:
     """Poll ``predicate`` until true, raising if it stays false past ``timeout``.
 
     Uses the real monotonic clock (the rate-limiter's ``_now`` is monkeypatched
-    to a frozen test clock, so it cannot be used for the timeout here).
+    to a frozen test clock, so it cannot be used for the timeout here). On
+    timeout ``detail`` (when supplied) is called to describe the observed state,
+    so a barrier that never converged reports *why* rather than a bare deadline.
     """
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:
-            raise AssertionError("condition not met within timeout")
+            suffix = f" — {detail()}" if detail is not None else ""
+            raise AssertionError(f"condition not met within {timeout}s{suffix}")
         time.sleep(0.001)
 
 
