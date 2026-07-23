@@ -358,10 +358,15 @@ class LLMClientConfig:
     Default Credentials** (``gcloud auth application-default login``,
     ``GOOGLE_APPLICATION_CREDENTIALS``, or a workload-identity/metadata-server
     token), never through ``LLMClientConfig``. ``vertex_location`` is the
-    **data-processing residency** control: it selects the regional endpoint
-    (``<location>-aiplatform.googleapis.com``) where the request runs, so a
+    **data-processing residency** control: it selects the endpoint where the
+    request runs (LiteLLM derives three shapes from it —
+    ``https://aiplatform.googleapis.com`` for ``"global"``,
+    ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region
+    geography, else ``https://<location>-aiplatform.googleapis.com``), so a
     regional value (e.g. ``"europe-west4"``) pins in-region processing while
-    the ``"global"`` endpoint gives no residency guarantee. Leave either
+    the ``"global"`` endpoint gives no residency guarantee. That pin is
+    overridable from outside the config — see
+    :class:`~llmkit.providers.vertex.VertexProvider`. Leave either
     ``None`` to let it resolve from the environment (``VERTEXAI_PROJECT`` /
     ``VERTEXAI_LOCATION``), with the location otherwise falling back to
     Google's default region.

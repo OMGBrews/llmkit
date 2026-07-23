@@ -27,6 +27,30 @@ class BedrockProvider(BaseProvider):
     also left unset, it resolves from the chain (``AWS_REGION_NAME`` /
     ``AWS_REGION``) like the credentials.
 
+    **One accepted edge: an ambient endpoint outranks the pinned region.** This
+    provider sends no ``api_base`` — the endpoint derives from
+    ``aws_region_name``, and computing it here would be the gateway-shaped work
+    llmkit does not do (``PRINCIPLES.md``; the same reason Vertex, and Google AI
+    Studio with nothing configured, are excluded from endpoint ownership). So
+    LiteLLM resolves it, consulting ``get_secret("AWS_BEDROCK_RUNTIME_ENDPOINT")``
+    ahead of the region-derived host. Measured against litellm 1.92.0 on
+    2026-07-23, with ``aws_region_name="eu-central-1"`` pinned in both arms::
+
+        nothing ambient  -> https://bedrock-runtime.eu-central-1.amazonaws.com
+                            /model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
+        AWS_BEDROCK_RUNTIME_ENDPOINT=https://hijacked.invalid
+                         -> https://hijacked.invalid
+                            /model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
+
+    The pinned region still wins over an ambient ``AWS_REGION_NAME``, and the
+    SigV4 credential scope keeps following it — so redirecting to a *different
+    AWS region* fails loudly on signature, while redirecting anywhere else
+    succeeds silently and hands that host a live signature over the real
+    payload. Unlike Vertex, this route never consults the ``litellm.api_base``
+    module global, so the surface is exactly one name — though ``get_secret``
+    also serves it from a configured LiteLLM key-management backend, so
+    ``printenv`` is not a sufficient check.
+
     Structured output is pinned to ``instructor.Mode.JSON_SCHEMA`` — the
     same mode the direct :class:`AnthropicProvider` pins, for the same
     reason: the underlying model is Claude. ``Mode.ANTHROPIC_JSON`` (the pin

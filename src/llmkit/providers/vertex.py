@@ -38,8 +38,11 @@ class VertexProvider(BaseProvider):
     default region.
 
     ``vertex_location`` is the **data-processing residency** control: it selects
-    the regional endpoint (``<location>-aiplatform.googleapis.com``) where the
-    request is processed. Pass a regional value (e.g. ``"europe-west4"``,
+    the endpoint where the request is processed. LiteLLM derives three shapes
+    from it — ``https://aiplatform.googleapis.com`` for ``"global"``,
+    ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region geography
+    (``"us"``, ``"eu"``), else ``https://<location>-aiplatform.googleapis.com``.
+    Pass a regional value (e.g. ``"europe-west4"``,
     ``"asia-northeast1"``) to pin in-region processing; the ``"global"`` endpoint
     gives no residency guarantee. Note Gemini availability is **region-specific**,
     so a region chosen for residency may not host every model — including the
@@ -47,6 +50,42 @@ class VertexProvider(BaseProvider):
     with a Vertex ``400 FAILED_PRECONDITION`` ("Precondition check failed."), an
     *availability* error distinct from auth/permission failures; pass a ``model``
     the region actually serves.
+
+    **Two accepted edges, and both can override that residency pin.** This
+    provider sends no ``api_base`` — the endpoint derives from
+    ``vertex_location``, and computing it here would be the gateway-shaped work
+    llmkit does not do (``PRINCIPLES.md``; the same reason Bedrock, and Google
+    AI Studio with nothing configured, are excluded from endpoint ownership).
+    So LiteLLM's own resolution stays in charge, with two consequences.
+
+    *(1) An ambient endpoint value outranks the pinned location.* LiteLLM
+    resolves ``api_base or litellm.api_base or get_secret("VERTEXAI_API_BASE")``
+    (``litellm/main.py``), and the module global outranks the variable. The
+    resolved value does not swap the host into the derived URL — it **replaces
+    the URL**, composed as ``"{value}:{action}"`` — so project, location and
+    model all vanish, and the ADC-minted ``Authorization: Bearer ya29.…`` rides
+    to the new host. Measured against litellm 1.92.0 on 2026-07-23, with
+    ``vertex_location="europe-west4"`` pinned in both arms::
+
+        nothing ambient     -> https://europe-west4-aiplatform.googleapis.com/v1
+                               /projects/<p>/locations/europe-west4/publishers
+                               /google/models/gemini-2.5-flash-lite:generateContent
+        VERTEXAI_API_BASE=https://hijacked.invalid/v1
+                            -> https://hijacked.invalid/v1:generateContent
+
+    A value carrying a path or trailing slash redirects silently, as above; a
+    **bare host** instead fails loudly (``Invalid port: 'generateContent'``) and
+    sends nothing. ``VERTEX_API_BASE`` (no ``AI``) is embeddings-only and does
+    not affect completions. Note ``get_secret`` also consults a configured
+    LiteLLM key-management backend, so the surface is wider than an environment
+    variable and ``printenv`` is not a sufficient check.
+
+    *(2) LiteLLM may itself move the call out of the pinned location*, with no
+    ambient value involved: it reroutes to a model's first ``supported_regions``
+    entry when its shipped cost map lists regions excluding the pinned one,
+    warning only on the verbose logger. The ``gemini-2.5-flash-lite`` default
+    carries no such restriction in litellm 1.92.0 — but that is dependency data,
+    not a guarantee.
 
     Structured output defaults to ``instructor.Mode.JSON_SCHEMA`` — Gemini's
     native JSON-schema mode, the same mode the direct ``GoogleProvider`` pins,

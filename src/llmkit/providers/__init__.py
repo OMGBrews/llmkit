@@ -168,7 +168,10 @@ def make_provider(
             carries a model-derived API version) and so sends nothing when
             neither is set, and Ollama's LiteLLM route ranks ``litellm.api_base``
             above the value sent. Not accepted by Bedrock/Vertex, whose endpoints
-            derive from region/location.
+            LiteLLM derives from ``aws_region_name`` / ``vertex_location`` — for
+            those two an ambient endpoint value can override the pinned region,
+            which matters because that region is the residency control (see each
+            provider's class docstring).
         reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
             ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; not accepted by any other

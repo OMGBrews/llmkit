@@ -33,8 +33,12 @@ from llmkit.providers.base import (
 #: derivation — the gateway-shaped work llmkit does not do (``PRINCIPLES.md``),
 #: and the same reason Bedrock and Vertex are excluded from endpoint ownership.
 #: The cost is scoped and documented: with no ``base_url`` and no
-#: ``GEMINI_API_BASE``, this provider alone still leaves the endpoint to
-#: LiteLLM's chain. Tracked in the wrapper's Bedrock/Vertex endpoint follow-up.
+#: ``GEMINI_API_BASE``, this provider leaves the endpoint to LiteLLM's chain —
+#: the third of the three cases where llmkit declines to name an endpoint it
+#: would have to *compute*, alongside Bedrock and Vertex. Naming either closes
+#: it here, which is what makes this case the mildest of the three; the decision
+#: covering all three is settled (README, "``BEDROCK`` and ``VERTEX`` do not own
+#: their endpoints").
 _DEFAULT_BASE_URL: str | None = None
 
 

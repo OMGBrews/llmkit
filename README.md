@@ -608,6 +608,12 @@ the host's `.env` had not been read into yet.
 | `DEEPSEEK` | `DEEPSEEK_API_BASE` | `https://api.deepseek.com/beta` |
 | `GOOGLE` (AI Studio) | `GEMINI_API_BASE` | *(none — LiteLLM picks, see below)* |
 | `OLLAMA` | *(none)* | `http://localhost:11434` |
+| `BEDROCK` | `AWS_BEDROCK_RUNTIME_ENDPOINT` — read by **LiteLLM**, not llmkit | derived from `aws_region_name` by LiteLLM |
+| `VERTEX` | `VERTEXAI_API_BASE`, outranked by the `litellm.api_base` global — both read by **LiteLLM**, not llmkit | derived from `vertex_location` by LiteLLM |
+
+The last two rows are governed differently from the six above them, and the
+[section below](#bedrock-and-vertex-do-not-own-their-endpoints) says why and what
+it costs.
 
 **`GOOGLE` is the one provider with no llmkit default**, and the absence is
 deliberate: its base is the one that cannot be a constant. The AI Studio base
@@ -653,9 +659,71 @@ closing it would mean reaching into a dependency's globals.
 `OPENROUTER` and `OLLAMA` deliberately read **no** endpoint variable: both
 already named their endpoint in every configuration (a default that is a real
 URL, overridable via `base_url`), so honouring extra variables would widen the
-ambient surface for no gain. `BEDROCK` and `VERTEX` are absent from the table
-because they reject `base_url` outright — their endpoints derive from
-`aws_region_name` and `vertex_location` respectively.
+ambient surface for no gain.
+
+### `BEDROCK` and `VERTEX` do not own their endpoints
+
+These two reject `base_url` outright, and llmkit sends them no `api_base`:
+their endpoints are *derived* rather than configured — Bedrock's from
+`aws_region_name`, Vertex's from `vertex_location`. llmkit names an endpoint
+where the endpoint is a constant it can measure once; where it is computed from
+an input llmkit does not own, llmkit declines to compute it and LiteLLM's own
+resolution stays in charge. (Google AI Studio with neither `base_url` nor
+`GEMINI_API_BASE` set is the third case in that same family, for the API-version
+reason above.) The alternative would be llmkit constructing regional URLs — the
+gateway-shaped work this library [deliberately does not do](PRINCIPLES.md), and
+for Vertex it would mean running Google credential resolution just to build a
+path, since the project id comes from ADC.
+
+**The cost is scoped, and it is sharper here than elsewhere, because these are
+the two providers whose region knob is a residency control.** An ambient
+endpoint value overrides the region you pinned. Measured against litellm 1.92.0
+(2026-07-23), with the region/location explicitly pinned in *both* arms:
+
+```
+BEDROCK, aws_region_name="eu-central-1"
+  nothing set   -> https://bedrock-runtime.eu-central-1.amazonaws.com/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
+  with the var  -> https://hijacked.invalid/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
+
+VERTEX, vertex_location="europe-west4"
+  nothing set   -> https://europe-west4-aiplatform.googleapis.com/v1/projects/<p>/locations/europe-west4/publishers/google/models/gemini-2.5-flash-lite:generateContent
+  with the var  -> https://hijacked.invalid/v1:generateContent
+```
+
+Four things that matter if you pin residency:
+
+- **What travels.** Vertex sends the ADC-minted `Authorization: Bearer ya29.…`
+  to the overridden host; Bedrock hands it a live SigV4 signature over the real
+  payload. This is credential exposure as much as region drift. Bedrock's SigV4
+  scope keeps following the region you pinned, so redirecting to a *different
+  AWS region* fails loudly on signature; redirecting anywhere else succeeds
+  silently.
+- **Vertex's surface is two sources, Bedrock's is one.** For Vertex, LiteLLM
+  resolves `api_base or litellm.api_base or VERTEXAI_API_BASE` on one line, and
+  the in-process global **outranks** the variable — no environment hygiene
+  reaches a global that any dependency or notebook cell can set. Bedrock's route
+  never consults that global. (`VERTEX_API_BASE`, without the `AI`, is
+  embeddings-only and does not affect completions.)
+- **Vertex replaces the whole URL rather than swapping the host**, composing
+  `"{value}:{action}"` — so a value carrying a path or trailing slash redirects
+  silently, while a *bare host* fails loudly with `Invalid port:
+  'generateContent'` and sends nothing. Do not read a crash as the only failure
+  mode.
+- **`printenv` is not a valid check.** Importing LiteLLM runs `load_dotenv()`,
+  and its search walks up from the installed package directory — so a `.env`
+  sitting above your virtualenv is in force from any working directory. Both
+  names are read through LiteLLM's `get_secret`, which also consults a
+  configured key-management backend. An empty string is safe; a stray value is
+  not.
+
+**Vertex has a second residency override with no environment variable
+involved.** LiteLLM reroutes a pinned `vertex_location` to a model's first
+`supported_regions` entry when its shipped cost map lists regions that exclude
+yours, warning only on the verbose logger. llmkit's `gemini-2.5-flash-lite`
+default carries no such restriction today, but that is data in a dependency, not
+a guarantee — so treat `vertex_location` as pinning residency *for models the
+installed LiteLLM does not constrain*, and check a region-sensitive workload
+against the endpoint it actually reaches.
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
 
@@ -671,7 +739,7 @@ The default model is Claude Haiku 4.5 via its **cross-region inference profile**
 pip install "omg-llmkit[vertex]"
 ```
 
-**`vertex_location` is the data-processing residency control.** It selects the regional endpoint (`<location>-aiplatform.googleapis.com`) where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. The default model is Gemini 2.5 Flash-Lite (parity with the AI Studio provider). As with AI Studio, Gemini 2.5 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
+**`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 2.5 Flash-Lite (parity with the AI Studio provider). As with AI Studio, Gemini 2.5 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
 
 > **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host every model — including the `gemini-2.5-flash-lite` default. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a `model` the region actually serves (e.g. some regions offer `gemini-2.5-flash` but not `-flash-lite`). Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
 

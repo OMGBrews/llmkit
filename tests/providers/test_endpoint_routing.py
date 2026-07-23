@@ -64,6 +64,18 @@ reasoned about.
 Every test clears all six endpoint environment variables before asserting:
 importing ``litellm`` runs ``load_dotenv()``, so an ambient value can be injected
 into the process, and a pass that depended on one would be worthless.
+
+One test here covers a provider on the *other* side of that decision. Bedrock
+sends no ``api_base`` at all — its endpoint is LiteLLM's to derive from
+``aws_region_name`` — but llmkit still documents that region as the control over
+where the request is processed, so
+``test_bedrock_region_selects_the_endpoint_it_promises`` holds that promise to
+the wire. It asserts the positive property (the URL a pinned region reaches),
+never LiteLLM's precedence between its own ambient sources, which stays
+deliberately untested. Vertex has no equivalent here: observing its URL requires
+patching a private LiteLLM seam to mint an OAuth token, so its routing is
+covered at the kwargs level in ``test_vertex_routing.py`` instead — an asymmetry
+worth naming rather than leaving to be discovered.
 """
 
 from __future__ import annotations
@@ -400,6 +412,64 @@ def test_gemini_api_version_still_follows_the_model(
     assert url == (
         f"https://generativelanguage.googleapis.com/{expected_version}"
         f"/models/{model}:generateContent"
+    )
+
+
+@pytest.mark.parametrize("region", ["us-east-1", "eu-central-1"])
+def test_bedrock_region_selects_the_endpoint_it_promises(
+    region: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned ``aws_region_name`` reaches the endpoint the docs promise it does.
+
+    Bedrock is one of the three providers that deliberately send no ``api_base``
+    (with Vertex, and Google AI Studio when nothing is configured), so llmkit
+    does not *choose* this URL — LiteLLM derives it from the region. But llmkit
+    still makes a promise about it: ``aws_region_name`` is documented as the
+    control over where the request is processed, the counterpart of Vertex's
+    residency knob. Nothing offline held that promise to the wire, which left
+    the two providers whose region knob carries a compliance meaning as the only
+    two making a URL claim no test checked.
+
+    This asserts the positive property — the artifact llmkit means to produce —
+    rather than LiteLLM's internal precedence, which is deliberately untested:
+    pinning a dependency's resolution order on a path llmkit does not own would
+    be the open-ended blocklist this design rejected. Two regions, because a
+    single-region assertion cannot distinguish the pinned region from an ambient
+    one (and a developer ``.env`` may well carry ``AWS_REGION_NAME``).
+
+    The ``%3A`` is not decoration: the inference-profile model id contains a
+    colon, and it is percent-encoded into the path. A hand-written constant
+    would plausibly get that wrong, which is why this literal was measured
+    (litellm 1.92.0, 2026-07-23) rather than composed.
+    """
+    pytest.importorskip("boto3", reason="Bedrock's optional extra is not installed")
+
+    _clear_endpoint_env(monkeypatch)
+    # LiteLLM's own resolution reaches further than the six bearer aliases:
+    # the endpoint override, the ambient region chain, and any real credential
+    # or profile ``load_dotenv()`` injected all have to go before this asserts.
+    for name in (
+        "AWS_BEDROCK_RUNTIME_ENDPOINT",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_REGION_NAME",
+        "AWS_DEFAULT_REGION",
+        "AWS_SESSION_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # SigV4 signs locally, so fakes build a real URL without a real credential.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAFAKEFAKEFAKEFAKE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "0" * 40)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent")
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent")
+
+    built = build_provider(LLMClientConfig(provider=Provider.BEDROCK, aws_region_name=region))
+    assert "api_base" not in built.completion_kwargs()
+
+    assert capture_request_url(built) == (
+        f"https://bedrock-runtime.{region}.amazonaws.com"
+        + "/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse"
     )
 
 

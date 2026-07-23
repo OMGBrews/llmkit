@@ -397,7 +397,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request is byte-identical to before (the defaults are LiteLLM's own, measured).
   OpenRouter and Ollama already sent `api_base` unconditionally; Bedrock and
   Vertex accept no `base_url` at all (their endpoints derive from
-  `aws_region_name` / `vertex_location`).
+  `aws_region_name` / `vertex_location`). **Those two, and Google AI Studio with
+  nothing configured, are now documented as the three cases where llmkit
+  declines to name an endpoint it would have to compute** — including the part
+  that bites: an ambient `AWS_BEDROCK_RUNTIME_ENDPOINT` or `VERTEXAI_API_BASE`
+  (or, for Vertex, the `litellm.api_base` global, which outranks it) overrides
+  the region you pinned, and that region is the residency control. Measured and
+  written up under
+  [`BEDROCK` and `VERTEX` do not own their endpoints](README.md#bedrock-and-vertex-do-not-own-their-endpoints),
+  with a new offline test pinning that a configured `aws_region_name` reaches
+  the endpoint the docs promise.
 
 - **`with_retries` no longer re-asks an open circuit under its default
   `retry_on=None`.** A bare `CircuitOpenError` (raised by the opt-in circuit
