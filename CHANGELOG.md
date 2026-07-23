@@ -95,6 +95,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`model_from_json_schema` rejects subschema applicators at every site, not
+  only beside a `$ref`.** `allOf`, `not`, `if`, `then`, `else`,
+  `dependentSchemas`, `dependentRequired`, `propertyNames`, `patternProperties`,
+  `prefixItems`, `contains`, `unevaluatedProperties`, and `unevaluatedItems`
+  raised beside a `$ref` but were **silently discarded** anywhere else — beside
+  a plain `type`, in an array's `items`, in a `$def` body reached through a bare
+  `$ref`, on the non-null branch of a nullable `anyOf`, or on the root object.
+  The generated model then validated something the schema never described, in
+  *both* directions: a dropped `allOf` of `minimum`/`maximum` accepted `999` for
+  a `5..10` field, and a dropped `prefixItems` re-read the sibling `items` as
+  "every element" instead of "every element after the prefix", so the model
+  *rejected* a response the schema permits — paying for the loss in retries.
+  Each now raises a `ValueError` naming the keyword and its schema path.
+  `anyOf`/`oneOf` are untouched: they are the nullable spelling and still build.
+  **Migration:** this is a build-time break for a schema carrying one of the 13
+  keywords anywhere reachable from the root — and because llmkit's documented
+  pattern is build-once-at-import, it surfaces at import/startup/test, never
+  mid-traffic. Either express the constraint with a supported keyword (a plain
+  `minimum`/`maximum` instead of an `allOf` of bounds) or validate it outside
+  the generated model. The model it replaces was, by construction, not the model
+  the schema described.
+
 - **A config knob the selected provider does not read is now rejected, not
   silently ignored.** `LLMClientConfig` / `make_provider` accepted every
   provider-shaped field for every provider and each provider used only the ones

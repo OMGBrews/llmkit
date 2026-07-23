@@ -244,6 +244,36 @@ bound. A keyword that would redefine the reference's *structure* (`type`,
 unconstrained scalar. Move such a keyword into the referenced `$def`, or inline
 the schema.
 
+**Subschema applicators are rejected everywhere, not only beside a `$ref`.**
+`allOf`, `not`, `if` / `then` / `else`, `dependentSchemas`,
+`dependentRequired`, `propertyNames`, `patternProperties`, `prefixItems`,
+`contains`, `unevaluatedProperties`, and `unevaluatedItems` constrain an
+instance by *composition*, and a generated field is one annotation plus the
+bounds in the table above — so an applicator has nowhere to land. Each raises a
+`ValueError` naming the keyword and its path, at every site: a property, an
+array's `items`, a nested object, the body of a `$def` reached through a
+`$ref`, the non-null branch of a nullable `anyOf`, and the root object.
+
+```python
+model_from_json_schema(
+    {
+        "type": "object",
+        "properties": {"score": {"type": "integer", "allOf": [{"maximum": 10}]}},
+        "required": ["score"],
+    }
+)
+# ValueError: Unsupported keyword 'allOf' at '$.score': subschema applicators ...
+```
+
+Rejecting is not pedantry — dropping one is wrong in *both* directions. A
+dropped `allOf` bound makes the model accept a value the schema forbids; a
+dropped `prefixItems` changes what the sibling `items` means (Draft 2020-12
+reads it as "every element *after* the prefix"), so the model rejects a
+response the schema permits and the spurious `ValidationError` is paid for in
+retries. Either express the constraint with a supported keyword, or validate it
+outside the generated model. The nullable spellings — `anyOf` / `oneOf` with a
+single non-null branch plus a `null` branch — are unaffected and still build.
+
 A propertyless object is rejected the same way: `{"type": "object"}` with no
 `properties` — or an explicit empty `{"properties": {}}` — raises at translation
 time (it would otherwise build a zero-field model that rejects every real
@@ -257,10 +287,15 @@ is not recognised and is dropped — the bound is enforced as the sibling's
 *inclusive* `minimum`/`maximum`. If your schema comes from an OpenAPI 3.0
 document, rewrite exclusive bounds in the numeric form.
 
-**Anything outside the table above is silently dropped** — `pattern`, `format`,
-`multipleOf`, `uniqueItems`, `const`, and the rest are *not* enforced. This is
-deliberate: partial enforcement that looks complete is worse than none. If a
-schema relies on one of those, validate it elsewhere.
+**Leaf constraints outside the table above are silently dropped** — `pattern`,
+`format`, `multipleOf`, `uniqueItems`, `const`, and the rest are *not*
+enforced. This is deliberate: partial enforcement that looks complete is worse
+than none. If a schema relies on one of those, validate it elsewhere. The drop
+is scoped to per-value keywords like these; a *structural* construct outside
+the supported subset — a subschema applicator, a multi-variant union, a typed
+`additionalProperties` map — raises instead of vanishing, because losing one
+silently changes the shape the model validates rather than merely leaving a
+value unchecked.
 
 ### Rate limiting
 

@@ -562,8 +562,10 @@ def test_ref_sibling_properties_raises_clear_value_error() -> None:
 def test_ref_sibling_allof_raises_clear_value_error() -> None:
     """An ``allOf`` (or any subschema applicator) beside a ``$ref`` is a
     conjunction the converter cannot express, so it raises rather than merging and
-    silently dropping the restriction — the same rule as a type/enum sibling, and
-    symmetric with a bare ``allOf`` property (which already fails loud)."""
+    silently dropping the restriction — the same rule as a type/enum sibling. The
+    wording stays ``$ref``-specific: the applicator guard that now rejects
+    ``allOf`` at every site runs after the ``$ref`` hop, so it does not pre-empt
+    this more specific message."""
     schema: dict[str, object] = {
         "type": "object",
         "properties": {"c": {"$ref": "#/$defs/Color", "allOf": [{"enum": ["red"]}]}},
@@ -651,6 +653,173 @@ def test_ref_sibling_restating_target_structural_key_is_accepted() -> None:
     # The non-structural sibling bound still rides through alongside.
     with pytest.raises(ValidationError):
         _ = model(n=4)
+
+
+# --- Subschema applicators fail loud at EVERY site, not only beside a $ref ---
+
+# Each body is a minimal *valid* schema carrying the applicator beside a plain
+# ``type``. Every one of these BUILDS on the pre-guard converter (verified) and
+# silently drops the applicator — which is what makes the assertions below
+# meaningful: pre-fix each parametrisation reports ``DID NOT RAISE ValueError``,
+# not an incidental error from some other rejection.
+_APPLICATOR_BODIES: list[tuple[str, dict[str, object]]] = [
+    ("allOf", {"type": "integer", "allOf": [{"minimum": 5}, {"maximum": 10}]}),
+    ("not", {"type": "string", "not": {"enum": ["forbidden"]}}),
+    ("if", {"type": "integer", "if": {"minimum": 0}}),
+    ("then", {"type": "integer", "then": {"maximum": 10}}),
+    ("else", {"type": "integer", "else": {"maximum": 10}}),
+    (
+        "dependentSchemas",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "dependentSchemas": {"a": {"required": ["b"]}},
+        },
+    ),
+    (
+        "dependentRequired",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "dependentRequired": {"a": ["b"]},
+        },
+    ),
+    (
+        "propertyNames",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "propertyNames": {"maxLength": 0},
+        },
+    ),
+    (
+        "patternProperties",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "patternProperties": {"^a$": {"type": "integer"}},
+        },
+    ),
+    (
+        "prefixItems",
+        {"type": "array", "items": {"type": "boolean"}, "prefixItems": [{"type": "string"}]},
+    ),
+    ("contains", {"type": "array", "items": {"type": "string"}, "contains": {"const": "x"}}),
+    (
+        "unevaluatedProperties",
+        {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "unevaluatedProperties": False,
+        },
+    ),
+    ("unevaluatedItems", {"type": "array", "items": {"type": "string"}, "unevaluatedItems": False}),
+]
+
+
+@pytest.mark.parametrize(
+    ("keyword", "body"), _APPLICATOR_BODIES, ids=[k for k, _ in _APPLICATOR_BODIES]
+)
+def test_applicator_beside_type_raises_clear_value_error(
+    keyword: str, body: dict[str, object]
+) -> None:
+    """Every subschema applicator raises when it sits beside a plain ``type``.
+
+    The ``$ref``-sibling guard covered these only next to a ``$ref``; beside a
+    ``type`` the dispatch succeeded and the applicator evaporated, producing a
+    model that accepts data the schema forbids (``allOf`` bounds, ``not``,
+    ``contains``, …) or rejects data the schema permits (``prefixItems``)."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": body},
+        "required": ["n"],
+    }
+    with pytest.raises(ValueError, match=rf"Unsupported keyword '{keyword}' at '\$\.n'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_root_level_applicator_raises_at_root_path() -> None:
+    """A root-level applicator raises and names the root path.
+
+    The root reaches ``_build_object`` directly and never passes through the
+    field resolver, so a guard placed only on the resolver leaves root ``if`` /
+    ``then`` silently dropped."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"type": "integer"}},
+        "required": ["n"],
+        "if": {"properties": {"n": {"minimum": 0}}},
+        "then": {"properties": {"n": {"maximum": 10}}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported keyword 'if' at '\$'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_array_item_applicator_raises_naming_item_path() -> None:
+    """An applicator on an array's ``items`` schema raises at the item path.
+
+    Pre-fix the model built and accepted ``{"f": ["forbidden"]}``, exactly the
+    value the ``not`` excluded."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "f": {"type": "array", "items": {"type": "string", "not": {"enum": ["forbidden"]}}}
+        },
+        "required": ["f"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported keyword 'not' at '\$\.f\[\]'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_applicator_inside_ref_target_raises_at_use_site() -> None:
+    """An applicator in a ``$ref`` *target* raises, reported at the use site.
+
+    The sibling guard inspects siblings only and never the target body, so a
+    bare ``{"$ref": ...}`` to a def carrying ``allOf`` slipped through it
+    entirely: the model built and accepted ``999`` for a ``5..10`` bound."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/S"}},
+        "required": ["n"],
+        "$defs": {"S": {"type": "integer", "allOf": [{"minimum": 5}, {"maximum": 10}]}},
+    }
+    with pytest.raises(ValueError, match=r"Unsupported keyword 'allOf' at '\$\.n'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_applicator_on_nullable_branch_raises() -> None:
+    """An applicator on the non-null branch of a nullable ``anyOf`` raises —
+    pinning that the check runs on the *resolved* node, after the nullable
+    unwrap folds the branch in."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "n": {"anyOf": [{"type": "string", "not": {"enum": ["forbidden"]}}, {"type": "null"}]}
+        },
+        "required": ["n"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported keyword 'not' at '\$\.n'"):
+        _ = model_from_json_schema(schema)
+
+
+def test_applicator_error_names_first_keyword_deterministically() -> None:
+    """A node carrying two applicators reports the alphabetically first one, so
+    the parametrised matches above stay stable regardless of dict order."""
+    schema: dict[str, object] = {
+        "title": "M",
+        "type": "object",
+        "properties": {
+            "n": {"type": "string", "not": {"enum": ["x"]}, "allOf": [{"minLength": 3}]}
+        },
+        "required": ["n"],
+    }
+    with pytest.raises(ValueError, match=r"Unsupported keyword 'allOf' at '\$\.n'"):
+        _ = model_from_json_schema(schema)
 
 
 def test_bound_on_nullable_branch_is_found() -> None:

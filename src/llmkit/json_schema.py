@@ -41,6 +41,17 @@ construct, rather than silently producing a wrong model:
   ``then`` / ``else`` / …) — is a JSON-Schema conjunction a merge cannot express,
   so it is rejected unless it restates the target's own value: a ``$ref``-sibling
   ``enum`` or ``allOf`` is a clear error, never a silently-widened field
+* subschema *applicators* — ``allOf`` / ``not`` / ``if`` / ``then`` / ``else`` /
+  ``dependentSchemas`` / ``dependentRequired`` / ``propertyNames`` /
+  ``patternProperties`` / ``prefixItems`` / ``contains`` /
+  ``unevaluatedProperties`` / ``unevaluatedItems`` — are **rejected at every
+  site**, not only beside a ``$ref``. Each constrains by composition and a
+  generated field is one annotation plus a fixed set of ``Field`` bounds, so an
+  applicator has nowhere to land; dropping one is wrong in both directions (a
+  dropped ``allOf`` bound accepts what the schema forbids; a dropped
+  ``prefixItems`` re-reads the sibling ``items`` as "every element" and rejects
+  what the schema permits). ``anyOf`` / ``oneOf`` are exempt — they are the
+  nullable spelling, consumed below
 * ``object`` with ``properties``; a propertyless object (``properties`` absent
   *or* an explicit empty ``{}``) is rejected unless it opts into open-ended keys
   with ``additionalProperties: true`` — otherwise it would build a zero-field
@@ -65,10 +76,15 @@ shape. The supported set is **exactly**:
 * ``description`` → ``Field(description=...)`` (instructor surfaces this as
   per-field guidance to the model)
 
-Any other constraint keyword (``pattern``, ``format``, ``multipleOf``,
+Any other *leaf* constraint keyword (``pattern``, ``format``, ``multipleOf``,
 ``uniqueItems``, ``const``, …) is **silently dropped** — deliberately, to
 avoid partial enforcement that looks complete. Nothing outside the list above
 is enforced; if a schema relies on one of those, validate it elsewhere.
+
+The silent drop is scoped to those per-value keywords. A *structural* construct
+outside the supported subset — a subschema applicator, a multi-variant union, a
+typed ``additionalProperties`` map — raises instead, because losing one changes
+the shape the model validates rather than leaving a single value unchecked.
 
 A schema-level ``default`` on a non-required field is likewise **not** carried
 into the model: the field becomes optional with a ``None`` default and, via the
@@ -225,42 +241,18 @@ class _FieldConstraints(NamedTuple):
     max_length: int | None = None
 
 
-# JSON-schema keywords that define a schema's *structure* (its type and shape),
-# as opposed to metadata or value bounds. When one of these sits beside a
-# ``$ref``, it cannot be folded into the referenced target without changing what
-# the target validates: Draft 2020-12 applies such a sibling as a *conjunction*
-# (an intersection with the target), which a last-writer-wins merge cannot
-# express. So a structural sibling is honoured only when it restates the
-# target's own value verbatim (a redundant no-op some generators emit) and
-# otherwise fails loud — never silently widening or replacing the reference.
-# Everything else beside a ``$ref`` (``description``, ``default``, the
-# numeric/length bounds, benign annotations, unknown keywords) is non-structural
-# and merges over the target with the outer, property-level value winning.
-#
-# The set is the union of three groups the converter treats as structure-bearing:
-#   - the type/shape keywords it dispatches on (``type`` / ``enum`` / ``items`` /
-#     ``properties`` / ``required`` / ``additionalProperties``);
-#   - every subschema *applicator* — a bare one of these already fails loud as an
-#     unsupported construct, so it must fail loud beside a ``$ref`` too rather
-#     than merge-and-drop (``anyOf`` / ``oneOf`` / ``allOf`` / ``not`` /
-#     ``if`` / ``then`` / ``else`` / ``dependentSchemas`` / ``dependentRequired`` /
-#     ``propertyNames`` / ``patternProperties`` / ``prefixItems`` / ``contains`` /
-#     ``unevaluatedProperties`` / ``unevaluatedItems``);
-#   - ``title``, because the object-class cache is keyed by the ``$ref`` name and
-#     names the class from ``title``, so a per-site sibling ``title`` would rename
-#     the *shared* referenced class for every other reference site. It belongs on
-#     the ``$def``, not a use site.
-_STRUCTURAL_REF_SIBLINGS: frozenset[str] = frozenset(
+# Subschema applicators the converter never consumes, at any site. Each
+# constrains the instance by *composition* — a conjunction (``allOf``), a
+# negation (``not``), a condition (``if`` / ``then`` / ``else`` /
+# ``dependentSchemas`` / ``dependentRequired``), or a positional / name-keyed
+# rule (``prefixItems`` / ``contains`` / ``patternProperties`` /
+# ``propertyNames`` / ``unevaluated*``). A generated field carries exactly one
+# annotation plus a fixed set of ``Field`` bounds, so an applicator has nowhere
+# to land: it would simply vanish, and the model would then validate something
+# the schema never described. Hence it fails loud at EVERY site (see
+# :meth:`_Converter._reject_unsupported_applicators`), not only beside a ``$ref``.
+_UNSUPPORTED_APPLICATORS: frozenset[str] = frozenset(
     {
-        "type",
-        "enum",
-        "items",
-        "properties",
-        "required",
-        "additionalProperties",
-        "title",
-        "anyOf",
-        "oneOf",
         "allOf",
         "not",
         "if",
@@ -275,6 +267,51 @@ _STRUCTURAL_REF_SIBLINGS: frozenset[str] = frozenset(
         "unevaluatedProperties",
         "unevaluatedItems",
     }
+)
+
+# The type/shape keywords the converter dispatches on. Away from a ``$ref``
+# these are read and honoured; beside one they are structural (below).
+# ``title`` belongs here because the object-class cache is keyed by the ``$ref``
+# name and names the class from ``title``, so a per-site sibling ``title`` would
+# rename the *shared* referenced class for every other reference site. It
+# belongs on the ``$def``, not a use site.
+_SHAPE_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "type",
+        "enum",
+        "items",
+        "properties",
+        "required",
+        "additionalProperties",
+        "title",
+    }
+)
+
+# JSON-schema keywords that define a schema's *structure* (its type and shape),
+# as opposed to metadata or value bounds. When one of these sits beside a
+# ``$ref``, it cannot be folded into the referenced target without changing what
+# the target validates: Draft 2020-12 applies such a sibling as a *conjunction*
+# (an intersection with the target), which a last-writer-wins merge cannot
+# express. So a structural sibling is honoured only when it restates the
+# target's own value verbatim (a redundant no-op some generators emit) and
+# otherwise fails loud — never silently widening or replacing the reference.
+# Everything else beside a ``$ref`` (``description``, ``default``, the
+# numeric/length bounds, benign annotations, unknown keywords) is non-structural
+# and merges over the target with the outer, property-level value winning.
+#
+# Derived from the two sets above so they cannot drift, plus the union spellings:
+#   - :data:`_SHAPE_KEYWORDS` — dispatched on elsewhere, a conjunction here;
+#   - :data:`_UNSUPPORTED_APPLICATORS` — rejected here *and* everywhere else. A
+#     bare applicator fails loud only when no sibling ``type`` / ``enum`` sits
+#     with it (``{"allOf": [...]}`` alone has nothing to dispatch on); with one,
+#     dispatch succeeds and the applicator would be silently dropped, which is
+#     why the applicator guard is not scoped to ``$ref`` sites at all;
+#   - ``anyOf`` / ``oneOf``, which are the converter's *nullable* spelling and
+#     are consumed by :meth:`_Converter._unwrap_nullable` — structural beside a
+#     ``$ref``, but deliberately absent from the applicator set above, since
+#     rejecting them everywhere would reject nullability itself.
+_STRUCTURAL_REF_SIBLINGS: frozenset[str] = (
+    _SHAPE_KEYWORDS | _UNSUPPORTED_APPLICATORS | frozenset({"anyOf", "oneOf"})
 )
 
 
@@ -640,6 +677,14 @@ class _Converter:
             if unwrapped is inner:
                 break
             inner = unwrapped
+        # Check the FULLY resolved node — after the ``$ref`` merge and after
+        # ``_unwrap_nullable`` — so one call covers the property node, the array
+        # item node, a ``$def`` body reached through a bare ``$ref``, and the
+        # non-null branch of a nullable union, each reported at its use-site path.
+        # The ``$ref``-sibling guard above already ran inside the loop, so a
+        # sibling applicator still gets the more specific "Unsupported $ref
+        # sibling" message rather than this one.
+        self._reject_unsupported_applicators(inner, field_path)
         return _ResolvedField(inner, nullable, ref_name)
 
     def _reject_structural_ref_siblings(
@@ -667,6 +712,35 @@ class _Converter:
                     + f"or widen the reference). Move {key!r} into the referenced $def, "
                     + "or inline the schema instead of referencing it."
                 )
+
+    def _reject_unsupported_applicators(self, schema: JsonDict, field_path: str) -> None:
+        """Fail loud on a subschema applicator the converter cannot honour.
+
+        A generated field is one annotation plus a fixed set of ``Field`` bounds,
+        so an applicator (see :data:`_UNSUPPORTED_APPLICATORS`) has nowhere to
+        land. Dropping one is wrong in BOTH directions: a dropped ``allOf`` bound
+        makes the model accept a value the schema forbids, and a dropped
+        ``prefixItems`` makes the sibling ``items`` mean "every element" instead
+        of "every element after the prefix", so the model *rejects* a response the
+        schema permits. Unlike a dropped leaf constraint (``pattern`` / ``format``
+        — documented as unenforced), neither loss is visible to the caller.
+
+        Distinct from :meth:`_reject_structural_ref_siblings`, which fires only
+        beside a ``$ref`` and only for a sibling that redefines the target. This
+        runs at every site — including a bare ``$ref`` whose *target body* carries
+        an applicator, which the sibling guard structurally cannot see.
+        """
+        offender = next((k for k in sorted(schema) if k in _UNSUPPORTED_APPLICATORS), None)
+        if offender is None:
+            return
+        raise ValueError(
+            f"Unsupported keyword {offender!r} at {field_path!r}: subschema applicators "
+            + "(allOf / not / if / then / else / contains / prefixItems / patternProperties "
+            + "/ propertyNames / dependentSchemas / dependentRequired / unevaluated*) "
+            + "constrain by composition and cannot be carried into a generated field, so "
+            + "they would be silently dropped — changing what the model accepts. Express "
+            + f"{offender!r} with a supported keyword, or validate it outside the model."
+        )
 
     def _annotation_from_resolved(self, resolved: _ResolvedField, field_path: str) -> object:
         """Build a field's Python annotation from an already-resolved schema node.
@@ -1079,6 +1153,10 @@ class _Converter:
             root_ref, target = self._resolve_ref(cast("str", root["$ref"]))
             self._reject_structural_ref_siblings(siblings, target, "$")
             root = {**target, **siblings}
+        # Outside the ``$ref`` branch on purpose: the root reaches
+        # ``_build_object`` directly and never passes through ``_resolve_field``,
+        # so without this call a root-level ``if`` / ``allOf`` stays silent.
+        self._reject_unsupported_applicators(root, "$")
         jtype = root.get("type")
         if jtype not in (None, "object"):
             raise ValueError(
@@ -1140,7 +1218,14 @@ def model_from_json_schema(
     * ``additionalProperties``: ``true`` (open object, extra keys kept) or
       ``false`` / absent (strict); a typed map raises ``ValueError``
 
-    Per-field constraints (carried into ``Field``; everything else dropped):
+    Subschema applicators (``allOf`` / ``not`` / ``if`` / ``then`` / ``else`` /
+    ``dependentSchemas`` / ``dependentRequired`` / ``propertyNames`` /
+    ``patternProperties`` / ``prefixItems`` / ``contains`` / ``unevaluated*``)
+    constrain by composition and cannot ride on a generated field, so each
+    raises ``ValueError`` naming the keyword and its path — at *every* site, not
+    only beside a ``$ref``. Nullable ``anyOf`` / ``oneOf`` are unaffected.
+
+    Per-field constraints (carried into ``Field``; other leaf keywords dropped):
 
     * numeric ``minimum``/``maximum`` → ``ge``/``le``,
       ``exclusiveMinimum``/``exclusiveMaximum`` → ``gt``/``lt``
@@ -1148,8 +1233,9 @@ def model_from_json_schema(
     * ``minItems``/``maxItems`` → ``min_length``/``max_length`` (arrays)
     * ``description`` → per-field ``Field`` description (instructor guidance)
 
-    Any constraint outside that set (``pattern``, ``format``, ``multipleOf``,
-    …) is **silently dropped** — no partial enforcement.
+    Any *leaf* constraint outside that set (``pattern``, ``format``,
+    ``multipleOf``, …) is **silently dropped** — no partial enforcement. A
+    structural construct outside the subset raises instead of vanishing.
 
     Serialization contract:
         A non-required field becomes an optional Pydantic field defaulting to
