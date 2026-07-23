@@ -416,7 +416,7 @@ The default directory is resolved **lazily at the first write** and then frozen 
 2. `data/llm-logs/` under the nearest ancestor directory carrying a `pyproject.toml` or `.git` (nearest wins) — and when the sink creates that directory it also seeds a `.gitignore`, so prompt logs never land in your repository's history;
 3. otherwise a per-user state directory (`$XDG_STATE_HOME/llmkit/llm-logs` on Linux, `~/Library/Logs/llmkit` on macOS, `%LOCALAPPDATA%\llmkit\logs` on Windows) — never a CWD-relative path.
 
-The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=...)` is always used as-is. Pass `configure_llm_logging(None)` to disable logging entirely.
+The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=...)` is used as given, made absolute at construction so that a *relative* path (or a relative `LLMKIT_LOG_DIR`) names one directory for the sink's lifetime instead of following the process around. Pass `configure_llm_logging(None)` to disable logging entirely.
 
 On POSIX, a sink-created directory is `0o700` and log files are `0o600` — prompt data is owner-only by default. A pre-existing directory is never re-chmodded: pre-create the directory yourself to share logs with other readers.
 
@@ -427,7 +427,10 @@ Long-running services no longer accumulate unbounded prompt data. By default the
 ```python
 LocalYamlLogSink(retention_days=None)                  # keep everything forever
 LocalYamlLogSink(retention_days=7, max_index_bytes=None)  # tighter age bound, no rotation
+LocalYamlLogSink(retention_days=0)                     # ValueError — see below
 ```
+
+Each bound takes a **positive** integer or `None`; `0` and negatives raise `ValueError` at construction. `0` is rejected rather than quietly interpreted because it has two opposite plausible meanings — "keep nothing" (`logrotate`'s `rotate 0`) and "no limit" (many SaaS retention settings) — and the destructive reading is what the mechanics would actually do: the prune cutoff would be *now*, so the first write would delete every log in the directory, including the file it had just written and whose path it returns. `None` is the only opt-out, for both bounds.
 
 Sink I/O never runs on the event loop: writes are offloaded to a worker thread (the one deliberate exception is a stream abandoned mid-flight, whose record is written synchronously so it can't be lost while the generator unwinds).
 
@@ -492,7 +495,9 @@ class StructuredStdoutSink:
 configure_llm_logging(StructuredStdoutSink())   # pass None to disable logging entirely
 ```
 
-The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally.
+`configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
+
+The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 
 An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit[otel]` extra; the pluggable seam makes it a non-breaking addition.
 

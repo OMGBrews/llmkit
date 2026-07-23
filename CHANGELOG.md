@@ -251,7 +251,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first successful write announces the directory *and* the policy at INFO —
   before anything is ever deleted. Opt out with
   `LocalYamlLogSink(retention_days=None)` (and/or `max_index_bytes=None`) if
-  your logs are an archive rather than a debugging aid.
+  your logs are an archive rather than a debugging aid. Both bounds are
+  validated at construction and take a **positive** int or `None`: `0` and
+  negatives raise `ValueError` rather than being read as either of their two
+  plausible meanings — `retention_days=0` would put the prune cutoff at *now*,
+  deleting every log on the first write (including the file that write just
+  produced, whose path it returns), and `max_index_bytes=0` would rotate
+  `index.jsonl` away on every housekeeping pass. The error names `None` as the
+  opt-out.
 
 - **⚠️ The default log directory moved for processes not launched from a
   project root.** It is now resolved lazily at first write — `LLMKIT_LOG_DIR`,
@@ -280,6 +287,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failure (and any *new* failure signature — different exception type or
   errno) logs a WARNING with traceback; identical repeats drop to DEBUG. The
   latch re-arms on success and on `configure_llm_logging`.
+
+- **⚠️ A sink misconfiguration now fails where it is made, not on every later
+  call.** `configure_llm_logging` raises `TypeError` for anything that is
+  neither `None` nor a `LogSink` — including the missing-parens slip of
+  passing the sink *class* — instead of installing it and turning every
+  subsequent call's log into a latched warning far from the mistake. The check
+  is structural (a `write` method must exist; its signature is the type
+  checker's job). `LocalYamlLogSink` likewise rejects a non-`Path` `log_dir`
+  at construction rather than losing every log inside the write path's
+  best-effort swallow. A relative log directory — explicit, via
+  `LLMKIT_LOG_DIR`, or via a relative `XDG_STATE_HOME`/`LOCALAPPDATA` — is now
+  made absolute when the sink freezes it, so it names one directory for the
+  process's life instead of following a `chdir` and splitting the logs. And a
+  third-party `write_returning_path` that breaks its `Path | None` contract is
+  treated as a failed write (one latched warning, no path) rather than passed
+  through, so `capture_llm_log_paths()` yields only real paths.
+  **Migration:** pass an instance, not a class, and a `Path`, not a `str`. In
+  tests, a bare `MagicMock()` no longer registers as a sink (structural checks
+  use static attribute lookup, which `__getattr__` proxies don't satisfy) —
+  use `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
+  A relative log directory stops tracking the working directory.
 
 ### Deprecated
 

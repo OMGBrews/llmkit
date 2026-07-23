@@ -99,14 +99,23 @@ def _resolve_default_log_dir() -> tuple[Path, bool]:
     per-user state directory. Only the project-root case (the one where a
     repository could accidentally swallow prompt logs) returns ``True``, which
     makes the sink seed a ``.gitignore`` when it creates that directory.
+
+    Every branch returns an absolute path — a *relative* ``LLMKIT_LOG_DIR``
+    (or ``XDG_STATE_HOME`` / ``LOCALAPPDATA``, which the state-dir fallback
+    reads verbatim) would otherwise be re-anchored to the process's current
+    directory on each use, which is exactly the chdir-splits-the-logs failure
+    the sink freezes its answer to prevent. Absolute, not resolved: symlinks
+    are left intact, since the frozen answer only has to be stable, not
+    canonical.
     """
     env_dir = os.environ.get(LOG_DIR_ENV_VAR)
     if env_dir:
-        return Path(env_dir), False
+        return Path(env_dir).absolute(), False
     root = _find_project_root(Path.cwd())
     if root is not None:
+        # Already absolute: rooted at Path.cwd().
         return root / "data" / "llm-logs", True
-    return _user_state_log_dir(), False
+    return _user_state_log_dir().absolute(), False
 
 
 def default_log_dir() -> Path:
@@ -325,6 +334,7 @@ class LLMCallRecord:
     queue_wait_ms: float | None = None
 
 
+@runtime_checkable
 class LogSink(Protocol):
     """Destination for :class:`LLMCallRecord`s.
 
@@ -336,6 +346,12 @@ class LogSink(Protocol):
     *file paths* without authoring a sink, use
     :func:`~llmkit.capture.capture_llm_records` or
     :func:`~llmkit.capture.capture_llm_log_paths`.
+
+    ``@runtime_checkable`` so :func:`configure_llm_logging` can reject a
+    non-sink at configuration time instead of letting every subsequent write
+    fail into the best-effort swallow. The check is structural and tests
+    attribute *presence* only — a ``write`` with the wrong signature still
+    passes, the same limitation :class:`_PathReturningLogSink` documents.
     """
 
     def write(self, record: LLMCallRecord) -> None: ...
@@ -352,7 +368,9 @@ class _PathReturningLogSink(Protocol):
     contract. Being ``@runtime_checkable``, the :func:`isinstance` test matches
     structurally — any sink exposing a ``write_returning_path`` method counts,
     so a third-party sink opts into path-capture purely by defining one (it
-    *must* then return ``Path | None``). A sink that implements only
+    *must* then return ``Path | None``; :func:`write_llm_log` enforces that
+    much, treating anything else as a failed write rather than letting it
+    reach the path-capture buffer). A sink that implements only
     :meth:`LogSink.write` does not match and is path-capture-invisible.
     """
 
@@ -382,7 +400,9 @@ class LocalYamlLogSink:
     ``log_dir=None`` (the default) resolves via :func:`default_log_dir` at
     the first write and freezes the answer for the sink's lifetime, so a
     mid-run ``chdir`` cannot split logs across directories; an explicit path
-    is used as-is. The first successful write emits one INFO naming the
+    is frozen the same way, made absolute at construction (symlinks intact)
+    so a *relative* one names one directory forever rather than following
+    the process around. The first successful write emits one INFO naming the
     absolute directory and the retention policy — before anything is ever
     pruned. When the sink itself creates the directory it is ``0o700`` and
     files are ``0o600`` (a pre-existing directory is never re-chmodded —
@@ -395,6 +415,9 @@ class LocalYamlLogSink:
     an ``index.jsonl`` past ``max_index_bytes`` (default 50 MiB; ``None``
     never rotates) is rotated to a date-stamped sibling that ages out under
     the same policy. Housekeeping runs at most hourly, on the write path.
+    Both bounds take a *positive* value or ``None``; ``0`` and negatives are
+    rejected at construction rather than given one of their two plausible
+    meanings (see :meth:`__init__`).
     """
 
     def __init__(
@@ -404,7 +427,50 @@ class LocalYamlLogSink:
         retention_days: int | None = DEFAULT_RETENTION_DAYS,
         max_index_bytes: int | None = DEFAULT_MAX_INDEX_BYTES,
     ) -> None:
-        self._log_dir: Path | None = log_dir
+        """Configure the sink, validating the growth bounds eagerly.
+
+        An explicit ``log_dir`` is made absolute here so the directory the
+        sink freezes cannot move under a later ``chdir``.
+
+        Both bounds stay plain public attributes afterwards: this validates
+        *construction*, so assigning ``sink.retention_days = 0`` later reopens
+        the hole. Configure the sink once, at startup, as the module docstring
+        describes.
+
+        Raises:
+            ValueError: if ``retention_days`` or ``max_index_bytes`` is set to
+                a non-positive value. ``0`` is rejected rather than read as
+                "unlimited": the prune cutoff would be *now*, so the first
+                write deletes every log in the directory — including the file
+                that write just produced, whose path it still returns.
+                ``None`` is the opt-out for both (keep forever / never
+                rotate). Validation lives in the constructor, not the write
+                path, because a host's configuration mistake should be a loud
+                one-line fix at startup — the write path is best-effort by
+                contract and would degrade this to a warning.
+            TypeError: if ``log_dir`` is neither a :class:`~pathlib.Path` nor
+                ``None``. A ``str`` would otherwise fail deep in the first
+                write, where the best-effort swallow turns "every log is
+                lost" into one warning.
+        """
+        if retention_days is not None and retention_days < 1:
+            raise ValueError(
+                "retention_days must be an integer >= 1 or None "
+                + f"(None keeps every log forever), got {retention_days!r}"
+            )
+        if max_index_bytes is not None and max_index_bytes < 1:
+            raise ValueError(
+                "max_index_bytes must be an integer >= 1 or None "
+                + f"(None never rotates index.jsonl), got {max_index_bytes!r}"
+            )
+        # Deliberate runtime guard at a public boundary, like the one in
+        # configure_llm_logging: the annotation says Path, but an untyped
+        # caller's "logs" string would only surface at the first write.
+        if log_dir is not None and not isinstance(log_dir, Path):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard at public boundary
+            raise TypeError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
+                f"log_dir must be a Path or None, got {type(log_dir).__name__}"
+            )
+        self._log_dir: Path | None = None if log_dir is None else log_dir.absolute()
         self.retention_days: int | None = retention_days
         self.max_index_bytes: int | None = max_index_bytes
         # True once the default resolution chose the project-root location —
@@ -787,14 +853,56 @@ _sink: LogSink | None = LocalYamlLogSink()
 _sink_latch = _OnceLatch()
 
 
+class _SinkContractError(TypeError):
+    """A sink matched a capability protocol structurally but broke its contract.
+
+    Its own type — rather than a bare ``TypeError`` — keeps the warn-once
+    latch's ``(type, errno)`` signature distinct, so a sink that returns junk
+    from ``write_returning_path`` and *also* raises a genuine ``TypeError``
+    later still gets a second loud warning instead of being folded into the
+    first.
+    """
+
+
 def configure_llm_logging(sink: LogSink | None) -> None:
     """Set the sink that receives every :class:`LLMCallRecord`.
 
     Pass ``None`` to disable logging entirely (writes become no-ops).
     Re-arms the warn-once latch on sink failures, so a newly configured sink
     gets a fresh loud first warning if it too turns out to be broken.
+
+    Raises:
+        TypeError: if *sink* is neither ``None`` nor a :class:`LogSink`
+            instance — including the easy slip of passing the sink *class*
+            rather than an instance of it. Configuration is checkable now, so
+            it is checked now: an object with no ``write`` would otherwise be
+            installed silently and turn every subsequent call's log into a
+            latched warning at write time, far from the mistake. The
+            structural check tests attribute *presence* only — a ``write``
+            with the wrong signature still gets through, the limitation
+            :class:`_PathReturningLogSink` already documents and a type
+            checker catches at the call site. One consequence worth knowing
+            in tests: a bare ``MagicMock()`` does **not** match (structural
+            checks use static attribute lookup, which sees through no
+            ``__getattr__``), so stub with ``Mock(spec=LogSink)``, a small
+            fake class, or ``None``.
     """
     global _sink
+    # Deliberate runtime guards at the library's public boundary: the annotation
+    # says ``LogSink | None``, but an untyped caller passing something else
+    # would otherwise install it silently and lose every subsequent log.
+    if isinstance(sink, type):
+        # A class object carries ``write`` as an attribute, so it satisfies the
+        # structural check below while failing every write on the missing
+        # ``self`` — the exact deferred failure this guard exists to prevent.
+        raise TypeError(
+            f"sink must be a LogSink instance, not the class itself — did you mean {sink.__name__}()?"
+        )
+    if sink is not None and not isinstance(sink, LogSink):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard at public boundary
+        raise TypeError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
+            "sink must implement LogSink (a write(record) method) or be None, "
+            + f"got {type(sink).__name__}"
+        )
     _sink = sink
     _sink_latch.succeeded()
 
@@ -815,12 +923,27 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
     simply empty for such sinks, while
     :func:`~llmkit.capture.capture_llm_records` still captures
     the record itself.
+
+    A third-party ``write_returning_path`` that breaks its ``Path | None``
+    contract is treated as a sink failure — latched warning, ``None``
+    returned — rather than passed through, so nothing but a real path ever
+    reaches :func:`~llmkit.capture.capture_llm_log_paths`'s ``list[Path]``.
     """
     if _sink is None:
         return None
     try:
         if isinstance(_sink, _PathReturningLogSink):
             path = _sink.write_returning_path(record)
+            # Same deliberate guard as the configure-time one: a structural
+            # protocol match promises the method exists, never that it honors
+            # its return annotation. Raising here routes the contract breach
+            # through the latched warning below, so a broken third-party sink
+            # degrades like any other write failure instead of smuggling a
+            # non-Path into capture_llm_log_paths()'s list[Path].
+            if path is not None and not isinstance(path, Path):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard on a third-party return
+                raise _SinkContractError(
+                    f"write_returning_path must return Path | None, got {type(path).__name__}"
+                )
         else:
             _sink.write(record)
             path = None
