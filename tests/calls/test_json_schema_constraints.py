@@ -244,9 +244,10 @@ def test_constraint_keyword_on_mismatched_type_is_dropped_not_crashing() -> None
 
 
 def test_mixed_string_and_integer_enum_is_rejected_clearly() -> None:
-    """A mixed string/int enum can't be faithfully represented (one base coerces
-    members), so it's rejected with a clear, path-naming error rather than
-    silently building a model that rejects its own schema-valid integer values."""
+    """A mixed string/int enum stays rejected with a clear, path-naming error.
+    ``Literal`` could technically carry the mix, but the supported subset is
+    kept homogeneous for parity with every prior release — relaxing it is a
+    deliberate follow-up, not a silent side effect of the annotation change."""
     schema: dict[str, object] = {
         "title": "M",
         "type": "object",

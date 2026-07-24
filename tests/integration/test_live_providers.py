@@ -98,6 +98,7 @@ from pydantic import BaseModel
 from llmkit import (
     LLMProviderInterface,
     Provider,
+    model_from_json_schema,
     structured_llm_call,
 )
 from llmkit.providers import make_provider
@@ -415,6 +416,69 @@ async def test_live_default_model(provider: Provider) -> None:
             + f"replace {type(built).__name__}._default_model."
         )
         raise
+
+
+@pytest.mark.asyncio
+async def test_openrouter_strict_schema_ref_hygiene_live() -> None:
+    """A ``model_from_json_schema`` model with described enum + object fields
+    survives OpenAI's strict ``response_format`` validator.
+
+    Regression for the 0.7.0 emission: the enum factored into ``$defs`` with
+    the ``description`` beside the ``$ref``, and every OpenAI-served model
+    rejected the call with a 400 (``$ref cannot have keywords
+    {'description'}``) — reported by found-in-words, whose judge rubrics all
+    use exactly this shape via ``openai/gpt-4o-mini`` on OpenRouter. The
+    model id is deliberately NOT env-overridable: it must stay an
+    OpenAI-served slug, because OpenAI's strict validator (reached through
+    OpenRouter's ``strict_json_schema`` upgrade) is the thing under test.
+    Non-OpenAI models accept the broken shape, which is what masked the bug.
+    """
+    schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "recognizability_score": {
+                "type": "integer",
+                "enum": [-1, 1, 2, 3, 4, 5],
+                "description": "How recognizable the phrase is; -1 means not a real phrase.",
+            },
+            "assessment": {
+                "type": "object",
+                "description": "Structured detail behind the score.",
+                "additionalProperties": False,
+                "properties": {
+                    "confident": {
+                        "type": "boolean",
+                        "description": "Whether the judgement is confident.",
+                    }
+                },
+                "required": ["confident"],
+            },
+        },
+        "required": ["recognizability_score", "assessment"],
+    }
+    judgment = model_from_json_schema(schema, name="phrase_judgment")
+    provider = make_provider(
+        Provider.OPENROUTER,
+        model="openai/gpt-4o-mini",
+        **_live_credentials(Provider.OPENROUTER),
+    )
+    result = await structured_llm_call(
+        # Dictate the answer so the assertion is deterministic: a 400 from the
+        # schema validator is the failure this test exists to catch, and a
+        # correctly-parsed dictated value proves the round trip.
+        "Judge the phrase 'the quick brown fox'. It is extremely recognizable: "
+        + "score it exactly 5, and mark the assessment as confident.",
+        judgment,
+        feature="integration-smoke",
+        label="openrouter-strict-ref-hygiene",
+        provider=provider,
+        max_tokens=1024,
+    )
+    assert result.model_dump() == {
+        "recognizability_score": 5,
+        "assessment": {"confident": True},
+    }
 
 
 @pytest.mark.asyncio

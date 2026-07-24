@@ -28,7 +28,10 @@ construct, rather than silently producing a wrong model:
   ``null`` / nullable via ``["string", "null"]`` or ``anyOf`` with a null
   branch)
 * ``array`` (``items``), including arrays of objects
-* ``enum`` (on a scalar field)
+* ``enum`` (on a scalar field) — the annotation is an inline ``Literal[...]``,
+  so the emitted schema carries the enum *in place* (``{"type": ..., "enum":
+  [...]}``, a legal sibling of ``description``), never a ``$defs`` entry
+  behind a ``$ref``
 * nested objects, inline or via local ``$defs`` / ``$ref`` references
   (``#/$defs/Name`` or the legacy ``#/definitions/Name``). A ``$ref`` may carry
   siblings: metadata and value bounds (``description``, ``default``, the
@@ -108,15 +111,32 @@ null branch) and legitimately set to ``None`` is **kept**, because dropping a
 required field would itself break re-validation. Callers can pass
 ``exclude_none=False`` to keep every null, or ``exclude_none=True`` for the
 native "drop all nulls" behaviour.
+
+Emitted JSON schema (strict structured outputs)
+------------------------------------------------
+instructor serialises the generated model with a zero-argument
+``model_json_schema()`` call, and OpenAI's strict ``response_format``
+validator rejects any ``$ref`` node carrying sibling keywords (``$ref cannot
+have keywords {'description'}``) as well as ``allOf`` wholesale. The
+generated models therefore guarantee neither shape appears in the emitted
+document: enum fields are inline ``Literal`` annotations (no ``$ref`` at
+all), and a *described object-typed property* — which pydantic factors into
+``$defs`` and references with the ``description`` beside the ``$ref`` — is
+inlined at the use site with the siblings merged over the def (outer wins),
+after which ``$defs`` entries nothing references any more are pruned. Bare
+``$ref`` nodes, which the validator allows, stay shared. Out of scope here:
+strict mode also demands every property be listed in ``required``, so a
+schema with *optional* fields still needs relaxing before a ``strict: true``
+call can accept it.
 """
 
 from __future__ import annotations
 
+import copy
 import keyword
 import re
 import warnings
-from collections.abc import Callable, Mapping
-from enum import Enum
+from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Annotated,
     Any,
@@ -139,6 +159,7 @@ from pydantic import (
     create_model,
     model_serializer,
 )
+from pydantic.json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaMode
 
 __all__ = ["model_from_json_schema"]
 
@@ -196,6 +217,19 @@ class _DumpJsonKwargs(TypedDict, total=False):
     fallback: Callable[[Any], Any] | None  # pyright: ignore[reportExplicitAny]  # raw-pydantic — pydantic types ``fallback`` as ``Callable[[Any], Any]``
     serialize_as_any: bool
     polymorphic_serialization: bool | None
+
+
+class _ModelJsonSchemaExtra(TypedDict, total=False):
+    """``model_json_schema`` keywords newer than the pydantic floor (2.8).
+
+    The ``model_json_schema`` override below names the four parameters every
+    supported pydantic has and takes the rest through ``Unpack`` of this
+    TypedDict, so a newer keyword (``union_format``, pydantic 2.13) is
+    forwarded only when a caller actually passes it — forwarding it eagerly
+    with its default would crash the lowest-versions resolution.
+    """
+
+    union_format: Literal["any_of", "primitive_type_array"]
 
 
 # A JSON-schema dict: string keys to arbitrary JSON values. Modelled with
@@ -384,6 +418,118 @@ def _read_directive(context: object) -> str:
     return "optional"
 
 
+# The one ``$ref`` spelling pydantic's default ``ref_template`` produces, and
+# the only one the emission walkers below rewrite: a custom template yields
+# refs they cannot resolve, which are left untouched rather than guessed at.
+_REF_PREFIX = "#/$defs/"
+
+
+def _inline_ref_siblings(root: JsonDict) -> None:
+    """Rewrite every ``$ref``-with-siblings node into an inline schema, in place.
+
+    Pydantic factors a named model annotation into ``$defs`` and references it;
+    a per-field ``description`` then lands **beside** the ``$ref`` (pydantic
+    ≥2.9) or wraps it in a single-branch ``allOf`` (pydantic <2.9). OpenAI's
+    strict structured-outputs validator rejects both shapes — ``$ref cannot
+    have keywords {...}``, and ``allOf`` is unsupported outright — so each
+    offending use site gets its own copy of the referenced def with the
+    sibling keys merged on top (outer wins, the same precedence
+    ``_resolve_field`` applies on the input side). Bare ``$ref`` nodes, which
+    the validator allows, are left shared.
+
+    Termination: generated schemas cannot contain a ``$ref`` cycle (recursive
+    input schemas are rejected at build time), so both the inline loop and the
+    walk over freshly-inlined content bottom out.
+    """
+    defs_raw = root.get("$defs")
+    defs: JsonDict = cast("JsonDict", defs_raw) if isinstance(defs_raw, dict) else {}
+
+    def rewrite(node: JsonDict) -> None:
+        # Normalise the pre-2.9 spelling — ``{"allOf": [{"$ref": ...}],
+        # "description": ...}`` — to the sibling form, so one inline path
+        # below covers both pydantic eras.
+        all_of = node.get("allOf")
+        if (
+            "$ref" not in node
+            and isinstance(all_of, list)
+            and len(cast("list[JsonValue]", all_of)) == 1
+            and isinstance(cast("list[JsonValue]", all_of)[0], dict)
+            and set(cast("JsonDict", cast("list[JsonValue]", all_of)[0])) == {"$ref"}
+        ):
+            node["$ref"] = cast("JsonDict", cast("list[JsonValue]", all_of)[0])["$ref"]
+            del node["allOf"]
+        # Inline while the node is a resolvable ``$ref`` with siblings — the
+        # loop covers a def that is itself a bare ``$ref`` alias.
+        while True:
+            ref = node.get("$ref")
+            if not isinstance(ref, str) or len(node) == 1 or not ref.startswith(_REF_PREFIX):
+                return
+            target = defs.get(ref.removeprefix(_REF_PREFIX))
+            if not isinstance(target, dict):
+                return
+            siblings = {k: v for k, v in node.items() if k != "$ref"}
+            node.clear()
+            node.update(copy.deepcopy(cast("JsonDict", target)))
+            node.update(siblings)
+
+    def walk(value: JsonValue) -> None:
+        if isinstance(value, dict):
+            node = cast("JsonDict", value)
+            rewrite(node)
+            for child in node.values():
+                walk(child)
+        elif isinstance(value, list):
+            for item in cast("list[JsonValue]", value):
+                walk(item)
+
+    walk(root)
+
+
+def _prune_unreferenced_defs(root: JsonDict) -> None:
+    """Drop ``$defs`` entries nothing references any more, in place.
+
+    Inlining ``$ref``-with-siblings sites can leave a def with no remaining
+    referrer. Reachability is computed transitively from the non-``$defs``
+    part of the document, so a def referenced only by another dead def goes
+    too; when nothing survives the ``$defs`` key is removed entirely.
+    """
+    defs_raw = root.get("$defs")
+    if not isinstance(defs_raw, dict):
+        return
+    defs = cast("JsonDict", defs_raw)
+
+    def refs_in(value: JsonValue, acc: set[str]) -> None:
+        if isinstance(value, dict):
+            node = cast("JsonDict", value)
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith(_REF_PREFIX):
+                acc.add(ref.removeprefix(_REF_PREFIX))
+            for child in node.values():
+                refs_in(child, acc)
+        elif isinstance(value, list):
+            for item in cast("list[JsonValue]", value):
+                refs_in(item, acc)
+
+    needed: set[str] = set()
+    for key, value in root.items():
+        if key != "$defs":
+            refs_in(value, needed)
+    frontier = list(needed)
+    while frontier:
+        target = defs.get(frontier.pop())
+        if target is None:
+            continue
+        found: set[str] = set()
+        refs_in(target, found)
+        for name in found - needed:
+            needed.add(name)
+            frontier.append(name)
+    for name in [n for n in defs if n not in needed]:
+        del defs[name]
+    if not defs:
+        del root["$defs"]
+
+
 class _JsonSchemaModel(BaseModel):
     """Base for every generated model: drops *optional* ``None`` on dump.
 
@@ -401,6 +547,10 @@ class _JsonSchemaModel(BaseModel):
     native "drop all nulls" behaviour.
     """
 
+    # ``use_enum_values`` is inert since enum fields became inline ``Literal``
+    # annotations (a validated instance always holds the raw scalar; there is
+    # no Enum member to unwrap). Kept for one release as a belt while that
+    # change beds in, then removable.
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", use_enum_values=True)
 
     # Field names OPTIONAL in the source schema (absent from its ``required``
@@ -450,13 +600,48 @@ class _JsonSchemaModel(BaseModel):
         kwargs["context"] = _with_directive(kwargs.get("context"), exclude_none)
         return super().model_dump_json(**kwargs)
 
+    @classmethod
+    @override
+    def model_json_schema(
+        cls,
+        by_alias: bool = True,
+        ref_template: str = DEFAULT_REF_TEMPLATE,
+        schema_generator: type[GenerateJsonSchema] = GenerateJsonSchema,
+        mode: JsonSchemaMode = "validation",
+        **kwargs: Unpack[_ModelJsonSchemaExtra],
+    ) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]  # raw-pydantic — mirrors model_json_schema's dict[str, Any] return
+        """Pydantic's schema, post-processed to survive OpenAI's strict validator.
+
+        instructor serialises the model with exactly this call, zero-argument,
+        so this override is the one seam where the emitted document can be
+        made strict-safe: a ``$ref`` that pydantic gave sibling keywords (a
+        described object-typed property) is inlined at the use site, and defs
+        nothing references any more are pruned. Rewrites only apply to the
+        default ``ref_template``'s ``#/$defs/`` refs — a custom template's
+        refs pass through untouched.
+        """
+        schema = cast(
+            "JsonDict",
+            super().model_json_schema(
+                by_alias=by_alias,
+                ref_template=ref_template,
+                schema_generator=schema_generator,
+                mode=mode,
+                **kwargs,
+            ),
+        )
+        _inline_ref_siblings(schema)
+        _prune_unreferenced_defs(schema)
+        return schema
+
 
 class _JsonSchemaModelAllow(_JsonSchemaModel):
     """Open-ended variant for objects whose schema sets ``additionalProperties: true``.
 
     Subclasses the strict base so the child ``model_config`` merges with the
-    parent's: it keeps ``use_enum_values`` and the ``exclude_none`` dump
-    override while flipping ``extra`` from ``"forbid"`` to ``"allow"``.
+    parent's: it keeps the parent's config keys and the ``exclude_none`` dump
+    and ``model_json_schema`` overrides while flipping ``extra`` from
+    ``"forbid"`` to ``"allow"``.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow")
@@ -501,6 +686,20 @@ def _as_list(element: object) -> object:
     annotation, so the type-level cast is confined here.
     """
     return list[cast("type", element)]
+
+
+def _as_literal(members: Sequence[str | int]) -> object:
+    """Build the inline ``Literal[...]`` annotation for an enum field's members.
+
+    Subscripting ``Literal`` with a runtime tuple is order-preserving and, in
+    value position, well-typed — the runtime-built annotation idiom the
+    sibling helpers above confine. Pydantic inlines a ``Literal`` annotation
+    straight into the property schema (``{"type": ..., "enum": [...]}``),
+    never into ``$defs`` behind a ``$ref`` — the shape OpenAI's strict
+    structured-outputs validator requires when a ``description`` sits beside
+    the enum.
+    """
+    return Literal[tuple(members)]
 
 
 def _with_constraints(annotation: object, c: _FieldConstraints) -> object:
@@ -757,9 +956,9 @@ class _Converter:
             # member (``{"type": ["string", "null"], "enum": ["a", null]}``) —
             # JSON Schema requires it there for an actual ``null`` to validate.
             # Nullability is already resolved into the ``X | None`` union, so
-            # drop the ``null`` member before building the Enum. A ``null``
-            # member on a NON-nullable field is left in place so ``_build_enum``
-            # still rejects the contradiction loudly.
+            # drop the ``null`` member before building the enum annotation. A
+            # ``null`` member on a NON-nullable field is left in place so
+            # ``_build_enum`` still rejects the contradiction loudly.
             if resolved.nullable and isinstance(inner["enum"], list):
                 non_null_members: list[JsonValue] = [v for v in inner["enum"] if v is not None]
                 if not non_null_members:
@@ -877,13 +1076,25 @@ class _Converter:
             ),
         )
 
-    def _build_enum(self, schema: JsonDict, field_path: str) -> type[Enum]:
+    def _build_enum(self, schema: JsonDict, field_path: str) -> object:
+        """Build the ``Literal[...]`` annotation for an ``enum``-bearing node.
+
+        A ``Literal`` rather than a generated ``Enum`` class: pydantic inlines
+        it into the property schema, so the per-field ``description`` lands
+        beside an inline ``enum`` (legal everywhere) instead of beside a
+        ``$ref`` (rejected by OpenAI's strict validator), and a validated
+        instance holds the raw scalar with no member-name machinery in
+        between. One deliberate strictness delta versus the former int-based
+        ``Enum``: a numeric *string* (``"2"``) no longer coerces to the
+        integer member — strict providers guarantee a real integer on the
+        wire, and a weak model's quoted number should re-ask, not slide.
+        """
         values = schema.get("enum")
         if not isinstance(values, list) or not values:
             raise ValueError(
                 f"Unsupported enum at {field_path!r}: 'enum' must be a non-empty list."
             )
-        members: dict[str, JsonValue] = {}
+        members: list[str | int] = []
         all_int = True
         any_int = False
         for value in cast("list[JsonValue]", values):
@@ -896,46 +1107,17 @@ class _Converter:
                 any_int = True
             else:
                 all_int = False
-            raw = str(value)
-            key = re.sub(r"\W+", "_", raw).strip("_").upper() or "VALUE"
-            # Prefix with a LETTER, never a leading underscore. Stripping ``_``
-            # above drops a leading sign, so ``-1`` and ``1`` both reduce to
-            # ``"1"`` — re-encode the sign here so they stay distinct, and keep
-            # the name letter-led so the collision suffix below can never form a
-            # reserved ``_sunder_`` / ``__dunder__`` name (Python's Enum rejects
-            # those: ``_1_`` from a digit-led ``_1`` was the original crash).
-            if raw.lstrip().startswith("-"):
-                key = f"NEG_{key}"
-            elif key[0].isdigit():
-                key = f"N_{key}"
-            while key in members:
-                key = f"{key}_"
-            members[key] = value
-        # A mixed string/integer enum has no faithful single base: with
-        # ``use_enum_values=True`` an ``int`` base + str member (or vice versa)
-        # coerces members to one type, so the generated model would reject its
-        # own schema-valid values (e.g. integer ``1`` stored as ``"1"``). The
-        # supported subset is a homogeneous string *or* integer enum; reject the
-        # mix loudly, naming the construct, rather than silently misbuilding.
+            members.append(value)
+        # ``Literal`` could carry a mixed string/integer enum, but the
+        # supported subset stays homogeneous for parity with every prior
+        # release (the Enum-based build had no faithful single base for a
+        # mix). Relaxing this is a deliberate follow-up, not a side effect.
         if any_int and not all_int:
             raise ValueError(
                 f"Unsupported mixed-type enum at {field_path!r}: enum members must be all "
                 + "strings or all integers, not a mix of both."
             )
-        title = schema.get("title")
-        name = (
-            _safe_model_name(title) if isinstance(title, str) and title else self._anon_name("Enum")
-        )
-        # Mix in str/int so members compare equal to their raw value and stay
-        # JSON-clean. The generated models also set ``use_enum_values=True``
-        # (see ``_JsonSchemaModel``), so a validated instance stores the raw
-        # scalar — ``model_dump()`` yields ``2``, not ``<Enum._2: 2>`` — which
-        # is what dict consumers (those who ``model_dump()`` the result) and
-        # the provider JSON both expect.
-        base: type = int if all_int else str
-        # The functional ``Enum(...)`` call returns a new enum *class* at runtime,
-        # but the stubs type it as an ``Enum`` instance — hence the narrow ignore.
-        return Enum(name, members, type=base)  # pyright: ignore[reportReturnType]  # runtime str/int-mixin enum class
+        return _as_literal(members)
 
     def _build_object(
         self, schema: JsonDict, field_path: str, *, ref_name: str | None = None

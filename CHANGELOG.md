@@ -355,6 +355,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`model_from_json_schema` models now emit OpenAI-strict-safe JSON schemas:
+  no `$ref` ever carries sibling keywords, and enums inline as `Literal`.**
+  Any enum property with a `description` — the single most common LLM-judge
+  rubric shape — built a named `Enum` class that pydantic factored into
+  `$defs`, leaving the description **beside the `$ref`**; OpenAI's strict
+  `response_format` validator rejects exactly that node (`400: $ref cannot
+  have keywords {'description'}`), so every OpenAI- and Azure-served model
+  failed while most others accepted the same document, masking the bug
+  (reported by found-in-words, whose default judge configuration —
+  `openai/gpt-4o-mini` via OpenRouter — was 100% broken; measured live
+  2026-07-24). A *described object-typed property* produced the identical
+  illegal node through the same factoring. The fix lands at two levels.
+  Enum fields are now `Literal[...]` annotations, so pydantic emits the enum
+  *in place* (`{"type": ..., "enum": [...], "description": ...}` — the shape
+  OpenAI's documentation shows) and the whole Enum-class apparatus
+  (member-name mangling, `$defs` entries) is gone; validated instances hold
+  raw scalars exactly as before (`use_enum_values=True` already guaranteed
+  that, and is now inert — kept one release, then removable). Object refs
+  cannot inline at the annotation level, so the generated base model now
+  overrides `model_json_schema()` — the exact zero-argument call instructor
+  makes — to inline any `$ref` carrying siblings at its use site (sibling
+  keys win, matching the input-side outer-wins merge; pydantic <2.9's
+  single-branch-`allOf` spelling of the same construct is normalised too)
+  and prune `$defs` nothing references any more. Bare `$ref`s, which the
+  strict validator allows, stay shared. **One deliberate strictness delta**:
+  the int-based `Enum` used to coerce a numeric *string* (`"2"`) into the
+  member `2`; `Literal` rejects it. Strict providers guarantee a real
+  integer on the wire, so the quoted spelling only ever came from a weak
+  non-strict model — which now hits instructor's validation re-ask instead
+  of sliding through. Out of scope, unchanged: OpenAI strict mode also
+  requires every property listed in `required`, so schemas with *optional*
+  fields still need that pre-existing gap addressed separately.
+
 - **OpenAI, Anthropic, and DeepSeek now always send an explicit `api_base`, so
   the endpoint is llmkit's documented decision.** Those three — and Google (AI
   Studio), which keeps the documented exception below — omitted `api_base`

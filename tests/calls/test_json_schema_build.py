@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from enum import Enum
+from typing import Literal, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -514,12 +515,12 @@ def test_integer_enum_accepts_rejects_and_dumps_raw_int() -> None:
     }
     model = model_from_json_schema(schema)
     inst = model(level=2)
-    # Dumps as a raw int (int-mixin enum), not ``Level.VALUE``.
+    # Dumps as a raw int — enum fields are ``Literal`` annotations, so an
+    # instance holds the scalar itself, never an Enum member.
     dumped = inst.model_dump()
     assert dumped["level"] == 2
     assert isinstance(dumped["level"], int)
     assert "2" in model(level=2).model_dump_json()
-    # Genuinely the raw scalar, not the Enum member (use_enum_values).
     assert not isinstance(dumped["level"], Enum)
     # Out-of-enum value rejected.
     with pytest.raises(ValidationError):
@@ -530,9 +531,9 @@ def test_signed_integer_enum_builds_and_dumps_raw() -> None:
     """A non-contiguous integer enum with a negative sentinel (FiW's eval-judge
     schema) must build without raising and round-trip as raw ints.
 
-    Regression: ``-1`` and ``1`` both reduced to the member key ``"1"`` (the
-    sign was stripped), so the collision suffix bumped one to ``_1_`` — a
-    reserved ``_sunder_`` name Python's ``Enum`` rejects."""
+    Historically this shape stressed Enum member-name mangling (``-1`` and
+    ``1`` collided into a reserved ``_sunder_`` name); the ``Literal``
+    annotation has no member names to mangle, but the shape stays covered."""
     schema: dict[str, object] = {
         "type": "object",
         "properties": {"score": {"type": "integer", "enum": [-1, 1, 2, 3, 4, 5]}},
@@ -549,10 +550,11 @@ def test_signed_integer_enum_builds_and_dumps_raw() -> None:
             _ = model(score=bad)
 
 
-def test_enum_member_names_are_never_reserved() -> None:
-    """Generated enum member names must never be ``_sunder_`` / ``__dunder__``
-    (Python's ``Enum`` reserves them), whatever digit-led or colliding values
-    the schema carries."""
+def test_enum_annotation_is_inline_literal_with_every_member() -> None:
+    """An enum field's annotation is ``Literal[...]`` — no generated ``Enum``
+    class, so no member-name mangling to get wrong: every schema value
+    survives as itself, in order, including the negative / digit-led /
+    would-collide values that used to stress the mangler."""
     model = model_from_json_schema(
         {
             "type": "object",
@@ -561,14 +563,27 @@ def test_enum_member_names_are_never_reserved() -> None:
         }
     )
     annotation = model.model_fields["v"].annotation
-    # The field is a required integer enum, so its annotation is the generated
-    # ``Enum`` subclass — narrow to it so ``__members__`` is statically known.
-    assert annotation is not None
-    assert issubclass(annotation, Enum)
-    names = list(annotation.__members__)
-    assert len(names) == 5  # no collisions collapsed members
-    for name in names:
-        assert not (name.startswith("_") and name.endswith("_")), name  # not _sunder_/__dunder__
+    assert get_origin(annotation) is Literal
+    assert get_args(annotation) == (-1, 0, 1, -2, 2)
+
+
+def test_int_enum_rejects_numeric_string() -> None:
+    """A quoted number (``"2"``) is REJECTED for an integer enum — the
+    ``Literal`` annotation does not coerce, where the former int-based
+    ``Enum`` did. Deliberate strictness (documented in the changelog): a
+    strict provider guarantees a real integer on the wire, so a quoted number
+    only ever comes from a weak non-strict model, which should hit
+    instructor's re-ask rather than slide through."""
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "properties": {"score": {"type": "integer", "enum": [-1, 1, 2, 3, 4, 5]}},
+            "required": ["score"],
+        }
+    )
+    assert model(score=2).model_dump() == {"score": 2}
+    with pytest.raises(ValidationError):
+        _ = model(score="2")
 
 
 # --- Canonical nullable enum (null as an enum member) ----------------------
