@@ -4,7 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] — 2026-07-24
+
+A fail-loud, own-the-decision release. Configuration that silently did nothing
+now raises: unread provider knobs, a missing API key, invalid log-sink bounds,
+and JSON-Schema applicators the converter used to drop. The endpoint each
+request goes to is now llmkit's explicit, documented decision rather than
+LiteLLM's ambient resolution chain, generated schemas survive OpenAI's strict
+`response_format` validator, the sync acquire path reaches full breaker/AIMD
+parity with async, and the log sink defaults to 30-day retention and private
+permissions. The typed surface goes public (`Message`, `ReasoningEffort`,
+`UNSET`), and the Python floor drops to 3.12.
 
 ### Added
 
@@ -1618,7 +1628,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
-[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.7.0...HEAD
+[0.8.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.8.0
 [0.7.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.5.0
