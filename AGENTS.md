@@ -67,6 +67,10 @@ which in practice means a maintainer runs the live suite against your PR.
 
 - `main` is linear: pull requests are **squash-merged**, one commit per
   change. Force pushes to `main` are blocked.
+- Merging is not quite the last step for OMG Brews maintainers: the
+  `OMGBrews/llmkit-dev` work environment records this repo as a submodule and
+  its pointer moves separately — [`docs/consumed-by.md`](docs/consumed-by.md).
+  Irrelevant to outside contributors.
 - Keep the public surface small — `llmkit` owns call ergonomics, not
   transport.
 - No `dict[str, Any]` / bare `Any`; use precise types.
