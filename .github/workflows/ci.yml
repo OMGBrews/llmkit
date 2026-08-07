@@ -163,3 +163,44 @@ jobs:
 
           print("wheel smoke test passed")
           PY
+
+  ci-ok:
+    # The single context branch protection requires. `check` is a matrix job, so
+    # it never reports under that bare name — it reports as `check (ubuntu-latest,
+    # 3.12)` and four siblings — and a ruleset requiring `check` waits forever on
+    # a context nothing produces. Every PR then sits BLOCKED on a green tree and
+    # merges only by admin bypass, which is indistinguishable from a gate that
+    # works. One aggregator name is also stable across matrix edits: adding a
+    # Python version here never needs a matching edit in repo settings.
+    needs: [check, floors, package]
+    # `always()` is load-bearing. Without it a failed dependency skips this job,
+    # and GitHub counts a skipped required check as satisfied — the misconfigured
+    # state this job exists to end, arrived at from the other direction.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every upstream job succeeded
+        # Asserts the positive property rather than the absence of failure:
+        # `cancelled` and `skipped` fail here, where a `!= 'failure'` test would
+        # pass. The count guards the case word-splitting would otherwise swallow
+        # — a renamed job interpolates as the empty string and simply vanishes
+        # from the list, leaving the survivors to report a unanimous success.
+        # Bump EXPECTED when adding a job to `needs`.
+        env:
+          RESULTS: ${{ needs.check.result }} ${{ needs.floors.result }} ${{ needs.package.result }}
+          EXPECTED: "3"
+        run: |
+          echo "upstream results: ${RESULTS}"
+          seen=0
+          for result in ${RESULTS}; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::an upstream job did not succeed (${RESULTS})"
+              exit 1
+            fi
+            seen=$((seen + 1))
+          done
+          if [ "${seen}" -ne "${EXPECTED}" ]; then
+            echo "::error::expected ${EXPECTED} upstream results, saw ${seen} (${RESULTS})"
+            exit 1
+          fi
+          echo "all ${EXPECTED} upstream jobs succeeded"
