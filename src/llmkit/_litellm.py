@@ -315,12 +315,16 @@ def _coerce_text_content(content: object) -> str:
 def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
     """Extract the first choice's textual delta from a stream chunk.
 
-    LiteLLM assigns ``StreamingChoices.delta`` and ``Delta.content`` inside
-    ``__init__`` rather than as annotated class attributes, so the static type
-    of ``chunk.choices[0].delta.content`` is ``Unknown``. We narrow the two
-    dynamic hops to their real runtime types (``Delta``, then ``str | None``)
-    here so the streaming loop reads a precise ``str | None`` — the one place
-    that knows the litellm stream object's shape (raw-llm).
+    LiteLLM assigns ``StreamingChoices.delta`` inside ``__init__`` rather than
+    as an annotated class attribute, so the static type of
+    ``chunk.choices[0].delta`` is ``Unknown``. We narrow that hop to its real
+    runtime type here so the streaming loop reads a precise ``str | None`` —
+    the one place that knows the litellm stream object's shape (raw-llm).
+
+    ``Delta.content`` needed the same treatment until litellm 1.95.0 annotated
+    it as ``str | None``; the cast is now redundant and ``reportUnnecessaryCast``
+    rejects it. The declared floor is older (``litellm>=1.87.1``), but only the
+    newest-resolution ``check`` job type-checks, so the floor is unaffected.
     """
     if not chunk.choices:
         # Metadata-only / keepalive frames carry no choice to index — e.g. the
@@ -331,7 +335,7 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
         return None
     choice: StreamingChoices = chunk.choices[0]
     delta: Delta = choice.delta
-    return cast("str | None", delta.content)
+    return delta.content
 
 
 async def acompletion_structured[T: BaseModel](
