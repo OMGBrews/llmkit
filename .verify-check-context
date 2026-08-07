@@ -1,0 +1,2 @@
+Throwaway branch: verifies that the pr-flow ruleset accepts the ci-ok context.
+This PR is never merged; the branch is deleted after the check.
