@@ -17,13 +17,13 @@ this repo's `main`, never a PR-branch SHA (squash merges orphan those) and never
 backwards; the wrapper's `.github/workflows/pointer-check.yml` enforces both on every PR
 and push.
 
-This edge is the fleet's one exception to "pointers move only when someone asks." Since
-the scheduled bump bot was retired 2026-07-28 that is true everywhere else, but the
-wrapper keeps a repo-local backstop: `.github/dependabot.yml` rolls the `library` pointer
-to this repo's `main` daily, and `dependabot-automerge.yml` lands a green roll without a
-human click. The backstop bounds the lag at about a day; it does not make the bump
-semantic or immediate, and a red roll simply stays open. So the deliberate bump still
-happens: `/ship` includes the parent pointer-bump in its plan **by default** when a
+Nothing moves that pointer on a schedule. The wrapper ran a daily Dependabot roll as a
+backstop until 2026-08-07 and retired it, so this edge now follows the same rule as every
+other one in the maintainers' fleet: **pointers move only when someone asks.** A wrapper
+pointer that lags this repo's `main` is therefore the expected state between deliberate
+bumps, not a fault — it means nobody has recorded the change upward yet, and it is
+reported rather than healed. The deliberate bump is what closes it:
+`/ship` includes the parent pointer-bump in its plan **by default** when a
 session ships this repo without `OMGBrews/llmkit-dev` attached — the maintainer strikes
 it to decline, and the decline is recorded in the ship report rather than the parent
 being reported as current. In practice that path runs from the wrapper, which mounts
