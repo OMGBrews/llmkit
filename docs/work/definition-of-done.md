@@ -67,5 +67,5 @@ as "not docs-only", never as a pass.
   litellm, instructor, or pydantic passes every gate above and still fails CI.
 - **This repo keeps no task buckets.** Planning, task documents, and maintainer runbooks
   live in `OMGBrews/llmkit-dev`, which mounts this repo as a submodule
-  ([`../consumed-by.md`](../consumed-by.md)); `docs/tasks/` here holds this file and nothing
-  else.
+  ([`consumed-by.md`](consumed-by.md)); `docs/work/` here holds this file and the
+  consumed-by list, and nothing else.
