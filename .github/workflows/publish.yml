@@ -67,7 +67,7 @@ jobs:
         # `id-token: write`, so a retagged action must never slip in. setup-uv
         # also stopped publishing floating major tags at v8, so its comment tracks
         # a full patch release.
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d  # v10.0.0
         with:
           # This job only builds; it installs no dependencies, so there is
           # nothing worth caching. Left at the default, setup-uv would key the
