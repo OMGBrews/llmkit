@@ -127,6 +127,7 @@ def _transport_provider(
 
 def capture_structured_provider_kwargs(
     *,
+    temperature: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
@@ -134,9 +135,12 @@ def capture_structured_provider_kwargs(
     """Drive the real ``acompletion_structured`` over a faked instructor client
     and return the kwargs the provider call (``create_with_completion``) saw.
 
-    ``max_tokens`` / ``reasoning_effort`` are the per-call values forwarded to
-    the transport; ``provider_effort`` sets the provider's own configured
-    reasoning effort (the fallback when no per-call value is given).
+    ``temperature`` / ``max_tokens`` / ``reasoning_effort`` are the per-call
+    values forwarded to the transport; ``provider_effort`` sets the provider's
+    own configured reasoning effort (the fallback when no per-call value is
+    given). The default ``temperature=None`` forwards **no** ``temperature``
+    key at all (the transport's gating), matching the public ``None``
+    semantics.
     """
     from llmkit import _litellm
 
@@ -157,7 +161,7 @@ def capture_structured_provider_kwargs(
             _litellm.acompletion_structured(
                 "hi",
                 OkSchema,
-                temperature=0.0,
+                temperature=temperature,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
@@ -170,12 +174,19 @@ def capture_structured_provider_kwargs(
 
 def capture_text_provider_kwargs(
     *,
+    temperature: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
 ) -> dict[str, object]:
     """Drive the real ``acompletion_text`` over a faked ``litellm.acompletion``
-    and return the kwargs the provider request saw."""
+    and return the kwargs the provider request saw.
+
+    ``temperature`` / ``max_tokens`` / ``reasoning_effort`` are the per-call
+    values forwarded to the transport; ``provider_effort`` sets the provider's
+    own configured reasoning effort. The default ``temperature=None``
+    forwards **no** ``temperature`` key at all.
+    """
     from llmkit import _litellm
 
     seen: dict[str, object] = {}
@@ -192,7 +203,7 @@ def capture_text_provider_kwargs(
         text, _cost = asyncio.run(
             _litellm.acompletion_text(
                 "hi",
-                temperature=0.0,
+                temperature=temperature,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
@@ -205,12 +216,19 @@ def capture_text_provider_kwargs(
 
 def capture_stream_provider_kwargs(
     *,
+    temperature: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
 ) -> dict[str, object]:
     """Drive the real ``astream_text`` over a faked LiteLLM stream and return
-    the kwargs the provider call (``litellm.acompletion``) saw."""
+    the kwargs the provider call (``litellm.acompletion``) saw.
+
+    ``temperature`` / ``max_tokens`` / ``reasoning_effort`` are the per-call
+    values forwarded to the transport; ``provider_effort`` sets the provider's
+    own configured reasoning effort. The default ``temperature=None``
+    forwards **no** ``temperature`` key at all.
+    """
     from llmkit import _litellm
 
     seen: dict[str, object] = {}
@@ -234,7 +252,7 @@ def capture_stream_provider_kwargs(
             chunk
             async for chunk in _litellm.astream_text(
                 "hi",
-                temperature=0.0,
+                temperature=temperature,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,

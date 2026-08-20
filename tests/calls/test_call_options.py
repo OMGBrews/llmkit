@@ -268,3 +268,55 @@ def test_options_threads_through_text_and_sync() -> None:
     assert text_recorder[1]["max_tokens"] == 128
     assert struct_calls[0]["model"] == "shared-model"
     assert struct_calls[0]["max_tokens"] == 128
+
+
+def test_explicit_temperature_none_overrides_options_value() -> None:
+    """An explicit ``temperature=None`` keyword wins over a numeric options
+    value — the ``model=None`` idiom applied to the sampling temperature.
+    Resolution yields ``None`` (not options' ``0.9``); the transport's
+    gating then sends no ``temperature`` key at all (pinned at the wire
+    seam in ``test_temperature.py``)."""
+    fake, calls = _structured_recorder()
+    options = LLMCallOptions(temperature=0.9)
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=fake),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> None:
+            _ = await structured_output.structured_llm_call(
+                "hi",
+                OkSchema,
+                feature="extraction",
+                temperature=None,  # explicit -> wins over options' 0.9
+                options=options,
+            )
+
+        asyncio.run(_run())
+
+    assert calls[0]["temperature"] is None
+
+
+def test_options_temperature_none_overrides_default() -> None:
+    """``LLMCallOptions(temperature=None)`` wins over
+    ``DEFAULT_TEMPERATURE`` when the keyword is unset — the options field
+    resolves to ``None`` (the transport then omits the key)."""
+    fake, calls = _structured_recorder()
+    options = LLMCallOptions(temperature=None)
+    with (
+        patch("llmkit._litellm.acompletion_structured", side_effect=fake),
+        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+    ):
+
+        async def _run() -> None:
+            _ = await structured_output.structured_llm_call(
+                "hi",
+                OkSchema,
+                feature="extraction",
+                temperature=UNSET,
+                options=options,
+            )
+
+        asyncio.run(_run())
+
+    assert calls[0]["temperature"] is None

@@ -36,8 +36,9 @@ class Unset(Enum):
     ``Literal[Unset.UNSET]`` and a passed one is its real type, so the merge
     helper resolves to the right branch with no ``cast``. Public on purpose:
     it appears in the call functions' and :class:`LLMCallOptions`' signatures,
-    and a caller's own typed wrapper can declare ``temperature: float | Unset
-    = UNSET`` and forward unconditionally. Test with ``is``/``is not`` only —
+    and a caller's own typed wrapper can declare ``temperature: float | None
+    | Unset = UNSET`` and forward unconditionally. Test with ``is``/``is not``
+    only —
     ``UNSET`` is truthy, and truthiness on e.g. ``float | Unset`` is a bug
     either way (``0.0`` is falsy too).
     """
@@ -94,7 +95,9 @@ class LLMCallOptions:
     Attributes:
         temperature: Sampling temperature. Unset defers to the per-call
             ``temperature`` keyword (:data:`DEFAULT_TEMPERATURE`, ``0.2``,
-            when that is also unset).
+            when that is also unset); an explicit ``None`` forwards no
+            ``temperature`` kwarg at all, leaving the provider's default
+            sampling in effect.
         model: Model override. Unset defers to the per-call ``model``
             keyword, then to the provider default.
         max_tokens: Completion-length cap. Unset defers to the per-call
@@ -107,7 +110,7 @@ class LLMCallOptions:
             ``provider`` keyword (the globally-configured provider).
     """
 
-    temperature: float | Unset = UNSET
+    temperature: float | None | Unset = UNSET
     model: str | None | Unset = UNSET
     max_tokens: int | None | Unset = UNSET
     reasoning_effort: ReasoningEffort | None | Unset = UNSET
@@ -138,7 +141,7 @@ class _ResolvedCallArgs:
     collapsed. Internal to the call-function module.
     """
 
-    temperature: float
+    temperature: float | None
     model: str | None
     max_tokens: int | None
     reasoning_effort: ReasoningEffort | None
@@ -149,7 +152,7 @@ class _ResolvedCallArgs:
 def resolve_call_args(
     options: LLMCallOptions | None,
     *,
-    temperature: float | Unset,
+    temperature: float | None | Unset,
     model: str | None | Unset,
     max_tokens: int | None | Unset,
     reasoning_effort: ReasoningEffort | None | Unset,
@@ -169,6 +172,12 @@ def resolve_call_args(
     * otherwise the true default stands (:data:`DEFAULT_TEMPERATURE`,
       :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``None`` for the rest — the
       ``None``s the transport then resolves against the configured client).
+
+    For ``temperature`` specifically, an explicit ``None`` is a real,
+    resolved value: it forwards **no** ``temperature`` kwarg to the provider,
+    so the provider's default sampling applies — the requested escape hatch
+    from :data:`DEFAULT_TEMPERATURE` (``0.2``), which still stands whenever
+    neither the keyword nor ``options`` supplies a value.
 
     ``options=None`` is simply an all-unset options, so the flat-kwarg path
     resolves to the same values as before options existed. The true defaults

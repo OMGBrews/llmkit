@@ -24,8 +24,12 @@ from pydantic import BaseModel
 
 import llmkit
 from llmkit import (
+    UNSET,
+    LLMCallOptions,
     Message,
     ReasoningEffort,
+    Unset,
+    stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
@@ -85,6 +89,31 @@ async def _typecheck_reasoning_effort_accepts_values() -> None:
     _ = await text_llm_call("hi", feature="t", reasoning_effort=None)
 
 
+async def _typecheck_temperature_accepts_none() -> None:
+    # ``temperature=None`` — "use the provider default; send no temperature
+    # kwarg" — is accepted on every public call surface, direct and through
+    # options. Numeric values (including 0.0) remain accepted.
+    _ = await structured_llm_call("hi", _Out, feature="t", temperature=None)
+    _ = structured_llm_call_sync("hi", _Out, feature="t", temperature=None)
+    _ = await text_llm_call("hi", feature="t", temperature=None)
+    _ = text_llm_call_sync("hi", feature="t", temperature=None)
+    _ = text_llm_call_stream("hi", feature="t", temperature=None)
+    _ = stream_text_with_log("hi", feature="t", temperature=None)
+    _ = await structured_llm_call("hi", _Out, feature="t", temperature=0.0)
+    _ = await text_llm_call("hi", feature="t", temperature=0.7)
+    opts: LLMCallOptions = LLMCallOptions(temperature=None)
+    _ = await structured_llm_call("hi", _Out, feature="t", options=opts)
+    _ = LLMCallOptions(temperature=0.4)
+
+    # The documented typed-wrapper idiom, now widened: a wrapper typed
+    # ``float | None | Unset`` forwards the sentinel unconditionally and
+    # lets llmkit resolve "not passed" vs "None" vs a number.
+    def wrapper(prompt: str, temperature: float | None | Unset = UNSET) -> None:
+        _ = text_llm_call(prompt, feature="t", temperature=temperature)
+
+    _ = wrapper
+
+
 def _typecheck_prompt_rejects_invalid_shapes() -> None:
     # The raw wire shape the fix retired: dict[str, str] permits typo keys and
     # forbids multimodal content, so it is no longer assignable to the prompt.
@@ -113,6 +142,7 @@ def test_typecheck_helpers_exist() -> None:
     for helper in (
         _typecheck_prompt_accepts_valid_shapes,
         _typecheck_reasoning_effort_accepts_values,
+        _typecheck_temperature_accepts_none,
         _typecheck_prompt_rejects_invalid_shapes,
     ):
         assert callable(helper)

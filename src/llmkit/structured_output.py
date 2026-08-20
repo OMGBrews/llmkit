@@ -111,7 +111,7 @@ async def structured_llm_call[T: BaseModel](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -141,7 +141,11 @@ async def structured_llm_call[T: BaseModel](
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
             Resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when
-            neither this keyword nor ``options`` supplies a value.
+            neither this keyword nor ``options`` supplies a value; an
+            explicit ``None`` forwards **no** ``temperature`` kwarg at all,
+            leaving the provider's default sampling in effect (the escape
+            hatch for providers whose guidance says to omit it — e.g.
+            Gemini 3.x).
         model: Optional model override (provider default when it resolves to
             ``None``). *Dual-homed* — also settable on
             :class:`~llmkit.LLMClientConfig`; this per-call value overrides
@@ -333,7 +337,7 @@ def structured_llm_call_sync[T: BaseModel](
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -387,7 +391,7 @@ async def text_llm_call(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -413,7 +417,9 @@ async def text_llm_call(
         label: Optional finer-grained identifier for the log filename.
         temperature: Sampling temperature passed to the provider. Resolves
             to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when neither
-            this keyword nor ``options`` supplies a value.
+            this keyword nor ``options`` supplies a value; an explicit
+            ``None`` forwards **no** ``temperature`` kwarg at all, leaving
+            the provider's default sampling in effect.
         model: Optional model override (provider default when it resolves
             to ``None``). *Dual-homed* with
             :class:`~llmkit.LLMClientConfig`: per-call overrides
@@ -544,7 +550,7 @@ def text_llm_call_sync(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -584,7 +590,7 @@ async def text_llm_call_stream(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -610,7 +616,10 @@ async def text_llm_call_stream(
     to the provider only when it resolves to a value (``reasoning_effort``
     resolved against the configured :class:`~llmkit.LLMClientConfig` value
     when ``None``) and is recorded on the call's
-    :class:`~llmkit.logging.LLMCallRecord`.
+    :class:`~llmkit.logging.LLMCallRecord`. ``temperature`` follows the same
+    rule: an explicit ``None`` forwards **no** ``temperature`` kwarg at all
+    (the provider's default sampling applies), while the unset path still
+    resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``).
 
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. Streamed responses
@@ -786,7 +795,7 @@ def stream_text_with_log(
     *,
     feature: str,
     label: str | None = None,
-    temperature: float | Unset = UNSET,
+    temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
@@ -827,7 +836,7 @@ async def _stream_once(
     *,
     feature: str,
     label: str | None,
-    temperature: float,
+    temperature: float | None,
     model: str | None,
     max_tokens: int | None,
     reasoning_effort: ReasoningEffort | None,
@@ -926,7 +935,7 @@ def _build_text_record(
     prompt: str | list[Message],
     text: str | None,
     start_t: float,
-    temperature: float,
+    temperature: float | None,
     model: str | None,
     provider: LLMProviderInterface | None,
     error: str | None,

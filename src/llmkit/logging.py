@@ -313,6 +313,13 @@ class LLMCallRecord:
     — ``duration_ms`` includes it, so provider latency is approximately
     ``duration_ms - queue_wait_ms``. All three default ``None`` for
     directly-constructed records.
+
+    ``temperature`` is ``None`` exactly when the call requested the
+    provider's default sampling (``temperature=None`` — no ``temperature``
+    kwarg sent); an unset call resolves llmkit's
+    :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) and records that value.
+    Custom sinks that read ``record.temperature`` must handle the ``None``
+    state (the YAML sink writes it as ``null``).
     """
 
     started_at: datetime
@@ -320,7 +327,7 @@ class LLMCallRecord:
     label: str | None
     model: str | None
     provider: str | None
-    temperature: float
+    temperature: float | None
     duration_ms: float
     schema: str
     prompt: str | list[Message]

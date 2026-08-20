@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`temperature=None` requests the provider's default sampling** — the
+  first way to *omit* the `temperature` field from a provider request.
+  Previously every call materialized llmkit's `0.2` default, so an
+  application could not follow provider guidance that says to leave
+  sampling temperature unset (Gemini 3.x deprecates
+  `temperature`/`top_p`/`top_k`). An explicit `None` — passed directly or
+  through `LLMCallOptions` — wins the existing **config < options <
+  explicit keyword** precedence and resolves to *no* `temperature` kwarg on
+  the outgoing request (an identity check, so `0.0` stays a real forwarded
+  value). It is accepted on every call surface: structured, plain-text,
+  streaming, the sync wrappers, and the deprecated `stream_text_with_log`
+  alias. The unset path is unchanged: a call that passes neither a keyword
+  nor an options value still forwards `DEFAULT_TEMPERATURE` (`0.2`).
+  The typed-wrapper idiom widens to `temperature: float | None | Unset =
+  UNSET`.
+
+### Changed
+
+- **`LLMCallRecord.temperature` is now `float | None`.** A call that
+  omitted the temperature records `None` (YAML `null`), distinct from the
+  `0.2` a default call records. **Source-breaking for typed custom sinks**
+  that read `record.temperature` as a bare `float` — e.g. a `float` format
+  spec now raises on the omitted state; handle the `None` case (see the
+  README's logging section). The default YAML sink needs no change: it
+  already emitted `null` for the nullable `max_tokens` / `reasoning_effort`
+  fields.
+
+### Notes
+
+- **Gemini 3.x: the warning goes away, the field does not (yet).** Sending
+  `temperature=None` removes LiteLLM's `DeprecationWarning` for
+  `temperature`/`top_p`/`top_k` on Gemini 3.x — but with every released
+  LiteLLM, `VertexGeminiConfig.map_openai_params` re-inserts
+  `temperature = 1.0` (Google's recommended value) after the kwarg is
+  dropped, so the deprecated field is still sent on the wire there.
+  Removing that injection is an upstream LiteLLM change; until its release
+  is consumed by llmkit, `temperature=None` on Gemini 3.x means "no
+  warning, wire value `1.0`". The upstream contribution, floor bump, and
+  transformation-level wire proof are tracked in the
+  `contribute-and-consume-litellm-gemini-3-temperature-fix` task; this
+  release deliberately does not claim provider-wire omission on Gemini 3.x.
+
 ## [0.8.0] — 2026-07-24
 
 A fail-loud, own-the-decision release. Configuration that silently did nothing

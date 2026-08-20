@@ -149,6 +149,16 @@ def test_unset_max_tokens_and_reasoning_effort_serialize_as_null(tmp_path: Path)
     assert "reasoning_effort" in doc and doc["reasoning_effort"] is None
 
 
+def test_omitted_temperature_round_trips_as_null(tmp_path: Path) -> None:
+    """An intentionally-omitted temperature (``None`` — "use the provider
+    default") serializes as YAML ``null``, distinct from the ``0.2``
+    default value a regular record carries."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(temperature=None))
+    assert path is not None
+    doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert "temperature" in doc and doc["temperature"] is None
+
+
 def test_max_tokens_and_reasoning_effort_stay_out_of_the_index(tmp_path: Path) -> None:
     """The index is deliberately compact (cross-call triage fields only):
     request-shaping knobs live in the per-call YAML, not ``index.jsonl``."""

@@ -342,7 +342,7 @@ async def acompletion_structured[T: BaseModel](
     prompt: str | list[Message],
     output_schema: type[T],
     *,
-    temperature: float,
+    temperature: float | None,
     model: str | None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -372,6 +372,12 @@ async def acompletion_structured[T: BaseModel](
     LiteLLM accepts ``max_tokens`` as a standard cross-provider kwarg and
     instructor forwards extra kwargs to the wrapped completion, so no
     per-provider branching is needed.
+
+    ``temperature`` is forwarded the same way: only when not ``None``. A
+    resolved ``None`` sends no ``temperature`` key at all (the provider's
+    default sampling applies) — the escape hatch from llmkit's
+    :data:`~llmkit.DEFAULT_TEMPERATURE` for providers whose guidance says to
+    omit the field (Gemini 3.x deprecates it).
 
     ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
     ``"disable"`` turns Gemini thinking off). When ``None``, the provider's
@@ -414,7 +420,6 @@ async def acompletion_structured[T: BaseModel](
                 model=litellm_model,
                 messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
                 response_model=output_schema,
-                temperature=temperature,
                 # instructor's in-call schema-repair budget: two total attempts
                 # = exactly one schema-repair re-ask, and only for a genuine
                 # parse failure — never for a length truncation, a transport, or
@@ -425,6 +430,12 @@ async def acompletion_structured[T: BaseModel](
                 **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
                 **({"max_tokens": max_tokens} if max_tokens is not None else {}),
                 **({"reasoning_effort": effort} if effort is not None else {}),
+                # Gate temperature like max_tokens / reasoning_effort: a
+                # ``None`` resolved value sends no ``temperature`` key at all
+                # (not an explicit ``None`` kwarg), so the provider's default
+                # sampling applies — see options.resolve_call_args. The
+                # identity check keeps ``0.0`` a real, forwarded value.
+                **({"temperature": temperature} if temperature is not None else {}),
             )
         except IncompleteOutputException as e:
             # The declined re-ask propagates instructor's exception bare (no
@@ -447,7 +458,7 @@ async def acompletion_structured[T: BaseModel](
 async def acompletion_text(
     prompt: str | list[Message],
     *,
-    temperature: float,
+    temperature: float | None,
     model: str | None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -458,8 +469,10 @@ async def acompletion_text(
     ``reasoning_effort`` controls provider thinking tokens, resolved against
     the provider's configured value when ``None`` (an explicit value
     overrides it); the kwarg is only forwarded when the resolved value is
-    not ``None``. ``provider`` overrides the configured provider for this
-    call only (``None`` uses the globally-configured one).
+    not ``None``. ``temperature`` is forwarded only when not ``None`` — a
+    resolved ``None`` sends no ``temperature`` key at all (the provider's
+    default sampling applies). ``provider`` overrides the configured
+    provider for this call only (``None`` uses the globally-configured one).
 
     Returns ``(text, approximate_cost)``. The text is the first choice's
     message content coerced to a string via :func:`_coerce_text_content`
@@ -473,7 +486,11 @@ async def acompletion_text(
         resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
-            temperature=temperature,
+            # Gate temperature like max_tokens / reasoning_effort: a
+            # ``None`` resolved value sends no ``temperature`` key at all,
+            # so the provider's default sampling applies. Identity check
+            # keeps ``0.0`` a real, forwarded value.
+            **({"temperature": temperature} if temperature is not None else {}),
             **creds,
             # Gate max_tokens like the structured/stream paths: an unset cap
             # sends no ``max_tokens`` key at all (not an explicit ``None``), so
@@ -498,7 +515,7 @@ async def acompletion_text(
 async def astream_text(
     prompt: str | list[Message],
     *,
-    temperature: float,
+    temperature: float | None,
     model: str | None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
@@ -514,7 +531,9 @@ async def astream_text(
     controls provider thinking tokens — parity with the non-streaming text and
     structured paths. Each is only forwarded when set (``reasoning_effort``
     resolved against the provider's configured value when ``None``), so the
-    default request is byte-identical to the prior stream call.
+    default request is byte-identical to the prior stream call. ``temperature``
+    is forwarded only when not ``None`` — a resolved ``None`` sends no
+    ``temperature`` key at all (the provider's default sampling applies).
     """
     provider = provider if provider is not None else build_provider()
     creds = provider.completion_kwargs()
@@ -523,7 +542,11 @@ async def astream_text(
         resp = await _acompletion(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
-            temperature=temperature,
+            # Gate temperature like max_tokens / reasoning_effort: a
+            # ``None`` resolved value sends no ``temperature`` key at all,
+            # so the provider's default sampling applies. Identity check
+            # keeps ``0.0`` a real, forwarded value.
+            **({"temperature": temperature} if temperature is not None else {}),
             stream=True,
             **creds,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),

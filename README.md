@@ -108,7 +108,7 @@ The public call surface:
 > warns `DeprecationWarning` and is removed in 1.0. Switch the call.
 
 > **Two defaults worth knowing up front.**
-> - **`temperature` defaults to `0.2`** — biased toward deterministic output. A *creative* caller must override it explicitly (e.g. `temperature=1.0`); it is otherwise quietly conservative.
+> - **`temperature` defaults to `0.2`** — biased toward deterministic output. A *creative* caller must override it explicitly (e.g. `temperature=1.0`); it is otherwise quietly conservative. Pass `temperature=None` to send **no `temperature` field at all**, using the provider's own default sampling — see [Provider-default sampling (`temperature=None`)](#provider-default-sampling-temperaturenone).
 > - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
 ### Reusing call options
@@ -132,7 +132,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider`. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider`. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`) to request the provider's default sampling instead of llmkit's `0.2`.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -144,9 +144,23 @@ The flat-keyword path is unchanged — pass no `options` and nothing about exist
 
 **config < `options` < explicit per-call keyword**
 
-So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
+So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and `LLMCallOptions(temperature=None)` overrides the `0.2` default when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
 
-`Unset` (the type) and `UNSET` (the value) are exported for one idiom: your own typed wrapper can declare `temperature: float | Unset = UNSET` and forward it unconditionally, letting llmkit resolve "not passed" instead of re-inventing the sentinel. Compare with `is`/`is not` only — never truthiness.
+`Unset` (the type) and `UNSET` (the value) are exported for one idiom: your own typed wrapper can declare `temperature: float | None | Unset = UNSET` and forward it unconditionally, letting llmkit resolve "not passed" vs "provider default" (`None`) vs a number instead of re-inventing the sentinel. Compare with `is`/`is not` only — never truthiness.
+
+#### Provider-default sampling (`temperature=None`)
+
+The three states are distinct, and each means something different on the wire:
+
+| You pass | Meaning | Wire |
+|---|---|---|
+| *(nothing)* | use llmkit's default | `temperature: 0.2` |
+| `temperature=0.5` (any number, incl. `0.0`) | your value | `temperature: 0.5` |
+| `temperature=None` | provider's built-in default sampling | **no `temperature` key at all** |
+
+`None` is accepted on every call surface — structured, plain-text, streaming, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, distinct from the `0.2` a default call records.
+
+**Gemini 3.x caveat.** Google's Gemini 3 guidance deprecates `temperature`/`top_p`/`top_k` and recommends removing them from every request; LiteLLM currently emits a `DeprecationWarning` when any of them is present. Omitting the field via `temperature=None` removes that warning — but with every *released* LiteLLM, `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models after the kwarg is dropped, so the deprecated field is still sent on the wire for Gemini 3.x specifically. Removing that injection is an upstream LiteLLM change; until its release is consumed by llmkit (tracked in the `contribute-and-consume-litellm-gemini-3-temperature-fix` task), `temperature=None` on Gemini 3.x means "no warning, wire value `1.0`".
 
 ### Contracts as JSON-schema dicts
 
@@ -441,7 +455,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field now: an omitted temperature (`temperature=None` on the call) records as `null`, distinct from the `0.2` a default call records, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise).
 
 ### Where the logs go
 
