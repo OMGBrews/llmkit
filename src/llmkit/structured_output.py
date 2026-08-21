@@ -50,6 +50,7 @@ from llmkit.retry import (
     handle_retry_failure,
     with_retries,
 )
+from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
 
 logger = logging.getLogger(__name__)
@@ -311,6 +312,7 @@ async def structured_llm_call[T: BaseModel](
                     call_id=call_id,
                     attempt=attempt,
                     queue_wait_ms=_queue_wait_ms.get(),
+                    run_id=get_run_id(),
                 )
             )
 
@@ -979,4 +981,5 @@ def _build_text_record(
         call_id=call_id,
         attempt=attempt,
         queue_wait_ms=_queue_wait_ms.get(),
+        run_id=get_run_id(),
     )

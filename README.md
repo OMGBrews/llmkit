@@ -416,7 +416,7 @@ for internal use).
 `LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
 1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call are joinable from the file heads alone). Small metadata is next; the large `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
-2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, call_id, attempt, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
+2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
 ```
 # ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 1840ms | $0.0007
@@ -428,6 +428,7 @@ label: exec_summary
 model: google/gemini-2.5-flash
 provider: openrouter
 schema: Summary
+run_id: nightly-eval-2026-06-05
 call_id: 9f3c21ab54d64f1f8f2c14febc03a7d1
 attempt: 1
 temperature: 0.0
@@ -441,7 +442,40 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one.
+
+### Grouping calls by run
+
+`call_id` joins the attempts of one logical call. It cannot tell you which calls belonged to one **run** — an eval sweep, a rehearsal, an incident replay — and neither can the timestamp, because a time window stops discriminating the moment two runs overlap. Set a `run_id` and every record, YAML body and `index.jsonl` line carries it, so one shared log directory stays filterable:
+
+```bash
+jq 'select(.run_id == "nightly-eval-2026-06-05")' index.jsonl
+```
+
+Three ways to set it, most specific first:
+
+```python
+import llmkit
+
+llmkit.set_run_id("nightly-eval-2026-06-05")   # process-wide, until cleared with None
+
+with llmkit.run_scope("tuner-session-7"):      # scoped to the block
+    ...
+
+llmkit.get_run_id()                            # what's in force right now
+```
+
+…and `LLMKIT_RUN_ID` in the environment, which needs no code change at all:
+
+```bash
+LLMKIT_RUN_ID=nightly-eval-2026-06-05 python -m your_eval_sweep
+```
+
+The environment variable is the lowest layer, so an explicit `set_run_id` or `run_scope` overrides it; a blank one counts as unset. A blank *programmatic* value raises instead — pass `None` to mean "no run id". With nothing set, `run_id` is `null` and records are otherwise exactly what llmkit wrote before this existed.
+
+Which of the two programmatic setters you want depends on your concurrency, because they fail in opposite directions. `run_scope` is context-scoped: it survives the sync bridge (a `*_sync` call runs on llmkit's persistent loop inside a copy of your context), but a `threading.Thread` you start yourself gets a *fresh* context and will not see it. `set_run_id` is a process global — visible from every thread and every loop, but a single value, so it cannot express two runs overlapping in one process. Use `set_run_id` for "this process is one run" (including a thread-pool fan-out), `run_scope` for a host driving several runs at once.
+
+`run_id` and `LLMKIT_LOG_DIR` are independent and compose freely — but tagging is what lets you keep *one* greppable history instead of walking N per-run directories.
 
 ### Where the logs go
 
