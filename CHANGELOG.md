@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **⚠️ The log sink owns its directory's `*.yaml` and `index-*.jsonl`
+  namespace — now stated in the docs.** Behaviour is unchanged; what changes is
+  that it is a documented contract rather than something you find out from a
+  deletion. `LocalYamlLogSink`'s retention pass is a **glob over `log_dir`**,
+  not a list of files the sink remembers writing: any `*.yaml` or rotated-index
+  `index-*.jsonl` file in that directory older than `retention_days` is deleted,
+  whoever wrote it. Co-locating your own YAML with the per-call logs therefore
+  puts it under llmkit's 30-day clock — usually what you want (a
+  cross-reference file and the logs it references rot together), but it makes
+  `log_dir` llmkit's directory rather than shared storage. Give llmkit a
+  directory of its own (`LocalYamlLogSink(log_dir=...)` or `LLMKIT_LOG_DIR`) or
+  set `retention_days=None` if you need your files to outlive the policy. The
+  active `index.jsonl` is never age-pruned — only its rotated generations are.
+  (Raised by PIA Maker's 0.8.0 consumer validation.)
+
 ## [0.8.0] — 2026-07-24
 
 A fail-loud, own-the-decision release. Configuration that silently did nothing
@@ -1628,6 +1647,7 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.8.0...main
 [0.8.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.8.0
 [0.7.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.7.0
 [0.6.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.6.0

@@ -415,6 +415,14 @@ class LocalYamlLogSink:
     an ``index.jsonl`` past ``max_index_bytes`` (default 50 MiB; ``None``
     never rotates) is rotated to a date-stamped sibling that ages out under
     the same policy. Housekeeping runs at most hourly, on the write path.
+    **Pruning is a glob over the directory, not a list of files the sink
+    remembers writing**: the sink owns ``log_dir``'s ``*.yaml`` and
+    ``index-*.jsonl`` namespace, so a co-located file of either shape ages
+    out under the same policy whoever wrote it — deliberate (a
+    cross-reference file and the logs it references rot on one clock), but
+    it makes ``log_dir`` llmkit's directory rather than shared storage.
+    Give llmkit a directory of its own if you need co-located files to
+    outlive the policy.
     Both bounds take a *positive* value or ``None``; ``0`` and negatives are
     rejected at construction rather than given one of their two plausible
     meanings (see :meth:`__init__`).
@@ -815,7 +823,12 @@ class LocalYamlLogSink:
 
         Age pruning covers the per-call ``*.yaml`` files and previously
         rotated ``index-*.jsonl`` generations, keyed on file mtime so tests
-        (and operators) can reason about it with ``touch``. Rotation renames
+        (and operators) can reason about it with ``touch``. The patterns are
+        globs over the directory, so this owns the whole ``*.yaml`` /
+        ``index-*.jsonl`` namespace in ``log_dir`` and sweeps a co-located
+        foreign file of either shape too — the documented contract, not an
+        oversight (the active ``index.jsonl`` is excluded: the pattern
+        requires the rotation hyphen). Rotation renames
         the active index with :func:`os.replace` — atomic on POSIX, and a
         concurrent writer holding the old file descriptor simply finishes its
         ``O_APPEND`` line into the rotated file, so no index line is ever
