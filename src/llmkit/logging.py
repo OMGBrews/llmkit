@@ -311,8 +311,19 @@ class LLMCallRecord:
     (which breaks under concurrent same-feature fan-out). ``queue_wait_ms``
     is the time this attempt spent queued behind llmkit's own rate limiter
     — ``duration_ms`` includes it, so provider latency is approximately
-    ``duration_ms - queue_wait_ms``. All three default ``None`` for
-    directly-constructed records.
+    ``duration_ms - queue_wait_ms``.
+
+    ``run_id`` is the *outer* scope ``call_id`` does not provide: the run —
+    an eval sweep, a rehearsal, an incident replay — that this call belonged
+    to, so a shared log directory can be filtered by run instead of by
+    timestamp window (which breaks whenever two runs overlap). The call layer
+    stamps it from :func:`~llmkit.run_scope.get_run_id`, which resolves an
+    active :func:`~llmkit.run_scope.run_scope`, then a process-wide
+    :func:`~llmkit.run_scope.set_run_id`, then ``LLMKIT_RUN_ID``.
+
+    All four default ``None`` for directly-constructed records — and a
+    ``None`` ``run_id`` is the pre-``run_id`` shape of every record, YAML
+    body and index line.
     """
 
     started_at: datetime
@@ -332,6 +343,7 @@ class LLMCallRecord:
     call_id: str | None = None
     attempt: int | None = None
     queue_wait_ms: float | None = None
+    run_id: str | None = None
 
 
 @runtime_checkable
@@ -423,6 +435,7 @@ class LocalYamlLogSink:
     it makes ``log_dir`` llmkit's directory rather than shared storage.
     Give llmkit a directory of its own if you need co-located files to
     outlive the policy.
+
     Both bounds take a *positive* value or ``None``; ``0`` and negatives are
     rejected at construction rather than given one of their two plausible
     meanings (see :meth:`__init__`).
@@ -598,6 +611,7 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
                 "temperature": record.temperature,
@@ -756,6 +770,7 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
                 "duration_ms": round(record.duration_ms, 1),
@@ -828,12 +843,12 @@ class LocalYamlLogSink:
         ``index-*.jsonl`` namespace in ``log_dir`` and sweeps a co-located
         foreign file of either shape too — the documented contract, not an
         oversight (the active ``index.jsonl`` is excluded: the pattern
-        requires the rotation hyphen). Rotation renames
-        the active index with :func:`os.replace` — atomic on POSIX, and a
-        concurrent writer holding the old file descriptor simply finishes its
-        ``O_APPEND`` line into the rotated file, so no index line is ever
-        torn or lost. A file vanishing mid-scan (a concurrent prune, a manual
-        cleanup) is skipped, not an error.
+        requires the rotation hyphen). Rotation renames the active index with
+        :func:`os.replace` — atomic on POSIX, and a concurrent writer holding
+        the old file descriptor simply finishes its ``O_APPEND`` line into the
+        rotated file, so no index line is ever torn or lost. A file vanishing
+        mid-scan (a concurrent prune, a manual cleanup) is skipped, not an
+        error.
         """
         if self.retention_days is not None:
             cutoff = time.time() - self.retention_days * 86400

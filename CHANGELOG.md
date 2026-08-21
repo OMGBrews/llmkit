@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`run_id`: a first-class run scope on every record and index line.**
+  `call_id` joins the retry attempts of one *logical call*; nothing joined the
+  calls of one **run** — an eval sweep, a rehearsal, an incident replay — so
+  attributing a call to a run meant filtering `index.jsonl` by timestamp
+  window, which stops discriminating the moment two runs overlap. Set a run id
+  and `LLMCallRecord.run_id`, the per-call YAML body and the `index.jsonl`
+  line all carry it, so one *shared* log directory stays filterable
+  (`jq 'select(.run_id == "…")'`) instead of fragmenting into a directory per
+  run.
+
+  Three layers, most specific first: `llmkit.run_scope("…")` (a context
+  manager), `llmkit.set_run_id("…" | None)` (process-wide), and the
+  `LLMKIT_RUN_ID` environment variable, read at record-build time so a
+  shell-launched process needs no code change. `llmkit.get_run_id()` reports
+  what is in force. A blank environment variable counts as unset; a blank
+  programmatic value raises rather than tagging every record with a value that
+  groups nothing.
+
+  Both programmatic layers exist because they fail in opposite directions:
+  `run_scope` is context-scoped and crosses the `run_sync` bridge (which copies
+  the caller's context onto llmkit's persistent loop) but not a
+  `threading.Thread`, which starts with a fresh context; `set_run_id` is a
+  process global — visible from every thread and every loop, but a single
+  value. Use the global for "this process is one run", the scope for a host
+  driving several at once.
+
+  `run_id` composes with `LLMKIT_LOG_DIR` and is independent of it. With no
+  scope set it is `null`, and records, YAML bodies and index lines are
+  otherwise unchanged — every pre-existing index key keeps its name and
+  position, so current consumers parse the new line as-is.
+
 ### Changed
 
 - **⚠️ The log sink owns its directory's `*.yaml` and `index-*.jsonl`

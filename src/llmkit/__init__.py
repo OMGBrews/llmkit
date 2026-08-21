@@ -11,6 +11,7 @@ This package provides:
 - A process-global async rate limiter shared across all calls
 - Default-on transient-error retries with full-jitter backoff (RetryPolicy)
 - Per-call invocation logging via a pluggable sink (with approximate cost)
+- Run scoping, so every record and index line is filterable by run id
 
 The headline surface below is what a typical consumer needs. Lower-level
 symbols stay importable from their submodules (``llmkit.providers``,
@@ -90,6 +91,12 @@ from llmkit.retry import (
     RetryProgressCallback,
     retry_progress_callback,
 )
+from llmkit.run_scope import (
+    RUN_ID_ENV_VAR,
+    get_run_id,
+    run_scope,
+    set_run_id,
+)
 from llmkit.structured_output import (
     STREAM_ABANDONED_ERROR,
     stream_text_with_log,
@@ -123,6 +130,11 @@ __all__ = [
     "LocalYamlLogSink",
     "configure_llm_logging",
     "default_log_dir",
+    # Run scoping (tag every record + index line with a run id)
+    "RUN_ID_ENV_VAR",
+    "get_run_id",
+    "run_scope",
+    "set_run_id",
     # Rate limiting
     "configure_rate_limit",
     "get_rate_limit_config",
