@@ -311,7 +311,7 @@ class LLMCallRecord:
     (which breaks under concurrent same-feature fan-out). ``queue_wait_ms``
     is the time this attempt spent queued behind llmkit's own rate limiter
     — ``duration_ms`` includes it, so provider latency is approximately
-    ``duration_ms - queue_wait_ms``. All three default ``None`` for
+    ``duration_ms - queue_wait_ms``. All four default ``None`` for
     directly-constructed records.
 
     ``temperature`` is ``None`` exactly when the call requested the
@@ -320,6 +320,17 @@ class LLMCallRecord:
     :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) and records that value.
     Custom sinks that read ``record.temperature`` must handle the ``None``
     state (the YAML sink writes it as ``null``).
+
+    ``run_id`` is the *outer* scope ``call_id`` does not provide: the run —
+    an eval sweep, a rehearsal, an incident replay — that this call belonged
+    to, so a shared log directory can be filtered by run instead of by
+    timestamp window (which breaks whenever two runs overlap). The call layer
+    stamps it from :func:`~llmkit.run_scope.get_run_id`, which resolves an
+    active :func:`~llmkit.run_scope.run_scope`, then a process-wide
+    :func:`~llmkit.run_scope.set_run_id`, then ``LLMKIT_RUN_ID``.
+
+    A ``None`` ``run_id`` is the pre-``run_id`` shape of every record, YAML
+    body and index line.
     """
 
     started_at: datetime
@@ -339,6 +350,7 @@ class LLMCallRecord:
     call_id: str | None = None
     attempt: int | None = None
     queue_wait_ms: float | None = None
+    run_id: str | None = None
 
 
 @runtime_checkable
@@ -597,6 +609,7 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
                 "temperature": record.temperature,
@@ -755,6 +768,7 @@ class LocalYamlLogSink:
                 "model": record.model,
                 "provider": record.provider,
                 "schema": record.schema,
+                "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
                 "duration_ms": round(record.duration_ms, 1),

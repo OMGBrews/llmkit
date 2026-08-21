@@ -99,6 +99,7 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
         "model",
         "provider",
         "schema",
+        "run_id",
         "call_id",
         "attempt",
         "duration_ms",
