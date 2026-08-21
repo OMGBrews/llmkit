@@ -804,7 +804,7 @@ configure_llm_client(lambda: LLMClientConfig(
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
-`reasoning_effort` controls provider "thinking"/reasoning tokens, forwarded to LiteLLM. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output.
+`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit translates the portable setting to its native `reasoning.effort` object: Gemini 3.x receives `"minimal"` because it requires thinking, while other models receive `"none"`. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning.
 
 Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
 
@@ -886,7 +886,8 @@ cause.
 `OpenRouterProvider` defends against this **by default**: it sets OpenRouter's
 [`provider.require_parameters`](https://openrouter.ai/docs/features/provider-routing#requiring-providers-to-support-all-parameters)
 routing preference, so a request only lands on a serving endpoint that honors
-*every* parameter sent — including the structured `response_format`. The trade-off
+*every* parameter sent — including the structured `response_format` and native
+`reasoning` control when configured. The trade-off
 is that restricting routing to capable endpoints can in principle reduce
 availability or shift cost. To opt out (and accept the silent-free-form-JSON
 risk), construct the provider directly:

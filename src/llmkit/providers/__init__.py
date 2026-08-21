@@ -172,8 +172,8 @@ def make_provider(
             those two an ambient endpoint value can override the pinned region,
             which matters because that region is the residency control (see each
             provider's class docstring).
-        reasoning_effort: Provider "thinking" effort forwarded to LiteLLM;
-            ``None`` leaves the provider default in place.
+        reasoning_effort: Provider "thinking" effort translated to its
+            request control; ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; not accepted by any other
             provider.
         vertex_project: GCP project id for Vertex AI; not accepted by any other

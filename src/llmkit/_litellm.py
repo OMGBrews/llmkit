@@ -171,6 +171,47 @@ def _resolve_reasoning_effort(
     return getattr(provider, "reasoning_effort", None)
 
 
+def _reasoning_request_kwargs(
+    provider: LLMProviderInterface, effort: ReasoningEffort | None, model: str | None
+) -> dict[str, object]:
+    """Build provider-owned reasoning kwargs, retaining old providers' fallback.
+
+    ``reasoning_kwargs`` was added after the provider interface shipped, so
+    third-party providers may not implement it yet. They retain the original
+    flat LiteLLM request shape until they opt into a native translation.
+    """
+    if effort is None:
+        return {}
+    try:
+        translate = provider.reasoning_kwargs
+    except AttributeError:
+        return {"reasoning_effort": effort}
+    return translate(effort, model or provider.model)
+
+
+def _completion_request_kwargs(
+    provider: LLMProviderInterface, effort: ReasoningEffort | None, model: str | None
+) -> dict[str, object]:
+    """Merge provider credentials and a reasoning translation for one request."""
+    creds = provider.completion_kwargs()
+    reasoning = _reasoning_request_kwargs(provider, effort, model)
+    native_body = reasoning.pop("extra_body", None)
+    if native_body is None:
+        return {**creds, **reasoning}
+    if not isinstance(native_body, dict):
+        raise TypeError("Provider reasoning extra_body must be a dict")
+    native_body = cast("dict[str, object]", native_body)
+    existing_body = creds.get("extra_body")
+    if existing_body is None:
+        merged_body = native_body
+    elif isinstance(existing_body, dict):
+        existing_body = cast("dict[str, object]", existing_body)
+        merged_body = {**existing_body, **native_body}
+    else:
+        raise TypeError("Provider completion extra_body must be a dict")
+    return {**creds, **reasoning, "extra_body": merged_body}
+
+
 def _response_cost(
     raw: object,
 ) -> float | None:
@@ -394,8 +435,9 @@ async def acompletion_structured[T: BaseModel](
     Returns ``(parsed, approximate_cost)``.
     """
     provider = provider if provider is not None else build_provider()
-    creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    litellm_model = provider.litellm_model(model)
+    request_kwargs = _completion_request_kwargs(provider, effort, model)
     # The completion callable is the library's seam under instructor: providers
     # that opt in via ``strict_json_schema`` (OpenRouter) get their
     # ``response_format`` upgraded to strict enforcement on the way to LiteLLM.
@@ -413,7 +455,6 @@ async def acompletion_structured[T: BaseModel](
         "instructor.AsyncInstructor",
         cast("object", instructor.from_litellm(completion, mode=provider.instructor_mode)),
     )
-    litellm_model = provider.litellm_model(model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         try:
             result = await client.chat.completions.create_with_completion(
@@ -427,9 +468,8 @@ async def acompletion_structured[T: BaseModel](
                 # call — tenacity retrying objects mutate iteration state. The
                 # cross-call transient/validation budgets live in llmkit.retry.
                 max_retries=_schema_repair_retrying(),
-                **creds,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential kwargs (api_key / api_base / aws_region_name)
+                **request_kwargs,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential/native kwargs
                 **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-                **({"reasoning_effort": effort} if effort is not None else {}),
                 # Gate temperature like max_tokens / reasoning_effort: a
                 # ``None`` resolved value sends no ``temperature`` key at all
                 # (not an explicit ``None`` kwarg), so the provider's default
@@ -480,8 +520,8 @@ async def acompletion_text(
     none).
     """
     provider = provider if provider is not None else build_provider()
-    creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    request_kwargs = _completion_request_kwargs(provider, effort, model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
@@ -491,13 +531,12 @@ async def acompletion_text(
             # so the provider's default sampling applies. Identity check
             # keeps ``0.0`` a real, forwarded value.
             **({"temperature": temperature} if temperature is not None else {}),
-            **creds,
+            **request_kwargs,
             # Gate max_tokens like the structured/stream paths: an unset cap
             # sends no ``max_tokens`` key at all (not an explicit ``None``), so
             # the request stays byte-identical to prior behaviour. Creds are
             # splatted first to match the structured/stream helpers exactly.
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-            **({"reasoning_effort": effort} if effort is not None else {}),
         )
         # Non-streaming acompletion returns a ModelResponse (the stub's union
         # also admits CustomStreamWrapper, only reachable with stream=True);
@@ -536,8 +575,8 @@ async def astream_text(
     ``temperature`` key at all (the provider's default sampling applies).
     """
     provider = provider if provider is not None else build_provider()
-    creds = provider.completion_kwargs()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    request_kwargs = _completion_request_kwargs(provider, effort, model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
@@ -548,9 +587,8 @@ async def astream_text(
             # keeps ``0.0`` a real, forwarded value.
             **({"temperature": temperature} if temperature is not None else {}),
             stream=True,
-            **creds,
+            **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-            **({"reasoning_effort": effort} if effort is not None else {}),
         )
         # stream=True makes acompletion return a CustomStreamWrapper, whose
         # async iteration yields typed ModelResponseStream chunks.

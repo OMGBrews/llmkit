@@ -27,6 +27,7 @@ instructor client) while leaving non-opted-in providers' requests untouched.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
@@ -70,6 +71,20 @@ def test_config_build_keeps_require_parameters_on() -> None:
     assert provider.completion_kwargs()["extra_body"] == _ROUTING_PREF
 
 
+def test_reasoning_kwargs_use_openrouter_native_effort() -> None:
+    """Portable ``disable`` maps to each model family's lowest native control."""
+    provider = OpenRouterProvider(api_key="k")
+    assert provider.reasoning_kwargs("disable", "google/gemini-3.5-flash") == {
+        "extra_body": {"reasoning": {"effort": "minimal"}}
+    }
+    assert provider.reasoning_kwargs("disable", "google/gemini-2.5-flash-lite") == {
+        "extra_body": {"reasoning": {"effort": "none"}}
+    }
+    assert provider.reasoning_kwargs("xhigh", "google/gemini-2.5-flash-lite") == {
+        "extra_body": {"reasoning": {"effort": "xhigh"}}
+    }
+
+
 def test_routing_preference_threads_into_litellm_call() -> None:
     """The ``extra_body`` routing pref reaches the underlying LiteLLM call.
 
@@ -97,7 +112,9 @@ class _OkSchema(BaseModel):
     ok: bool
 
 
-def _drive_structured_call(provider: object) -> dict[str, object]:
+def _drive_structured_call(
+    provider: object, *, reasoning_effort: str | None = None
+) -> dict[str, object]:
     """Run a structured call through the *real* instructor client and return
     the kwargs the (stubbed) LiteLLM transport received.
 
@@ -128,11 +145,77 @@ def _drive_structured_call(provider: object) -> dict[str, object]:
                 _OkSchema,
                 temperature=0.0,
                 model=None,
+                reasoning_effort=reasoning_effort,
                 provider=cast("LLMProviderInterface", provider),
             )
         )
     assert parsed.ok is True
     return captured
+
+
+def _assert_native_reasoning(captured: dict[str, object], effort: str) -> None:
+    """Assert the native body survived the transport merge without a flat kwarg."""
+    assert captured["extra_body"] == {
+        "provider": {"require_parameters": True},
+        "reasoning": {"effort": effort},
+    }
+    assert "reasoning_effort" not in captured
+
+
+def test_structured_reasoning_uses_native_body_for_config_and_override() -> None:
+    """Both resolution sources reach the structured wire in native form."""
+    configured = OpenRouterProvider(
+        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="disable"
+    )
+    _assert_native_reasoning(_drive_structured_call(configured), "minimal")
+
+    override = OpenRouterProvider(api_key="k", model="google/gemini-3.5-flash")
+    _assert_native_reasoning(
+        _drive_structured_call(override, reasoning_effort="disable"), "minimal"
+    )
+
+
+def test_text_and_stream_reasoning_use_native_body() -> None:
+    """Both resolution sources reach the text and stream transports natively."""
+    configured = OpenRouterProvider(
+        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="disable"
+    )
+    override = OpenRouterProvider(api_key="k", model="google/gemini-3.5-flash")
+    captured: list[dict[str, object]] = []
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.append(kwargs)
+        if kwargs.get("stream"):
+
+            class _Stream:
+                def __aiter__(self) -> AsyncIterator[object]:
+                    async def _iterate() -> AsyncIterator[object]:
+                        yield SimpleNamespace(choices=[])
+
+                    return _iterate()
+
+            return _Stream()
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))])
+
+    async def _drive() -> None:
+        for provider, effort in ((configured, None), (override, "disable")):
+            text, _cost = await _litellm.acompletion_text(
+                "hi", temperature=0.0, model=None, reasoning_effort=effort, provider=provider
+            )
+            assert text == "hi"
+            _ = [
+                chunk
+                async for chunk in _litellm.astream_text(
+                    "hi", temperature=0.0, model=None, reasoning_effort=effort, provider=provider
+                )
+            ]
+
+    with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
+        asyncio.run(_drive())
+
+    assert len(captured) == 4
+    for kwargs in captured:
+        _assert_native_reasoning(kwargs, "minimal")
 
 
 def test_strict_json_schema_upgrade_reaches_the_wire() -> None:

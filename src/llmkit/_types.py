@@ -38,13 +38,14 @@ class Message(TypedDict):
 #: parameter: ``"disable"`` turns provider thinking off; ``"low"`` / ``"medium"``
 #: / ``"high"`` scale it. The trailing ``| str`` is a deliberate escape hatch —
 #: providers accept values outside this set (e.g. OpenAI's ``"minimal"``), and
-#: llmkit forwards the value verbatim to LiteLLM without validating it.
+#: llmkit forwards the value without validating it, translating only where a
+#: provider needs a native request control (for example OpenRouter).
 #:
 #: This alias is **advisory, not enforcing**: under the type checker
 #: ``Literal[...] | str`` widens to ``str``, so it names and documents the
 #: canonical set and drives editor autocomplete but does *not* statically reject
 #: a typo. A closed ``Literal`` (no ``| str``) would reject a typo, but it would
-#: also reject the provider-specific values the forward-verbatim design
+#: also reject the provider-specific values the non-validating design
 #: intentionally permits — so the open tail is the right trade for a thin,
 #: non-validating wrapper.
 type ReasoningEffort = Literal["disable", "low", "medium", "high"] | str

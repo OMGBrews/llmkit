@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **OpenRouter now translates `reasoning_effort` into its native request
+  control.** A configured or per-call effort is sent as
+  `reasoning: {"effort": ...}` rather than LiteLLM's flat kwarg, which avoids
+  OpenRouter's local preflight rejection for Gemini 3.x. Portable `"disable"`
+  becomes `"minimal"` for mandatory-thinking Gemini 3.x models and `"none"`
+  elsewhere; other native values pass through unchanged. The existing
+  `provider.require_parameters` preference remains in the same request body.
+
 - **`temperature=None` requests the provider's default sampling** — the
   first way to *omit* the `temperature` field from a provider request.
   Previously every call materialized llmkit's `0.2` default, so an

@@ -335,9 +335,9 @@ class LLMClientConfig:
     id is always well-formed — never a dangling ``"anthropic/"``.
 
     ``reasoning_effort`` controls provider "thinking"/reasoning tokens,
-    mirroring LiteLLM's standard param (``"disable" | "low" | "medium" |
-    "high"``). ``None`` (the default) sends no reasoning kwarg, leaving the
-    provider's own default in place — byte-identical to prior behaviour. Set
+    with portable aliases (``"disable" | "low" | "medium" | "high"``).
+    ``None`` (the default) sends no reasoning control, leaving the provider's
+    own default in place — byte-identical to prior behaviour. Set
     it once here (e.g. ``"disable"``) to have **every** call inherit the
     setting; Gemini's default-on thinking otherwise spends reasoning tokens
     against ``max_tokens`` and can truncate small-capped structured output.
@@ -480,6 +480,10 @@ class LLMProviderInterface(Protocol):
     @property
     def reasoning_effort(self) -> ReasoningEffort | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default."""
+        ...
+
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate a resolved reasoning effort into provider request kwargs."""
         ...
 
     def litellm_model(self, model: str | None = None) -> str:
@@ -659,11 +663,20 @@ class BaseProvider(ABC):
     def reasoning_effort(self) -> ReasoningEffort | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default.
 
-        Forwarded to LiteLLM as ``reasoning_effort`` when set (see
-        :mod:`llmkit._litellm`); ``None`` sends nothing, so the provider's
-        own thinking default stands.
+        Translated by :meth:`reasoning_kwargs` when set; ``None`` sends
+        nothing, so the provider's own thinking default stands.
         """
         return self._reasoning_effort
+
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Return LiteLLM's portable reasoning kwarg for ``effort``.
+
+        Providers with a native reasoning control override this method.  It is
+        concrete so existing provider subclasses only implementing the two
+        abstract construction hooks remain valid.
+        """
+        del model
+        return {"reasoning_effort": effort}
 
     def litellm_model(self, model: str | None = None) -> str:
         """Return the provider-prefixed LiteLLM model string.

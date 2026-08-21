@@ -157,7 +157,7 @@ async def structured_llm_call[T: BaseModel](
             :func:`text_llm_call`.
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort (``"disable" | "low" | "medium" |
-            "high"``). Unset defers to ``options``, then to the value
+            "high"``; provider-native values are also accepted). Unset defers to ``options``, then to the value
             configured on :class:`~llmkit.LLMClientConfig`; an explicit
             value wins for this call. ``"disable"`` turns Gemini thinking
             off so it doesn't consume the ``max_tokens`` budget.

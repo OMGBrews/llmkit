@@ -497,6 +497,23 @@ async def test_openrouter_live() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openrouter_reasoning_effort_live() -> None:
+    """OpenRouter accepts native translated disable controls on Gemini.
+
+    The ids are deliberately hard-coded: Gemini 3.5 Flash is the
+    mandatory-thinking incident model, while Gemini 2.5 Flash-Lite exercises
+    OpenRouter's true ``none`` branch. The offline routing tests capture the
+    corresponding outgoing native bodies; this smoke proves each reaches the
+    gateway and returns visible structured output under the small shared cap.
+    """
+    for model in ("google/gemini-3.5-flash", "google/gemini-2.5-flash-lite"):
+        provider = make_provider(
+            Provider.OPENROUTER, model=model, **_live_credentials(Provider.OPENROUTER)
+        )
+        await _assert_structured_roundtrip(provider, reasoning_effort="disable")
+
+
+@pytest.mark.asyncio
 async def test_google_live() -> None:
     await _override_roundtrip(Provider.GOOGLE, _GOOGLE_MODEL)
 

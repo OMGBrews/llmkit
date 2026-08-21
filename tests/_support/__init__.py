@@ -122,6 +122,14 @@ def _transport_provider(
     provider.instructor_mode = instructor_mode
     provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = reasoning_effort
+
+    # Keep the transport double explicit as the provider contract grows:
+    # MagicMock would manufacture a new hook whose ``**`` expansion is an empty
+    # dict, letting reasoning tests pass without asserting a real request shape.
+    def _reasoning_kwargs(effort: str, _model: str) -> dict[str, object]:
+        return {"reasoning_effort": effort}
+
+    provider.reasoning_kwargs = MagicMock(side_effect=_reasoning_kwargs)
     return provider
 
 

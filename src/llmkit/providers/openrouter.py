@@ -97,6 +97,25 @@ class OpenRouterProvider(BaseProvider):
         return kwargs
 
     @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate portable effort into OpenRouter's native ``reasoning`` body.
+
+        Gemini 3.x requires thinking, so its portable ``disable`` intent maps
+        to OpenRouter's lowest supported effort, ``minimal``. Other OpenRouter
+        models can receive the explicit ``none`` control. Values outside the
+        portable aliases pass through: OpenRouter accepts additional native
+        levels and should reject an unsupported value itself.
+        """
+        native_effort = (
+            "minimal"
+            if effort == "disable" and model.startswith("google/gemini-3")
+            else "none"
+            if effort == "disable"
+            else effort
+        )
+        return {"extra_body": {"reasoning": {"effort": native_effort}}}
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OpenRouterProvider:
         """Construct from an :class:`LLMClientConfig` (OpenRouter endpoint default).
