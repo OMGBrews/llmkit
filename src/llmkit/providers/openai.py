@@ -54,6 +54,9 @@ class OpenAIProvider(BaseProvider):
     _model_prefix: ClassVar[str] = "openai/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
+    #: Measured on the native OpenAI route; both parameters share the standard
+    #: chat-completions request shape.
+    _compose_tools_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "OPENAI_API_KEY"
     #: The endpoint variables LiteLLM consulted for this route, in its own
     #: precedence order (measured, not read off the source). Read here so a host

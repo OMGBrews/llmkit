@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, override
 
 from pydantic import BaseModel
 
@@ -106,6 +106,21 @@ class ToolCallResult:
 
     def to_log_dict(self) -> dict[str, object]:
         return {"text": self.text, "tool_calls": [call.to_wire() for call in self.tool_calls]}
+
+
+@dataclass(frozen=True)
+class ToolComposeResult[T: BaseModel](ToolCallResult):
+    """A tool turn that may instead contain a validated final answer.
+
+    ``parsed`` is ``None`` when the model requested tools.  When no tools were
+    requested, it is the caller's validated ``output_schema`` instance.
+    """
+
+    parsed: T | None
+
+    @override
+    def to_log_dict(self) -> dict[str, object]:
+        return {**super().to_log_dict(), "parsed": self.parsed}
 
 
 def tool_result_message(tool_call_id: str, content: str) -> ToolResultMessage:

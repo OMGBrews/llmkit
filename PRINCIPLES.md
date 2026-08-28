@@ -6,7 +6,7 @@ The design principles behind `llmkit` — the durable promises the library makes
 
 ## Validated structured output is the contract
 
-The core promise: you pass a Pydantic model and get back a validated instance of it, or an exception — never a plausible-looking object with empty or wrong fields. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs (instructor's automatic mode silently regresses some providers to empty results — llmkit refuses it). So `structured_llm_call` gives you the same reliable, typed result whether you're on OpenAI, Gemini, Claude, DeepSeek, Bedrock, or a local model.
+The core promise: you pass a Pydantic model and get back a validated instance of it, or an exception — never a plausible-looking object with empty or wrong fields. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs (instructor's automatic mode silently regresses some providers to empty results — llmkit refuses it). So `structured_llm_call` gives you the same reliable, typed result whether you're on OpenAI, Gemini, Claude, DeepSeek, Bedrock, or a local model. On measured compose-capable routes, `tool_llm_call(..., output_schema=...)` makes a tool turn return either requested calls or that same validated final instance; unavailable or preview-only routes fail loudly and keep the portable two-step tool-loop-plus-finalization pattern.
 
 ## Opinionated where it counts, out of your way everywhere else
 

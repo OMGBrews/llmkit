@@ -102,6 +102,12 @@ async def _acompletion_strict_json_schema(
     :pyattr:`~llmkit.providers.base.BaseProvider.strict_json_schema`; the
     mutation targets the request dict instructor builds fresh per call.
     """
+    _stricten_json_schema_response_format(kwargs)
+    return await _acompletion(**kwargs)
+
+
+def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
+    """Mutate a JSON-schema response format into the strict wire shape."""
     response_format = kwargs.get("response_format")
     if (
         isinstance(response_format, dict)
@@ -114,7 +120,6 @@ async def _acompletion_strict_json_schema(
             schema = json_schema.get("schema")
             if isinstance(schema, dict):
                 cast("dict[str, object]", schema)["additionalProperties"] = False
-    return await _acompletion(**kwargs)
 
 
 async def drain_async_logging(*, timeout: float | None) -> None:
@@ -575,6 +580,7 @@ async def acompletion_tools(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
+    response_format: dict[str, object] | None = None,
 ) -> tuple[
     str | None, list[object], str | None, tuple[int | None, int | None, int | None], float | None
 ]:
@@ -584,6 +590,8 @@ async def acompletion_tools(
         raise ValueError(f"{provider.name} does not support tool_choice on this route")
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    if response_format is not None and provider.strict_json_schema:
+        _stricten_json_schema_response_format({"response_format": response_format})
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
@@ -592,6 +600,7 @@ async def acompletion_tools(
             model=provider.litellm_model(model),
             messages=_messages(prompt),
             tools=[definition.to_litellm() for definition in tools],
+            **({"response_format": response_format} if response_format is not None else {}),
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
             **request_kwargs,

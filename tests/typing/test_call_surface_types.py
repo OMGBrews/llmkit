@@ -28,6 +28,9 @@ from llmkit import (
     LLMCallOptions,
     Message,
     ReasoningEffort,
+    ToolCallResult,
+    ToolComposeResult,
+    ToolDefinition,
     Unset,
     stream_text_with_log,
     structured_llm_call,
@@ -35,6 +38,8 @@ from llmkit import (
     text_llm_call,
     text_llm_call_stream,
     text_llm_call_sync,
+    tool_llm_call,
+    tool_llm_call_sync,
 )
 
 
@@ -48,6 +53,15 @@ async def _typecheck_prompt_accepts_valid_shapes() -> None:
     _ = assert_type(structured_llm_call_sync("hi", _Out, feature="t"), _Out)
     _ = assert_type(await text_llm_call("hi", feature="t"), str)
     _ = assert_type(text_llm_call_sync("hi", feature="t"), str)
+    tools = [ToolDefinition("lookup", "", {"type": "object"})]
+    _ = assert_type(await tool_llm_call("hi", tools, feature="t"), ToolCallResult)
+    _ = assert_type(tool_llm_call_sync("hi", tools, feature="t"), ToolCallResult)
+    _ = assert_type(
+        await tool_llm_call("hi", tools, feature="t", output_schema=_Out), ToolComposeResult[_Out]
+    )
+    _ = assert_type(
+        tool_llm_call_sync("hi", tools, feature="t", output_schema=_Out), ToolComposeResult[_Out]
+    )
 
     # An inline list of message dicts matches Message structurally.
     _ = await structured_llm_call(

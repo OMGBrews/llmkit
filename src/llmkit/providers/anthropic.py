@@ -67,6 +67,10 @@ class AnthropicProvider(BaseProvider):
     _model_prefix: ClassVar[str] = "anthropic/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "claude-sonnet-4-6"
+    #: Measured on the native Anthropic route. Legacy models are additionally
+    #: rejected by ``guard_compose_tools_schema`` because LiteLLM's fallback
+    #: replaces caller tools with a forced response-format tool.
+    _compose_tools_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "ANTHROPIC_API_KEY"
     #: The endpoint variables LiteLLM consulted for this route, in its own
     #: precedence order (measured, not read off the source). Read here so a host
@@ -99,6 +103,21 @@ class AnthropicProvider(BaseProvider):
                 self._base_url, env_vars=self._base_url_env_vars, default=_DEFAULT_BASE_URL
             ),
         }
+
+    @override
+    def guard_compose_tools_schema(self, model: str | None) -> None:
+        """Refuse LiteLLM's legacy forced-tool structured-output fallback."""
+        from litellm.utils import supports_native_structured_output
+
+        from llmkit.exceptions import ComposeUnsupportedError
+
+        candidate = model or self.model
+        if not supports_native_structured_output(candidate, "anthropic"):
+            raise ComposeUnsupportedError(
+                f"Anthropic model {candidate!r} cannot safely combine tools with an output "
+                + "schema; use the portable two-step pattern (tool loop, then "
+                + "structured_llm_call)."
+            )
 
     @override
     @classmethod

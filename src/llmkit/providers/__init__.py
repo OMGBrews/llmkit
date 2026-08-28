@@ -237,6 +237,7 @@ def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:
         provider_name=provider.name,
         model=provider.model,
         is_local=provider.is_local,
+        compose_tools_schema=provider.compose_tools_schema,
     )
 
 

@@ -33,6 +33,7 @@ from typing import cast
 from unittest.mock import patch
 
 import litellm
+import pytest
 from pydantic import BaseModel
 
 from llmkit import _litellm
@@ -247,3 +248,34 @@ def test_non_strict_provider_request_is_untouched() -> None:
     json_schema = cast("dict[str, object]", response_format["json_schema"])
     assert "strict" not in json_schema
     assert "additionalProperties" not in cast("dict[str, object]", json_schema["schema"])
+
+
+@pytest.mark.asyncio
+async def test_compose_tools_request_keeps_openrouter_strict_shape() -> None:
+    """The compose lane shares the structured lane's strict wire mutation."""
+    captured: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[], usage=None)
+
+    with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
+        from llmkit._litellm import acompletion_tools
+        from llmkit.tools import ToolDefinition
+
+        _ = await acompletion_tools(
+            "hi",
+            [ToolDefinition("lookup", "", {"type": "object"})],
+            tool_choice=None,
+            temperature=None,
+            model="x/y",
+            provider=OpenRouterProvider(api_key="k", model="x/y"),
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "Answer", "schema": {"type": "object"}},
+            },
+        )
+    response_format = cast("dict[str, object]", captured["response_format"])
+    json_schema = cast("dict[str, object]", response_format["json_schema"])
+    assert json_schema["strict"] is True
+    assert cast("dict[str, object]", json_schema["schema"])["additionalProperties"] is False

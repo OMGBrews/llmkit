@@ -478,6 +478,15 @@ class LLMProviderInterface(Protocol):
         ...
 
     @property
+    def compose_tools_schema(self) -> bool:
+        """Whether this provider has a measured stable tools+schema capability."""
+        ...
+
+    def guard_compose_tools_schema(self, model: str | None) -> None:
+        """Refuse a model that would silently fall back while composing."""
+        ...
+
+    @property
     def supports_tool_choice(self) -> bool:
         """Whether this route accepts LiteLLM's ``tool_choice`` control."""
         ...
@@ -575,6 +584,10 @@ class BaseProvider(ABC):
     #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
     #: pattern).
     _strict_json_schema: ClassVar[bool] = False
+    #: Whether tools plus a strict response schema are a measured, stable
+    #: capability for this provider. Preview-only or unmeasured routes remain
+    #: false so callers receive a loud steer to the portable two-step pattern.
+    _compose_tools_schema: ClassVar[bool] = False
     _supports_tool_choice: ClassVar[bool] = True
 
     #: The routing-contract hooks validated for every concrete subclass.
@@ -664,6 +677,19 @@ class BaseProvider(ABC):
         upgrade itself happens at the LiteLLM call seam in ``llmkit._litellm``.
         """
         return self._strict_json_schema
+
+    @property
+    def compose_tools_schema(self) -> bool:
+        """Whether this provider supports a combined tools + schema request."""
+        return self._compose_tools_schema
+
+    def guard_compose_tools_schema(self, model: str | None) -> None:
+        """Apply provider/model-specific compose safety checks.
+
+        Most providers have no additional model split.  Routes with a
+        synthetic-tool fallback override this before a transport call.
+        """
+        del model
 
     @property
     def supports_tool_choice(self) -> bool:
@@ -781,3 +807,4 @@ class LLMInfo:
     provider_name: str
     model: str
     is_local: bool
+    compose_tools_schema: bool

@@ -20,8 +20,10 @@ import importlib.util
 from importlib.machinery import ModuleSpec
 
 import pytest
+from litellm import utils as litellm_utils
 
 from llmkit import (
+    ComposeUnsupportedError,
     LLMClientConfig,
     Provider,
     build_provider,
@@ -68,3 +70,17 @@ def test_build_provider_anthropic_constructs_without_sdk() -> None:
     )
     assert isinstance(provider, AnthropicProvider)
     assert provider.litellm_model() == "anthropic/claude-sonnet-4-6"
+
+
+def test_anthropic_compose_guard_refuses_litellm_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact LiteLLM selector, not a stale llmkit model list, gates compose."""
+
+    def _unsupported(model: str, provider: str | None = None) -> bool:
+        del model, provider
+        return False
+
+    monkeypatch.setattr(litellm_utils, "supports_native_structured_output", _unsupported)
+    with pytest.raises(ComposeUnsupportedError, match="two-step"):
+        AnthropicProvider(api_key="x", model="claude-legacy").guard_compose_tools_schema(None)

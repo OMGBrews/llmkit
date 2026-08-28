@@ -30,13 +30,13 @@ import warnings
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
-from typing import cast
+from typing import cast, overload
 
 from pydantic import BaseModel, JsonValue
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.capture import record_call, record_call_async, resolve_model_and_provider
-from llmkit.exceptions import ResultValidationError, ToolArgumentError
+from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
@@ -53,7 +53,14 @@ from llmkit.retry import (
 )
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
-from llmkit.tools import TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition
+from llmkit.tools import (
+    TokenUsage,
+    ToolCall,
+    ToolCallResult,
+    ToolChoice,
+    ToolComposeResult,
+    ToolDefinition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1044,6 +1051,7 @@ def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> 
     return ToolCall(call_id, name, arguments_raw, cast("dict[str, object]", parsed), validated)
 
 
+@overload
 async def tool_llm_call(
     prompt: str | Sequence[ChatMessage],
     tools: Sequence[ToolDefinition],
@@ -1058,8 +1066,46 @@ async def tool_llm_call(
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
-) -> ToolCallResult:
-    """Run one tool-enabled turn; callers execute returned calls themselves."""
+    output_schema: None = None,
+) -> ToolCallResult: ...
+
+
+@overload
+async def tool_llm_call[T: BaseModel](
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+    output_schema: type[T],
+) -> ToolComposeResult[T]: ...
+
+
+async def tool_llm_call[T: BaseModel](
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+    output_schema: type[T] | None = None,
+) -> ToolCallResult | ToolComposeResult[T]:
+    """Run one tool-enabled turn, optionally accepting a schema-validated final answer."""
     resolved = resolve_call_args(
         options,
         temperature=temperature,
@@ -1070,18 +1116,26 @@ async def tool_llm_call(
         provider=provider,
     )
     provider = _build_call_provider(resolved.provider)
+    if output_schema is not None:
+        if provider is None or not provider.compose_tools_schema:
+            name = "the configured provider" if provider is None else provider.name
+            raise ComposeUnsupportedError(
+                f"{name} does not support combining tools with an output schema; use the "
+                + "portable two-step pattern (tool loop, then structured_llm_call)."
+            )
+        provider.guard_compose_tools_schema(resolved.model)
     definitions = {definition.name: definition for definition in tools}
     call_id = uuid.uuid4().hex
     attempt_count = 0
 
-    async def _attempt() -> ToolCallResult:
+    async def _attempt() -> ToolCallResult | ToolComposeResult[T]:
         from llmkit import _litellm
 
         nonlocal attempt_count
         attempt_count += 1
         _ = _queue_wait_ms.set(None)
         started_at, start_t = datetime.now(UTC), time.monotonic()
-        result: ToolCallResult | None = None
+        result: ToolCallResult | ToolComposeResult[T] | None = None
         cost: float | None = None
         error: str | None = None
         try:
@@ -1094,14 +1148,39 @@ async def tool_llm_call(
                 max_tokens=resolved.max_tokens,
                 reasoning_effort=resolved.reasoning_effort,
                 provider=provider,
+                response_format=(
+                    {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": output_schema.__name__,
+                            "schema": output_schema.model_json_schema(),
+                        },
+                    }
+                    if output_schema is not None
+                    else None
+                ),
             )
             parsed_calls = [_tool_call_from_raw(raw, definitions) for raw in raw_calls]
-            result = ToolCallResult(
+            base = (
                 text,
                 parsed_calls,
                 stop_reason if isinstance(stop_reason, str) else None,
                 TokenUsage(*counts),
             )
+            if output_schema is None:
+                result = ToolCallResult(*base)
+            elif parsed_calls:
+                result = ToolComposeResult[T](*base, parsed=None)
+            else:
+                if text is None:
+                    raise ResultValidationError("compose response had neither tool calls nor text")
+                try:
+                    parsed = output_schema.model_validate_json(text)
+                except Exception as exc:
+                    raise ResultValidationError(
+                        f"compose response failed validation: {exc}"
+                    ) from exc
+                result = ToolComposeResult[T](*base, parsed=parsed)
             return result
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1117,7 +1196,9 @@ async def tool_llm_call(
                     provider=resolved_provider,
                     temperature=resolved.temperature,
                     duration_ms=(time.monotonic() - start_t) * 1000,
-                    schema="tools",
+                    schema=(
+                        "tools" if output_schema is None else f"tools+{output_schema.__name__}"
+                    ),
                     prompt=prompt,
                     response=result.to_log_dict() if result is not None else None,
                     error=error,
@@ -1144,7 +1225,7 @@ async def tool_llm_call(
                 )
             )
 
-    return await with_retries(
+    completed = await with_retries(
         _attempt,
         max_attempts=resolved.retry.max_attempts,
         label=label or feature,
@@ -1153,10 +1234,55 @@ async def tool_llm_call(
         retry_after_cap=resolved.retry.retry_after_cap,
         retry_on=resolved.retry.retry_on,
         validation_max_attempts=resolved.retry.validation_max_attempts,
-        validation_retry_on=_tool_validation_budget(resolved.retry),
+        validation_retry_on=(
+            _tool_validation_budget(resolved.retry)
+            if output_schema is None
+            else _result_validation_budget(resolved.retry)
+        ),
     )
+    return completed
 
 
-def tool_llm_call_sync(*args: object, **kwargs: object) -> ToolCallResult:
+@overload
+def tool_llm_call_sync(
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+    output_schema: None = None,
+) -> ToolCallResult: ...
+
+
+@overload
+def tool_llm_call_sync[T: BaseModel](
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+    output_schema: type[T],
+) -> ToolComposeResult[T]: ...
+
+
+def tool_llm_call_sync(
+    *args: object, **kwargs: object
+) -> ToolCallResult | ToolComposeResult[BaseModel]:
     """Synchronous wrapper around :func:`tool_llm_call`."""
-    return run_sync(tool_llm_call(*args, **kwargs))  # pyright: ignore[reportArgumentType]  # dynamic forwarding wrapper
+    return run_sync(tool_llm_call(*args, **kwargs))  # pyright: ignore[reportArgumentType, reportCallIssue, reportUnknownArgumentType]  # dynamic forwarding wrapper

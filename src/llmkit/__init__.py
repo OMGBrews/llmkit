@@ -48,6 +48,7 @@ from llmkit.exceptions import (
     LLM_TOOL_ERRORS,
     LLM_TRANSPORT_ERRORS,
     CircuitOpenError,
+    ComposeUnsupportedError,
     OutputLimitError,
     ResultValidationError,
     ServiceUnavailableError,
@@ -116,6 +117,7 @@ from llmkit.tools import (
     ToolCall,
     ToolCallResult,
     ToolChoice,
+    ToolComposeResult,
     ToolDefinition,
     ToolName,
     ToolResultMessage,
@@ -194,6 +196,7 @@ __all__ = [
     "ToolChoice",
     "ToolCall",
     "ToolCallResult",
+    "ToolComposeResult",
     "TokenUsage",
     "tool_result_message",
     # JSON-schema-dict structured output (build-once-reuse helper)
@@ -208,6 +211,7 @@ __all__ = [
     "CircuitOpenError",
     "OutputLimitError",
     "ResultValidationError",
+    "ComposeUnsupportedError",
     "ServiceUnavailableError",
     "ToolArgumentError",
     # Package metadata

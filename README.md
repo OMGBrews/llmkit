@@ -98,8 +98,39 @@ The public call surface:
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `text_llm_call_sync(...)` | Synchronous wrapper around the above |
 | `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
+| `tool_llm_call(prompt, tools, feature, ..., output_schema=...)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
+| `tool_llm_call_sync(...)` | Synchronous wrapper around the tool turn |
 
-`prompt` is typed `str | list[Message]` on all five. A plain string is sent as-is; the list form is a list of `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim. `Message` is exported so your own prompt builders can be annotated against it rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected.
+`prompt` is typed `str | list[Message]` on all call functions. A plain string is sent as-is; the list form is a list of `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim. `Message` is exported so your own prompt builders can be annotated against it rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected.
+
+### Tool calls with a structured final answer
+
+The portable pattern is still **two steps**: run a tool loop with `tool_llm_call`, then make one `structured_llm_call` for the final answer. That works across every provider, including Gemini.
+
+For a measured compose-capable route, pass `output_schema=` to the tool call instead. Each turn is either a normal `ToolComposeResult` with `tool_calls` and `parsed is None`, or a final answer with `parsed` set to your validated Pydantic instance. Anthropic and OpenAI support the combined request; unsupported providers and unsafe legacy Claude models raise `ComposeUnsupportedError` *before any request* with a steer to the portable pattern.
+
+```python
+from pydantic import BaseModel
+from llmkit import ToolDefinition, tool_llm_call
+
+class Answer(BaseModel):
+    total: int
+
+result = await tool_llm_call(
+    "Calculate 2 + 3; use the tool if needed.",
+    [ToolDefinition("add", "Add values", {"type": "object"})],
+    output_schema=Answer,
+    feature="calculator",
+)
+if result.tool_calls:
+    # Execute calls and make the next tool turn with the updated history.
+    ...
+else:
+    assert result.parsed is not None
+    assert result.parsed.total == 5
+```
+
+Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior; their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
 
 **Type-check migration.** `prompt` was previously `str | list[dict[str, str]]`, so a call site passing a *variable* annotated `list[dict[str, str]]` now fails the type check — re-annotate it `list[Message]`. Inline message-dict literals are unaffected, and runtime behaviour is identical either way (a `TypedDict` is a plain `dict`).
 

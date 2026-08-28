@@ -171,6 +171,10 @@ class _AdditionArgs(BaseModel):
     right: int
 
 
+class _ToolAnswer(BaseModel):
+    total: int
+
+
 # Cheap, broadly-available default models per provider. Override via the
 # matching ``*_SMOKE_MODEL`` env var if a key lacks access to one of these.
 # OpenRouter is deliberately covered TWICE — see the two tests below. This
@@ -423,6 +427,31 @@ async def _assert_tool_roundtrip(provider: LLMProviderInterface) -> None:
     assert finished.tool_calls == []
     assert finished.text is not None
     assert "5" in finished.text
+
+
+async def _assert_compose_roundtrip(provider: LLMProviderInterface) -> None:
+    """One request can ask for a tool or return a validated final answer."""
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    result = await tool_llm_call(
+        "Return the final answer 5 as JSON. Do not call a tool.",
+        [add],
+        feature="integration-compose-smoke",
+        label=provider.name,
+        provider=provider,
+        tool_choice="none",
+        output_schema=_ToolAnswer,
+        max_tokens=128,
+    )
+    assert result.tool_calls == []
+    assert result.parsed == _ToolAnswer(total=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", [Provider.ANTHROPIC, Provider.OPENAI])
+async def test_live_compose_tools_with_structured_final(provider: Provider) -> None:
+    """The two measured compose routes produce a validated final answer."""
+    built = make_provider(provider, **_live_credentials(provider))
+    await _assert_compose_roundtrip(built)
 
 
 @pytest.mark.asyncio

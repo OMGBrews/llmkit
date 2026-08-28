@@ -493,3 +493,13 @@ class ResultValidationError(Exception):
     propagates to the caller, carrying the rejecting message (and, if the host
     raised it ``from`` another error, that ``__cause__``).
     """
+
+
+class ComposeUnsupportedError(Exception):
+    """Raised before transport when tools and a response schema cannot compose.
+
+    This is a permanent route/model configuration error, intentionally outside
+    :data:`LLM_RECOVERABLE_ERRORS`: retrying cannot make a provider support the
+    combined request.  Use the portable two-step pattern (tool loop followed by
+    ``structured_llm_call``) instead.
+    """

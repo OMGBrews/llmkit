@@ -26,6 +26,7 @@ def test_describe_llm_resolves_provider_default_model() -> None:
     assert info.provider_name == "Google AI Studio"
     assert info.model == "gemini-2.5-flash-lite"
     assert info.is_local is False
+    assert info.compose_tools_schema is False
 
 
 def test_describe_llm_honors_explicit_model() -> None:
@@ -34,6 +35,11 @@ def test_describe_llm_honors_explicit_model() -> None:
         LLMClientConfig(provider=Provider.GOOGLE, api_key="k", model="gemini-2.5-pro")
     )
     assert info.model == "gemini-2.5-pro"
+
+
+def test_describe_llm_exposes_measured_compose_capability() -> None:
+    info = describe_llm(LLMClientConfig(provider=Provider.OPENAI, api_key="k"))
+    assert info.compose_tools_schema is True
 
 
 def test_describe_llm_marks_only_ollama_local() -> None:
