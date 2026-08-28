@@ -96,10 +96,15 @@ import pytest
 from pydantic import BaseModel
 
 from llmkit import (
+    ChatMessage,
     LLMProviderInterface,
     Provider,
+    ToolDefinition,
+    ToolName,
     model_from_json_schema,
     structured_llm_call,
+    tool_llm_call,
+    tool_result_message,
 )
 from llmkit.providers import make_provider
 
@@ -157,6 +162,13 @@ class CountryProfile(BaseModel):
     eu_member: bool
     land_borders: int
     largest_cities: list[str]
+
+
+class _AdditionArgs(BaseModel):
+    """Arguments for the deliberately tiny, deterministic live tool."""
+
+    left: int
+    right: int
 
 
 # Cheap, broadly-available default models per provider. Override via the
@@ -379,6 +391,40 @@ async def _override_roundtrip(provider: Provider, model: str) -> None:
     await _assert_structured_roundtrip(built, reasoning_effort=_REASONING_EFFORT.get(provider))
 
 
+async def _assert_tool_roundtrip(provider: LLMProviderInterface) -> None:
+    """Offer a tool, return its result, then require a natural-language finish."""
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    history: list[ChatMessage] = [
+        {"role": "user", "content": "Use the add tool to calculate 2 plus 3."}
+    ]
+    requested = await tool_llm_call(
+        history,
+        [add],
+        feature="integration-tool-smoke",
+        label=provider.name,
+        provider=provider,
+        tool_choice=ToolName("add"),
+        max_tokens=256,
+    )
+    assert len(requested.tool_calls) == 1
+    call = requested.tool_calls[0]
+    assert call.name == "add"
+    assert call.validated == _AdditionArgs(left=2, right=3)
+    history.extend([requested.to_message(), tool_result_message(call.id, "5")])
+    finished = await tool_llm_call(
+        history,
+        [add],
+        feature="integration-tool-smoke",
+        label=provider.name,
+        provider=provider,
+        tool_choice="none",
+        max_tokens=256,
+    )
+    assert finished.tool_calls == []
+    assert finished.text is not None
+    assert "5" in finished.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", list(Provider))
 async def test_live_default_model(provider: Provider) -> None:
@@ -551,3 +597,19 @@ async def test_bedrock_live() -> None:
 async def test_vertex_live() -> None:
     # This call is what *measures* the Mode.JSON_SCHEMA pin against live Vertex.
     await _override_roundtrip(Provider.VERTEX, _VERTEX_MODEL)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_roundtrip_live() -> None:
+    provider = make_provider(
+        Provider.ANTHROPIC, model=_ANTHROPIC_MODEL, **_live_credentials(Provider.ANTHROPIC)
+    )
+    await _assert_tool_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_vertex_tool_roundtrip_live() -> None:
+    provider = make_provider(
+        Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    await _assert_tool_roundtrip(provider)
