@@ -24,7 +24,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "litellm>=1.87.1",
+    "litellm>=1.95.0",
     # instructor's `from_litellm` validates the provider mode pins against its
     # LiteLLM mode registry at client construction (1.15.3 removed the
     # non-core modes from that registry, which broke three providers with

@@ -478,6 +478,11 @@ class LLMProviderInterface(Protocol):
         ...
 
     @property
+    def supports_tool_choice(self) -> bool:
+        """Whether this route accepts LiteLLM's ``tool_choice`` control."""
+        ...
+
+    @property
     def reasoning_effort(self) -> ReasoningEffort | None:
         """Configured reasoning/thinking effort, or ``None`` for provider default."""
         ...
@@ -570,6 +575,7 @@ class BaseProvider(ABC):
     #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
     #: pattern).
     _strict_json_schema: ClassVar[bool] = False
+    _supports_tool_choice: ClassVar[bool] = True
 
     #: The routing-contract hooks validated for every concrete subclass.
     _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")
@@ -658,6 +664,11 @@ class BaseProvider(ABC):
         upgrade itself happens at the LiteLLM call seam in ``llmkit._litellm``.
         """
         return self._strict_json_schema
+
+    @property
+    def supports_tool_choice(self) -> bool:
+        """Whether this provider supports explicit tool selection."""
+        return self._supports_tool_choice
 
     @property
     def reasoning_effort(self) -> ReasoningEffort | None:

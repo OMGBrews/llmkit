@@ -37,6 +37,7 @@ class OllamaProvider(BaseProvider):
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "llama3.2"
     is_local: ClassVar[bool] = True
+    _supports_tool_choice: ClassVar[bool] = False
     _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"base_url"})
 
     def __init__(

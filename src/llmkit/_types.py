@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
+from llmkit.tools import AssistantToolMessage, ToolResultMessage
+
 
 class Message(TypedDict):
     """One chat message in a ``prompt``: a ``role`` and its ``content``.
@@ -49,3 +51,8 @@ class Message(TypedDict):
 #: intentionally permits — so the open tail is the right trade for a thin,
 #: non-validating wrapper.
 type ReasoningEffort = Literal["disable", "low", "medium", "high"] | str
+
+# ``Message`` deliberately stays closed for existing callers. Tool loops use
+# this union, which retains ordinary messages and adds the OpenAI-normalized
+# assistant-call / tool-result wire shapes.
+type ChatMessage = Message | AssistantToolMessage | ToolResultMessage

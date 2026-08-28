@@ -22,20 +22,21 @@ the capture context managers live in :mod:`llmkit.capture`
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 import warnings
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
-from llmkit._types import Message, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.capture import record_call, record_call_async, resolve_model_and_provider
-from llmkit.exceptions import ResultValidationError
+from llmkit.exceptions import ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
@@ -52,6 +53,7 @@ from llmkit.retry import (
 )
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
+from llmkit.tools import TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,11 @@ def _result_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], 
     nothing raises it — and keeps the call functions from branching on the hook.
     """
     return (*retry.validation_retry_on, ResultValidationError)
+
+
+def _tool_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], ...]:
+    """Tool argument errors use the same bounded repair budget as schemas."""
+    return (*retry.validation_retry_on, ToolArgumentError)
 
 
 def _build_call_provider(
@@ -107,7 +114,7 @@ STREAM_ABANDONED_ERROR = "Abandoned: stream closed by consumer before completion
 
 
 async def structured_llm_call[T: BaseModel](
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     output_schema: type[T],
     *,
     feature: str,
@@ -334,7 +341,7 @@ async def structured_llm_call[T: BaseModel](
 
 
 def structured_llm_call_sync[T: BaseModel](
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     output_schema: type[T],
     *,
     feature: str,
@@ -389,7 +396,7 @@ def structured_llm_call_sync[T: BaseModel](
 
 
 async def text_llm_call(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     feature: str,
     label: str | None = None,
@@ -548,7 +555,7 @@ async def text_llm_call(
 
 
 def text_llm_call_sync(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     feature: str,
     label: str | None = None,
@@ -588,7 +595,7 @@ def text_llm_call_sync(
 
 
 async def text_llm_call_stream(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     feature: str,
     label: str | None = None,
@@ -793,7 +800,7 @@ async def text_llm_call_stream(
 
 
 def stream_text_with_log(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     feature: str,
     label: str | None = None,
@@ -834,7 +841,7 @@ def stream_text_with_log(
 
 
 async def _stream_once(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     feature: str,
     label: str | None,
@@ -934,7 +941,7 @@ def _build_text_record(
     started_at: datetime,
     feature: str,
     label: str | None,
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     text: str | None,
     start_t: float,
     temperature: float | None,
@@ -992,3 +999,164 @@ def _build_text_record(
         queue_wait_ms=_queue_wait_ms.get(),
         run_id=get_run_id(),
     )
+
+
+def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> ToolCall:
+    """Narrow LiteLLM's intentionally open tool-call objects at one boundary."""
+    call_id = getattr(raw, "id", None)
+    function = getattr(raw, "function", None)
+    name = getattr(function, "name", None)
+    arguments_raw = getattr(function, "arguments", None)
+    if (
+        not isinstance(call_id, str)
+        or not isinstance(name, str)
+        or not isinstance(arguments_raw, str)
+    ):
+        raise ToolArgumentError(
+            name if isinstance(name, str) else None,
+            call_id if isinstance(call_id, str) else None,
+            arguments_raw if isinstance(arguments_raw, str) else None,
+            "provider returned a malformed tool call",
+        )
+    definition = definitions.get(name)
+    if definition is None:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, f"model requested unknown tool {name!r}"
+        )
+    try:
+        parsed = cast("object", json.loads(arguments_raw))
+    except json.JSONDecodeError as exc:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, "tool arguments are not valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, "tool arguments must be a JSON object"
+        )
+    try:
+        validated = (
+            definition.model.model_validate(parsed) if definition.model is not None else None
+        )
+    except Exception as exc:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, f"tool arguments failed validation: {exc}"
+        ) from exc
+    return ToolCall(call_id, name, arguments_raw, cast("dict[str, object]", parsed), validated)
+
+
+async def tool_llm_call(
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+) -> ToolCallResult:
+    """Run one tool-enabled turn; callers execute returned calls themselves."""
+    resolved = resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+    )
+    provider = _build_call_provider(resolved.provider)
+    definitions = {definition.name: definition for definition in tools}
+    call_id = uuid.uuid4().hex
+    attempt_count = 0
+
+    async def _attempt() -> ToolCallResult:
+        from llmkit import _litellm
+
+        nonlocal attempt_count
+        attempt_count += 1
+        _ = _queue_wait_ms.set(None)
+        started_at, start_t = datetime.now(UTC), time.monotonic()
+        result: ToolCallResult | None = None
+        cost: float | None = None
+        error: str | None = None
+        try:
+            text, raw_calls, stop_reason, counts, cost = await _litellm.acompletion_tools(
+                prompt,
+                tools,
+                tool_choice=tool_choice,
+                temperature=resolved.temperature,
+                model=resolved.model,
+                max_tokens=resolved.max_tokens,
+                reasoning_effort=resolved.reasoning_effort,
+                provider=provider,
+            )
+            parsed_calls = [_tool_call_from_raw(raw, definitions) for raw in raw_calls]
+            result = ToolCallResult(
+                text,
+                parsed_calls,
+                stop_reason if isinstance(stop_reason, str) else None,
+                TokenUsage(*counts),
+            )
+            return result
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            resolved_model, resolved_provider = resolve_model_and_provider(resolved.model, provider)
+            _ = await record_call_async(
+                LLMCallRecord(
+                    started_at=started_at,
+                    feature=feature,
+                    label=label,
+                    model=resolved_model,
+                    provider=resolved_provider,
+                    temperature=resolved.temperature,
+                    duration_ms=(time.monotonic() - start_t) * 1000,
+                    schema="tools",
+                    prompt=prompt,
+                    response=result.to_log_dict() if result is not None else None,
+                    error=error,
+                    approximate_cost=cost,
+                    max_tokens=resolved.max_tokens,
+                    reasoning_effort=resolved.reasoning_effort,
+                    call_id=call_id,
+                    attempt=attempt_count,
+                    queue_wait_ms=_queue_wait_ms.get(),
+                    run_id=get_run_id(),
+                    tools=[definition.to_litellm() for definition in tools],
+                    tool_calls=[call.to_wire() for call in result.tool_calls]
+                    if result is not None
+                    else None,
+                    usage=(
+                        None
+                        if result is None
+                        else {
+                            "prompt_tokens": result.usage.prompt_tokens,
+                            "completion_tokens": result.usage.completion_tokens,
+                            "total_tokens": result.usage.total_tokens,
+                        }
+                    ),
+                )
+            )
+
+    return await with_retries(
+        _attempt,
+        max_attempts=resolved.retry.max_attempts,
+        label=label or feature,
+        backoff_base_seconds=resolved.retry.backoff_base_seconds,
+        max_backoff_seconds=resolved.retry.max_backoff_seconds,
+        retry_after_cap=resolved.retry.retry_after_cap,
+        retry_on=resolved.retry.retry_on,
+        validation_max_attempts=resolved.retry.validation_max_attempts,
+        validation_retry_on=_tool_validation_budget(resolved.retry),
+    )
+
+
+def tool_llm_call_sync(*args: object, **kwargs: object) -> ToolCallResult:
+    """Synchronous wrapper around :func:`tool_llm_call`."""
+    return run_sync(tool_llm_call(*args, **kwargs))  # pyright: ignore[reportArgumentType]  # dynamic forwarding wrapper

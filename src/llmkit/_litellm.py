@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from typing import cast
 
 import instructor
@@ -34,7 +34,7 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
-from llmkit._types import Message, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitError,
@@ -42,6 +42,7 @@ from llmkit.exceptions import (
 )
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
+from llmkit.tools import ToolChoice, ToolDefinition, ToolName
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +151,9 @@ async def drain_async_logging(*, timeout: float | None) -> None:
         logger.debug("LiteLLM async-logging drain failed", exc_info=True)
 
 
-def _messages(prompt: str | list[Message]) -> list[Message]:
+def _messages(prompt: str | Sequence[ChatMessage]) -> list[ChatMessage]:
     """Normalise a prompt into LiteLLM's message-list shape."""
-    return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+    return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
 
 
 def _resolve_reasoning_effort(
@@ -380,7 +381,7 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
 
 
 async def acompletion_structured[T: BaseModel](
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     output_schema: type[T],
     *,
     temperature: float | None,
@@ -496,7 +497,7 @@ async def acompletion_structured[T: BaseModel](
 
 
 async def acompletion_text(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     temperature: float | None,
     model: str | None,
@@ -551,8 +552,69 @@ async def acompletion_text(
     return _coerce_text_content(content), _response_cost(response)
 
 
+def _usage_counts(response: ModelResponse) -> tuple[int | None, int | None, int | None]:
+    """Extract portable usage fields without trusting a provider-specific model."""
+    usage = getattr(response, "usage", None)
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    total = getattr(usage, "total_tokens", None)
+    return (
+        prompt if isinstance(prompt, int) else None,
+        completion if isinstance(completion, int) else None,
+        total if isinstance(total, int) else None,
+    )
+
+
+async def acompletion_tools(
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    tool_choice: ToolChoice | None,
+    temperature: float | None,
+    model: str | None,
+    max_tokens: int | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
+    provider: LLMProviderInterface | None = None,
+) -> tuple[
+    str | None, list[object], str | None, tuple[int | None, int | None, int | None], float | None
+]:
+    """One raw-LiteLLM tool completion, with the usual limiter and TPM debit."""
+    provider = provider if provider is not None else build_provider()
+    if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
+        raise ValueError(f"{provider.name} does not support tool_choice on this route")
+    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    request_kwargs = _completion_request_kwargs(provider, effort, model)
+    choice: object = tool_choice
+    if isinstance(tool_choice, ToolName):
+        choice = {"type": "function", "function": {"name": tool_choice.value}}
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
+        resp = await _acompletion(
+            model=provider.litellm_model(model),
+            messages=_messages(prompt),
+            tools=[definition.to_litellm() for definition in tools],
+            **({"tool_choice": choice} if choice is not None else {}),
+            **({"temperature": temperature} if temperature is not None else {}),
+            **request_kwargs,
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+        )
+        response = cast("ModelResponse", resp)
+        slot.record_tokens(_total_tokens(response))
+    if not response.choices:
+        return None, [], None, _usage_counts(response), _response_cost(response)
+    message = response.choices[0].message
+    content = cast("object", getattr(message, "content", None))
+    raw_calls = cast("object", getattr(message, "tool_calls", None))
+    return (
+        _coerce_text_content(content) if content is not None else None,
+        cast("list[object]", raw_calls) if isinstance(raw_calls, list) else [],
+        getattr(response.choices[0], "finish_reason", None),
+        _usage_counts(response),
+        _response_cost(response),
+    )
+
+
 async def astream_text(
-    prompt: str | list[Message],
+    prompt: str | Sequence[ChatMessage],
     *,
     temperature: float | None,
     model: str | None,

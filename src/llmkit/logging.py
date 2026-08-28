@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 import yaml
 
-from llmkit._types import Message, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort
 
 logger = logging.getLogger(__name__)
 
@@ -341,7 +342,7 @@ class LLMCallRecord:
     temperature: float | None
     duration_ms: float
     schema: str
-    prompt: str | list[Message]
+    prompt: str | Sequence[ChatMessage]
     response: Any  # pyright: ignore[reportExplicitAny]  # raw-llm — Pydantic dump or accumulated text
     error: str | None
     approximate_cost: float | None = None
@@ -351,6 +352,9 @@ class LLMCallRecord:
     attempt: int | None = None
     queue_wait_ms: float | None = None
     run_id: str | None = None
+    tools: list[dict[str, object]] | None = None
+    tool_calls: list[dict[str, object]] | None = None
+    usage: dict[str, int | None] | None = None
 
 
 @runtime_checkable
@@ -624,6 +628,9 @@ class LocalYamlLogSink:
                 "temperature": record.temperature,
                 "max_tokens": record.max_tokens,
                 "reasoning_effort": record.reasoning_effort,
+                "tools": record.tools,
+                "tool_calls": record.tool_calls,
+                "usage": record.usage,
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None

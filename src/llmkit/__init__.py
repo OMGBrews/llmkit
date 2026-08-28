@@ -35,7 +35,7 @@ the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
-from llmkit._types import Message, ReasoningEffort
+from llmkit._types import ChatMessage, Message, ReasoningEffort
 from llmkit.capture import (
     capture_llm_log_paths,
     capture_llm_records,
@@ -45,11 +45,13 @@ from llmkit.exceptions import (
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_RECOVERABLE_ERRORS,
     LLM_SCHEMA_ERRORS,
+    LLM_TOOL_ERRORS,
     LLM_TRANSPORT_ERRORS,
     CircuitOpenError,
     OutputLimitError,
     ResultValidationError,
     ServiceUnavailableError,
+    ToolArgumentError,
 )
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
@@ -105,6 +107,19 @@ from llmkit.structured_output import (
     text_llm_call,
     text_llm_call_stream,
     text_llm_call_sync,
+    tool_llm_call,
+    tool_llm_call_sync,
+)
+from llmkit.tools import (
+    AssistantToolMessage,
+    TokenUsage,
+    ToolCall,
+    ToolCallResult,
+    ToolChoice,
+    ToolDefinition,
+    ToolName,
+    ToolResultMessage,
+    tool_result_message,
 )
 
 # Distribution version, resolved from installed metadata rather than hardcoded
@@ -158,6 +173,8 @@ __all__ = [
     "text_llm_call",
     "text_llm_call_sync",
     "text_llm_call_stream",
+    "tool_llm_call",
+    "tool_llm_call_sync",
     # Deprecated pre-1.0 alias for ``text_llm_call_stream`` (removed at 1.0).
     "stream_text_with_log",
     "STREAM_ABANDONED_ERROR",
@@ -168,19 +185,31 @@ __all__ = [
     "UNSET",
     "DEFAULT_TEMPERATURE",
     "Message",
+    "ChatMessage",
     "ReasoningEffort",
+    "AssistantToolMessage",
+    "ToolResultMessage",
+    "ToolDefinition",
+    "ToolName",
+    "ToolChoice",
+    "ToolCall",
+    "ToolCallResult",
+    "TokenUsage",
+    "tool_result_message",
     # JSON-schema-dict structured output (build-once-reuse helper)
     "model_from_json_schema",
     # Exception handling
     "LLM_RECOVERABLE_ERRORS",
     "LLM_TRANSPORT_ERRORS",
     "LLM_SCHEMA_ERRORS",
+    "LLM_TOOL_ERRORS",
     "LLM_BACKPRESSURE_ERRORS",
     "LLM_OUTPUT_LIMIT_ERRORS",
     "CircuitOpenError",
     "OutputLimitError",
     "ResultValidationError",
     "ServiceUnavailableError",
+    "ToolArgumentError",
     # Package metadata
     "__version__",
 ]

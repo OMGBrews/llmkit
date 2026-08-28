@@ -269,6 +269,7 @@ def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvi
         "_model_prefix",
         "is_local",
         "_strict_json_schema",
+        "_supports_tool_choice",
     )
     for attr in routing_attrs:
         assert typing.get_origin(hints[attr]) is typing.ClassVar, (

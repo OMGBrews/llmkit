@@ -265,6 +265,21 @@ LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     InstructorRetryException,
 )
 
+
+class ToolArgumentError(Exception):
+    """A model requested an unknown tool or supplied invalid arguments."""
+
+    def __init__(
+        self, tool_name: str | None, call_id: str | None, arguments_raw: str | None, reason: str
+    ):
+        super().__init__(reason)
+        self.tool_name: str | None = tool_name
+        self.call_id: str | None = call_id
+        self.arguments_raw: str | None = arguments_raw
+
+
+LLM_TOOL_ERRORS: tuple[type[Exception], ...] = (ToolArgumentError,)
+
 # The genuine *parse* failures — a malformed or schema-invalid response the model
 # can plausibly fix if asked again. This is the **single source of truth** for two
 # decisions that must never drift apart (a type instructor re-asks in-call must
@@ -401,6 +416,7 @@ LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_SCHEMA_ERRORS,
     *LLM_BACKPRESSURE_ERRORS,
     *LLM_OUTPUT_LIMIT_ERRORS,
+    *LLM_TOOL_ERRORS,
 )
 
 
