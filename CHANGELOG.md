@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A streaming tool turn: `tool_llm_call_stream`.** The tool lane returns a
+  turn only once it is complete, which is right for a loop and wrong for a chat
+  panel — assistant prose arrives in paragraph-sized blobs. This streams the
+  prose and still ends at the same `ToolCallResult`, over the same
+  `tools`/`tool_choice` surface as `tool_llm_call`. It is an async generator
+  yielding `TextDeltaEvent | ToolCallResult`: text events as they arrive, then
+  the completed turn as the **last item yielded** (an async generator cannot
+  return a value, so the two shapes are distinct types and you discriminate on
+  the type, not on position). `TextDeltaEvent(text)` is a new public frozen
+  dataclass. Breaking out after the result is the intended stopping point and
+  records as a completed call; leaving earlier records the partial transcript
+  under `STREAM_ABANDONED_ERROR`. Records log under the `tools-stream` schema
+  carrying `tools`, `tool_calls` and `usage`. Three deliberate differences from
+  `tool_llm_call`: no `output_schema=` (compose is rejected at the signature,
+  so the type checker enforces it — use the portable two-step pattern); no
+  `_sync` twin (`run_sync` bridges coroutines, not async generators, as for
+  `text_llm_call_stream`); and retries are transport-only, so an all-malformed
+  round's `ToolArgumentError` reaches you unretried rather than being re-asked
+  on `validation_max_attempts`. Unlike the plain text stream this lane requests
+  token usage on the stream, so `result.usage`, the log record and the TPM
+  debit stay populated — measured live on Vertex, Anthropic, OpenAI,
+  OpenRouter, Google AI Studio and DeepSeek. New exports:
+  `tool_llm_call_stream` and `TextDeltaEvent`.
+
 - **A tool-calling lane: `tool_llm_call` and `tool_llm_call_sync`.** llmkit now
   owns one tool-enabled completion *turn*; the loop stays in your application,
   which is where the decision to execute a tool belongs. Describe each tool

@@ -100,6 +100,12 @@ The public call surface:
 | `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 | `tool_llm_call(prompt, tools, feature, ..., output_schema=...)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
 | `tool_llm_call_sync(...)` | Synchronous wrapper around the tool turn |
+| `tool_llm_call_stream(prompt, tools, feature, ...)` | Async generator yielding `TextDeltaEvent`s, ending with the completed `ToolCallResult` |
+
+**The two streaming functions have no `_sync` twin, and cannot.** `run_sync`
+bridges a coroutine; an async generator is not one, and there is no way to hand
+a synchronous caller a lazily-produced stream without inventing a thread-backed
+iterator llmkit deliberately does not own. Consume them from async code.
 
 `prompt` is typed `str | list[Message]` on all call functions. A plain string is sent as-is; the list form is a list of `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim. `Message` is exported so your own prompt builders can be annotated against it rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected.
 
@@ -131,6 +137,59 @@ else:
 ```
 
 Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior; their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
+
+### Streaming a tool turn
+
+A tool turn returns only once it is complete, so a chat panel rendering
+assistant prose gets it in paragraph-sized blobs. `tool_llm_call_stream` yields
+that prose as it arrives and then ends with the **same** `ToolCallResult` the
+buffered call returns, so your tool loop is unchanged from the result onward:
+
+```python
+from llmkit import TextDeltaEvent, ToolCallResult, tool_llm_call_stream
+
+result: ToolCallResult | None = None
+async for event in tool_llm_call_stream(history, tools, feature="chat"):
+    if isinstance(event, TextDeltaEvent):
+        render(event.text)          # token-by-token, as it arrives
+    else:
+        result = event              # the completed turn; the stream is done
+
+assert result is not None
+for call in result.tool_calls:
+    ...                             # your loop, exactly as before
+```
+
+The completed result is the **last item yielded**, not a return value — an
+async generator cannot return one. That is why the two shapes are distinct
+types: you discriminate on the type, never on position. Breaking out after the
+result is the intended way to stop, and is recorded as a *completed* call;
+leaving earlier records the partial transcript with `STREAM_ABANDONED_ERROR`,
+never a clean `ok`.
+
+Four differences from `tool_llm_call`, all deliberate:
+
+- **No `output_schema=`.** Compose is rejected at the signature, so the type
+  checker enforces it rather than a runtime raise. Use the portable two-step
+  pattern (tool loop, then `structured_llm_call`).
+- **No sync variant** — see the note under the call-surface table.
+- **Retries are transport-only.** As on `text_llm_call_stream`, only a
+  transient failure *before the first yielded item* is retried; once anything
+  has reached you, a mid-stream error propagates unretried. One consequence
+  worth stating: a round in which **every** requested call is malformed raises
+  `ToolArgumentError` here **without** the buffered lane's re-ask, because
+  there is no way to restart a stream the caller has begun consuming. A round
+  in which only *some* calls are malformed behaves identically to the buffered
+  lane — survivors on `tool_calls`, failures on `invalid_calls`.
+- **Usage is real, not null.** Unlike the plain text stream, this lane requests
+  `stream_options={"include_usage": True}`, so `result.usage`, the log record's
+  `usage`, and the token-rate limiter's debit are all populated. Measured on
+  Vertex, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek; Bedrock
+  and Ollama are covered by the same code path but that measurement is still
+  outstanding.
+
+Log records use the `tools-stream` schema and carry the offered `tools`, the
+returned `tool_calls`, and `usage`, exactly as the buffered tool lane does.
 
 ### When a call doesn't parse
 
@@ -208,7 +267,7 @@ Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transp
 
 ### Reusing call options
 
-The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
+The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
 from llmkit import LLMCallOptions, structured_llm_call
@@ -423,7 +482,7 @@ from llmkit import configure_rate_limit
 configure_rate_limit(rpm=3_500, tpm=2_000_000)
 ```
 
-RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for streamed calls.)
+RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A plain *text* streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for those calls. `tool_llm_call_stream` is the exception: it asks the provider for usage on the stream, so it debits TPM like a buffered call.)
 
 #### Adaptive concurrency
 
@@ -551,7 +610,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field now: an omitted temperature (`temperature=None` on the call) records as `null`, distinct from the `0.2` a default call records, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. plain-text streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id`. `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field now: an omitted temperature (`temperature=None` on the call) records as `null`, distinct from the `0.2` a default call records, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
 
 ### Grouping calls by run
 
@@ -616,7 +675,7 @@ Sink I/O never runs on the event loop: writes are offloaded to a worker thread (
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, and `text_llm_call_stream`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
 **`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
 
@@ -1017,7 +1076,7 @@ Routing stays on for the config-driven path (`configure_llm_client` /
 
 Two retry layers, kept deliberately separate:
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
+- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
   - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
   - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
   - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget — never retried**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, so the fix is legible from the error alone: `completion_tokens` at a cap you set means *raise the cap*; a huge count under no cap means *the prompt induces runaway output*. A caller that genuinely wants the resample can opt back in by listing `OutputLimitError` explicitly in `retry_on`.
@@ -1048,7 +1107,7 @@ Two retry layers, kept deliberately separate:
   )
   ```
 
-  **Streaming caveat:** `text_llm_call_stream` can only retry a transient failure that happens *before the first chunk reaches the caller*. Once any chunk has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted.
+  **Streaming caveat:** `text_llm_call_stream` and `tool_llm_call_stream` can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
 
   **`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**); the previously-deprecated `max_retries` alias has been removed outright, so passing it now raises `TypeError`. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
 

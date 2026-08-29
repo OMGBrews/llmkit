@@ -102,7 +102,8 @@ def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     ``model``/``provider``, ``duration_ms``, ``error`` and the rest —
     without authoring a :class:`~llmkit.logging.LogSink`. Captures every
     call function (:func:`structured_llm_call`, :func:`text_llm_call`,
-    :func:`text_llm_call_stream`) and works across the ``run_sync`` bridge
+    :func:`text_llm_call_stream`, :func:`tool_llm_call`,
+    :func:`tool_llm_call_stream`) and works across the ``run_sync`` bridge
     (e.g. :func:`structured_llm_call_sync`), since the record is appended
     inside the async call path the bridge drives.
 

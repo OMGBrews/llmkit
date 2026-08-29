@@ -27,8 +27,10 @@ class LLMCallRecord:
     substituted when the caller passed ``None``) and ``provider`` names
     the active provider, so cost attribution is a ``grep`` over the logs
     rather than a code trace. ``schema`` is the output schema name for a
-    structured call, or the literal ``"text"`` / ``"stream"`` for a buffered
-    or streamed plain-text call. ``response`` is the Pydantic-dumped result,
+    structured call; the literal ``"text"`` / ``"stream"`` for a buffered or
+    streamed plain-text call; and ``"tools"`` / ``"tools-stream"`` for a
+    buffered or streamed tool turn (``"tools+<Name>"`` when a compose schema
+    was supplied). Nothing branches on the value — it is a grep key. ``response`` is the Pydantic-dumped result,
     the accumulated text, or ``None``.
 
     ``prompt`` is the request as the caller passed it: either the plain string

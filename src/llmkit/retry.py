@@ -199,7 +199,8 @@ class RetryPolicy:
     Realizes the "transient retries are on by default" opinion: the call
     functions (:func:`~llmkit.structured_llm_call`,
     :func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`,
-    and the sync wrapper) retry the ``retry_on`` / ``validation_retry_on``
+    :func:`~llmkit.tool_llm_call`, :func:`~llmkit.tool_llm_call_stream`,
+    and the sync wrappers) retry the ``retry_on`` / ``validation_retry_on``
     errors with bounded full-jitter backoff, without the caller wrapping
     every call.
 
@@ -514,7 +515,9 @@ async def with_retries_stream[T](
     in whatever frame is driving it, so the frame count depends on how many
     generators sit between here and the consumer. The default ``2`` is correct
     when the consumer iterates this generator directly; a wrapper that re-yields
-    from it (``text_llm_call_stream`` does) adds one frame and passes ``3``.
+    from it (``text_llm_call_stream`` and ``tool_llm_call_stream`` both do)
+    adds one frame and passes ``3``. It is chosen per call site, not inherited:
+    a second wrapper's correct value is not implied by the first one's.
     Getting this wrong does not fail loudly — it blames a line of llmkit for the
     caller's double-wrap, and collapses the default warning filter's
     per-call-site de-duplication onto that one line, so a host with two distinct
@@ -615,7 +618,8 @@ async def with_retries[T](
 
         The call functions (:func:`~llmkit.structured_llm_call`,
         :func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`,
-        and the sync wrapper) **already retry internally** by default. Wrapping
+        :func:`~llmkit.tool_llm_call`, :func:`~llmkit.tool_llm_call_stream`,
+        and the sync wrappers) **already retry internally** by default. Wrapping
         one of them in :func:`with_retries` would otherwise multiply the two
         budgets (the ``3 x 3 = 9`` trap). To prevent that, :func:`with_retries`
         detects (via a context variable) when it is running *inside* an
