@@ -520,7 +520,16 @@ async def test_structured_call_does_not_retry_circuit_open_error() -> None:
 
 async def test_streaming_call_does_not_retry_circuit_open_error() -> None:
     """The streaming loop does not retry a pre-first-chunk ``CircuitOpenError``:
-    it is outside the transport/validation sets the loop keys off."""
+    it is outside the transport/validation sets the loop keys off.
+
+    Stated rather than duplicated for ``tool_llm_call_stream``: the
+    classification is one ``isinstance`` against ``policy.retry_on`` /
+    ``policy.validation_retry_on`` inside
+    :func:`~llmkit.retry.with_retries_stream`, and neither set nor that check
+    varies by calling family. The tool lane's distinct retry property — that a
+    whole-round ``ToolArgumentError`` also escapes unretried, which is *not*
+    true of the buffered tool lane — is pinned in ``tests/calls/test_tool_stream.py``.
+    """
     calls = [0]
 
     async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:

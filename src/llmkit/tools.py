@@ -105,6 +105,25 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class TextDeltaEvent:
+    """One chunk of assistant prose from a streamed tool turn.
+
+    The non-terminal item :func:`~llmkit.tool_llm_call_stream` yields. It is a
+    typed event rather than a bare ``str`` because that stream yields a
+    *union*: text as it arrives, then one :class:`ToolCallResult` as the final
+    item. A consumer discriminates on the type — ``isinstance(event,
+    TextDeltaEvent)`` — which a bare string could not support without the
+    caller guessing from position.
+
+    The plain-text stream (:func:`~llmkit.text_llm_call_stream`) keeps yielding
+    ``str``: it has no second shape to distinguish, and wrapping it would break
+    every existing consumer for nothing.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class TokenUsage:
     prompt_tokens: int | None
     completion_tokens: int | None

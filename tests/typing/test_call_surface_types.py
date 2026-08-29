@@ -28,6 +28,7 @@ from llmkit import (
     LLMCallOptions,
     Message,
     ReasoningEffort,
+    TextDeltaEvent,
     ToolCallResult,
     ToolComposeResult,
     ToolDefinition,
@@ -39,6 +40,7 @@ from llmkit import (
     text_llm_call_stream,
     text_llm_call_sync,
     tool_llm_call,
+    tool_llm_call_stream,
     tool_llm_call_sync,
 )
 
@@ -89,6 +91,14 @@ async def _typecheck_prompt_accepts_valid_shapes() -> None:
 
     # Streaming takes the same prompt shapes and keeps its generator return type.
     _ = assert_type(text_llm_call_stream(msgs, feature="t"), AsyncGenerator[str])
+
+    # The streaming tool lane's committed shape, as a type: text events during
+    # the turn, the completed result as the last item. ``assert_type`` is exact,
+    # so widening or narrowing the union fails the gate.
+    _ = assert_type(
+        tool_llm_call_stream(msgs, tools, feature="t"),
+        AsyncGenerator[TextDeltaEvent | ToolCallResult],
+    )
 
 
 async def _typecheck_reasoning_effort_accepts_values() -> None:
@@ -149,6 +159,16 @@ def _typecheck_prompt_rejects_invalid_shapes() -> None:
     _ = structured_llm_call_sync([{"role": "usr", "content": "hi"}], _Out, feature="t")  # pyright: ignore[reportArgumentType]  # mistyped role
 
 
+def _typecheck_streaming_tool_lane_rejects_compose() -> None:
+    # Compose is rejected *at the signature*: ``tool_llm_call_stream`` takes no
+    # ``output_schema``, so the decision is enforced by the type checker rather
+    # than by a runtime raise. Under ``reportUnnecessaryTypeIgnoreComment`` this
+    # ignore becomes a failing warning the moment someone adds the parameter —
+    # which makes it a self-enforcing record of the decision, not a comment.
+    tools = [ToolDefinition("lookup", "", {"type": "object"})]
+    _ = tool_llm_call_stream("hi", tools, feature="t", output_schema=_Out)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+
+
 def test_typecheck_helpers_exist() -> None:
     # Reference the type-check-only helpers so they count as accessed. They are
     # analysed by basedpyright but never executed (they would need a configured
@@ -158,6 +178,7 @@ def test_typecheck_helpers_exist() -> None:
         _typecheck_reasoning_effort_accepts_values,
         _typecheck_temperature_accepts_none,
         _typecheck_prompt_rejects_invalid_shapes,
+        _typecheck_streaming_tool_lane_rejects_compose,
     ):
         assert callable(helper)
 
@@ -165,6 +186,12 @@ def test_typecheck_helpers_exist() -> None:
 def test_public_types_are_exported_and_message_is_a_dict() -> None:
     assert "Message" in llmkit.__all__
     assert "ReasoningEffort" in llmkit.__all__
+    assert "TextDeltaEvent" in llmkit.__all__
+    assert "tool_llm_call_stream" in llmkit.__all__
+    # There is deliberately no sync variant: ``run_sync`` bridges coroutines,
+    # not async generators, exactly as for ``text_llm_call_stream``.
+    assert not hasattr(llmkit, "tool_llm_call_stream_sync")
+    assert not hasattr(llmkit, "text_llm_call_stream_sync")
     # A Message is a plain dict at runtime (TypedDict has no runtime identity).
     message: Message = {"role": "user", "content": "hi"}
     assert message["role"] == "user"

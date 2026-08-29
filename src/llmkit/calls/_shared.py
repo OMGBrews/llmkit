@@ -1,8 +1,8 @@
 """What every call family does once, in one place.
 
-The four families (structured, text, streaming, tool) differ in what one
-*attempt* is; they agree on everything around it. That agreement lives here so
-the next family added does not become a fifth copy:
+The five families (structured, text, streamed text, tool, streamed tool) differ
+in what one *attempt* is; they agree on everything around it. That agreement
+lives here so the next family added does not become another copy:
 
 * :func:`prepare_call` — the per-call resolution every family does before its
   first attempt: merge the options, build the provider exactly once, mint the
@@ -14,7 +14,10 @@ the next family added does not become a fifth copy:
   augmented validation sets;
 * :func:`build_text_record` and :func:`resolve_model_and_provider` — record
   construction shared by the text and streaming surfaces, and the effective
-  model/provider resolution all four record.
+  model/provider resolution every family records;
+* :func:`parse_tool_calls` — narrowing a round's raw provider tool calls,
+  shared by the buffered and streaming tool surfaces so the salvage contract
+  (well-formed calls survive a partly malformed round) is written once.
 
 The **queue-wait protocol** is a cross-module contract worth stating where the
 scaffold lives: every attempt calls
@@ -26,12 +29,13 @@ previous attempt's queueing to an attempt that never queued.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import ResultValidationError, ToolArgumentError
@@ -41,9 +45,10 @@ from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, with_retries
 from llmkit.run_scope import get_run_id
+from llmkit.tools import ToolCall, ToolDefinition
 
 # One logger for the whole call surface, named explicitly rather than via
-# ``__name__`` so the four family modules share a single greppable name.
+# ``__name__`` so every family module shares a single greppable name.
 logger = logging.getLogger("llmkit.calls")
 
 
@@ -125,7 +130,7 @@ def prepare_call(
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
-    The preamble all four families share. Each keyword arrives exactly as the
+    The preamble every family shares. Each keyword arrives exactly as the
     call function received it — :data:`~llmkit.UNSET` when the caller did not
     pass it — and is merged by :func:`~llmkit.options.resolve_call_args`.
 
@@ -171,6 +176,95 @@ async def run_with_policy[T](
         validation_max_attempts=policy.validation_max_attempts,
         validation_retry_on=validation_retry_on,
     )
+
+
+def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> ToolCall:
+    """Narrow LiteLLM's intentionally open tool-call objects at one boundary."""
+    call_id = getattr(raw, "id", None)
+    function = getattr(raw, "function", None)
+    name = getattr(function, "name", None)
+    arguments_raw = getattr(function, "arguments", None)
+    if (
+        not isinstance(call_id, str)
+        or not isinstance(name, str)
+        or not isinstance(arguments_raw, str)
+    ):
+        raise ToolArgumentError(
+            name if isinstance(name, str) else None,
+            call_id if isinstance(call_id, str) else None,
+            arguments_raw if isinstance(arguments_raw, str) else None,
+            "provider returned a malformed tool call",
+        )
+    definition = definitions.get(name)
+    if definition is None:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, f"model requested unknown tool {name!r}"
+        )
+    try:
+        parsed = cast("object", json.loads(arguments_raw))
+    except json.JSONDecodeError as exc:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, "tool arguments are not valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, "tool arguments must be a JSON object"
+        )
+    try:
+        validated = (
+            definition.model.model_validate(parsed) if definition.model is not None else None
+        )
+    except Exception as exc:
+        raise ToolArgumentError(
+            name, call_id, arguments_raw, f"tool arguments failed validation: {exc}"
+        ) from exc
+    return ToolCall(call_id, name, arguments_raw, cast("dict[str, object]", parsed), validated)
+
+
+def parse_tool_calls(
+    raw_calls: list[object], definitions: dict[str, ToolDefinition]
+) -> tuple[list[ToolCall], list[ToolArgumentError]]:
+    """Narrow a round's raw calls per call, not as an all-or-nothing batch.
+
+    Parsing used to be a list comprehension, so the first unparseable call
+    raised out of it and took its well-formed siblings with it. Nothing has
+    executed at this point, which makes that lossy rather than unsafe — but
+    with parallel calls one bad argument string cost the entire round and a
+    re-ask. Each call is narrowed on its own instead, and the failures are
+    returned beside the survivors for :class:`~llmkit.ToolCallResult` to carry.
+
+    The one case that still raises is a round in which **every** call failed:
+    the turn produced nothing actionable, so it stays a whole-round
+    :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
+    budget exactly as before. A round with no calls at all is not a failure —
+    a text-only or compose answer takes that path.
+
+    Public-named inside a private module, the repo's convention for a seam two
+    families share: :func:`~llmkit.tool_llm_call` and
+    :func:`~llmkit.tool_llm_call_stream` both terminate in a
+    :class:`~llmkit.ToolCallResult`, so parsing once here is what keeps the
+    buffered and streamed lanes' salvage semantics from drifting apart. The
+    streaming lane cannot re-ask on the validation budget (a partially consumed
+    stream cannot be restarted), so the all-malformed raise reaches its caller
+    unretried — the contract is the same, its enforcement differs.
+    """
+    parsed: list[ToolCall] = []
+    invalid: list[ToolArgumentError] = []
+    for raw in raw_calls:
+        try:
+            parsed.append(_tool_call_from_raw(raw, definitions))
+        except ToolArgumentError as exc:
+            invalid.append(exc)
+    if invalid and not parsed:
+        raise invalid[0]
+    if invalid:
+        logger.warning(
+            "Dropped %d malformed tool call(s) from a round of %d: %s",
+            len(invalid),
+            len(raw_calls),
+            "; ".join(f"{error.tool_name!r}: {error}" for error in invalid),
+        )
+    return parsed, invalid
 
 
 def resolve_model_and_provider(

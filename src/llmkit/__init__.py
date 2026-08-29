@@ -6,7 +6,8 @@ agnostic call surface across cloud providers (OpenRouter, Google AI Studio,
 Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock) and local Ollama.
 
 This package provides:
-- The structured / plain-text / streaming call functions
+- The structured / plain-text / tool-calling call functions, buffered and
+  streamed
 - Provider switching based on a host-supplied config
 - A process-global async rate limiter shared across all calls
 - Default-on transient-error retries with full-jitter backoff (RetryPolicy)
@@ -40,6 +41,7 @@ from llmkit.calls import (
     text_llm_call_stream,
     text_llm_call_sync,
     tool_llm_call,
+    tool_llm_call_stream,
     tool_llm_call_sync,
 )
 from llmkit.capture import (
@@ -108,6 +110,7 @@ from llmkit.run_scope import (
     set_run_id,
 )
 from llmkit.tools import (
+    TextDeltaEvent,
     TokenUsage,
     ToolCall,
     ToolCallResult,
@@ -171,6 +174,7 @@ __all__ = [
     "text_llm_call_sync",
     "text_llm_call_stream",
     "tool_llm_call",
+    "tool_llm_call_stream",
     "tool_llm_call_sync",
     # Deprecated pre-1.0 alias for ``text_llm_call_stream`` (removed at 1.0).
     "stream_text_with_log",
@@ -192,6 +196,7 @@ __all__ = [
     "ToolCall",
     "ToolCallResult",
     "ToolComposeResult",
+    "TextDeltaEvent",
     "TokenUsage",
     "tool_result_message",
     "TOOL_ERROR_PREFIX",

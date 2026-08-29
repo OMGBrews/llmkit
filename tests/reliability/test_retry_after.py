@@ -331,7 +331,17 @@ async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.Monkey
 @pytest.mark.asyncio
 async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """``text_llm_call_stream`` honours a ``Retry-After`` on a pre-first-chunk
-    failure: the retry waits the server value before delivering the stream."""
+    failure: the retry waits the server value before delivering the stream.
+
+    Covers ``tool_llm_call_stream`` too, and deliberately without a second
+    case: ``Retry-After`` parsing and the sleep that honours it live entirely
+    inside :func:`~llmkit.retry.with_retries_stream`, which both streaming
+    families call with the same policy object. The only parameters that differ
+    between them — ``label``, ``surface``, ``warn_stacklevel`` — do not reach
+    the delay path, and the tool lane's own pre-first-event retry behaviour is
+    pinned in ``test_stream_retry_guard.py``. A duplicate here would exercise
+    the same lines through a longer wrapper.
+    """
     slept: list[float] = []
 
     async def _sleep(delay: float) -> None:

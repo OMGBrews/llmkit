@@ -6,10 +6,11 @@ The single place that talks to LiteLLM (and, for structured output,
 around these helpers; this module owns provider routing, the rate-limit
 semaphore, structured-output mode pinning, and best-effort cost extraction.
 
-It is also the **test seam**: unit tests patch these three coroutines
-(``acompletion_structured`` / ``acompletion_text`` / ``astream_text``) so
-the real call-function bodies — logging, retry, content coercion — still
-run over a faked provider response (see ``tests/_support`` ``patch_llm``).
+It is also the **test seam**: unit tests patch these entry points
+(``acompletion_structured`` / ``acompletion_text`` / ``acompletion_tools`` /
+``astream_text`` / ``astream_tools``) so the real call-function bodies —
+logging, retry, content coercion — still run over a faked provider response
+(see ``tests/_support`` ``patch_llm``).
 
 **Every reach into this module is a *function-local* ``import
 llmkit._litellm as _litellm``** (the call modules under :mod:`llmkit.calls`
@@ -38,7 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
+from dataclasses import dataclass, field
 from typing import cast
 
 import instructor
@@ -599,8 +601,13 @@ async def acompletion_text(
     return _coerce_text_content(content), _response_cost(response)
 
 
-def _usage_counts(response: ModelResponse) -> tuple[int | None, int | None, int | None]:
-    """Extract portable usage fields without trusting a provider-specific model."""
+def _usage_counts(response: object) -> tuple[int | None, int | None, int | None]:
+    """Extract portable usage fields without trusting a provider-specific model.
+
+    Typed ``object`` rather than ``ModelResponse`` because it is pure
+    ``getattr``: the streaming lane hands it a ``ModelResponseStream`` frame or
+    the stream wrapper itself, neither of which is a ``ModelResponse``.
+    """
     usage = getattr(response, "usage", None)
     prompt = getattr(usage, "prompt_tokens", None)
     completion = getattr(usage, "completion_tokens", None)
@@ -661,6 +668,214 @@ async def acompletion_tools(
         getattr(response.choices[0], "finish_reason", None),
         _usage_counts(response),
         _response_cost(response),
+    )
+
+
+@dataclass
+class _ToolCallFragments:
+    """One streamed tool call, accumulated across chunks by its ``index``.
+
+    LiteLLM's Anthropic and Gemini adapters both keep a *cumulative* index over
+    a turn's tool calls, so the index is the join key: the id and the function
+    name arrive once (usually on the fragment that opens the call) and the
+    argument string arrives in one or more pieces that concatenate in order.
+    """
+
+    id: str | None = None
+    name: str | None = None
+    arguments: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _StreamedFunction:
+    name: str | None
+    arguments: str
+
+
+@dataclass(frozen=True)
+class _StreamedToolCall:
+    """An assembled tool call in the attribute shape the parser narrows.
+
+    :func:`~llmkit.calls._shared.parse_tool_calls` reads ``.id``,
+    ``.function.name`` and ``.function.arguments`` off whatever the transport
+    hands it, and rejects anything that is not a ``str`` as a malformed call.
+    Assembling into this shape rather than a dict is what lets the streamed and
+    buffered lanes share one parser — and keeps a call whose id or name never
+    arrived an honest ``ToolArgumentError`` rather than a silent default.
+    """
+
+    id: str | None
+    function: _StreamedFunction
+
+
+@dataclass(frozen=True)
+class StreamedToolTurn:
+    """Everything but the prose from a streamed tool turn.
+
+    The final item :func:`astream_tools` yields, after the last text delta:
+    an async generator cannot ``return`` a value, so the assembled turn is a
+    terminal *yield* of a distinct type. Mirrors what
+    :func:`acompletion_tools` returns as a tuple.
+    """
+
+    raw_calls: list[object]
+    stop_reason: str | None
+    usage: tuple[int | None, int | None, int | None]
+    approximate_cost: float | None
+
+
+def _absorb_tool_fragments(
+    chunk: ModelResponseStream, fragments: dict[int, _ToolCallFragments]
+) -> None:
+    """Merge one chunk's tool-call deltas into the per-index accumulator.
+
+    Deliberately total-getattr rather than typed: LiteLLM annotates
+    ``Delta.tool_calls`` loosely and providers differ in which fields a given
+    fragment carries (Gemini sends a complete argument JSON in one fragment;
+    Anthropic and the OpenAI-compatible routes split it). Anything missing is
+    skipped rather than defaulted, so a call that never received an id or a
+    name stays malformed for the parser to reject.
+    """
+    if not chunk.choices:
+        return
+    delta: Delta = chunk.choices[0].delta
+    raw_calls = cast("object", getattr(delta, "tool_calls", None))
+    if not isinstance(raw_calls, list):
+        return
+    for position, raw in enumerate(cast("list[object]", raw_calls)):
+        index = getattr(raw, "index", None)
+        # A provider that omits ``index`` on a single-call turn falls back to
+        # the fragment's position within this chunk, which is the same key for
+        # the common one-call case and never merges two distinct calls.
+        key = index if isinstance(index, int) else position
+        fragment = fragments.setdefault(key, _ToolCallFragments())
+        call_id = getattr(raw, "id", None)
+        if isinstance(call_id, str) and call_id and fragment.id is None:
+            fragment.id = call_id
+        function = getattr(raw, "function", None)
+        name = getattr(function, "name", None)
+        if isinstance(name, str) and name and fragment.name is None:
+            fragment.name = name
+        arguments = getattr(function, "arguments", None)
+        if isinstance(arguments, str) and arguments:
+            fragment.arguments.append(arguments)
+
+
+def _assemble_tool_calls(fragments: dict[int, _ToolCallFragments]) -> list[object]:
+    """Close the accumulator into parser-shaped calls, in provider order."""
+    return [
+        _StreamedToolCall(
+            id=fragment.id,
+            function=_StreamedFunction(
+                name=fragment.name,
+                # A tool that takes no arguments streams no argument fragments
+                # on some routes, where the buffered lane receives ``"{}"``.
+                # Normalising here keeps the two lanes' parse results identical;
+                # a *truncated* argument stream is not affected, since partial
+                # JSON is non-empty and still fails to parse.
+                arguments="".join(fragment.arguments) or "{}",
+            ),
+        )
+        for _index, fragment in sorted(fragments.items())
+    ]
+
+
+def _chunk_finish_reason(chunk: ModelResponseStream) -> str | None:
+    """The first choice's ``finish_reason``, or ``None`` on a choice-less frame."""
+    if not chunk.choices:
+        return None
+    reason = cast("object", getattr(chunk.choices[0], "finish_reason", None))
+    return reason if isinstance(reason, str) else None
+
+
+async def astream_tools(
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    tool_choice: ToolChoice | None,
+    temperature: float | None,
+    model: str | None,
+    max_tokens: int | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
+    provider: LLMProviderInterface | None = None,
+) -> AsyncGenerator[str | StreamedToolTurn]:
+    """Stream a tool-enabled turn: text deltas, then one :class:`StreamedToolTurn`.
+
+    The streaming sibling of :func:`acompletion_tools`, sharing its
+    ``tool_choice`` guard: a route whose provider declares no ``tool_choice``
+    support raises before any request, so the streaming surface cannot
+    silently accept what the buffered one rejects.
+
+    Unlike :func:`astream_text` this **does** request
+    ``stream_options={"include_usage": True}``, so the turn's token usage
+    reaches the terminal :class:`~llmkit.ToolCallResult`, the log record's
+    ``usage`` field, and the TPM limiter's debit — the tool lane records usage
+    and a streamed tool turn should not be the one that does not.
+
+    The rate-limit slot is released **before** the terminal yield: a consumer
+    parked on the assembled result (the idiomatic stopping point) is running
+    its own tools, and holding a per-provider concurrency slot across that is
+    exactly the deadlock the limiter exists to avoid.
+    """
+    provider = provider if provider is not None else build_provider()
+    if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
+        raise ValueError(f"{provider.name} does not support tool_choice on this route")
+    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    request_kwargs = _completion_request_kwargs(provider, effort, model)
+    choice: object = tool_choice
+    if isinstance(tool_choice, ToolName):
+        choice = {"type": "function", "function": {"name": tool_choice.value}}
+    fragments: dict[int, _ToolCallFragments] = {}
+    stop_reason: str | None = None
+    usage_source: object = None
+    cost: float | None = None
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
+        resp = await _acompletion(
+            model=provider.litellm_model(model),
+            messages=_messages(prompt),
+            tools=[definition.to_litellm() for definition in tools],
+            **({"tool_choice": choice} if choice is not None else {}),
+            **({"temperature": temperature} if temperature is not None else {}),
+            stream=True,
+            stream_options={"include_usage": True},
+            **request_kwargs,
+            **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+        )
+        stream = cast("CustomStreamWrapper", resp)
+        try:
+            async for chunk in stream:
+                _absorb_tool_fragments(chunk, fragments)
+                reason = _chunk_finish_reason(chunk)
+                if reason is not None:
+                    stop_reason = reason
+                # ``include_usage`` puts usage on a *final* frame that usually
+                # carries no choices; keep the last frame that has any, and
+                # fall back to the wrapper's own accumulation below.
+                if getattr(chunk, "usage", None) is not None:
+                    usage_source = chunk
+                chunk_cost = _response_cost(chunk)
+                if chunk_cost is not None:
+                    cost = chunk_cost
+                delta = _chunk_delta_text(chunk)
+                if delta:
+                    yield delta
+        except Exception as e:
+            # Same re-ownership as ``astream_text``: a 503 can surface
+            # mid-iteration, after ``_acompletion`` has already returned.
+            normalized = normalize_service_unavailable(e)
+            if normalized is not e:
+                raise normalized from e
+            raise
+        if usage_source is None:
+            usage_source = stream
+        slot.record_tokens(_total_tokens(usage_source))
+        if cost is None:
+            cost = _response_cost(stream)
+    yield StreamedToolTurn(
+        raw_calls=_assemble_tool_calls(fragments),
+        stop_reason=stop_reason,
+        usage=_usage_counts(usage_source),
+        approximate_cost=cost,
     )
 
 

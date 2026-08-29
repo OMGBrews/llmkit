@@ -100,11 +100,14 @@ from llmkit import (
     ChatMessage,
     LLMProviderInterface,
     Provider,
+    TextDeltaEvent,
+    ToolCallResult,
     ToolDefinition,
     ToolName,
     model_from_json_schema,
     structured_llm_call,
     tool_llm_call,
+    tool_llm_call_stream,
     tool_result_message,
 )
 from llmkit.providers import make_provider
@@ -748,3 +751,111 @@ async def test_vertex_tool_schema_roundtrip_live() -> None:
         Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
     )
     await _assert_unnormalised_schema_roundtrip(provider)
+
+
+async def _assert_tool_stream_roundtrip(provider: LLMProviderInterface) -> None:
+    """Measure what only a live provider can settle about the streamed lane.
+
+    Three claims that no mock can establish, because each is a property of the
+    provider's own wire behaviour:
+
+    * **text and tool-call deltas interleave cleanly** — prose arrives as
+      events and the tool call still assembles from its fragments, rather than
+      one starving the other;
+    * **argument fragments reassemble into valid JSON** — the cumulative-index
+      accumulation is measured against however this provider actually splits
+      them (Gemini sends one complete fragment; Anthropic splits);
+    * **``stream_options={"include_usage": True}`` is honoured** — the terminal
+      result carries real token counts, which is what keeps the log record's
+      ``usage`` and the TPM debit meaningful on this lane.
+
+    The prompt asks for prose *and* a tool call so the interleaving has
+    something to interleave; ``tool_choice`` is left ``"auto"`` for the same
+    reason, since forcing a call suppresses the prose on both families.
+    """
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    deltas: list[str] = []
+    result: ToolCallResult | None = None
+    async for event in tool_llm_call_stream(
+        "Say one short sentence about what you are about to do, then use the add"
+        + " tool to calculate 2 plus 3.",
+        [add],
+        feature="integration-tool-stream-smoke",
+        label=provider.name,
+        provider=provider,
+        max_tokens=512,
+    ):
+        if isinstance(event, TextDeltaEvent):
+            # Ordering is part of the contract: no text may follow the result.
+            assert result is None, "a text delta arrived after the terminal result"
+            deltas.append(event.text)
+        else:
+            assert result is None, "more than one terminal result was yielded"
+            result = event
+
+    assert result is not None, "the stream ended without yielding a result"
+    # The tool call survived the streamed transport and validated locally.
+    assert len(result.tool_calls) == 1, result
+    call = result.tool_calls[0]
+    assert call.name == "add"
+    assert call.validated == _AdditionArgs(left=2, right=3)
+    assert not result.invalid_calls
+    # Prose really did stream as events rather than arriving in one blob at the
+    # end — the whole point of the lane.
+    assert deltas, "no text deltas arrived; the interleaving claim is unmeasured"
+    assert result.text == "".join(deltas)
+    # ``include_usage`` was honoured: real counts, not the nulls a stream
+    # reports without it.
+    assert result.usage.total_tokens is not None and result.usage.total_tokens > 0, result.usage
+    assert result.usage.prompt_tokens is not None and result.usage.prompt_tokens > 0, result.usage
+
+
+@pytest.mark.asyncio
+async def test_anthropic_tool_stream_roundtrip_live() -> None:
+    provider = make_provider(
+        Provider.ANTHROPIC, model=_ANTHROPIC_MODEL, **_live_credentials(Provider.ANTHROPIC)
+    )
+    await _assert_tool_stream_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_vertex_tool_stream_roundtrip_live() -> None:
+    provider = make_provider(
+        Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    await _assert_tool_stream_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_vertex_forced_tool_stream_reports_usage_live() -> None:
+    """A forced tool call streams no prose — and must still report usage.
+
+    The tool-only turn is the case where the terminal result is the *only*
+    yielded item, so nothing has reached the consumer before it. It is also
+    where ``include_usage`` matters most: without it this turn would log null
+    usage and debit the token limiter nothing at all.
+    """
+    provider = make_provider(
+        Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    events = [
+        event
+        async for event in tool_llm_call_stream(
+            "Use the add tool to calculate 2 plus 3.",
+            [add],
+            feature="integration-tool-stream-smoke",
+            label="vertex-forced",
+            provider=provider,
+            tool_choice=ToolName("add"),
+            max_tokens=256,
+        )
+    ]
+
+    assert len(events) == 1, events
+    result = events[0]
+    assert isinstance(result, ToolCallResult)
+    assert result.text is None
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].validated == _AdditionArgs(left=2, right=3)
+    assert result.usage.total_tokens is not None and result.usage.total_tokens > 0

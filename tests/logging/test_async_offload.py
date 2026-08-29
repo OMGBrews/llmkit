@@ -5,7 +5,8 @@ Pins the July-2026 audit fix for blocking log I/O on the async hot path:
 * every buffered call's record — and a *cleanly finished* stream's — is
   written on a worker thread, never the event loop, while the abandoned
   stream deliberately stays synchronous (suspending while ``GeneratorExit``
-  unwinds risks losing the truncation-witness record);
+  unwinds risks losing the truncation-witness record). Both streaming
+  families are covered, because each carries its own copy of that branch;
 * the ordering contracts survive the offload: the record and the written
   path are captured before the call returns, and a caller cancelled
   mid-write still gets the record on disk;
@@ -18,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
@@ -120,6 +122,78 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
     assert len(sink.records) == 2
     clean_thread, abandoned_thread = sink.write_threads
     assert clean_thread != threading.get_ident()
+    assert abandoned_thread == threading.get_ident()
+    assert sink.records[0].error is None
+    assert sink.records[1].error == llm_calls.STREAM_ABANDONED_ERROR
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_offloads_a_completed_turn_and_syncs_an_abandoned_one() -> None:
+    """The same two branches on the streaming *tool* lane, which copies them.
+
+    ``calls/tool_stream.py`` does not share ``_stream_once``'s ``finally`` — it
+    has its own — so the text lane's evidence says nothing about it. The extra
+    thing pinned here is the completion latch's effect on the *record path*: a
+    consumer that takes the terminal result and stops must land on the
+    off-loop, error-free branch, not the synchronous abandonment one.
+    """
+    from pydantic import BaseModel
+
+    from llmkit import ToolCallResult, ToolDefinition
+    from llmkit._litellm import StreamedToolTurn
+
+    class _Args(BaseModel):
+        left: int
+
+    tools = [ToolDefinition.from_model("add", _Args, "Add.")]
+
+    @dataclass
+    class _Function:
+        name: str
+        arguments: str
+
+    @dataclass
+    class _RawCall:
+        id: str
+        function: _Function
+
+    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            yield "a"
+            yield "b"
+            yield StreamedToolTurn(
+                raw_calls=[_RawCall("call_1", _Function("add", '{"left": 1}'))],
+                stop_reason="tool_calls",
+                usage=(1, 2, 3),
+                approximate_cost=None,
+            )
+
+        return _gen()
+
+    sink = _ThreadRecordingSink()
+    configure_llm_logging(sink)
+    try:
+        with (
+            patch("llmkit._litellm.astream_tools", side_effect=_fake_stream),
+            patch("llmkit.providers.build_provider", return_value=provider_mock()),
+        ):
+            # Took the result and stopped → a completed call, off-loop write.
+            stream = llm_calls.tool_llm_call_stream("hi", tools, feature="test")
+            async for event in stream:
+                if isinstance(event, ToolCallResult):
+                    break
+            await stream.aclose()
+            # Left mid-prose → a real abandonment, synchronous write.
+            early = llm_calls.tool_llm_call_stream("hi", tools, feature="test")
+            async for _event in early:
+                break
+            await early.aclose()
+    finally:
+        configure_llm_logging(LocalYamlLogSink())
+
+    assert len(sink.records) == 2
+    completed_thread, abandoned_thread = sink.write_threads
+    assert completed_thread != threading.get_ident()
     assert abandoned_thread == threading.get_ident()
     assert sink.records[0].error is None
     assert sink.records[1].error == llm_calls.STREAM_ABANDONED_ERROR

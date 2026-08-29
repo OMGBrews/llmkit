@@ -18,14 +18,17 @@ The families:
 * :mod:`~llmkit.calls.text` — buffered plain text;
 * :mod:`~llmkit.calls.stream` — streamed plain text;
 * :mod:`~llmkit.calls.tool` — one tool-enabled turn;
-* ``_shared`` — what all four do once per call, so a fifth family would not
-  become a fifth copy.
+* :mod:`~llmkit.calls.tool_stream` — one tool-enabled turn, streamed: text
+  deltas, then the same completed result;
+* ``_shared`` — what every family does once per call, so the next one added
+  does not become another copy.
 """
 
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR, stream_text_with_log, text_llm_call_stream
 from llmkit.calls.structured import structured_llm_call, structured_llm_call_sync
 from llmkit.calls.text import text_llm_call, text_llm_call_sync
 from llmkit.calls.tool import tool_llm_call, tool_llm_call_sync
+from llmkit.calls.tool_stream import tool_llm_call_stream
 
 __all__ = [
     "STREAM_ABANDONED_ERROR",
@@ -36,5 +39,6 @@ __all__ = [
     "text_llm_call_stream",
     "text_llm_call_sync",
     "tool_llm_call",
+    "tool_llm_call_stream",
     "tool_llm_call_sync",
 ]

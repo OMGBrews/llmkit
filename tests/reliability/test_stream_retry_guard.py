@@ -13,6 +13,11 @@ unretried) does not multiply the two budgets. These pin:
 * without an outer loop, the stream's own retry behaviour is unchanged; and
 * the guard flag never leaks into the consumer's context — not between
   chunks, not after a full drain, not after an early break.
+
+``tool_llm_call_stream`` re-yields from the same loop and so participates in
+the same guard. What is *not* shared is its ``warn_stacklevel``: that is a
+per-call-site constant chosen by each wrapper, so the last two tests pin it
+independently rather than inheriting the text lane's evidence.
 """
 
 from __future__ import annotations
@@ -276,3 +281,121 @@ async def test_guard_flag_clear_after_early_break() -> None:
         await stream.aclose()
 
     assert _retry_scope.get() is None
+
+
+# --- the streaming tool lane: same guard, its own wrapper frame -----------
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
+    """``tool_llm_call_stream`` picks its own ``warn_stacklevel``, so pin it too.
+
+    The value is a per-call-site constant, not shared code: the text lane's
+    ``3`` proves nothing about a second wrapper that also re-yields. Getting it
+    wrong does not fail loudly — it blames a line of llmkit for the caller's
+    double-wrap and collapses every host's warning onto that one line — which
+    is exactly why it is asserted rather than assumed.
+    """
+    from pydantic import BaseModel
+
+    from llmkit import ToolDefinition
+
+    class _Args(BaseModel):
+        left: int
+
+    tools = [ToolDefinition.from_model("add", _Args, "Add.")]
+
+    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        raise TimeoutError("always")
+        # Unreachable by design; makes this an async generator.
+        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
+
+    async def _site_one() -> list[object]:
+        return [
+            e
+            async for e in llm_calls.tool_llm_call_stream(
+                "a", tools, feature="t", retry=_NO_BACKOFF
+            )
+        ]
+
+    async def _site_two() -> list[object]:
+        return [
+            e
+            async for e in llm_calls.tool_llm_call_stream(
+                "b", tools, feature="t", retry=_NO_BACKOFF
+            )
+        ]
+
+    caught: list[warnings.WarningMessage] = []
+    with quiet_logging(), patch("llmkit._litellm.astream_tools", _transport):
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("default")
+            for site in (_site_one, _site_two):
+                with contextlib.suppress(TimeoutError):
+                    _ = await with_retries(site, max_attempts=2, retry_on=(TimeoutError,))
+            caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
+
+    assert len(caught) == 2, [f"{w.filename}:{w.lineno}" for w in caught]
+    assert all(w.filename == __file__ for w in caught), [w.filename for w in caught]
+    assert len({w.lineno for w in caught}) == 2
+    # The warning names this surface, not the text one it was modelled on.
+    assert all("tool_llm_call_stream" in str(w.message) for w in caught)
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_retries_before_the_first_event_and_not_after() -> None:
+    """The transport-only budget, on the lane whose terminal item is a result.
+
+    Pre-first-event failures exhaust the budget; a failure after any event has
+    reached the consumer propagates unretried, because a partly consumed stream
+    cannot be restarted — the same contract the text stream documents.
+    """
+    from pydantic import BaseModel
+
+    from llmkit import ToolDefinition
+
+    class _Args(BaseModel):
+        left: int
+
+    tools = [ToolDefinition.from_model("add", _Args, "Add.")]
+    attempts = 0
+
+    def _failing_before(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            nonlocal attempts
+            attempts += 1
+            raise TimeoutError("pre-first")
+            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
+
+        return _gen()
+
+    with quiet_logging(), patch("llmkit._litellm.astream_tools", side_effect=_failing_before):
+        with pytest.raises(TimeoutError):
+            _ = [
+                e
+                async for e in llm_calls.tool_llm_call_stream(
+                    "a", tools, feature="t", retry=_NO_BACKOFF
+                )
+            ]
+    assert attempts == _NO_BACKOFF.max_attempts
+
+    attempts = 0
+
+    def _failing_after(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        async def _gen() -> AsyncIterator[object]:
+            nonlocal attempts
+            attempts += 1
+            yield "some prose"
+            raise TimeoutError("mid-stream")
+
+        return _gen()
+
+    with quiet_logging(), patch("llmkit._litellm.astream_tools", side_effect=_failing_after):
+        with pytest.raises(TimeoutError):
+            _ = [
+                e
+                async for e in llm_calls.tool_llm_call_stream(
+                    "a", tools, feature="t", retry=_NO_BACKOFF
+                )
+            ]
+    assert attempts == 1
