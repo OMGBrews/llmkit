@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The four largest modules are now subpackages, and the import cycle is
+  gone.** `structured_output.py` (1180 lines), `rate_limiting.py` (1882),
+  `json_schema.py` (1455) and `logging.py` (1006) each held several separable
+  concerns behind one name, and in the rate limiter's case the layout hid one
+  entirely — the circuit breaker sat between a 215-line token bucket and a
+  511-line limiter class. Each is now a package of modules named for what they
+  own: `llmkit/calls/` (one module per call family plus the scaffold they
+  share), `llmkit/rate_limiting/` (tuning, observability, buckets, adaptive
+  gates, breaker, outcome feedback, limiter), `llmkit/logging/` (record, sink,
+  the shipped YAML sink, the sink registry, path safety, the dumper) and
+  `llmkit/json_schema/` (the build side and the emitted model's runtime side).
+
+  **Purely internal**: every name in `llmkit.__all__` keeps importing from
+  `llmkit` unchanged, and `llmkit.providers`, `llmkit.retry`,
+  `llmkit.rate_limiting` and `llmkit.logging` all keep working as import paths.
+  The one removal is `llmkit.structured_output`, which was never a documented
+  import path — its nine public names are re-exported from `llmkit` as before,
+  and the module itself is a hard cut rather than a re-export shim, matching
+  the deep-import cut recorded under 0.2.0.
+
+- **The streaming retry loop moved into `llmkit.retry`** as
+  `with_retries_stream`, beside the awaitable one. `text_llm_call_stream` had
+  hand-rolled its own copy of the nested-retry guard, the exhaustion log line
+  and the backoff call. Behaviour is unchanged, including the two ways the
+  streaming loop deliberately differs: retry applies only before the first
+  chunk, and its double-wrap warning additionally requires the failure to have
+  been retryable.
+
+- **`import llmkit` no longer closes a static import cycle.** The call layer
+  reaches the LiteLLM transport through `import llmkit._litellm as _litellm`
+  instead of `from llmkit import _litellm`; the import stays function-local, so
+  `import llmkit` still leaves litellm out of `sys.modules`, and the module
+  object is still bound by attribute, so patching the transport still works.
+  With the cycle gone, the package's only file-level pyright rule waiver is
+  removed.
+
+### Fixed
+
+- `LLMCallRecord`'s docstring documented nine of its eighteen fields; the tool
+  lane's `tools`, `tool_calls` and `usage` had never been described anywhere,
+  though the YAML body has always written them. `llmkit._types` claimed to
+  import nothing from `llmkit` while importing two TypedDicts from
+  `llmkit.tools`; those two now live in `_types` and `tools` imports them back,
+  so the claim is true and the leaf no longer drags pydantic into its
+  importers. `llmkit.sync` advised callers to "prefer the a-prefixed async
+  variants", which have never existed.
+
 ## [0.9.0] — 2026-08-21
 
 ### Added

@@ -16,6 +16,15 @@ reimplement transport. Design promises: [PRINCIPLES.md](PRINCIPLES.md).
 Layout: `src/llmkit/` is the package; `tests/` is the offline suite;
 `tests/integration/` is the live half (see below before touching it).
 
+Inside the package, the five subpackages are where the substance lives and each
+one's `__init__.py` docstring names its own modules: `calls/` (the public call
+surface, one module per family), `providers/` (one per vendor behind a single
+dispatch), `rate_limiting/`, `logging/` and `json_schema/`. The rest are single
+modules: `retry`, `exceptions`, `options`, `capture`, `run_scope`, `sync`,
+`tools`, `_types`, and `_litellm` (the only place that talks to LiteLLM). Start
+from the subpackage `__init__` when you need the design rationale — that is
+where it is kept.
+
 ## Setup
 
 ```bash

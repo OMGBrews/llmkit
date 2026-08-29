@@ -32,18 +32,27 @@ basedpyright runs in its `recommended` tier (stricter than the `standard`
 default, and at least as strict as the editor extension's defaults) and is clean
 at **0 errors, 0 warnings with no baseline** — there is no `.basedpyright/baseline.json`,
 so **any new finding fails CI**. The untyped LiteLLM/instructor surface is given
-precise types at the boundary; the suppressions that remain are inline
-`# pyright: ignore[<rule>]` comments (plus one file-level rule disable in
-`__init__.py` for the package's deferred-import test seam), each naming the
-specific rule it silences. Two conventions govern them: a suppression forced by
-an untyped or loosely-typed **third-party surface** carries a `raw-*` tag naming
-the culprit (`raw-llm` for LiteLLM/instructor/yaml, `raw-pydantic` for pydantic's
-`Any`-typed seams) — these cluster in `_litellm.py`, `logging.py`, and
-`json_schema.py`; the rest (pytest fixtures invoked by name, test helpers,
-runtime guards at a public boundary) carry a short trailing reason comment
-instead. Prefer real types; when you must suppress, name the rule and say why
-(with a `raw-*` tag when a third-party type forces it), and never suppress to
-quiet a finding in new code that could be typed precisely.
+precise types at the boundary; every suppression that remains is an inline
+`# pyright: ignore[<rule>]` comment naming the specific rule it silences —
+there are no file-level rule disables anywhere in the package. Two conventions
+govern them: a suppression forced by an untyped or loosely-typed **third-party
+surface** carries a `raw-*` tag naming the culprit (`raw-llm` for
+LiteLLM/instructor/yaml, `raw-pydantic` for pydantic's `Any`-typed seams) —
+these cluster in `_litellm.py`, `json_schema/emitted.py`, and `logging/`; the
+rest (pytest fixtures invoked by name, test helpers, runtime guards at a public
+boundary) carry a short trailing reason comment instead. Prefer real types; when
+you must suppress, name the rule and say why (with a `raw-*` tag when a
+third-party type forces it), and never suppress to quiet a finding in new code
+that could be typed precisely.
+
+One structural rule falls out of `reportPrivateUsage` being an **error** in
+`src`: it fires on a leading-underscore symbol used outside its declaring
+module, for an import *and* for attribute access. So a symbol that crosses a
+module boundary carries a public name even when it is package-internal, and
+privacy is expressed by the *module* name instead — `llmkit/_types.py`,
+`llmkit/rate_limiting/_tuning.py` and friends hold public-named symbols. What
+is public is what `llmkit.__all__` and each subpackage's `__all__` list, not
+whatever happens to lack an underscore.
 
 Please run them locally before opening a PR. New behavior needs a test.
 
