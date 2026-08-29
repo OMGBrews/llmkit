@@ -58,6 +58,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ComposeUnsupportedError`; full documentation is README's "Tool calls with a
   structured final answer".
 
+- **`get_log_sink()` — read back the installed log sink.** `configure_llm_logging`
+  had no counterpart, so a host installing a sink temporarily (a test harness, an
+  eval run capturing records) had to read the private module attribute to know
+  what to put back. When the logging module became a package that attribute
+  moved, and every such helper silently restored logging to *off* with no error
+  anywhere. `get_log_sink()` returns the installed `LogSink | None`, so the
+  save/restore idiom is correct in every starting state — including logging
+  deliberately disabled (`None`) and the default sink, which is a specific
+  instance holding its own resolved directory rather than something
+  `LocalYamlLogSink()` reconstructs. Documented in README's "Write your own
+  `LogSink`".
+
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is

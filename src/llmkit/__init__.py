@@ -66,6 +66,7 @@ from llmkit.logging import (
     LogSink,
     configure_llm_logging,
     default_log_dir,
+    get_log_sink,
 )
 from llmkit.options import (
     DEFAULT_TEMPERATURE,
@@ -138,6 +139,7 @@ __all__ = [
     "LogSink",
     "LocalYamlLogSink",
     "configure_llm_logging",
+    "get_log_sink",
     "default_log_dir",
     # Run scoping (tag every record + index line with a run id)
     "RUN_ID_ENV_VAR",

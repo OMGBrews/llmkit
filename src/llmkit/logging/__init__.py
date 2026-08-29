@@ -21,8 +21,8 @@ they own:
 * :mod:`~llmkit.logging.record` — :class:`LLMCallRecord`, the data contract;
 * :mod:`~llmkit.logging.sink` — the :class:`LogSink` protocol;
 * :mod:`~llmkit.logging.local_yaml` — the shipped file sink;
-* :mod:`~llmkit.logging.registry` — the configured sink and
-  :func:`write_llm_log`;
+* :mod:`~llmkit.logging.registry` — the configured sink, its
+  :func:`get_log_sink` reader, and :func:`write_llm_log`;
 * ``_paths`` — log-directory resolution and filename safety;
 * ``_yaml`` — the safe-load-able dumper;
 * ``_latch`` — the warn-once latch both the sink and the registry use.
@@ -35,7 +35,7 @@ from llmkit.logging.local_yaml import (
     LocalYamlLogSink,
 )
 from llmkit.logging.record import INDEX_FILENAME, LLMCallRecord
-from llmkit.logging.registry import configure_llm_logging, write_llm_log
+from llmkit.logging.registry import configure_llm_logging, get_log_sink, write_llm_log
 from llmkit.logging.sink import LogSink
 
 __all__ = [
@@ -48,5 +48,6 @@ __all__ = [
     "LogSink",
     "configure_llm_logging",
     "default_log_dir",
+    "get_log_sink",
     "write_llm_log",
 ]

@@ -643,6 +643,21 @@ configure_llm_logging(StructuredStdoutSink())   # pass None to disable logging e
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
+**Installing a sink temporarily: `get_log_sink()`.** `configure_llm_logging` sets; `get_log_sink()` reads back what is installed (`LogSink | None`). Save and restore around a scope rather than guessing what to put back:
+
+```python
+from llmkit import configure_llm_logging, get_log_sink
+
+previous = get_log_sink()
+configure_llm_logging(MyCapturingSink())
+try:
+    ...
+finally:
+    configure_llm_logging(previous)
+```
+
+Restoring the returned value is what makes this correct in the two starting states a guess gets wrong: logging deliberately disabled (`None`), and the default sink, which is a *specific instance* carrying its own resolved log directory and housekeeping clock — `configure_llm_logging(LocalYamlLogSink())` puts back an equivalent sink, not the one that was there. Reach for `capture_llm_records()` above when you only want the records; this pair is for genuinely swapping the installed sink.
+
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 
 An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit[otel]` extra; the pluggable seam makes it a non-breaking addition.

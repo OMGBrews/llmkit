@@ -42,6 +42,7 @@ from llmkit import (
     capture_llm_log_paths,
     configure_llm_logging,
     default_log_dir,
+    get_log_sink,
 )
 from llmkit.capture import record_call
 from llmkit.logging import INDEX_FILENAME, write_llm_log
@@ -369,6 +370,61 @@ def test_wrapper_latch_covers_custom_sinks_and_resets_on_configure(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 2
     assert all("LLM log sink raised" in r.message for r in warnings)
+
+
+def test_get_log_sink_reads_back_exactly_what_was_configured() -> None:
+    """The read half of the configuration pair, asserted as an identity — a
+    getter that returned an equivalent-but-different sink would be useless for
+    the save/restore idiom it exists to serve, and ``None`` (logging off) has
+    to survive the round trip as a value rather than degrade to a default."""
+
+    class _MinimalSink:
+        def write(self, record: LLMCallRecord) -> None:  # pyright: ignore[reportUnusedParameter]  # test-helper — record is intentionally ignored
+            ...
+
+    installed = _MinimalSink()
+    try:
+        configure_llm_logging(installed)
+        assert get_log_sink() is installed
+        configure_llm_logging(None)
+        assert get_log_sink() is None
+        file_sink = LocalYamlLogSink()
+        configure_llm_logging(file_sink)
+        assert get_log_sink() is file_sink
+    finally:
+        configure_llm_logging(LocalYamlLogSink())
+
+
+def test_get_log_sink_restores_the_previous_sink_across_a_temporary_swap() -> None:
+    """The documented save/restore idiom, end to end. This is the failure the
+    accessor exists to prevent: a host reading a *private* module attribute
+    (``llmkit.logging._sink`` before this package was split out) silently got
+    ``None`` after the move and restored logging to *off* — no error anywhere.
+    Asserted through the public pair only."""
+
+    class _CapturingSink:
+        def __init__(self) -> None:
+            self.records: list[LLMCallRecord] = []
+
+        def write(self, record: LLMCallRecord) -> None:
+            self.records.append(record)
+
+    outer = LocalYamlLogSink()
+    inner = _CapturingSink()
+    try:
+        configure_llm_logging(outer)
+
+        previous = get_log_sink()
+        configure_llm_logging(inner)
+        try:
+            _ = write_llm_log(_record())
+        finally:
+            configure_llm_logging(previous)
+
+        assert len(inner.records) == 1
+        assert get_log_sink() is outer
+    finally:
+        configure_llm_logging(LocalYamlLogSink())
 
 
 def test_configure_llm_logging_rejects_a_non_sink() -> None:

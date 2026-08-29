@@ -110,6 +110,42 @@ def configure_llm_logging(sink: LogSink | None) -> None:
     _sink_latch.succeeded()
 
 
+def get_log_sink() -> LogSink | None:
+    """Return the sink currently installed, or ``None`` when logging is off.
+
+    The read half of the pair :func:`configure_llm_logging` writes, following
+    the library's ``get_*`` reads / ``configure_*`` sets convention (the
+    :func:`~llmkit.get_rate_limit_config` precedent). It exists so a host that
+    installs a sink *temporarily* — a test harness, an eval run that captures
+    records into its own buffer — can restore what was there before instead of
+    guessing:
+
+    ```python
+    previous = get_log_sink()
+    configure_llm_logging(MySink())
+    try:
+        ...
+    finally:
+        configure_llm_logging(previous)
+    ```
+
+    Restoring the return value is what makes that correct in every starting
+    state, including the two a guess gets wrong: logging deliberately disabled
+    (``None``), and the eagerly-constructed default sink, which is a *specific
+    instance* holding its own resolved log directory and housekeeping clock —
+    ``configure_llm_logging(LocalYamlLogSink())`` puts back an equivalent sink,
+    not the same one.
+
+    Reading the module attribute instead (``llmkit.logging.registry._sink``, or
+    the pre-split ``llmkit.logging._sink``) is what this replaces, and is the
+    reason it is worth a public name: a private attribute that moves — as it
+    did when this package was split out of one module — turns a save/restore
+    helper into a permanent ``configure_llm_logging(None)`` with no error
+    anywhere, caught only by a test that reads the private name too.
+    """
+    return _sink
+
+
 def write_llm_log(record: LLMCallRecord) -> Path | None:
     """Hand ``record`` to the configured sink, swallowing any failure.
 
