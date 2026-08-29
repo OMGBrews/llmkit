@@ -24,6 +24,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
 from llmkit._types import (
+    TOOL_ERROR_PREFIX,
     AssistantToolMessage,
     ChatMessage,
     Message,
@@ -193,6 +194,7 @@ __all__ = [
     "ToolComposeResult",
     "TokenUsage",
     "tool_result_message",
+    "TOOL_ERROR_PREFIX",
     # JSON-schema-dict structured output (build-once-reuse helper)
     "model_from_json_schema",
     # Exception handling

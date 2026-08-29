@@ -97,6 +97,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so cancellation semantics are unchanged. An exception carrying no message now
   records its bare type name instead of a dangling `"<Type>: "`.
 
+- **`tool_result_message(..., is_error=True)` — one convention for a tool that
+  failed.** The tool-result helper was text-only, so every application invented
+  its own error envelope (a JSON wrapper, a bare traceback, a sentence in the
+  result) and the same model recovered differently depending on which one it
+  met. `is_error` is now an optional fourth key on `ToolResultMessage`, omitted
+  entirely when the result is fine — an ordinary tool-result message is
+  byte-identical to before. There is no wire field to carry it (measured
+  against the declared floor, litellm 1.95.0: the Anthropic translation builds
+  its `tool_result` block from the id and content alone, and an
+  OpenAI-compatible route would forward an unknown key to a provider that may
+  reject it), so the transport renders it as the new exported
+  `TOOL_ERROR_PREFIX` on the content and drops the key — one rendering,
+  identical on every provider. The flag stays on the message the caller holds
+  and in the `prompt` the log records. New export: `TOOL_ERROR_PREFIX`.
+
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is

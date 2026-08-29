@@ -32,12 +32,48 @@ class AssistantToolMessage(TypedDict):
     content: str | None
 
 
-class ToolResultMessage(TypedDict):
-    """The application-supplied result of one requested tool call."""
+class _ToolResultMessageFields(TypedDict):
+    """The keys every tool-result message carries; see :class:`ToolResultMessage`."""
 
     role: Literal["tool"]
     tool_call_id: str
     content: str
+
+
+class ToolResultMessage(_ToolResultMessageFields, total=False):
+    """The application-supplied result of one requested tool call.
+
+    ``is_error`` is the optional fourth key: set it when the tool failed, so
+    the model is told the difference between a result and a failure instead of
+    inferring it from prose. Build the message with
+    :func:`~llmkit.tool_result_message` rather than by hand — the key is
+    omitted entirely when the result is fine, so an ordinary tool-result
+    message is exactly the three-key dict it always was.
+
+    It is llmkit's own field, not a wire field. No provider accepts it on the
+    OpenAI-normalized ``{"role": "tool"}`` shape: LiteLLM's Anthropic
+    translation builds its ``tool_result`` block from the id and the content
+    alone (measured against litellm 1.95.0, the declared floor —
+    ``convert_to_anthropic_tool_result``, whose own comment records that the
+    OpenAI shape cannot express the distinction), and an OpenAI-compatible
+    route would forward the unknown key to a provider that may reject it. So
+    the transport renders it into the content as
+    :data:`TOOL_ERROR_PREFIX` and drops the key, which reaches every provider
+    identically; the flag itself stays on the message the caller holds, and in
+    the ``prompt`` the log records, so the provenance keeps the distinction
+    structurally even though the wire cannot.
+    """
+
+    is_error: bool
+
+
+#: What :data:`ToolResultMessage`'s ``is_error`` becomes on the wire: the
+#: content is sent prefixed with this marker. One convention, owned by llmkit
+#: and identical on every provider, so a host does not invent a private JSON
+#: error envelope per application and models do not diverge in how they
+#: recover. Exported so a caller can recognise the marker in a transcript or
+#: strip it before display.
+TOOL_ERROR_PREFIX = "ERROR: "
 
 
 class Message(TypedDict):

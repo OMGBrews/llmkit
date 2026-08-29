@@ -147,6 +147,25 @@ for error in result.invalid_calls:  # what the model got wrong, if anything
 
 `result.to_message()` is built from `tool_calls` alone, so the assistant turn you append names only the calls you can answer — pair each with a `tool_result_message` and the history has no dangling `tool_call_id` for the provider to reject. A round in which **every** requested call is malformed still raises `ToolArgumentError` for the whole round and is re-asked within `RetryPolicy.validation_max_attempts`, exactly as before: there is nothing to salvage, and an empty successful-looking turn would be worse than an error. Dropped calls also appear under `invalid_calls` in the call's log record, so a round that quietly lost one never reads as a clean round.
 
+### Telling the model a tool failed
+
+Tools fail — a timeout, a 500, a lookup that finds nothing. Say so with `is_error=True` instead of inventing an envelope:
+
+```python
+from llmkit import tool_result_message
+
+try:
+    output = run_tool(call)
+except ToolFailed as exc:
+    message = tool_result_message(call.id, f"{exc}", is_error=True)
+else:
+    message = tool_result_message(call.id, output)
+```
+
+Without a standard flag every application invents its own convention — a JSON wrapper, a bare traceback, a sentence in the result — and the same model recovers differently depending on which one it meets. This is the convention, so it doesn't.
+
+**What the model actually receives.** The flag is llmkit's, not the wire's. There is no field to carry it: LiteLLM's Anthropic translation builds its `tool_result` block from the call id and the content alone (measured against `litellm>=1.95.0`, the declared floor — its own source comment records that the OpenAI-normalized shape cannot express the distinction), and an OpenAI-compatible route would forward an unknown key straight to a provider that may reject it. So the transport prefixes the content with `TOOL_ERROR_PREFIX` (`"ERROR: "`, exported so you can recognise or strip it) and drops the key — one rendering, identical on every provider. The flag itself stays on the message you hold and in the `prompt` the log records, so your provenance keeps the distinction structurally even though the wire cannot. Omitting `is_error` sends exactly the three-key message it always did.
+
 ### Tool schemas: hand them over unprocessed
 
 **`ToolDefinition.from_model()` output works on every supported provider as-is. Do not pre-process it.** A Pydantic model with a nested model or an enum renders `$defs` and `$ref` in its JSON Schema, and llmkit forwards `parameters` verbatim — but the transport normalises per provider on the way to the wire. On the Gemini routes (Vertex AI and Google AI Studio) that means `additionalProperties` is stripped, `$defs` is popped, `$ref` targets are inlined, and keywords outside Gemini's `Schema` subset are filtered, so a schema Gemini's API rejects outright when posted raw is accepted through llmkit. Writing your own normalisation layer on top duplicates that work and will drift from it.

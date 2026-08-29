@@ -181,6 +181,30 @@ class ToolComposeResult[T: BaseModel](ToolCallResult):
         return {**super().to_log_dict(), "parsed": self.parsed}
 
 
-def tool_result_message(tool_call_id: str, content: str) -> ToolResultMessage:
-    """Construct a history message containing an application's tool result."""
-    return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+def tool_result_message(
+    tool_call_id: str, content: str, *, is_error: bool = False
+) -> ToolResultMessage:
+    """Construct a history message containing an application's tool result.
+
+    Pass ``is_error=True`` when the tool failed — a timeout, a 500, a lookup
+    that found nothing, an exception you caught — and *content* is the failure
+    text the model should see. Without a standard flag every host invents its
+    own error envelope (a JSON wrapper, a bare traceback, a sentence in the
+    result), and the same model recovers differently depending on which one it
+    meets; this is the one convention, so it does not.
+
+    The flag is llmkit's, not the wire's: no provider accepts an error field on
+    the OpenAI-normalized tool-result shape, so the transport renders it as a
+    :data:`~llmkit._types.TOOL_ERROR_PREFIX` prefix on the content and drops
+    the key (see :class:`~llmkit.ToolResultMessage`). The default omits the key
+    altogether, so an ordinary result is byte-identical to what this returned
+    before the flag existed.
+    """
+    message: ToolResultMessage = {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": content,
+    }
+    if is_error:
+        message["is_error"] = True
+    return message

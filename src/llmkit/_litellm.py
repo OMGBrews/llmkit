@@ -49,7 +49,7 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import TOOL_ERROR_PREFIX, ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitError,
@@ -171,9 +171,36 @@ async def drain_async_logging(*, timeout: float | None) -> None:
         logger.debug("LiteLLM async-logging drain failed", exc_info=True)
 
 
+def _wire_message(message: ChatMessage) -> ChatMessage:
+    """Render llmkit's own message extensions into what LiteLLM can send.
+
+    Today that is exactly one: :class:`~llmkit.ToolResultMessage`'s optional
+    ``is_error``. It has no wire equivalent — LiteLLM's Anthropic translation
+    builds its ``tool_result`` block from the id and content alone (measured
+    against litellm 1.95.0, the declared floor), and an OpenAI-compatible route
+    would forward the unknown key to a provider that may reject it — so the
+    flag becomes a :data:`~llmkit._types.TOOL_ERROR_PREFIX` prefix on the
+    content, which every provider receives identically, and the key is dropped.
+
+    Returns a **new** dict for a message it rewrites: the caller's history is
+    theirs, is what the log records as ``prompt``, and is fed back into the
+    next turn — flattening it in place would strip the flag from the record and
+    double the prefix on the following call.
+    """
+    if message["role"] != "tool" or not message.get("is_error", False):
+        return message
+    return {
+        "role": "tool",
+        "tool_call_id": message["tool_call_id"],
+        "content": f"{TOOL_ERROR_PREFIX}{message['content']}",
+    }
+
+
 def _messages(prompt: str | Sequence[ChatMessage]) -> list[ChatMessage]:
     """Normalise a prompt into LiteLLM's message-list shape."""
-    return [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    return [_wire_message(message) for message in prompt]
 
 
 def _resolve_reasoning_effort(
