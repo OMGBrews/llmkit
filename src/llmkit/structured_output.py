@@ -41,14 +41,7 @@ from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
-from llmkit.retry import (
-    RetryPolicy,
-    _in_active_retry_scope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
-    _retry_scope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
-    _RetryScope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
-    handle_retry_failure,
-    with_retries,
-)
+from llmkit.retry import RetryPolicy, with_retries, with_retries_stream
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
 from llmkit.tools import (
@@ -678,129 +671,30 @@ async def text_llm_call_stream(
     # ``_retry_scope`` reset-around-every-yield dance below exists to solve).
     call_id = uuid.uuid4().hex
 
-    # Nested-retry guard, mirroring ``with_retries``: when an outer llmkit
-    # retry loop is already active (the documented composable path — a host
-    # wrapping stream consumption, since mid-stream errors propagate
-    # unretried), this loop collapses to a single pass so the budgets don't
-    # multiply (the 3 x 3 = 9 trap). The accidental double-wrap — a failure
-    # this policy *would* have retried — warns; an explicit NO_RETRY inner
-    # stays silent. Keyed on the owning task (see ``_in_active_retry_scope``):
-    # a distinct call that only inherited the context across a task boundary is
-    # not collapsed.
-    if _in_active_retry_scope():
-        yielded_any = False
-        try:
-            # ``aclosing`` so an abandoning consumer's close propagates to the
-            # attempt generator *here and now* — its finally then logs the
-            # abandoned record deterministically, not whenever GC finalizes
-            # the suspended generator.
-            async with aclosing(
-                _stream_once(
-                    prompt,
-                    feature=feature,
-                    label=label,
-                    temperature=temperature,
-                    model=model,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    provider=provider,
-                    call_id=call_id,
-                    attempt=1,
-                )
-            ) as attempt_stream:
-                async for chunk in attempt_stream:
-                    yielded_any = True
-                    yield chunk
-            return
-        except Exception as exc:
-            would_have_retried = (
-                retry.max_attempts > 1
-                and not yielded_any
-                and isinstance(exc, (*retry.retry_on, *retry.validation_retry_on))
-            )
-            if would_have_retried:
-                warnings.warn(
-                    f"text_llm_call_stream({tag!r}) is nested inside an already-retrying "
-                    + "llmkit retry loop; this inner layer ran a single pass to avoid "
-                    + "multiplying retry budgets (the outer loop owns the retries). To "
-                    + "drive retries from an outer wrapper around a call function, opt "
-                    + "the inner call out with retry=NO_RETRY.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            raise
+    def _attempt(attempt: int) -> AsyncGenerator[str]:
+        return _stream_once(
+            prompt,
+            feature=feature,
+            label=label,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            call_id=call_id,
+            attempt=attempt,
+        )
 
-    # Mark this loop active (keyed on the owning task) so a nested llmkit retry
-    # layer in the same task collapses to a single pass, exactly as
-    # ``with_retries`` does. An async generator body runs in its *consumer's*
-    # context, so the scope is released around each ``yield`` (and re-armed on
-    # resume): holding it across a suspension would leak it into the consumer's
-    # own llmkit calls between chunks — and, on an early break, leave it set in
-    # their context for good. A generator can resume in a *different* task than
-    # the one it suspended in, so each re-arm installs a fresh ``_RetryScope``
-    # bound to the task resuming it.
-    token = _retry_scope.set(_RetryScope())
-    try:
-        for attempt in range(1, retry.max_attempts + 1):
-            yielded_any = False
-            try:
-                # ``aclosing`` for the same reason as the nested-retry branch
-                # above: an abandoning consumer's close must reach the attempt
-                # generator before this frame unwinds, so its abandoned-stream
-                # log is written deterministically rather than at GC time.
-                async with aclosing(
-                    _stream_once(
-                        prompt,
-                        feature=feature,
-                        label=label,
-                        temperature=temperature,
-                        model=model,
-                        max_tokens=max_tokens,
-                        reasoning_effort=reasoning_effort,
-                        provider=provider,
-                        call_id=call_id,
-                        attempt=attempt,
-                    )
-                ) as attempt_stream:
-                    async for chunk in attempt_stream:
-                        yielded_any = True
-                        _retry_scope.reset(token)
-                        try:
-                            yield chunk
-                        finally:
-                            token = _retry_scope.set(_RetryScope())
-                return
-            except Exception as exc:
-                # A partially-consumed stream can't be restarted, and only the
-                # curated transient set is retryable — so a non-transient error or
-                # a mid-stream failure (chunks already delivered) propagates as-is.
-                # Streaming is plain text (no schema parsing), so it budgets on the
-                # transport ``max_attempts`` only; both transient sets are matched
-                # for completeness so a stray validation error is still treated as
-                # transient rather than escaping unretried.
-                if (
-                    not isinstance(exc, (*retry.retry_on, *retry.validation_retry_on))
-                    or yielded_any
-                ):
-                    raise
-                # Pre-first-chunk transient failure: retry until the budget is
-                # spent. The final attempt logs an exhaustion ERROR before
-                # re-raising, mirroring ``with_retries`` so an operator greps the
-                # streaming and non-streaming surfaces the same way.
-                if attempt == retry.max_attempts:
-                    logger.error("%s: all %d attempts failed: %s", tag, retry.max_attempts, exc)
-                    raise
-                await handle_retry_failure(
-                    tag=tag,
-                    attempt=attempt,
-                    max_attempts=retry.max_attempts,
-                    error=exc,
-                    backoff_base_seconds=retry.backoff_base_seconds,
-                    max_backoff_seconds=retry.max_backoff_seconds,
-                    retry_after_cap=retry.retry_after_cap,
-                )
-    finally:
-        _retry_scope.reset(token)
+    # The retry loop itself lives in :mod:`llmkit.retry` beside the awaitable
+    # one, so the two stay reviewable together; this surface owns only what one
+    # attempt *is*. ``aclosing`` propagates an abandoning consumer's close down
+    # to the attempt generator while these frames are still live, so the
+    # abandoned-stream record is written deterministically rather than at GC.
+    async with aclosing(
+        with_retries_stream(_attempt, policy=retry, label=tag, surface="text_llm_call_stream")
+    ) as stream:
+        async for chunk in stream:
+            yield chunk
 
 
 def stream_text_with_log(

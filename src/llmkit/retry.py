@@ -1,9 +1,17 @@
 """Async transient-error retry layer.
 
-The call functions in :mod:`llmkit.structured_output` retry *transient*
-provider errors on their own by default (see :class:`RetryPolicy`); this
-module holds the loop they share. :func:`with_retries` is also exported as
-the explicit, composable advanced path a caller can wrap any awaitable in.
+The call functions in :mod:`llmkit.calls` retry *transient* provider errors on
+their own by default (see :class:`RetryPolicy`); this module holds the loops
+they share. There are two, because a stream is not an awaitable:
+
+* :func:`with_retries` retries an awaitable, and is also exported as the
+  explicit, composable advanced path a caller can wrap any awaitable in;
+* :func:`with_retries_stream` retries an *async generator*, and only up to its
+  first yielded chunk — a partially-consumed stream cannot be transparently
+  restarted.
+
+Both install the same task-keyed scope, so they compose with each other exactly
+as either composes with itself.
 
 Audit logging and timing remain the caller's concern: each attempt is its
 own LLM call (and its own log record), because the retry loop wraps the
@@ -36,8 +44,8 @@ import contextvars
 import logging
 import random
 import warnings
-from collections.abc import Awaitable, Callable, Generator
-from contextlib import contextmanager
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import aclosing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -459,6 +467,122 @@ async def handle_retry_failure(
             max_backoff_seconds,
         )
         await asyncio.sleep(random.uniform(0, ceiling))
+
+
+async def with_retries_stream[T](
+    attempt_factory: Callable[[int], AsyncGenerator[T]],
+    *,
+    policy: RetryPolicy,
+    label: str,
+    surface: str,
+) -> AsyncGenerator[T]:
+    """:func:`with_retries` for a stream: retry only *before* the first chunk.
+
+    The second of this module's two retry loops. It cannot be expressed as
+    :func:`with_retries` because a stream is not a ``Callable[[],
+    Awaitable[T]]`` that can simply be re-awaited: a partially-consumed stream
+    cannot be transparently restarted, so once any chunk has reached the
+    consumer a mid-stream error propagates unretried. Everything before the
+    first chunk is retried on ``policy``'s transport budget.
+
+    *attempt_factory* is called with the 1-based attempt number and returns one
+    attempt's async generator; each attempt is a distinct call (and, for the
+    call functions, its own log record). *surface* names the caller in the
+    double-wrap warning, and *label* is the tag used for the warning and the
+    exhaustion log line — the same ``"%s: all %d attempts failed: %s"`` message
+    :func:`with_retries` emits, from the same logger, so an operator greps the
+    streaming and non-streaming surfaces identically.
+
+    Two things about async generators drive the shape of the body, and neither
+    is optional:
+
+    * **The scope is released around every ``yield``.** An async generator's
+      body runs in its *consumer's* context, so holding the retry scope across
+      a suspension would leak it into the consumer's own llmkit calls between
+      chunks — and, on an early ``break``, leave it set in their context for
+      good. Each re-arm installs a fresh :class:`_RetryScope`, because a
+      generator may resume in a *different* task than the one it suspended in.
+    * **Each attempt is wrapped in ``aclosing``.** An abandoning consumer's
+      close must reach the attempt generator while this frame is still live, so
+      the attempt's own ``finally`` runs deterministically rather than whenever
+      the garbage collector finalizes a suspended generator — which is what
+      makes an abandoned stream's log record honest about being truncated.
+
+    Budgeting is transport-only: a stream carries no schema parsing, so there
+    is no separate validation budget. ``validation_retry_on`` is still matched
+    when classifying a failure, so a stray validation error pre-first-chunk is
+    treated as transient rather than escaping unretried.
+    """
+    tag = label
+    # Nested-retry guard, mirroring :func:`with_retries`: when an outer llmkit
+    # retry loop is already active in this task (the documented composable path
+    # — a host wrapping stream consumption, since mid-stream errors propagate
+    # unretried), collapse to a single pass so the budgets don't multiply (the
+    # 3 x 3 = 9 trap). The accidental double-wrap warns; an explicit NO_RETRY
+    # inner stays silent.
+    if _in_active_retry_scope():
+        yielded_any = False
+        try:
+            async with aclosing(attempt_factory(1)) as attempt_stream:
+                async for chunk in attempt_stream:
+                    yielded_any = True
+                    yield chunk
+            return
+        except Exception as exc:
+            # Stricter than ``with_retries``'s policy-shaped test on purpose:
+            # the inner layer only "would have retried" if the failure was
+            # actually retryable *and* arrived pre-first-chunk.
+            would_have_retried = (
+                policy.max_attempts > 1
+                and not yielded_any
+                and isinstance(exc, (*policy.retry_on, *policy.validation_retry_on))
+            )
+            if would_have_retried:
+                warnings.warn(
+                    f"{surface}({tag!r}) is nested inside an already-retrying "
+                    + "llmkit retry loop; this inner layer ran a single pass to avoid "
+                    + "multiplying retry budgets (the outer loop owns the retries). To "
+                    + "drive retries from an outer wrapper around a call function, opt "
+                    + "the inner call out with retry=NO_RETRY.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            raise
+
+    token = _retry_scope.set(_RetryScope())
+    try:
+        for attempt in range(1, policy.max_attempts + 1):
+            yielded_any = False
+            try:
+                async with aclosing(attempt_factory(attempt)) as attempt_stream:
+                    async for chunk in attempt_stream:
+                        yielded_any = True
+                        _retry_scope.reset(token)
+                        try:
+                            yield chunk
+                        finally:
+                            token = _retry_scope.set(_RetryScope())
+                return
+            except Exception as exc:
+                if (
+                    not isinstance(exc, (*policy.retry_on, *policy.validation_retry_on))
+                    or yielded_any
+                ):
+                    raise
+                if attempt == policy.max_attempts:
+                    logger.error("%s: all %d attempts failed: %s", tag, policy.max_attempts, exc)
+                    raise
+                await handle_retry_failure(
+                    tag=tag,
+                    attempt=attempt,
+                    max_attempts=policy.max_attempts,
+                    error=exc,
+                    backoff_base_seconds=policy.backoff_base_seconds,
+                    max_backoff_seconds=policy.max_backoff_seconds,
+                    retry_after_cap=policy.retry_after_cap,
+                )
+    finally:
+        _retry_scope.reset(token)
 
 
 async def with_retries[T](
