@@ -175,6 +175,12 @@ class _AdditionArgs(BaseModel):
     right: int
 
 
+class _LookupArgs(BaseModel):
+    """Arguments for the deliberately non-derivable live tool."""
+
+    key: str
+
+
 class _ToolAnswer(BaseModel):
     total: int
 
@@ -425,28 +431,44 @@ async def _override_roundtrip(provider: Provider, model: str) -> None:
 
 
 async def _assert_tool_roundtrip(provider: LLMProviderInterface) -> None:
-    """Offer a tool, return its result, then require a natural-language finish."""
-    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    """Offer a tool, return its result, then require a natural-language finish.
+
+    The tool is a *lookup*, not arithmetic, so the result is one the model
+    cannot derive on its own: a model that can compute ``2 + 3`` in its head
+    would answer "5" even if the tool result never reached it, which would let
+    a dropped ``tool_result_message`` pass unnoticed. The second turn re-sends
+    the history with ``tool_choice="none"`` plus an explicit request for the
+    result — Gemini's flash-lite models treat a completed tool exchange with no
+    instruction as a finished conversation and may reply with an empty
+    completion (``text=None``, ``stop_reason='stop'``, zero completion tokens).
+    The instruction names no expected value, so the answer still has to come
+    from the tool result.
+    """
+    lookup = ToolDefinition.from_model("lookup", _LookupArgs, "Look up a stored value by its key.")
     history: list[ChatMessage] = [
-        {"role": "user", "content": "Use the add tool to calculate 2 plus 3."}
+        {
+            "role": "user",
+            "content": "Use the lookup tool to fetch the stored value for key 'answer'.",
+        }
     ]
     requested = await tool_llm_call(
         history,
-        [add],
+        [lookup],
         feature="integration-tool-smoke",
         label=provider.name,
         provider=provider,
-        tool_choice=ToolName("add"),
+        tool_choice=ToolName("lookup"),
         max_tokens=256,
     )
     assert len(requested.tool_calls) == 1
     call = requested.tool_calls[0]
-    assert call.name == "add"
-    assert call.validated == _AdditionArgs(left=2, right=3)
-    history.extend([requested.to_message(), tool_result_message(call.id, "5")])
+    assert call.name == "lookup"
+    assert call.validated == _LookupArgs(key="answer")
+    history.extend([requested.to_message(), tool_result_message(call.id, "6560")])
+    history.append({"role": "user", "content": "State the result in one short sentence."})
     finished = await tool_llm_call(
         history,
-        [add],
+        [lookup],
         feature="integration-tool-smoke",
         label=provider.name,
         provider=provider,
@@ -455,7 +477,7 @@ async def _assert_tool_roundtrip(provider: LLMProviderInterface) -> None:
     )
     assert finished.tool_calls == []
     assert finished.text is not None
-    assert "5" in finished.text
+    assert "6560" in finished.text
 
 
 async def _assert_unnormalised_schema_roundtrip(provider: LLMProviderInterface) -> None:
@@ -733,6 +755,14 @@ async def test_anthropic_tool_roundtrip_live() -> None:
 async def test_vertex_tool_roundtrip_live() -> None:
     provider = make_provider(
         Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    await _assert_tool_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_google_tool_roundtrip_live() -> None:
+    provider = make_provider(
+        Provider.GOOGLE, model=_GOOGLE_MODEL, **_live_credentials(Provider.GOOGLE)
     )
     await _assert_tool_roundtrip(provider)
 
