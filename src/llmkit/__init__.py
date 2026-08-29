@@ -23,7 +23,13 @@ the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
-from llmkit._types import ChatMessage, Message, ReasoningEffort
+from llmkit._types import (
+    AssistantToolMessage,
+    ChatMessage,
+    Message,
+    ReasoningEffort,
+    ToolResultMessage,
+)
 from llmkit.capture import (
     capture_llm_log_paths,
     capture_llm_records,
@@ -100,7 +106,6 @@ from llmkit.structured_output import (
     tool_llm_call_sync,
 )
 from llmkit.tools import (
-    AssistantToolMessage,
     TokenUsage,
     ToolCall,
     ToolCallResult,
@@ -108,7 +113,6 @@ from llmkit.tools import (
     ToolComposeResult,
     ToolDefinition,
     ToolName,
-    ToolResultMessage,
     tool_result_message,
 )
 

@@ -343,9 +343,10 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
       sync helper from async code under *any* strategy — but keeps every
       persistent-loop guarantee: one loop for LiteLLM's logging worker even
       under a concurrent reentrant fan-out, cancel-on-timeout, and the shared
-      per-provider concurrency cap. (Prefer the ``a``-prefixed async variants
-      from async code; this path exists so a sync helper reached through an
-      async host is *safe*, not to make it a good idea.)
+      per-provider concurrency cap. (From async code prefer the async call
+      functions — the ones *without* the ``_sync`` suffix; this path exists so
+      a sync helper reached through an async host is *safe*, not to make it a
+      good idea.)
     * **The persistent loop itself** (a coroutine on it calls back into sync
       code): blocking its own thread would deadlock, so the coroutine is
       offloaded to a one-shot worker thread with its own fresh loop

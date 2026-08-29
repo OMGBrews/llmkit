@@ -1,19 +1,43 @@
-"""Shared public call-surface types: the message shape and the effort levels.
+"""Shared public call-surface types: the message shapes and the effort levels.
 
-A leaf module — it imports nothing from ``llmkit`` — so every layer that names
-these types can do so without an import cycle: the providers
-(:class:`~llmkit.LLMClientConfig`, the provider protocol), the logging record
-(:class:`~llmkit.LLMCallRecord`), the transport, and the public call functions.
-Both names are re-exported from the package top level (see
-:mod:`llmkit.__init__`), so a caller can annotate their own prompt builders and
-effort constants against ``llmkit.Message`` / ``llmkit.ReasoningEffort``.
+A true leaf module — it imports nothing from ``llmkit`` and nothing outside the
+standard library — so every layer that names these types can do so without an
+import cycle: the providers (:class:`~llmkit.LLMClientConfig`, the provider
+protocol), the logging record (:class:`~llmkit.LLMCallRecord`), the transport,
+the tool types in :mod:`llmkit.tools`, and the public call functions. The names
+are re-exported from the package top level (see :mod:`llmkit.__init__`), so a
+caller can annotate their own prompt builders and effort constants against
+``llmkit.Message`` / ``llmkit.ReasoningEffort``.
+
+The two tool *wire shapes* live here rather than beside the richer tool types
+in :mod:`llmkit.tools` for one structural reason: :data:`ChatMessage` — the
+prompt type every layer above depends on — names them, so hosting them in
+``tools`` would make this module import ``tools`` and drag pydantic into every
+importer of the leaf. The dependency runs the other way instead: ``tools``
+imports these two back for :meth:`~llmkit.ToolCallResult.to_message` and
+:func:`~llmkit.tool_result_message`, and both names stay importable from
+``llmkit.tools`` as well as from the package top level.
 """
 
 from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-from llmkit.tools import AssistantToolMessage, ToolResultMessage
+
+class AssistantToolMessage(TypedDict):
+    """An assistant turn that requested one or more tool calls."""
+
+    role: Literal["assistant"]
+    tool_calls: list[dict[str, object]]
+    content: str | None
+
+
+class ToolResultMessage(TypedDict):
+    """The application-supplied result of one requested tool call."""
+
+    role: Literal["tool"]
+    tool_call_id: str
+    content: str
 
 
 class Message(TypedDict):

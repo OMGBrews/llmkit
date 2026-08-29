@@ -1,27 +1,22 @@
-"""Public, provider-neutral types for one tool-enabled completion turn."""
+"""Public, provider-neutral types for one tool-enabled completion turn.
+
+The two *wire shapes* a tool loop appends to a prompt —
+:class:`~llmkit.AssistantToolMessage` and :class:`~llmkit.ToolResultMessage` —
+are defined in :mod:`llmkit._types` beside :data:`~llmkit._types.ChatMessage`,
+which names them, and imported back here (they remain importable from either
+module, and from the package top level). Everything else a tool turn needs —
+the definition, the parsed call, the result — lives here, because it is
+pydantic-backed and the leaf module deliberately is not.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict, override
+from typing import Literal, override
 
 from pydantic import BaseModel
 
-
-class AssistantToolMessage(TypedDict):
-    """An assistant turn that requested one or more tool calls."""
-
-    role: Literal["assistant"]
-    tool_calls: list[dict[str, object]]
-    content: str | None
-
-
-class ToolResultMessage(TypedDict):
-    """The application-supplied result of one requested tool call."""
-
-    role: Literal["tool"]
-    tool_call_id: str
-    content: str
+from llmkit._types import AssistantToolMessage, ToolResultMessage
 
 
 @dataclass(frozen=True)

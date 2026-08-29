@@ -332,6 +332,26 @@ class LLMCallRecord:
 
     A ``None`` ``run_id`` is the pre-``run_id`` shape of every record, YAML
     body and index line.
+
+    The remaining fields are the call's own identity and request shape:
+    ``started_at`` (UTC, when the attempt began), ``feature`` / ``label`` (the
+    caller-supplied telemetry pair that scopes the log filename and the
+    ``index.jsonl`` grouping), ``error`` (``"<ExceptionType>: <message>"`` for a
+    failed attempt, ``None`` for a clean one — a streamed call abandoned by its
+    consumer records :data:`~llmkit.STREAM_ABANDONED_ERROR` here rather than
+    ``None``), and ``max_tokens`` / ``reasoning_effort`` (the request-shaping
+    knobs as resolved for this call, ``None`` when not sent).
+
+    Three fields carry the **tool lane** and are ``None`` on every other
+    surface: ``tools`` is the tool list as offered to the provider (each entry
+    the ``{"type": "function", "function": {...}}`` wire shape
+    :meth:`~llmkit.ToolDefinition.to_litellm` produces), ``tool_calls`` is the
+    calls the model requested (:meth:`~llmkit.ToolCall.to_wire` shape), and
+    ``usage`` is the turn's token counts
+    (``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, any of which
+    may be ``None`` when the provider did not report it). The YAML body carries
+    all three; ``index.jsonl`` deliberately does not, so the compact scan line
+    keeps its fixed shape.
     """
 
     started_at: datetime
