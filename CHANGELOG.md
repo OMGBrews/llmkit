@@ -114,6 +114,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The minimum `litellm` is now 1.95.0**, up from 1.87.1 (raised with the
+  tool-calling lane, which needs it). If you pin llmkit's dependencies
+  yourself, upgrading llmkit now pulls a transport-layer jump of eight minor
+  litellm releases along with it — review litellm's own changelog across that
+  range rather than treating it as a patch bump.
+
+- **Unreleased builds now report a version of their own instead of the last
+  published one.** The package version is derived from git tags: a released
+  commit builds as exactly its `X.Y.Z` tag, and every commit after it builds as
+  `X.Y.Z+1.devN+g<sha>`. Nothing changes for an install from PyPI. What changes
+  is installing a candidate from a `git+https` pin, which previously reported
+  the last published version number — so a version check against it silently
+  passed, and a vulnerability scan matched it against the published release's
+  advisory record rather than the code actually installed. Such a build now
+  identifies the commit it came from. `llmkit.__version__` is unchanged and
+  needs no attention — it already reads the installed distribution's metadata,
+  so it reports the derived version automatically. `pyproject.toml` no longer
+  carries a static `version` field.
+
 - **The four largest modules are now subpackages, and the import cycle is
   gone.** `structured_output.py` (1288 lines), `rate_limiting.py` (1882),
   `json_schema.py` (1455) and `logging.py` (1006) each held several separable
