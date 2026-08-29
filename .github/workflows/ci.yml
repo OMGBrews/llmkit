@@ -122,6 +122,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The version is VCS-derived, and the default shallow, tag-less
+          # checkout does not fail the build — it silently derives a meaningless
+          # `0.0.1.devN+g<sha>`, because setuptools-scm finds a git repo with no
+          # tags in it. This job exists to smoke-test the real artifact, so it
+          # needs the tags that make the version real. The `check` and `floors`
+          # jobs build the project too (`uv sync` installs it), but nothing
+          # there reads a version, so they stay shallow and fast.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
@@ -138,17 +147,37 @@ jobs:
         run: uv build
 
       - name: Install the built wheel into a clean environment
+        id: install
         run: |
           uv venv --python 3.12 /tmp/smoke
           uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          # The wheel's filename states the version hatch-vcs derived for this
+          # build; the smoke test below holds the installed package to it.
+          wheel_version="$(basename dist/*.whl | sed -E 's/^omg_llmkit-(.+)-py3-none-any\.whl$/\1/')"
+          echo "wheel_version=${wheel_version}" >> "$GITHUB_OUTPUT"
+          echo "Built and installed version: ${wheel_version}"
 
       - name: Smoke-test the installed package
+        env:
+          WHEEL_VERSION: ${{ steps.install.outputs.wheel_version }}
         run: |
           /tmp/smoke/bin/python - <<'PY'
+          import os
+          from importlib.metadata import version
           from importlib.resources import files
           import llmkit  # resolves to the installed wheel, not the source tree
 
           assert (files("llmkit") / "py.typed").is_file(), "py.typed marker missing from the wheel"
+
+          # The version is VCS-derived, so a build has to be able to say which
+          # build it is. `0.0.0` is the configured fallback for a source tree
+          # with no VCS information — reaching it here means the checkout lost
+          # its git history, and the artifact would impersonate no release in
+          # particular. Anything else must match what the wheel was built as.
+          installed = version("omg-llmkit")
+          expected = os.environ["WHEEL_VERSION"]
+          assert installed != "0.0.0", "installed wheel fell back to 0.0.0 — the checkout carried no VCS information"
+          assert installed == expected, f"installed version {installed!r} does not match the built wheel {expected!r}"
 
           # The omg_llmkit shim must raise its actionable redirect — a bare
           # ModuleNotFoundError would mean the package failed to install at all.
