@@ -319,7 +319,7 @@ def test_yaml_dump_failure_returns_none_and_does_not_raise(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise yaml.YAMLError("dump failed")
 
-    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
     result = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert result is None
 
@@ -381,7 +381,7 @@ def test_non_enumerated_dump_failure_warns_and_leaves_no_orphan(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("exotic dumper failure")
 
-    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
     with caplog.at_level(logging.WARNING, logger="llmkit.logging"):
         result = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert result is None

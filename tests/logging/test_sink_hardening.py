@@ -294,7 +294,7 @@ def test_repeated_write_failure_warns_once_then_debug(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("disk on fire")
 
-    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
     sink = LocalYamlLogSink(tmp_path)
     with caplog.at_level(logging.DEBUG, logger="llmkit.logging"):
         for _ in range(3):
@@ -317,11 +317,11 @@ def test_recovery_rearms_the_latch(tmp_path: Path, caplog: pytest.LogCaptureFixt
     sink = LocalYamlLogSink(tmp_path)
     with caplog.at_level(logging.WARNING, logger="llmkit.logging"):
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("llmkit.logging.yaml.dump", _boom)
+            mp.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
             assert sink.write_returning_path(_record()) is None
         assert sink.write_returning_path(_record()) is not None
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("llmkit.logging.yaml.dump", _boom)
+            mp.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
             assert sink.write_returning_path(_record()) is None
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 2
@@ -337,7 +337,7 @@ def test_new_failure_signature_warns_again(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise failures[0]
 
-    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
     sink = LocalYamlLogSink(tmp_path)
     with caplog.at_level(logging.WARNING, logger="llmkit.logging"):
         assert sink.write_returning_path(_record()) is None
@@ -610,7 +610,7 @@ def test_failed_write_does_not_announce(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("nope")
 
-    monkeypatch.setattr("llmkit.logging.yaml.dump", _boom)
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _boom)
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert LocalYamlLogSink(tmp_path).write_returning_path(_record()) is None
     assert [r for r in caplog.records if r.levelno == logging.INFO] == []
