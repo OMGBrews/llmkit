@@ -11,12 +11,13 @@ pydantic-backed and the leaf module deliberately is not.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, override
 
 from pydantic import BaseModel
 
 from llmkit._types import AssistantToolMessage, ToolResultMessage
+from llmkit.exceptions import ToolArgumentError
 
 
 @dataclass(frozen=True)
@@ -112,12 +113,30 @@ class TokenUsage:
 
 @dataclass(frozen=True)
 class ToolCallResult:
-    """The text and/or requested calls from a single completion turn."""
+    """The text and/or requested calls from a single completion turn.
+
+    ``tool_calls`` holds every call that parsed and validated. When a turn
+    requests several calls in parallel and only *some* of them are malformed,
+    the well-formed ones survive here and each failure is reported on
+    ``invalid_calls`` as the :class:`~llmkit.ToolArgumentError` it raised —
+    nothing has executed yet, so discarding the whole round would only be a
+    lossy re-ask. A turn in which **every** requested call is malformed still
+    raises ``ToolArgumentError``, keeping the whole-round re-ask contract
+    (``RetryPolicy.validation_max_attempts``) exactly as it was.
+
+    ``to_message()`` is built from ``tool_calls`` alone, so the assistant turn
+    it produces names only the calls you can actually answer: feed a
+    :func:`~llmkit.tool_result_message` for each and the history stays
+    consistent, with no dangling ``tool_call_id`` for the provider to reject.
+    The dropped calls are yours to log, count, or re-prompt about in your own
+    words; they are also recorded in the call's log entry.
+    """
 
     text: str | None
     tool_calls: list[ToolCall]
     stop_reason: str | None
     usage: TokenUsage
+    invalid_calls: list[ToolArgumentError] = field(default_factory=list)
 
     def to_message(self) -> AssistantToolMessage:
         return {
@@ -127,7 +146,24 @@ class ToolCallResult:
         }
 
     def to_log_dict(self) -> dict[str, object]:
-        return {"text": self.text, "tool_calls": [call.to_wire() for call in self.tool_calls]}
+        logged: dict[str, object] = {
+            "text": self.text,
+            "tool_calls": [call.to_wire() for call in self.tool_calls],
+        }
+        # Only present when something was actually dropped, so the log shape of
+        # an ordinary turn is unchanged — and a turn that silently lost a call
+        # can never look like a clean one in the record.
+        if self.invalid_calls:
+            logged["invalid_calls"] = [
+                {
+                    "name": error.tool_name,
+                    "id": error.call_id,
+                    "arguments": error.arguments_raw,
+                    "reason": str(error),
+                }
+                for error in self.invalid_calls
+            ]
+        return logged
 
 
 @dataclass(frozen=True)
@@ -138,7 +174,7 @@ class ToolComposeResult[T: BaseModel](ToolCallResult):
     requested, it is the caller's validated ``output_schema`` instance.
     """
 
-    parsed: T | None
+    parsed: T | None = None
 
     @override
     def to_log_dict(self) -> dict[str, object]:

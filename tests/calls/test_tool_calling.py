@@ -95,6 +95,83 @@ async def test_unknown_tool_is_a_repairable_tool_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_one_malformed_call_no_longer_discards_its_well_formed_siblings() -> None:
+    """Nothing has executed when parsing happens, so dropping the whole round
+    for one bad argument string was lossy, not safe: with parallel calls it
+    cost every good call and forced a re-ask. The survivors stay, the failure
+    is reported beside them, and — the part that keeps the history valid — the
+    assistant turn names only the calls the caller can answer."""
+    definition = ToolDefinition.from_model("weather", _WeatherArgs, "Look up weather")
+    good = _RawCall("call_good", _Function("weather", '{"city":"Ottawa"}'))
+    bad = _RawCall("call_bad", _Function("weather", "{not json"))
+    with (
+        patch(
+            "llmkit._litellm.acompletion_tools",
+            return_value=(None, [good, bad], "tool_calls", (None, None, None), None),
+        ),
+        capturing_sink() as records,
+    ):
+        result = await tool_llm_call(
+            "weather?",
+            [definition],
+            feature="assistant",
+            provider=provider_mock(),
+            retry=NO_RETRY,
+        )
+    assert [call.id for call in result.tool_calls] == ["call_good"]
+    assert [error.call_id for error in result.invalid_calls] == ["call_bad"]
+    assert "not valid JSON" in str(result.invalid_calls[0])
+    # The wire history must not name a call the caller was never handed.
+    assert [call["id"] for call in result.to_message()["tool_calls"]] == ["call_good"]
+    # A round that quietly lost a call must not read as a clean one in the log.
+    logged = cast("dict[str, object]", records[0].response)
+    assert cast("list[dict[str, object]]", logged["invalid_calls"])[0]["id"] == "call_bad"
+
+
+@pytest.mark.asyncio
+async def test_a_round_of_only_malformed_calls_still_raises_for_the_whole_round() -> None:
+    """The re-ask contract, unchanged: when nothing in the round survived there
+    is nothing to salvage, so it stays a whole-round ``ToolArgumentError`` on
+    the validation budget rather than becoming an empty, successful-looking
+    turn the caller has to inspect ``invalid_calls`` to notice."""
+    bad = _RawCall("call_bad", _Function("weather", "{not json"))
+    worse = _RawCall("call_worse", _Function("weather", "[]"))
+    with patch(
+        "llmkit._litellm.acompletion_tools",
+        return_value=(None, [bad, worse], "tool_calls", (None, None, None), None),
+    ):
+        with pytest.raises(ToolArgumentError, match="not valid JSON"):
+            _ = await tool_llm_call(
+                "weather?",
+                [ToolDefinition.from_model("weather", _WeatherArgs)],
+                feature="assistant",
+                provider=provider_mock(),
+                retry=NO_RETRY,
+            )
+
+
+@pytest.mark.asyncio
+async def test_a_clean_round_carries_no_invalid_calls_and_logs_the_old_shape() -> None:
+    """The negative half of the pair: the new field is empty and the record's
+    ``response`` keeps exactly the keys it had, so the salvage path cannot be
+    confirmed by a test that would also pass with the field always populated."""
+    definition = ToolDefinition.from_model("weather", _WeatherArgs, "Look up weather")
+    raw = _RawCall("call_1", _Function("weather", '{"city":"Ottawa"}'))
+    with (
+        patch(
+            "llmkit._litellm.acompletion_tools",
+            return_value=(None, [raw], "tool_calls", (None, None, None), None),
+        ),
+        capturing_sink() as records,
+    ):
+        result = await tool_llm_call(
+            "weather?", [definition], feature="assistant", provider=provider_mock()
+        )
+    assert result.invalid_calls == []
+    assert sorted(cast("dict[str, object]", records[0].response)) == ["text", "tool_calls"]
+
+
+@pytest.mark.asyncio
 async def test_compose_validates_final_answer_and_logs_distinct_schema() -> None:
     definition = ToolDefinition.from_model("weather", _WeatherArgs, "Look up weather")
     with (

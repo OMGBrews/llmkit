@@ -132,6 +132,21 @@ else:
 
 Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior; their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
 
+### When a call doesn't parse
+
+A turn can request several calls at once, and one of them can come back unusable — arguments that aren't JSON, a tool you never offered, arguments the definition's model rejects. Nothing has executed at that point, so llmkit **keeps the calls that did parse** and reports each failure on `result.invalid_calls` as the `ToolArgumentError` it raised (carrying the tool name, the call id, and the raw argument string):
+
+```python
+result = await tool_llm_call(prompt, tools, feature="assistant")
+
+for call in result.tool_calls:      # every call that parsed and validated
+    ...
+for error in result.invalid_calls:  # what the model got wrong, if anything
+    log.warning("dropped %s: %s", error.tool_name, error)
+```
+
+`result.to_message()` is built from `tool_calls` alone, so the assistant turn you append names only the calls you can answer — pair each with a `tool_result_message` and the history has no dangling `tool_call_id` for the provider to reject. A round in which **every** requested call is malformed still raises `ToolArgumentError` for the whole round and is re-asked within `RetryPolicy.validation_max_attempts`, exactly as before: there is nothing to salvage, and an empty successful-looking turn would be worse than an error. Dropped calls also appear under `invalid_calls` in the call's log record, so a round that quietly lost one never reads as a clean round.
+
 ### Tool schemas: hand them over unprocessed
 
 **`ToolDefinition.from_model()` output works on every supported provider as-is. Do not pre-process it.** A Pydantic model with a nested model or an enum renders `$defs` and `$ref` in its JSON Schema, and llmkit forwards `parameters` verbatim — but the transport normalises per provider on the way to the wire. On the Gemini routes (Vertex AI and Google AI Studio) that means `additionalProperties` is stripped, `$defs` is popped, `$ref` targets are inlined, and keywords outside Gemini's `Schema` subset are filtered, so a schema Gemini's API rejects outright when posted raw is accepted through llmkit. Writing your own normalisation layer on top duplicates that work and will drift from it.

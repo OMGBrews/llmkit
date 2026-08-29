@@ -70,6 +70,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LocalYamlLogSink()` reconstructs. Documented in README's "Write your own
   `LogSink`".
 
+- **A malformed tool call no longer discards the well-formed calls beside it.**
+  A round's calls were narrowed in one list comprehension, so the first
+  unparseable call raised out of it and took its siblings with it — nothing has
+  executed at that point, which made it lossy rather than unsafe, but with
+  parallel calls one bad argument string cost the whole round and a re-ask.
+  Calls are now narrowed individually: the ones that parsed stay on
+  `ToolCallResult.tool_calls`, and each failure is reported on the new
+  `ToolCallResult.invalid_calls` as the `ToolArgumentError` it raised.
+  `to_message()` is still built from `tool_calls` alone, so the assistant turn
+  names only calls you can answer and the history carries no dangling
+  `tool_call_id`. A round in which *every* call is malformed still raises
+  `ToolArgumentError` for the whole round and is re-asked within
+  `RetryPolicy.validation_max_attempts` — the retry contract is unchanged.
+  Dropped calls are recorded under `invalid_calls` in the log entry's
+  `response` and logged at WARNING, so a round that lost one cannot read as a
+  clean round.
+
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is

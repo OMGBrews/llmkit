@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    logger,
     prepare_call,
     resolve_model_and_provider,
     result_validation_budget,
@@ -90,6 +91,43 @@ def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> 
     return ToolCall(call_id, name, arguments_raw, cast("dict[str, object]", parsed), validated)
 
 
+def _parse_calls(
+    raw_calls: list[object], definitions: dict[str, ToolDefinition]
+) -> tuple[list[ToolCall], list[ToolArgumentError]]:
+    """Narrow a round's raw calls per call, not as an all-or-nothing batch.
+
+    Parsing used to be a list comprehension, so the first unparseable call
+    raised out of it and took its well-formed siblings with it. Nothing has
+    executed at this point, which makes that lossy rather than unsafe — but
+    with parallel calls one bad argument string cost the entire round and a
+    re-ask. Each call is narrowed on its own instead, and the failures are
+    returned beside the survivors for :class:`~llmkit.ToolCallResult` to carry.
+
+    The one case that still raises is a round in which **every** call failed:
+    the turn produced nothing actionable, so it stays a whole-round
+    :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
+    budget exactly as before. A round with no calls at all is not a failure —
+    a text-only or compose answer takes that path.
+    """
+    parsed: list[ToolCall] = []
+    invalid: list[ToolArgumentError] = []
+    for raw in raw_calls:
+        try:
+            parsed.append(_tool_call_from_raw(raw, definitions))
+        except ToolArgumentError as exc:
+            invalid.append(exc)
+    if invalid and not parsed:
+        raise invalid[0]
+    if invalid:
+        logger.warning(
+            "Dropped %d malformed tool call(s) from a round of %d: %s",
+            len(invalid),
+            len(raw_calls),
+            "; ".join(f"{error.tool_name!r}: {error}" for error in invalid),
+        )
+    return parsed, invalid
+
+
 @overload
 async def tool_llm_call(
     prompt: str | Sequence[ChatMessage],
@@ -144,7 +182,14 @@ async def tool_llm_call[T: BaseModel](
     options: LLMCallOptions | None = None,
     output_schema: type[T] | None = None,
 ) -> ToolCallResult | ToolComposeResult[T]:
-    """Run one tool-enabled turn, optionally accepting a schema-validated final answer."""
+    """Run one tool-enabled turn, optionally accepting a schema-validated final answer.
+
+    A round in which only *some* requested calls are malformed keeps the
+    well-formed ones on ``tool_calls`` and reports the rest on
+    ``invalid_calls``; a round in which every call is malformed still raises
+    :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
+    budget. See :class:`~llmkit.ToolCallResult`.
+    """
     args, provider, call_id = prepare_call(
         options,
         temperature=temperature,
@@ -198,12 +243,13 @@ async def tool_llm_call[T: BaseModel](
                     else None
                 ),
             )
-            parsed_calls = [_tool_call_from_raw(raw, definitions) for raw in raw_calls]
+            parsed_calls, invalid_calls = _parse_calls(raw_calls, definitions)
             base = (
                 text,
                 parsed_calls,
                 stop_reason if isinstance(stop_reason, str) else None,
                 TokenUsage(*counts),
+                invalid_calls,
             )
             if output_schema is None:
                 result = ToolCallResult(*base)
