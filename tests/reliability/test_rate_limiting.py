@@ -41,18 +41,20 @@ import openai
 import pytest
 from instructor.core import InstructorRetryException
 
-from llmkit import CircuitOpenError, _litellm, rate_limiting, structured_output
+from llmkit import CircuitOpenError, _litellm, structured_output
 from llmkit.rate_limiting import (
-    _BREAKER_MIN_SAMPLES,
     GlobalRateLimiter,
     RateLimitSlot,
-    _CircuitState,
-    _RateBucket,
+    _tuning,
     configure_rate_limit,
     get_rate_limit_config,
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
+from llmkit.rate_limiting._adaptive import AdaptiveState, SyncAdaptiveGate
+from llmkit.rate_limiting._breaker import CircuitState
+from llmkit.rate_limiting._buckets import RateBucket
+from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
 from tests._support import quiet_logging
 
 
@@ -418,7 +420,7 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
 # --- sync/async parity: shared breaker + AIMD state and interrupt hardening ---
 #
 # The sync acquire path now shares the per-provider circuit breaker and AIMD
-# ``_AdaptiveState`` with the async path (only the in-flight *count* is its own
+# ``AdaptiveState`` with the async path (only the in-flight *count* is its own
 # population), and hardens the RPM-refund / permit-release the old fixed-semaphore
 # path skipped. These tests are all offline and assert state transitions, not
 # timing, to stay off the wall clock.
@@ -445,13 +447,13 @@ def test_sync_acquire_raises_circuit_open_when_breaker_open(
     The breaker is driven OPEN through its own ``on_record`` API (a full window of
     throttles); the frozen clock keeps it inside the cooldown so it rejects.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: stays OPEN
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: stays OPEN
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
-    for _ in range(_BREAKER_MIN_SAMPLES):  # a full window of throttles opens it
+    for _ in range(BREAKER_MIN_SAMPLES):  # a full window of throttles opens it
         _ = breaker.on_record(throttled=True)
-    assert breaker._state is _CircuitState.OPEN
+    assert breaker._state is CircuitState.OPEN
 
     # ``acquire_sync`` fetches the gate *before* consulting the breaker, so
     # pre-create it and assert the rejected call left that very object untouched.
@@ -477,7 +479,7 @@ def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
     shared per-provider AIMD limit, and a subsequent *async* acquire enforces the
     halved cap — proving the state is genuinely SHARED, not mirrored per path.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no recovery
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
     configure_rate_limit(max_concurrent=2)
     key = "google"
     holder_in = threading.Event()
@@ -542,7 +544,7 @@ def test_cross_population_saturated_throttle_decreases_shared_limit(
     so the shared AIMD limit must drop 2 -> 1. Fails pre-fix, where saturation was
     judged per gate and the async gate's local 1 < 2 classified the 429 as noise.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no recovery
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
     configure_rate_limit(max_concurrent=2)
     key = "google"
     holder_in = threading.Event()
@@ -579,7 +581,7 @@ def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) 
     slot is granted refunds the token — the bucket level is restored, mirroring the
     async path's cancellation refund.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no refill
     configure_rate_limit(max_concurrent=8, rpm=480)
     key = "openai"
     rpm_bucket = GlobalRateLimiter._get_rpm_bucket(key)
@@ -646,7 +648,7 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
     0.3s) instead of honouring the ~20Hz poll. Two holders saturate a cap-2 gate,
     three waiters queue in a pinned arrival order, and freeing exactly one slot
     admits the FIFO head while promoting the next waiter to a *set-but-uncommittable*
-    head — the precise spin condition. Counting live ``_AdaptiveState.limit()`` reads
+    head — the precise spin condition. Counting live ``AdaptiveState.limit()`` reads
     over a held real interval separates a bounded poll (a handful) from the spin.
     None of the pre-existing sync tests drove more than one genuinely-queued waiter,
     so this path — and the spin — was previously untested.
@@ -685,7 +687,7 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
         # Pin deque order: don't start the next until this one has actually queued.
         _wait_until(lambda i=i: len(gate._waiters) == i + 1)
 
-    orig_limit = rate_limiting._AdaptiveState.limit
+    orig_limit = AdaptiveState.limit
     try:
         # Free exactly one slot: the FIFO head (W0) commits and, per the wake path,
         # sets the NEXT head (W1) — which now has no capacity (H1 + W0 hold both
@@ -697,13 +699,13 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
         # condition. Count its live-limit reads over a real interval.
         calls = {"n": 0}
 
-        def counting(self: rate_limiting._AdaptiveState) -> int:
+        def counting(self: AdaptiveState) -> int:
             calls["n"] += 1
             return orig_limit(self)
 
-        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", counting)
+        monkeypatch.setattr(AdaptiveState, "limit", counting)
         time.sleep(0.2)  # a real interval (this test does not freeze the clock)
-        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", orig_limit)
+        monkeypatch.setattr(AdaptiveState, "limit", orig_limit)
         # ~4 for a 0.05s poll over 0.2s; the un-cleared-ticket spin was >100k.
         assert calls["n"] < 50, f"queued head busy-spun: {calls['n']} limit() reads in 0.2s"
 
@@ -713,7 +715,7 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
         hold_waiters.set()  # W0, W1 exit → slots free → W2 admitted
         _wait_until(lambda: order == [0, 1, 2])
     finally:
-        monkeypatch.setattr(rate_limiting._AdaptiveState, "limit", orig_limit)
+        monkeypatch.setattr(AdaptiveState, "limit", orig_limit)
         release_h0.set()
         release_h1.set()
         hold_waiters.set()
@@ -728,13 +730,13 @@ def test_sync_gate_drop_waiter_keeps_queue_contiguous_and_advances_head() -> Non
     """Dropping an abandoned ticket (the interrupt path's baton hand-off) removes
     only that waiter and hands the head baton on when — and only when — the head left.
 
-    Drives ``_SyncAdaptiveGate._drop_waiter`` directly (the ``finally`` an interrupted
+    Drives ``SyncAdaptiveGate._drop_waiter`` directly (the ``finally`` an interrupted
     ``acquire`` runs): a non-head waiter that leaves keeps the deque contiguous and
     signals nobody, so the real head keeps its turn; dropping the head wakes the new
     head so the queue can never wedge. The parity change's docstrings promise this
     but no thread-level test exercised it.
     """
-    gate = rate_limiting._SyncAdaptiveGate(rate_limiting._AdaptiveState(provider="x", ceiling=2))
+    gate = SyncAdaptiveGate(AdaptiveState(provider="x", ceiling=2))
     t0, t1, t2 = (threading.Event() for _ in range(3))
     gate._waiters.extend([t0, t1, t2])
 
@@ -873,8 +875,8 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
 def test_rate_bucket_acquire_drains_and_refills(monkeypatch: pytest.MonkeyPatch) -> None:
     """A token bucket drains on acquire, refills at its rate, and caps at capacity."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    bucket = _RateBucket(rate_per_sec=10.0, capacity=100.0)  # full at construction
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    bucket = RateBucket(rate_per_sec=10.0, capacity=100.0)  # full at construction
 
     # Full bucket: draining the whole capacity succeeds with no wait.
     assert bucket._try_acquire(100.0) == 0.0
@@ -896,8 +898,8 @@ def test_rate_bucket_record_drives_negative_then_recovers(
 ) -> None:
     """TPM accounting: a record over budget goes negative, then refills back up."""
     clock = {"t": 0.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    bucket = _RateBucket(rate_per_sec=100.0, capacity=6_000.0)  # tpm 6000
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    bucket = RateBucket(rate_per_sec=100.0, capacity=6_000.0)  # tpm 6000
 
     assert bucket._try_budget() == 0.0  # full → budget available
     bucket.record(6_500.0)  # one over-budget call → 500 into deficit
@@ -1014,10 +1016,10 @@ async def test_rpm_bucket_serves_async_waiters_fifo(monkeypatch: pytest.MonkeyPa
     time serves them in arrival order, with no over-admission.
     """
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     gates, pump = _install_controlled_sleep(monkeypatch)
 
-    bucket = _RateBucket(rate_per_sec=1.0, capacity=1.0)
+    bucket = RateBucket(rate_per_sec=1.0, capacity=1.0)
     assert bucket._try_acquire(1.0) == 0.0  # drain the initial token → empty, frozen
 
     order: list[int] = []
@@ -1053,10 +1055,10 @@ async def test_async_newcomer_cannot_barge_parked_head(monkeypatch: pytest.Monke
     the fix.
     """
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     gates, pump = _install_controlled_sleep(monkeypatch)
 
-    bucket = _RateBucket(rate_per_sec=1.0, capacity=1.0)
+    bucket = RateBucket(rate_per_sec=1.0, capacity=1.0)
     assert bucket._try_acquire(1.0) == 0.0  # drain → empty
 
     order: list[str] = []
@@ -1094,8 +1096,8 @@ def test_rpm_bucket_serves_sync_waiters_fifo(monkeypatch: pytest.MonkeyPatch) ->
     cap makes "one token per clock step" exact regardless of float fuzz.
     """
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)  # empty-wait ≈ 1ms
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    bucket = RateBucket(rate_per_sec=1_000.0, capacity=1.0)  # empty-wait ≈ 1ms
     assert bucket._try_acquire(1.0) == 0.0  # drain → empty, frozen
 
     order: list[int] = []
@@ -1137,7 +1139,7 @@ def test_sync_acquire_interrupt_does_not_wedge_queue(monkeypatch: pytest.MonkeyP
     and must never evict the still-running head with a positional pop.
     """
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
 
     # Make the 2nd ticket created (waiter B, queued behind the head) raise from its
     # wait(), simulating a Ctrl-C delivered while B is parked. Threads are built
@@ -1157,7 +1159,7 @@ def test_sync_acquire_interrupt_does_not_wedge_queue(monkeypatch: pytest.MonkeyP
                 raise KeyboardInterrupt("simulated Ctrl-C during ticket.wait()")
             return super().wait(timeout)
 
-    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)
+    bucket = RateBucket(rate_per_sec=1_000.0, capacity=1.0)
     assert bucket._try_acquire(1.0) == 0.0  # drain → empty
 
     order: list[str] = []
@@ -1214,8 +1216,8 @@ def test_sync_acquire_enqueue_window_exception_leaves_no_orphan(
     ticket leaked and the whole queue wedged.
     """
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    bucket = _RateBucket(rate_per_sec=1_000.0, capacity=1.0)
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    bucket = RateBucket(rate_per_sec=1_000.0, capacity=1.0)
     assert bucket._try_acquire(1.0) == 0.0  # drain → empty
 
     armed = {"v": True}
@@ -1247,7 +1249,7 @@ def test_async_fifo_lock_pruned_for_closed_loop() -> None:
     across loops; each loop installs its own lock, and a later touch prunes the
     dead one.
     """
-    bucket = _RateBucket(rate_per_sec=1.0, capacity=10.0)
+    bucket = RateBucket(rate_per_sec=1.0, capacity=10.0)
 
     async def touch() -> None:
         await bucket.acquire_async(1.0)
@@ -1275,7 +1277,7 @@ async def test_rpm_burst_is_capped_at_concurrency_not_a_full_minute(
     the worst case over any 60s window is ``max_concurrent + rpm`` (8 + 600 =
     608, ~1.3% over), not ``2 * rpm``.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     configure_rate_limit(max_concurrent=8, rpm=600)
 
     bucket = GlobalRateLimiter._get_rpm_bucket("openai")
@@ -1290,7 +1292,7 @@ async def test_rpm_burst_is_capped_at_concurrency_not_a_full_minute(
 
     # Even after an arbitrarily long idle stretch the level caps at capacity (8),
     # never back to 600 — so the post-idle burst stays bounded at 8, not rpm.
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 100_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 100_000.0)
     bucket._refill_locked()
     assert bucket._level == 8.0
 
@@ -1302,10 +1304,10 @@ async def test_tpm_burst_reservoir_is_one_second_not_a_full_minute(
 
     The token-dimension half of the same regression: the bucket no longer starts
     at ``tpm`` (a full minute, spendable in a burst before throttling) but at
-    ``tpm * _TPM_BURST_SECONDS / 60`` — a one-second reservoir — so an idle bucket
+    ``tpm * TPM_BURST_SECONDS / 60`` — a one-second reservoir — so an idle bucket
     can bank at most ~1.7% of ``tpm`` above the sustained rate.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(tpm=6_000)
 
     bucket = GlobalRateLimiter._get_tpm_bucket("openai")
@@ -1314,7 +1316,7 @@ async def test_tpm_burst_reservoir_is_one_second_not_a_full_minute(
 
     # The cap also bounds refill: after a long idle the reservoir tops out at the
     # 1s capacity, never back at a full minute's tokens.
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 100_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 100_000.0)
     bucket._refill_locked()
     assert bucket._level == 100.0
 
@@ -1354,7 +1356,7 @@ async def test_rpm_acquire_debits_the_request_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An RPM-configured acquire deducts one request token from the provider bucket."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     # Burst capacity is the concurrency width min(max_concurrent=8, rpm=120) = 8,
     # NOT a full minute's quota — so the bucket starts at 8, not 120.
     configure_rate_limit(rpm=120)  # 2 requests/sec sustained; burst 8
@@ -1369,7 +1371,7 @@ async def test_tpm_slot_records_against_provider_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``slot.record_tokens`` debits the provider's TPM bucket by the usage."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze
     # Burst capacity is a 1s reservoir = tpm/60 = 100 tokens (not a full minute),
     # so a 2000-token debit drives the level well negative — exactly the
     # smoothing signal that makes the next caller wait. The debit *amount* (2000)
@@ -1385,7 +1387,7 @@ async def test_tpm_slot_records_against_provider_bucket(
 async def test_tpm_over_budget_blocks_then_clears(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spending past the minute budget drives the bucket negative so the gate waits."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     configure_rate_limit(tpm=6_000)  # 100 tokens/sec sustained; burst 100 (1s)
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
@@ -1403,7 +1405,7 @@ async def test_tpm_budgets_are_independent_per_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Draining one provider's TPM budget leaves another provider's untouched."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(tpm=6_000)  # burst 100 (1s reservoir) per provider
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
@@ -1434,7 +1436,7 @@ async def test_call_layer_debits_tpm_from_response_usage(
     Fully offline — ``litellm.acompletion`` is faked to return a usage-bearing
     response, and the clock is frozen so the only level change is the debit.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(tpm=6_000)
 
     provider = MagicMock()
@@ -1482,7 +1484,7 @@ async def test_rpm_budget_shared_across_key_casings(
     drain the single shared bucket to zero — and the registry must hold exactly
     one (casefolded) entry, not one per casing.
     """
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     configure_rate_limit(rpm=2)
 
     async with rate_limit_acquire_async("openai"):  # host casing, public helper
@@ -1502,7 +1504,7 @@ async def test_tpm_budget_shared_across_key_casings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tokens recorded under "OPENAI" are visible to a "openai" acquirer's bucket."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     # tpm chosen so the 1s reservoir (tpm/60 = 4000) comfortably holds both
     # debits: the first call must leave the *shared* bucket positive, or the
     # second casing's TPM gate would (correctly) block waiting for refill — which

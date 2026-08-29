@@ -40,9 +40,7 @@ from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError, To
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
-from llmkit.rate_limiting import (
-    _queue_wait_ms,  # pyright: ignore[reportPrivateUsage]  # shared intra-package state
-)
+from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import (
     RetryPolicy,
     _in_active_retry_scope,  # pyright: ignore[reportPrivateUsage]  # shared intra-package guard state
@@ -262,10 +260,7 @@ async def structured_llm_call[T: BaseModel](
         nonlocal attempt_count
         attempt_count += 1
         attempt = attempt_count
-        # Reset before the transport runs: a stale stamp from a previous
-        # attempt (or an unrelated earlier call in this context) must never
-        # be attributed to an attempt that failed before acquiring.
-        _ = _queue_wait_ms.set(None)
+        begin_queue_wait()
         started_at = datetime.now(UTC)
         start_t = time.monotonic()
         response: T | None = None
@@ -330,7 +325,7 @@ async def structured_llm_call[T: BaseModel](
                     reasoning_effort=reasoning_effort,
                     call_id=call_id,
                     attempt=attempt,
-                    queue_wait_ms=_queue_wait_ms.get(),
+                    queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
                 )
             )
@@ -501,7 +496,7 @@ async def text_llm_call(
         nonlocal attempt_count
         attempt_count += 1
         attempt = attempt_count
-        _ = _queue_wait_ms.set(None)
+        begin_queue_wait()
         started_at = datetime.now(UTC)
         start_t = time.monotonic()
         # None until the transport returns: a failed attempt logs
@@ -880,11 +875,10 @@ async def _stream_once(
 
     started_at = datetime.now(UTC)
     start_t = time.monotonic()
-    # The limiter stamp for THIS attempt: reset before the transport
-    # acquires. This runs at first ``__anext__`` — consumer context, like
-    # every other line of this generator body — which is exactly where the
-    # transport's acquire will stamp it, so reset/stamp/read stay coherent.
-    _ = _queue_wait_ms.set(None)
+    # This runs at first ``__anext__`` — consumer context, like every other
+    # line of this generator body — which is exactly where the transport's
+    # acquire will stamp it, so reset/stamp/read stay coherent.
+    begin_queue_wait()
     accumulated: list[str] = []
     error: str | None = None
     try:
@@ -1006,7 +1000,7 @@ def _build_text_record(
         reasoning_effort=reasoning_effort,
         call_id=call_id,
         attempt=attempt,
-        queue_wait_ms=_queue_wait_ms.get(),
+        queue_wait_ms=current_queue_wait_ms(),
         run_id=get_run_id(),
     )
 
@@ -1137,7 +1131,7 @@ async def tool_llm_call[T: BaseModel](
 
         nonlocal attempt_count
         attempt_count += 1
-        _ = _queue_wait_ms.set(None)
+        begin_queue_wait()
         started_at, start_t = datetime.now(UTC), time.monotonic()
         result: ToolCallResult | ToolComposeResult[T] | None = None
         cost: float | None = None
@@ -1211,7 +1205,7 @@ async def tool_llm_call[T: BaseModel](
                     reasoning_effort=resolved.reasoning_effort,
                     call_id=call_id,
                     attempt=attempt_count,
-                    queue_wait_ms=_queue_wait_ms.get(),
+                    queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
                     tools=[definition.to_litellm() for definition in tools],
                     tool_calls=[call.to_wire() for call in result.tool_calls]

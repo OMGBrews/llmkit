@@ -35,7 +35,8 @@ from llmkit import (
     capture_llm_records,
     structured_output,
 )
-from llmkit.rate_limiting import GlobalRateLimiter, _queue_wait_ms
+from llmkit.rate_limiting import GlobalRateLimiter
+from llmkit.rate_limiting._observability import _queue_wait_ms
 from tests._support import OkSchema, provider_mock
 from tests._support import make_record as _record
 

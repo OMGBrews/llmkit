@@ -64,8 +64,8 @@ def _utcnow() -> datetime:
     ``Retry-After`` as an HTTP-date (rather than a delta-seconds count): the
     delay is ``parsed_date - _utcnow()``. A test can monkeypatch
     ``llmkit.retry._utcnow`` to make that arithmetic deterministic without real
-    sleeping — the same seam :func:`llmkit.rate_limiting._now` provides for the
-    token buckets.
+    sleeping — the same seam ``llmkit.rate_limiting._tuning.now`` provides for
+    the token buckets.
     """
     return datetime.now(UTC)
 

@@ -4,7 +4,7 @@ These never touch the network. They pin the aggregate guard that stops doomed
 work when a provider is *down* — the ``0.4.0`` follow-on to adaptive concurrency
 (AIMD), reading the *same* per-provider unwrapped outcome stream:
 
-* the breaker state machine on ``_CircuitBreaker`` (count-based ring, trip
+* the breaker state machine on ``CircuitBreaker`` (count-based ring, trip
   threshold + minimum sample, rolling window, cooldown → single HALF_OPEN probe,
   close-on-success-and-clear / reopen-on-failure-and-re-arm) — driven with a
   frozen clock;
@@ -41,19 +41,12 @@ from llmkit import (
     CircuitOpenError,
     backpressure_callback,
     configure_rate_limit,
-    rate_limiting,
     structured_output,
 )
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
-from llmkit.rate_limiting import (
-    _BREAKER_COOLDOWN,
-    _BREAKER_MIN_SAMPLES,
-    BackpressureEvent,
-    GlobalRateLimiter,
-    _Admit,
-    _CircuitBreaker,
-    _CircuitState,
-)
+from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, _tuning
+from llmkit.rate_limiting._breaker import Admit, CircuitBreaker, CircuitState
+from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN, BREAKER_MIN_SAMPLES
 from llmkit.retry import RetryPolicy, with_retries
 from tests._support import OkSchema, quiet_logging
 
@@ -72,56 +65,56 @@ def _wrapped(status: int) -> InstructorRetryException:
     )
 
 
-def _fill_throttles(breaker: _CircuitBreaker, n: int) -> None:
+def _fill_throttles(breaker: CircuitBreaker, n: int) -> None:
     """Feed *n* throttle outcomes straight into a breaker's window."""
     for _ in range(n):
         _ = breaker.on_record(throttled=True)
 
 
-# --- _CircuitBreaker state machine (frozen clock) ------------------------
+# --- CircuitBreaker state machine (frozen clock) ------------------------
 
 
 def test_full_window_of_throttles_opens(monkeypatch: pytest.MonkeyPatch) -> None:
     """A full window at/above the threshold opens; below the min sample it can't."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    breaker = _CircuitBreaker("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    breaker = CircuitBreaker("openai", ceiling=8)
     # Below the minimum sample, even all-throttles cannot trip the breaker.
-    for _ in range(_BREAKER_MIN_SAMPLES - 1):
+    for _ in range(BREAKER_MIN_SAMPLES - 1):
         assert breaker.on_record(throttled=True) is None
-        assert breaker._state is _CircuitState.CLOSED
+        assert breaker._state is CircuitState.CLOSED
     # The outcome that fills the window to the minimum sample opens it.
     event = breaker.on_record(throttled=True)
     assert event == BackpressureEvent("openai", 8, 0, "breaker_open")
-    assert breaker._state is _CircuitState.OPEN
+    assert breaker._state is CircuitState.OPEN
     # Within the cooldown, every admission is rejected (no event re-fired).
-    assert breaker.admit() == (_Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
 
 
 def test_sub_threshold_window_does_not_open(monkeypatch: pytest.MonkeyPatch) -> None:
     """A full window below the throttle threshold leaves the breaker closed."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    breaker = _CircuitBreaker("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    breaker = CircuitBreaker("openai", ceiling=8)
     # 9 throttles + 11 successes over a 20-wide window = 0.45 < 0.5.
-    for i in range(_BREAKER_MIN_SAMPLES):
+    for i in range(BREAKER_MIN_SAMPLES):
         _ = breaker.on_record(throttled=i < 9)
-    assert breaker._state is _CircuitState.CLOSED
-    assert breaker.admit()[0] is _Admit.NORMAL
+    assert breaker._state is CircuitState.CLOSED
+    assert breaker.admit()[0] is Admit.NORMAL
 
 
 def test_rolling_window_opens_once_throttles_dominate(monkeypatch: pytest.MonkeyPatch) -> None:
     """A healthy window then a storm: the breaker opens when throttles reach half
     of the *rolling* window, not from the start of time."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    breaker = _CircuitBreaker("openai", ceiling=4)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    breaker = CircuitBreaker("openai", ceiling=4)
     # Fill the window with successes — healthy, stays closed.
-    for _ in range(_BREAKER_MIN_SAMPLES):
+    for _ in range(BREAKER_MIN_SAMPLES):
         assert breaker.on_record(throttled=False) is None
-    assert breaker._state is _CircuitState.CLOSED
+    assert breaker._state is CircuitState.CLOSED
     # Now a throttle storm. The window is 20 wide, so the 10th throttle makes the
     # rolling fraction exactly 0.5 (10 throttles evicting 10 of the old successes).
-    for _ in range(_BREAKER_MIN_SAMPLES // 2 - 1):
+    for _ in range(BREAKER_MIN_SAMPLES // 2 - 1):
         assert breaker.on_record(throttled=True) is None
-    assert breaker._state is _CircuitState.CLOSED
+    assert breaker._state is CircuitState.CLOSED
     event = breaker.on_record(throttled=True)
     assert event == BackpressureEvent("openai", 4, 0, "breaker_open")
 
@@ -130,49 +123,49 @@ def test_cooldown_then_single_probe_closes_and_clears(monkeypatch: pytest.Monkey
     """After the cooldown, HALF_OPEN admits exactly one probe; a clean success
     closes the breaker and clears the window."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    breaker = _CircuitBreaker("openai", ceiling=8)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
-    assert breaker._state is _CircuitState.OPEN
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    breaker = CircuitBreaker("openai", ceiling=8)
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
+    assert breaker._state is CircuitState.OPEN
 
     # Still cooling down: rejected, no transition.
-    assert breaker.admit() == (_Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
     # Cooldown elapsed: the first admission becomes the single probe.
-    clock["t"] += _BREAKER_COOLDOWN
+    clock["t"] += BREAKER_COOLDOWN
     decision, event = breaker.admit()
-    assert decision is _Admit.PROBE
+    assert decision is Admit.PROBE
     assert event == BackpressureEvent("openai", 0, 1, "breaker_half_open")
-    assert breaker._state is _CircuitState.HALF_OPEN
+    assert breaker._state is CircuitState.HALF_OPEN
     # A second concurrent admission while the probe is out is rejected.
-    assert breaker.admit() == (_Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
 
     # The probe succeeds: close and clear the window.
     close_event = breaker.on_probe_success()
     assert close_event == BackpressureEvent("openai", 1, 8, "breaker_closed")
-    assert breaker._state is _CircuitState.CLOSED
+    assert breaker._state is CircuitState.CLOSED
     assert len(breaker._window) == 0
-    assert breaker.admit()[0] is _Admit.NORMAL
+    assert breaker.admit()[0] is Admit.NORMAL
 
 
 def test_probe_failure_reopens_and_rearms(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed probe re-opens the breaker and re-arms the cooldown; the claim is
     always released so the breaker cannot wedge HALF_OPEN."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    breaker = _CircuitBreaker("openai", ceiling=8)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
-    clock["t"] += _BREAKER_COOLDOWN
-    assert breaker.admit()[0] is _Admit.PROBE
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    breaker = CircuitBreaker("openai", ceiling=8)
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
+    clock["t"] += BREAKER_COOLDOWN
+    assert breaker.admit()[0] is Admit.PROBE
 
     reopen = breaker.on_probe_failure()
     assert reopen == BackpressureEvent("openai", 8, 0, "breaker_open")
-    assert breaker._state is _CircuitState.OPEN
+    assert breaker._state is CircuitState.OPEN
     assert breaker._probe_in_flight is False
     # The cooldown was re-armed from now: an immediate retry is rejected...
-    assert breaker.admit() == (_Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
     # ...and only after another full cooldown does a fresh probe go.
-    clock["t"] += _BREAKER_COOLDOWN
-    assert breaker.admit()[0] is _Admit.PROBE
+    clock["t"] += BREAKER_COOLDOWN
+    assert breaker.admit()[0] is Admit.PROBE
 
 
 # --- end-to-end wiring through acquire_async -----------------------------
@@ -182,7 +175,7 @@ async def test_opens_after_threshold_then_fails_fast(monkeypatch: pytest.MonkeyP
     """A full window of (wrapped, structured-path) throttles through the real
     acquire path opens the breaker; the next call raises ``CircuitOpenError``
     *before* the provider call, holding no slot (the call counter stays frozen)."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # frozen: still cooling
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: still cooling
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "openai"
     calls = [0]
@@ -190,20 +183,20 @@ async def test_opens_after_threshold_then_fails_fast(monkeypatch: pytest.MonkeyP
 
     with backpressure_callback(events.append):
         # Sequential (so unsaturated — AIMD stays put) wrapped 429s fill the window.
-        for _ in range(_BREAKER_MIN_SAMPLES):
+        for _ in range(BREAKER_MIN_SAMPLES):
             with pytest.raises(InstructorRetryException):
                 async with GlobalRateLimiter.acquire_async(key):
                     calls[0] += 1
                     raise _wrapped(429)  # D0: a structured-call throttle, wrapped
 
-        assert calls[0] == _BREAKER_MIN_SAMPLES  # every attempt reached the provider
+        assert calls[0] == BREAKER_MIN_SAMPLES  # every attempt reached the provider
         # The breaker is now OPEN: a fast fail, before the body and any slot.
         with pytest.raises(CircuitOpenError) as excinfo:
             async with GlobalRateLimiter.acquire_async(key):
                 calls[0] += 1  # must not run
 
     assert excinfo.value.provider == key
-    assert calls[0] == _BREAKER_MIN_SAMPLES  # frozen: no provider call while OPEN
+    assert calls[0] == BREAKER_MIN_SAMPLES  # frozen: no provider call while OPEN
     # Exactly one transition event fired — the open at the full window.
     assert events == [BackpressureEvent(key, 8, 0, "breaker_open")]
     # No concurrency slot was taken by the rejected call.
@@ -215,11 +208,11 @@ async def test_open_breaker_deducts_no_rpm_and_holds_no_slot(
 ) -> None:
     """A rejected (OPEN) call deducts no RPM token and occupies no concurrency
     slot — it fast-fails before either gate."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=8, rpm=600, breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
-    breaker._state = _CircuitState.OPEN
+    breaker._state = CircuitState.OPEN
     breaker._opened_at = 1_000.0  # within the cooldown at the frozen now
 
     with pytest.raises(CircuitOpenError):
@@ -234,24 +227,24 @@ async def test_half_open_probe_closes_on_success(monkeypatch: pytest.MonkeyPatch
     """Through the real acquire path: after the cooldown a clean probe closes the
     breaker, and normal calls flow again."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
 
     # Within the cooldown: fast fail.
     with pytest.raises(CircuitOpenError):
         async with GlobalRateLimiter.acquire_async(key):
             pass
 
-    clock["t"] += _BREAKER_COOLDOWN
+    clock["t"] += BREAKER_COOLDOWN
     events: list[BackpressureEvent] = []
     with backpressure_callback(events.append):
         async with GlobalRateLimiter.acquire_async(key):  # admitted as the probe
             pass  # clean success
 
-    assert breaker._state is _CircuitState.CLOSED
+    assert breaker._state is CircuitState.CLOSED
     assert events == [
         BackpressureEvent(key, 0, 1, "breaker_half_open"),
         BackpressureEvent(key, 1, 8, "breaker_closed"),
@@ -264,18 +257,18 @@ async def test_half_open_probe_closes_on_success(monkeypatch: pytest.MonkeyPatch
 async def test_half_open_probe_reopens_on_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
     """A probe that throttles re-opens the breaker and re-arms the cooldown."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
-    clock["t"] += _BREAKER_COOLDOWN
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
+    clock["t"] += BREAKER_COOLDOWN
 
     with pytest.raises(InstructorRetryException):
         async with GlobalRateLimiter.acquire_async(key):  # the probe
             raise _wrapped(429)  # ...throttles
 
-    assert breaker._state is _CircuitState.OPEN
+    assert breaker._state is CircuitState.OPEN
     # Re-armed cooldown: an immediate call is rejected again.
     with pytest.raises(CircuitOpenError):
         async with GlobalRateLimiter.acquire_async(key):
@@ -286,12 +279,12 @@ async def test_cancelled_probe_in_body_reverts_to_open(monkeypatch: pytest.Monke
     """A probe cancelled while its body runs reverts to OPEN (claim released) —
     no wedged HALF_OPEN — and other calls stay rejected meanwhile (single probe)."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
-    clock["t"] += _BREAKER_COOLDOWN
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
+    clock["t"] += BREAKER_COOLDOWN
 
     started = asyncio.Event()
 
@@ -302,7 +295,7 @@ async def test_cancelled_probe_in_body_reverts_to_open(monkeypatch: pytest.Monke
 
     task = asyncio.create_task(probe())
     _ = await started.wait()
-    assert breaker._state is _CircuitState.HALF_OPEN
+    assert breaker._state is CircuitState.HALF_OPEN
     assert breaker._probe_in_flight is True
     # The single probe is out: every other call is rejected.
     with pytest.raises(CircuitOpenError):
@@ -313,7 +306,7 @@ async def test_cancelled_probe_in_body_reverts_to_open(monkeypatch: pytest.Monke
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert breaker._state is _CircuitState.OPEN  # reverted, not wedged HALF_OPEN
+    assert breaker._state is CircuitState.OPEN  # reverted, not wedged HALF_OPEN
     assert breaker._probe_in_flight is False  # claim released
 
 
@@ -324,7 +317,7 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     RPM token is deducted) reverts to OPEN and refunds the RPM token — the probe
     claim shares the rpm-refund-on-cancel leak class and is released coherently."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])  # frozen: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])  # frozen: no refill
     configure_rate_limit(max_concurrent=8, rpm=480, tpm=6_000, breaker=True)
     key = "openai"
 
@@ -336,8 +329,8 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
 
     # Force OPEN with an already-elapsed cooldown (no clock advance, so TPM stays dry).
     breaker = GlobalRateLimiter._get_breaker(key)
-    breaker._state = _CircuitState.OPEN
-    breaker._opened_at = clock["t"] - _BREAKER_COOLDOWN - 1.0
+    breaker._state = CircuitState.OPEN
+    breaker._opened_at = clock["t"] - BREAKER_COOLDOWN - 1.0
 
     async def probe() -> None:
         async with GlobalRateLimiter.acquire_async(key):
@@ -347,7 +340,7 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     for _ in range(10):
         await asyncio.sleep(0)
     # Admitted as the probe, RPM debited, now parked on the exhausted TPM gate.
-    assert breaker._state is _CircuitState.HALF_OPEN
+    assert breaker._state is CircuitState.HALF_OPEN
     assert breaker._probe_in_flight is True
     assert rpm_bucket._level == 6.0  # RPM debited by the probe
 
@@ -355,16 +348,16 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert breaker._state is _CircuitState.OPEN  # reverted
+    assert breaker._state is CircuitState.OPEN  # reverted
     assert breaker._probe_in_flight is False  # claim released
     assert rpm_bucket._level == 7.0  # RPM refunded, not silently lost
 
 
 async def test_breakers_are_per_provider_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     """Opening one provider's breaker leaves every other provider unaffected."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=8, breaker=True)
-    _fill_throttles(GlobalRateLimiter._get_breaker("openai"), _BREAKER_MIN_SAMPLES)
+    _fill_throttles(GlobalRateLimiter._get_breaker("openai"), BREAKER_MIN_SAMPLES)
 
     # openai is open → fast fail.
     with pytest.raises(CircuitOpenError):
@@ -373,16 +366,16 @@ async def test_breakers_are_per_provider_isolated(monkeypatch: pytest.MonkeyPatc
     # google is untouched → admits normally.
     async with GlobalRateLimiter.acquire_async("google"):
         pass
-    assert GlobalRateLimiter._breaker_states["google"]._state is _CircuitState.CLOSED
+    assert GlobalRateLimiter._breaker_states["google"]._state is CircuitState.CLOSED
 
 
 async def test_breaker_off_is_a_complete_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``breaker=False`` (the default) nothing changes: no breaker is created,
     even a flood of throttles never raises ``CircuitOpenError``."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=8)  # breaker defaults off
     key = "openai"
-    for _ in range(_BREAKER_MIN_SAMPLES * 2):
+    for _ in range(BREAKER_MIN_SAMPLES * 2):
         with pytest.raises(InstructorRetryException):
             async with GlobalRateLimiter.acquire_async(key):
                 raise _wrapped(429)
@@ -401,7 +394,7 @@ def test_breaker_is_shared_across_event_loops() -> None:
     seen on every loop."""
     configure_rate_limit(max_concurrent=8, breaker=True)
     key = "google"
-    seen: list[_CircuitBreaker] = []
+    seen: list[CircuitBreaker] = []
 
     async def grab() -> None:
         seen.append(GlobalRateLimiter._get_breaker(key))
@@ -416,17 +409,17 @@ def test_probe_is_a_single_process_wide_claim(monkeypatch: pytest.MonkeyPatch) -
     any other, since the breaker is one shared, lock-guarded object — is rejected
     until the probe resolves."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    breaker = _CircuitBreaker("openai", ceiling=8)
-    _fill_throttles(breaker, _BREAKER_MIN_SAMPLES)
-    clock["t"] += _BREAKER_COOLDOWN
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    breaker = CircuitBreaker("openai", ceiling=8)
+    _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
+    clock["t"] += BREAKER_COOLDOWN
 
     decision, event = breaker.admit()
-    assert decision is _Admit.PROBE
+    assert decision is Admit.PROBE
     assert event == BackpressureEvent("openai", 0, 1, "breaker_half_open")
     # Two more admissions (standing in for two other loops) are both rejected.
-    assert breaker.admit() == (_Admit.REJECT, None)
-    assert breaker.admit() == (_Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
+    assert breaker.admit() == (Admit.REJECT, None)
 
 
 # --- CircuitOpenError is never retried -----------------------------------

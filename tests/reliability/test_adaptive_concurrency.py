@@ -3,16 +3,16 @@
 These never touch the network. They pin the negative-feedback loop the rate
 limiter grows under provider overload:
 
-* the AIMD math on ``_AdaptiveState`` (saturated decrease, refractory cooldown so
+* the AIMD math on ``AdaptiveState`` (saturated decrease, refractory cooldown so
   a correlated burst is one halving, floor at 1, wall-clock-paced recovery toward
   the ceiling, never exceeding it) — driven with a frozen clock;
-* the throttle classifier (``_is_throttle_signal``) over 429/503/529, the 500/
+* the throttle classifier (``is_throttle_signal``) over 429/503/529, the 500/
   timeout exclusions, and the ``InstructorRetryException`` unwrap (the structured
   path);
 * the end-to-end wiring through ``acquire_async``: a saturated structured-call
   throttle decreases the shared limit; an unsaturated one does not; ``adaptive=
   False`` pins the limit;
-* the FIFO ``_AdaptiveGate`` (no barging, a grown limit admits several waiters,
+* the FIFO ``AdaptiveGate`` (no barging, a grown limit admits several waiters,
   a shrunk limit never over-admits) and the gate enforcing a reduced limit;
 * the cancellation rpm-token refund and reconfiguration/cross-loop behaviour.
 
@@ -30,15 +30,11 @@ import pytest
 from instructor.core import InstructorRetryException
 from pydantic import ValidationError
 
-from llmkit import configure_rate_limit, rate_limiting
-from llmkit.rate_limiting import (
-    BackpressureEvent,
-    GlobalRateLimiter,
-    _AdaptiveGate,
-    _AdaptiveState,
-    _is_throttle_signal,
-    _SyncAdaptiveGate,
-)
+from llmkit import configure_rate_limit
+from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, _tuning
+from llmkit.rate_limiting._adaptive import AdaptiveGate, AdaptiveState, SyncAdaptiveGate
+from llmkit.rate_limiting._outcomes import is_throttle_signal
+from llmkit.rate_limiting._tuning import AIMD_DECREASE_COOLDOWN, AIMD_RECOVERY_INTERVAL
 from tests._support import OkSchema
 
 
@@ -79,34 +75,34 @@ class _Probe:
                 self.current -= 1
 
 
-# --- _is_throttle_signal -------------------------------------------------
+# --- is_throttle_signal -------------------------------------------------
 
 
 def test_throttle_signal_classifies_status_codes() -> None:
     """429/503/529 are throttle signals; 500, timeouts, and validation are not."""
-    assert _is_throttle_signal(_status_error(openai.RateLimitError, 429))
-    assert _is_throttle_signal(_status_error(openai.InternalServerError, 503))
-    assert _is_throttle_signal(_status_error(openai.InternalServerError, 529))
-    assert not _is_throttle_signal(_status_error(openai.InternalServerError, 500))
-    assert not _is_throttle_signal(TimeoutError("boom"))
-    assert not _is_throttle_signal(_validation_error())
+    assert is_throttle_signal(_status_error(openai.RateLimitError, 429))
+    assert is_throttle_signal(_status_error(openai.InternalServerError, 503))
+    assert is_throttle_signal(_status_error(openai.InternalServerError, 529))
+    assert not is_throttle_signal(_status_error(openai.InternalServerError, 500))
+    assert not is_throttle_signal(TimeoutError("boom"))
+    assert not is_throttle_signal(_validation_error())
 
 
 def test_throttle_signal_unwraps_instructor_wrapper() -> None:
     """A structured-call throttle wrapped in ``InstructorRetryException`` is seen."""
-    assert _is_throttle_signal(_wrapped(429))
+    assert is_throttle_signal(_wrapped(429))
     # A wrapped permanent 4xx is not a throttle.
-    assert not _is_throttle_signal(
+    assert not is_throttle_signal(
         InstructorRetryException(
             _status_error(openai.AuthenticationError, 401), n_attempts=1, total_usage=0
         )
     )
 
 
-# --- _AdaptiveState math (frozen clock) ----------------------------------
+# --- AdaptiveState math (frozen clock) ----------------------------------
 
 
-def _hold(state: _AdaptiveState, n: int) -> None:
+def _hold(state: AdaptiveState, n: int) -> None:
     """Prime the state's provider-wide in-flight aggregate to *n* held slots.
 
     ``on_throttle`` now judges saturation on that aggregate, so a unit test that
@@ -120,8 +116,8 @@ def _hold(state: _AdaptiveState, n: int) -> None:
 
 def test_saturated_throttle_halves_and_emits(monkeypatch: pytest.MonkeyPatch) -> None:
     """A saturated throttle halves the limit and returns a throttle event."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    state = AdaptiveState("openai", ceiling=8)
     _hold(state, 8)  # aggregate at the limit → saturated
     assert state.limit() == 8
     event = state.on_throttle()
@@ -131,8 +127,8 @@ def test_saturated_throttle_halves_and_emits(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_unsaturated_throttle_does_not_decrease(monkeypatch: pytest.MonkeyPatch) -> None:
     """A throttle received while below the limit changes nothing (not our fault)."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    state = AdaptiveState("openai", ceiling=8)
     # Unprimed: the aggregate (0) is below the limit (8), so the throttle is noise.
     assert state.on_throttle() is None
     assert state.limit() == 8
@@ -141,8 +137,8 @@ def test_unsaturated_throttle_does_not_decrease(monkeypatch: pytest.MonkeyPatch)
 def test_burst_within_cooldown_is_a_single_decrease(monkeypatch: pytest.MonkeyPatch) -> None:
     """Correlated throttles inside the refractory window cause one halving."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    state = AdaptiveState("openai", ceiling=8)
     _hold(state, 8)  # aggregate stays >= every post-halving limit
 
     assert state.on_throttle() is not None  # 8 -> 4
@@ -152,7 +148,7 @@ def test_burst_within_cooldown_is_a_single_decrease(monkeypatch: pytest.MonkeyPa
     assert state.on_throttle() is None
     assert state.limit() == 4
     # Past the cooldown, the next throttle halves again.
-    clock["t"] += rate_limiting._AIMD_DECREASE_COOLDOWN
+    clock["t"] += AIMD_DECREASE_COOLDOWN
     assert state.on_throttle() is not None  # 4 -> 2
     assert state.limit() == 2
 
@@ -160,13 +156,13 @@ def test_burst_within_cooldown_is_a_single_decrease(monkeypatch: pytest.MonkeyPa
 def test_decrease_floors_at_one(monkeypatch: pytest.MonkeyPatch) -> None:
     """Repeated throttles drive the limit to 1 and no lower."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    state = AdaptiveState("openai", ceiling=8)
     _hold(state, 8)  # aggregate stays >= every post-halving limit
     for expected in (4, 2, 1):
         assert state.on_throttle() is not None
         assert state.limit() == expected
-        clock["t"] += rate_limiting._AIMD_DECREASE_COOLDOWN
+        clock["t"] += AIMD_DECREASE_COOLDOWN
     # At the floor, a further throttle is a no-op (max(1, int(1*0.5)) == 1).
     assert state.on_throttle() is None
     assert state.limit() == 1
@@ -176,14 +172,14 @@ def test_recovery_is_wall_clock_paced(monkeypatch: pytest.MonkeyPatch) -> None:
     """Recovery climbs one step per elapsed interval, catches up after a gap, and
     never exceeds the ceiling — and a success with no elapsed time is a no-op."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    interval = rate_limiting._AIMD_RECOVERY_INTERVAL
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    interval = AIMD_RECOVERY_INTERVAL
+    state = AdaptiveState("openai", ceiling=8)
     _hold(state, 8)  # saturate the aggregate for the drive-to-floor throttles
     # Drive to the floor.
     for _ in range(3):
         _ = state.on_throttle()
-        clock["t"] += rate_limiting._AIMD_DECREASE_COOLDOWN
+        clock["t"] += AIMD_DECREASE_COOLDOWN
     assert state.limit() == 1
 
     # A success before an interval elapses does not recover.
@@ -212,11 +208,11 @@ def test_recovery_is_wall_clock_paced(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_throttle_restarts_the_recovery_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     """A decrease resets the recovery anchor, so recovery is measured from it."""
     clock = {"t": 1_000.0}
-    monkeypatch.setattr(rate_limiting, "_now", lambda: clock["t"])
-    state = _AdaptiveState("openai", ceiling=8)
+    monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
+    state = AdaptiveState("openai", ceiling=8)
     _hold(state, 8)  # saturate the aggregate
     _ = state.on_throttle()  # 8 -> 4 at t=1000
-    clock["t"] += rate_limiting._AIMD_RECOVERY_INTERVAL - 0.5  # just shy of a step
+    clock["t"] += AIMD_RECOVERY_INTERVAL - 0.5  # just shy of a step
     assert state.on_success() is None  # not yet a full interval since the decrease
     assert state.limit() == 4
 
@@ -231,10 +227,10 @@ async def test_saturation_is_judged_on_the_aggregate_across_async_gates(
     decrease because the *aggregate* (both gates) is at the limit, even though
     neither gate is alone at it. Fails pre-fix (per-gate saturation → no
     decrease)."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    state = _AdaptiveState("openai", ceiling=4)
-    gate_a = _AdaptiveGate(state)
-    gate_b = _AdaptiveGate(state)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    state = AdaptiveState("openai", ceiling=4)
+    gate_a = AdaptiveGate(state)
+    gate_b = AdaptiveGate(state)
     # Each gate holds 2 (fast path, never awaits): each is below the limit of 4
     # on its own, but together the aggregate is 4 == the limit.
     for _ in range(2):
@@ -253,10 +249,10 @@ async def test_saturation_counts_the_sync_gate_in_the_aggregate(
     """The aggregate spans populations: an async gate holding 2 and the sync gate
     holding 2 saturate a ceiling-4 state, so a throttle on the *async* gate
     decreases 4 -> 2. Fails pre-fix."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    state = _AdaptiveState("openai", ceiling=4)
-    async_gate = _AdaptiveGate(state)
-    sync_gate = _SyncAdaptiveGate(state)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    state = AdaptiveState("openai", ceiling=4)
+    async_gate = AdaptiveGate(state)
+    sync_gate = SyncAdaptiveGate(state)
     for _ in range(2):
         await async_gate.acquire()
         sync_gate.acquire()
@@ -272,10 +268,10 @@ async def test_aggregate_below_limit_is_still_unsaturated(
 ) -> None:
     """Below the shared limit a throttle is noise; and ``note_release`` pairs
     correctly, so a held-then-released slot never leaves the aggregate inflated."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
-    state = _AdaptiveState("openai", ceiling=4)
-    gate_a = _AdaptiveGate(state)
-    gate_b = _AdaptiveGate(state)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
+    state = AdaptiveState("openai", ceiling=4)
+    gate_a = AdaptiveGate(state)
+    gate_b = AdaptiveGate(state)
     await gate_a.acquire()
     await gate_b.acquire()  # aggregate 2 < limit 4
     assert gate_a.on_throttle() is None  # noise, and _last_decrease untouched
@@ -300,7 +296,7 @@ async def test_saturated_structured_throttle_decreases_shared_limit(
 ) -> None:
     """A structured-call throttle (wrapped) received at the limit halves it —
     proving the unwrap and the saturation gate on the real acquire path."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=2)
     key = "google"
     holder_in = asyncio.Event()
@@ -328,7 +324,7 @@ async def test_unsaturated_throttle_via_acquire_does_not_decrease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A throttle with only one call in flight (cap 8) does not move the limit."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=8)
     key = "google"
     with pytest.raises(InstructorRetryException):
@@ -339,7 +335,7 @@ async def test_unsaturated_throttle_via_acquire_does_not_decrease(
 
 async def test_adaptive_false_pins_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``adaptive=False`` a saturated throttle leaves the limit at the cap."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=2, adaptive=False)
     key = "google"
     holder_in = asyncio.Event()
@@ -365,7 +361,7 @@ async def test_adaptive_false_pins_the_limit(monkeypatch: pytest.MonkeyPatch) ->
 
 async def test_success_does_not_grow_above_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A never-throttled provider stays exactly at the ceiling (no growth above)."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=4)
     key = "google"
     for _ in range(10):
@@ -376,7 +372,7 @@ async def test_success_does_not_grow_above_ceiling(monkeypatch: pytest.MonkeyPat
 
 async def test_gate_enforces_a_reduced_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the shared limit is reduced, the gate admits only that many at once."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=4)
     key = "google"
     gate = GlobalRateLimiter._get_async_gate(key)
@@ -399,8 +395,8 @@ async def test_gate_enforces_a_reduced_limit(monkeypatch: pytest.MonkeyPatch) ->
 
 async def test_gate_serves_waiters_fifo() -> None:
     """Queued waiters are admitted strictly in arrival order (no barging)."""
-    state = _AdaptiveState("k", ceiling=1)
-    gate = _AdaptiveGate(state)
+    state = AdaptiveState("k", ceiling=1)
+    gate = AdaptiveGate(state)
     await gate.acquire()  # holder takes the only slot
     order: list[int] = []
 
@@ -421,9 +417,9 @@ async def test_gate_serves_waiters_fifo() -> None:
 
 async def test_release_after_grow_admits_multiple_waiters() -> None:
     """A grown limit admits several waiters at once on the next release (not one)."""
-    state = _AdaptiveState("k", ceiling=3)
+    state = AdaptiveState("k", ceiling=3)
     state._limit = 1
-    gate = _AdaptiveGate(state)
+    gate = AdaptiveGate(state)
     await gate.acquire()  # holder, in_flight == 1 == limit
     admitted: list[int] = []
 
@@ -444,9 +440,9 @@ async def test_release_after_grow_admits_multiple_waiters() -> None:
 
 async def test_shrink_never_admits_beyond_new_limit() -> None:
     """A shrunk limit holds back admission until in-flight drains below it."""
-    state = _AdaptiveState("k", ceiling=8)
+    state = AdaptiveState("k", ceiling=8)
     state._limit = 3
-    gate = _AdaptiveGate(state)
+    gate = AdaptiveGate(state)
     await gate.acquire()
     await gate.acquire()  # in_flight == 2, limit 3
 
@@ -475,8 +471,8 @@ async def test_shrink_never_admits_beyond_new_limit() -> None:
 
 async def test_cancelled_waiter_does_not_consume_a_slot() -> None:
     """A waiter cancelled while queued frees no phantom slot: the next waiter runs."""
-    state = _AdaptiveState("k", ceiling=1)
-    gate = _AdaptiveGate(state)
+    state = AdaptiveState("k", ceiling=1)
+    gate = AdaptiveGate(state)
     await gate.acquire()  # holder
 
     first_started = asyncio.Event()
@@ -516,7 +512,7 @@ async def test_cancelled_waiter_does_not_consume_a_slot() -> None:
 async def test_cancel_during_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """A call cancelled after its RPM token is deducted but before it holds a slot
     refunds the token — so a systematically-cancelled workload keeps its RPM."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)  # freeze: no refill
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     configure_rate_limit(max_concurrent=8, rpm=480, tpm=6_000)
     key = "openai"
 
@@ -548,7 +544,7 @@ async def test_cancel_during_acquire_refunds_rpm_token(monkeypatch: pytest.Monke
 async def test_configure_clears_adaptive_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """``configure`` clears the adaptive-state registry, so a reduced limit does
     not leak into the next configuration."""
-    monkeypatch.setattr(rate_limiting, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     configure_rate_limit(max_concurrent=4)
     key = "google"
     gate = GlobalRateLimiter._get_async_gate(key)
@@ -564,7 +560,7 @@ def test_adaptive_state_is_shared_across_event_loops() -> None:
     is per-loop), so a throttle on one loop lowers the limit every loop sees."""
     configure_rate_limit(max_concurrent=4)
     key = "google"
-    states: list[_AdaptiveState] = []
+    states: list[AdaptiveState] = []
 
     async def grab() -> None:
         states.append(GlobalRateLimiter._get_async_gate(key)._state)

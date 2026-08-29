@@ -34,7 +34,7 @@ from litellm.types.utils import ModelResponseStream
 
 from llmkit import LLM_RECOVERABLE_ERRORS, ServiceUnavailableError, _litellm
 from llmkit.exceptions import normalize_service_unavailable, underlying_provider_error
-from llmkit.rate_limiting import _is_throttle_signal
+from llmkit.rate_limiting._outcomes import is_throttle_signal
 from llmkit.retry import _retry_after_seconds
 from tests._support import OkSchema
 
@@ -170,8 +170,8 @@ def test_throttle_classification_survives_normalization() -> None:
     original = _litellm_503()
     normalized = normalize_service_unavailable(original)
     assert normalized is not original
-    assert _is_throttle_signal(original)
-    assert _is_throttle_signal(normalized)
+    assert is_throttle_signal(original)
+    assert is_throttle_signal(normalized)
 
 
 def test_non_503_errors_pass_through_untouched() -> None:
