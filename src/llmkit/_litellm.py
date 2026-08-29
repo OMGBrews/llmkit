@@ -11,6 +11,21 @@ It is also the **test seam**: unit tests patch these three coroutines
 the real call-function bodies — logging, retry, content coercion — still
 run over a faked provider response (see ``tests/_support`` ``patch_llm``).
 
+**Every reach into this module is a *function-local* ``import
+llmkit._litellm as _litellm``** (the call modules under :mod:`llmkit.calls`
+and :mod:`llmkit.sync`), never a module-level import. That is not style: this
+module imports ``litellm`` eagerly at line scope below, and ``import llmkit``
+must leave litellm out of ``sys.modules`` entirely — a multi-second import a
+local-first library consumed by CLIs should not pay until the first provider
+call. ``tests/packaging/test_litellm_lazy_import.py`` pins that contract in a
+fresh interpreter. Binding the *module object* (rather than
+``from llmkit._litellm import acompletion_structured``) is what additionally
+keeps the patch seam live: the attribute lookup resolves at call time, so a
+patch installed after import is seen. The absolute ``import llmkit._litellm``
+form is deliberate too — ``from llmkit import _litellm`` would route through
+the package ``__init__`` and reintroduce the static import cycle that used to
+force a file-level ``reportImportCycles`` waiver there.
+
 LiteLLM's ``acompletion`` and instructor's ``create_with_completion`` carry
 very strict, heavily-overloaded type stubs that reject this module's generic
 ``**credential-kwargs`` and ``list[Message]`` message shapes. Those

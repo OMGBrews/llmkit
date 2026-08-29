@@ -263,7 +263,8 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
     propagates ahead of any straggler outcome. The drains run whether *coro*
     succeeded or raised.
     """
-    from llmkit import _litellm
+    # Function-local + module-bound; see :mod:`llmkit._litellm`.
+    import llmkit._litellm as _litellm
 
     with _fallback_lock:
         loop = asyncio.new_event_loop()
@@ -428,7 +429,8 @@ async def _drain_and_close(timeout: float | None) -> None:
     task on the loop (most importantly LiteLLM's intentionally-infinite
     logging-worker loop) so the subsequent ``loop.stop`` / ``close`` is clean.
     """
-    from llmkit import _litellm
+    # Function-local + module-bound; see :mod:`llmkit._litellm`.
+    import llmkit._litellm as _litellm
 
     await _litellm.drain_async_logging(timeout=timeout)
     current = asyncio.current_task()

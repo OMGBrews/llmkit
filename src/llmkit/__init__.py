@@ -20,18 +20,6 @@ the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 ``with_retries``, and ``GlobalRateLimiter`` all live there.
 """
 
-# raw-cycle — This aggregator re-exports the public surface top-down
-# (``__init__`` → ``structured_output`` → ``sync``), while the call functions
-# reach back to the LiteLLM layer through a *function-local* ``from llmkit
-# import _litellm`` (structured_output.py, sync.py). That deferred import is a
-# deliberate test seam: tests patch ``llmkit._litellm`` coroutines, so the
-# lookup must resolve at call time, not bind at module load. It closes a static
-# import cycle through this package's ``__init__`` that is harmless at runtime
-# (the package is fully loaded before any call fires). basedpyright reports it
-# as a file-level ``reportImportCycles`` with no line range, so it can't be
-# suppressed inline — disable the rule for this re-export module only.
-# pyright: reportImportCycles=false
-
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 

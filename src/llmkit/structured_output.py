@@ -254,9 +254,10 @@ async def structured_llm_call[T: BaseModel](
     attempt_count = 0
 
     async def _attempt() -> T:
-        # Deferred import so test patches on ``llmkit._litellm``
-        # call functions resolve at call time.
-        from llmkit import _litellm
+        # Function-local so ``import llmkit`` never pays litellm's import
+        # cost, and module-object-bound so a test patch installed after
+        # import is still seen (see :mod:`llmkit._litellm`).
+        import llmkit._litellm as _litellm
 
         nonlocal attempt_count
         attempt_count += 1
@@ -494,7 +495,8 @@ async def text_llm_call(
     attempt_count = 0
 
     async def _attempt() -> str:
-        from llmkit import _litellm
+        # Function-local + module-bound; see :mod:`llmkit._litellm`.
+        import llmkit._litellm as _litellm
 
         nonlocal attempt_count
         attempt_count += 1
@@ -873,7 +875,8 @@ async def _stream_once(
     and ContextVars set in a generator body leak into the consumer's
     context — see the caller).
     """
-    from llmkit import _litellm
+    # Function-local + module-bound; see :mod:`llmkit._litellm`.
+    import llmkit._litellm as _litellm
 
     started_at = datetime.now(UTC)
     start_t = time.monotonic()
@@ -1129,7 +1132,8 @@ async def tool_llm_call[T: BaseModel](
     attempt_count = 0
 
     async def _attempt() -> ToolCallResult | ToolComposeResult[T]:
-        from llmkit import _litellm
+        # Function-local + module-bound; see :mod:`llmkit._litellm`.
+        import llmkit._litellm as _litellm
 
         nonlocal attempt_count
         attempt_count += 1
