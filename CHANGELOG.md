@@ -6,6 +6,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A tool-calling lane: `tool_llm_call` and `tool_llm_call_sync`.** llmkit now
+  owns one tool-enabled completion *turn*; the loop stays in your application,
+  which is where the decision to execute a tool belongs. Describe each tool
+  with `ToolDefinition(name, description, parameters)` — or
+  `ToolDefinition.from_model(name, Model)` to derive the JSON Schema from a
+  Pydantic model *and* get the model's arguments validated back — and steer
+  selection with `tool_choice` (`"auto"`, `"none"`, `"required"`, or
+  `ToolName("...")`). The turn returns a `ToolCallResult` carrying `text`, the
+  narrowed `tool_calls`, `stop_reason`, and a `TokenUsage`. Each `ToolCall`
+  carries the raw argument string, the parsed `arguments` dict, and `validated`
+  (the Pydantic instance when the definition supplied a model). Feeding the
+  next turn is two helpers: `result.to_message()` for the assistant turn, and
+  `tool_result_message(call.id, output)` for each result. A malformed
+  provider payload, an unknown tool name, non-JSON arguments, or arguments that
+  fail the definition's model all raise `ToolArgumentError`, which names the
+  tool, the call id, and the raw arguments; like a schema-validation failure it
+  is re-asked within `RetryPolicy.validation_max_attempts` before it surfaces.
+  The turn keeps the rest of the call
+  surface's behaviour: retries, rate limiting, `feature`/`label`, `options=`,
+  the per-call `provider=` override, and per-call logging under the `tools`
+  log schema, whose records carry the offered `tools`, the returned
+  `tool_calls`, and `usage`. New exports: `tool_llm_call`, `tool_llm_call_sync`,
+  `ToolDefinition`, `ToolName`, `ToolChoice`, `ToolCall`, `ToolCallResult`,
+  `TokenUsage`, `tool_result_message`, `AssistantToolMessage`,
+  `ToolResultMessage`, and `ToolArgumentError`.
+
+- **`output_schema=` on a tool call: one turn that either requests tools or
+  returns a validated final answer.** The portable pattern is still two steps —
+  a tool loop, then one `structured_llm_call` — and it works everywhere,
+  including Gemini. On a route measured to support the combined request, passing
+  `output_schema=` collapses the last turn into the loop: the call returns a
+  `ToolComposeResult`, whose `parsed` is `None` on a turn that requested tools
+  and your validated instance on the turn that answered. **Anthropic and OpenAI
+  support it**; every other provider — and the unsafe legacy Claude models the
+  Anthropic guard rejects — raises the new `ComposeUnsupportedError` *before any
+  request*, with a steer to the portable pattern. It is deliberately outside
+  `LLM_RECOVERABLE_ERRORS`: retrying cannot make a provider support the combined
+  request. Branch on capability instead of on the exception with
+  `describe_llm(config).compose_tools_schema` (from `llmkit.providers`). Compose
+  turns keep the tool lane's retry, rate-limit, usage, and logging behaviour;
+  their log schema is `tools+<ModelName>`. The final answer is validated
+  locally and a malformed one is retried within `validation_max_attempts` —
+  unlike the instructor-backed structured lane there is no repair prompt, so a
+  retry re-sends the complete tool history. Gemini's own compose feature is
+  preview-only, so llmkit keeps Gemini on the portable path; the
+  `gemini_structured_output="json"` escape hatch is an instructor-mode setting
+  and does not apply here. New exports: `ToolComposeResult` and
+  `ComposeUnsupportedError`; full documentation is README's "Tool calls with a
+  structured final answer".
+
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is
