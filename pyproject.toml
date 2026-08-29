@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "omg-llmkit"
-version = "0.9.0"
+dynamic = ["version"]
 description = "A thin, opinionated, local-first structured-output + logging layer over LiteLLM"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -114,6 +114,26 @@ dev = [
     "omg-llmkit[bedrock]",
     "omg-llmkit[vertex]",
 ]
+
+# The version is derived from git, not written down. A tagged release commit
+# builds as exactly `X.Y.Z`; every commit after it builds as
+# `X.Y.Z+1.devN+g<sha>`, so an unreleased build installed from a `git+https`
+# pin self-identifies instead of impersonating the last published release.
+# That impersonation had real consequences downstream: a consumer's
+# dependency-bump version check went inert, and their `pip-audit` gate matched
+# the installed candidate against the *published* version's advisory record.
+# The `vX.Y.Z` tags this repo already uses are the shape setuptools-scm parses
+# by default, so no tag pattern is configured here.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# Builds from a git checkout read the tags; builds from an sdist read the
+# version hatch-vcs froze into PKG-INFO. This covers the third case — a plain
+# source tree that is neither — which would otherwise fail the build outright.
+# `0.0.0` sorts below and matches no published release, so a build that lands
+# here is visibly not a release rather than quietly wearing one's number.
+fallback_version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 # ``omg_llmkit`` is a one-line import shim: the distribution installs as
