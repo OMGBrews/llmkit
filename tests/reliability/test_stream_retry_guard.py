@@ -17,6 +17,7 @@ unretried) does not multiply the two budgets. These pin:
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from collections.abc import AsyncIterator
 from unittest.mock import patch
@@ -68,6 +69,59 @@ async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
     # NOT 9 (3 x 3). The guard prevented the multiplication.
     assert calls[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
+    """The warning must name the *consumer's* ``async for``, once per call site.
+
+    ``pytest.warns`` cannot see either property: it installs the ``always``
+    filter and resets the registry, so it reports every warning regardless of
+    origin, and it never inspects ``filename``/``lineno``. Both are what the
+    warning is *for* — a host is being told which of its double-wrapped calls to
+    fix, and Python's default filter de-duplicates per warn-site, so an origin
+    inside llmkit would collapse every caller's warning into one.
+
+    ``text_llm_call_stream`` re-yields from :func:`with_retries_stream`, so the
+    warning's frame count depends on that wrapper; this pins the
+    ``warn_stacklevel`` that compensates for it.
+    """
+
+    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        raise TimeoutError("always")
+        # Unreachable by design (see above).
+        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
+
+    # Two callers with their OWN ``async for`` lines: the default filter keys on
+    # the warn site, so sharing ``_drain`` would legitimately collapse them to
+    # one and the count below would prove nothing.
+    async def _site_one() -> list[str]:
+        return [
+            c async for c in llm_calls.text_llm_call_stream("a", feature="t", retry=_NO_BACKOFF)
+        ]
+
+    async def _site_two() -> list[str]:
+        return [
+            c async for c in llm_calls.text_llm_call_stream("b", feature="t", retry=_NO_BACKOFF)
+        ]
+
+    caught: list[warnings.WarningMessage] = []
+    with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+        with warnings.catch_warnings(record=True) as recorded:
+            # The real default filter, not pytest.warns' ``always`` — the
+            # per-warn-site de-duplication is half of what is being pinned.
+            warnings.simplefilter("default")
+            for site in (_site_one, _site_two):
+                with contextlib.suppress(TimeoutError):
+                    _ = await with_retries(site, max_attempts=2, retry_on=(TimeoutError,))
+            caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
+
+    # Two distinct caller sites -> two warnings. One would mean the origin
+    # collapsed onto a single line of llmkit source.
+    assert len(caught) == 2, [f"{w.filename}:{w.lineno}" for w in caught]
+    # Every one attributed to this file, not to anything under src/llmkit.
+    assert all(w.filename == __file__ for w in caught), [w.filename for w in caught]
+    assert len({w.lineno for w in caught}) == 2
 
 
 @pytest.mark.asyncio

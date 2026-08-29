@@ -122,7 +122,16 @@ async def text_llm_call_stream(
     # to the attempt generator while these frames are still live, so the
     # abandoned-stream record is written deterministically rather than at GC.
     async with aclosing(
-        with_retries_stream(_attempt, policy=args.retry, label=tag, surface="text_llm_call_stream")
+        with_retries_stream(
+            _attempt,
+            policy=args.retry,
+            label=tag,
+            surface="text_llm_call_stream",
+            # This frame — the ``async for`` below — sits between the warning
+            # and the consumer, so the double-wrap warning needs one extra
+            # level to name the caller's own line rather than this one.
+            warn_stacklevel=3,
+        )
     ) as stream:
         async for chunk in stream:
             yield chunk

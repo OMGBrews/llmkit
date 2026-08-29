@@ -829,7 +829,20 @@ class _Converter:
                 message=r'Field name ".*" in .* shadows an attribute in parent',
                 category=UserWarning,
             )
-            model = create_model(model_name, __base__=base, **fields)  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
+            model = create_model(
+                model_name,
+                __base__=base,
+                __module__="llmkit.json_schema",
+                # Pinned, not inferred. ``create_model`` reads ``__module__``
+                # off the calling frame, and pydantic's schema generator
+                # disambiguates two ``$defs`` that share a ``title`` using the
+                # module path — so letting it follow this file would change the
+                # emitted document (the bytes sent to the provider) for any
+                # schema with colliding titles, purely because the converter
+                # moved into a submodule. The package is the honest owner
+                # anyway: ``model_from_json_schema`` is what built the class.
+                **fields,  # pyright: ignore[reportAny]  # raw-pydantic — create_model dynamic **field_definitions splat
+            )
         model.__llmkit_optional_fields__ = frozenset(optional_fields)
         if ref_name is not None:
             self._built[ref_name] = model

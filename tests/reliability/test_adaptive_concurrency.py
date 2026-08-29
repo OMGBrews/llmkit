@@ -16,7 +16,7 @@ limiter grows under provider overload:
   a shrunk limit never over-admits) and the gate enforcing a reduced limit;
 * the cancellation rpm-token refund and reconfiguration/cross-loop behaviour.
 
-Clock-driven state reads ``rate_limiting._now`` (monkeypatched) so cooldown and
+Clock-driven state reads ``rate_limiting._tuning.now`` (monkeypatched) so cooldown and
 recovery are deterministic and nothing sleeps for real.
 """
 

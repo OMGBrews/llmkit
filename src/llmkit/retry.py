@@ -324,7 +324,7 @@ class _RetryScope:
     """Identity of one running llmkit retry loop: the task that owns it.
 
     :func:`with_retries` (and the streaming loop in
-    :mod:`llmkit.structured_output`) installs one of these while it runs, so a
+    :func:`with_retries_stream`) installs one of these while it runs, so a
     *nested* retry loop reached **in the same task** — the classic ``3 x 3 = 9``
     trap of a host wrapping a call function that already retries — detects the
     active policy and runs a single pass. Binding the scope to
@@ -421,7 +421,7 @@ async def handle_retry_failure(
     Logs a warning, fires the installed progress callback (swallowing any
     error it raises), then sleeps — in that order. Shared by
     :func:`with_retries` and the streaming retry loop in
-    :mod:`llmkit.structured_output` so both surfaces back off, warn, and report
+    :func:`with_retries_stream` so both surfaces back off, warn, and report
     identically. The final failure is *not* routed here: callers learn about
     exhaustion from the re-raised exception.
 
@@ -475,6 +475,7 @@ async def with_retries_stream[T](
     policy: RetryPolicy,
     label: str,
     surface: str,
+    warn_stacklevel: int = 2,
 ) -> AsyncGenerator[T]:
     """:func:`with_retries` for a stream: retry only *before* the first chunk.
 
@@ -507,6 +508,17 @@ async def with_retries_stream[T](
       the attempt's own ``finally`` runs deterministically rather than whenever
       the garbage collector finalizes a suspended generator — which is what
       makes an abandoned stream's log record honest about being truncated.
+
+    *warn_stacklevel* exists because the double-wrap warning must name the
+    **consumer's** ``async for``, and this is an async generator: its body runs
+    in whatever frame is driving it, so the frame count depends on how many
+    generators sit between here and the consumer. The default ``2`` is correct
+    when the consumer iterates this generator directly; a wrapper that re-yields
+    from it (``text_llm_call_stream`` does) adds one frame and passes ``3``.
+    Getting this wrong does not fail loudly — it blames a line of llmkit for the
+    caller's double-wrap, and collapses the default warning filter's
+    per-call-site de-duplication onto that one line, so a host with two distinct
+    double-wrap sites is told about only the first.
 
     Budgeting is transport-only: a stream carries no schema parsing, so there
     is no separate validation budget. ``validation_retry_on`` is still matched
@@ -545,7 +557,7 @@ async def with_retries_stream[T](
                     + "drive retries from an outer wrapper around a call function, opt "
                     + "the inner call out with retry=NO_RETRY.",
                     RuntimeWarning,
-                    stacklevel=2,
+                    stacklevel=warn_stacklevel,
                 )
             raise
 

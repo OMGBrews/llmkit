@@ -1,6 +1,6 @@
 """Synchronous bridge: drive async coroutines on one persistent event loop.
 
-The sync call wrappers (``*_sync`` in :mod:`llmkit.structured_output`) need to
+The sync call wrappers (``*_sync`` in :mod:`llmkit.calls`) need to
 drive an ``async`` coroutine to completion from synchronous code. :func:`run_sync`
 is that bridge.
 

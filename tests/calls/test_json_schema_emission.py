@@ -277,3 +277,35 @@ def test_emission_is_deterministic_across_calls() -> None:
         _STRICT_BATTERY["def-containing-described-members"], name="Repeat"
     )
     assert model.model_json_schema() == model.model_json_schema()
+
+
+def test_generated_models_carry_a_pinned_module_so_colliding_defs_stay_stable() -> None:
+    """The emitted ``$defs`` keys must not depend on where the converter lives.
+
+    ``create_model`` reads ``__module__`` off its calling frame, and pydantic
+    disambiguates two ``$defs`` that share a ``title`` using the module path. So
+    an unpinned ``__module__`` makes the document sent to the provider depend on
+    which file inside llmkit happens to call ``create_model`` — a wire-format
+    change from a pure refactor, invisible to every other test here because it
+    only shows up when two definitions collide on ``title``.
+    """
+    model = model_from_json_schema({"type": "object", "properties": {"a": {"type": "string"}}})
+    assert model.__module__ == "llmkit.json_schema"
+
+    colliding = {
+        "type": "object",
+        "properties": {
+            "left": {"$ref": "#/$defs/L"},
+            "right": {"$ref": "#/$defs/R"},
+        },
+        "$defs": {
+            "L": {"title": "Shared", "type": "object", "properties": {"x": {"type": "string"}}},
+            "R": {"title": "Shared", "type": "object", "properties": {"y": {"type": "integer"}}},
+        },
+    }
+    emitted = cast("dict[str, object]", model_from_json_schema(colliding).model_json_schema())
+    defs = cast("dict[str, object]", emitted.get("$defs", {}))
+    # Both definitions survive under distinct keys, and neither key carries a
+    # module path that would move with the converter.
+    assert len(defs) == 2, defs
+    assert not any("convert" in key for key in defs), sorted(defs)

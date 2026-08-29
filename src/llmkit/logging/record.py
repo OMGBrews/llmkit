@@ -31,6 +31,12 @@ class LLMCallRecord:
     or streamed plain-text call. ``response`` is the Pydantic-dumped result,
     the accumulated text, or ``None``.
 
+    ``prompt`` is the request as the caller passed it: either the plain string
+    or the full :data:`~llmkit._types.ChatMessage` list, including any
+    assistant-tool-call and tool-result turns a tool loop appended. A sink
+    receives it unnormalized — there is no single string form — so a sink that
+    renders prompts must handle both shapes.
+
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
     per-response cost (no local price table) and is ``None`` when the

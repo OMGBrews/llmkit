@@ -21,7 +21,7 @@ def now() -> float:
     """Monotonic clock read, indirected so offline tests can advance time.
 
     The token buckets read the clock through this one function; a test can
-    monkeypatch ``llmkit.rate_limiting.now`` to drive refill deterministically
+    monkeypatch ``llmkit.rate_limiting._tuning.now`` to drive refill deterministically
     without real sleeping.
     """
     return time.monotonic()

@@ -21,7 +21,9 @@ one's `__init__.py` docstring names its own modules: `calls/` (the public call
 surface, one module per family), `providers/` (one per vendor behind a single
 dispatch), `rate_limiting/`, `logging/` and `json_schema/`. The rest are single
 modules: `retry`, `exceptions`, `options`, `capture`, `run_scope`, `sync`,
-`tools`, `_types`, and `_litellm` (the only place that talks to LiteLLM). Start
+`tools`, `_types`, and `_litellm` (the only place that *calls* LiteLLM — two
+other modules touch it narrowly: `exceptions` resolves litellm's 503 class
+lazily, and the Anthropic provider reads one capability helper). Start
 from the subpackage `__init__` when you need the design rationale — that is
 where it is kept.
 

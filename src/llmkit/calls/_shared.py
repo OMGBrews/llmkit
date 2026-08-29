@@ -78,7 +78,7 @@ def build_call_provider(
     degrades to ``None`` rather than breaking the call: the transport then
     re-resolves and surfaces the real configuration error, and the log path
     degrades to ``(model, None)`` via
-    :func:`~llmkit.capture.resolve_model_and_provider`. Building is config +
+    :func:`resolve_model_and_provider` below. Building is config +
     cached SDK checks (no I/O), so resolving it here before the retry loop is
     safe and happens once per call, not per attempt.
     """

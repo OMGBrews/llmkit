@@ -2,7 +2,7 @@
 
 The single place that talks to LiteLLM (and, for structured output,
 ``instructor`` over LiteLLM). The public call functions in
-:mod:`llmkit.structured_output` build/log :class:`LLMCallRecord`s
+:mod:`llmkit.calls` build/log :class:`LLMCallRecord`s
 around these helpers; this module owns provider routing, the rate-limit
 semaphore, structured-output mode pinning, and best-effort cost extraction.
 

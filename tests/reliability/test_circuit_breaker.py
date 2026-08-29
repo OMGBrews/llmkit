@@ -22,7 +22,7 @@ work when a provider is *down* — the ``0.4.0`` follow-on to adaptive concurren
   ``InstructorRetryException`` — the structured call function, or the streaming
   loop; an explicit ``retry_on`` listing the type still opts back in.
 
-Clock-driven state reads ``rate_limiting._now`` (monkeypatched) so the cooldown
+Clock-driven state reads ``rate_limiting._tuning.now`` (monkeypatched) so the cooldown
 is deterministic and nothing sleeps for real.
 """
 

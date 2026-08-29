@@ -9,7 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is
-  gone.** `structured_output.py` (1180 lines), `rate_limiting.py` (1882),
+  gone.** `structured_output.py` (1288 lines), `rate_limiting.py` (1882),
   `json_schema.py` (1455) and `logging.py` (1006) each held several separable
   concerns behind one name, and in the rate limiter's case the layout hid one
   entirely — the circuit breaker sat between a 215-line token bucket and a
@@ -20,21 +20,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the shipped YAML sink, the sink registry, path safety, the dumper) and
   `llmkit/json_schema/` (the build side and the emitted model's runtime side).
 
-  **Purely internal**: every name in `llmkit.__all__` keeps importing from
-  `llmkit` unchanged, and `llmkit.providers`, `llmkit.retry`,
-  `llmkit.rate_limiting` and `llmkit.logging` all keep working as import paths.
-  The one removal is `llmkit.structured_output`, which was never a documented
-  import path — its nine public names are re-exported from `llmkit` as before,
-  and the module itself is a hard cut rather than a re-export shim, matching
-  the deep-import cut recorded under 0.2.0.
+  **The documented surface is unchanged**: every name in `llmkit.__all__` still
+  imports from `llmkit`, and `llmkit.providers`, `llmkit.retry`,
+  `llmkit.rate_limiting` and `llmkit.logging` all still work as import paths.
+  What a split *does* change is deep imports of names those modules never
+  promised — see **Removed** below, and read it before upgrading if you import
+  anything from llmkit that is not in `llmkit.__all__`.
 
 - **The streaming retry loop moved into `llmkit.retry`** as
   `with_retries_stream`, beside the awaitable one. `text_llm_call_stream` had
   hand-rolled its own copy of the nested-retry guard, the exhaustion log line
-  and the backoff call. Behaviour is unchanged, including the two ways the
-  streaming loop deliberately differs: retry applies only before the first
+  and the backoff call. Retry semantics are unchanged, including the two ways
+  the streaming loop deliberately differs: retry applies only before the first
   chunk, and its double-wrap warning additionally requires the failure to have
-  been retryable.
+  been retryable. Its **exhaustion `ERROR` line now logs under `llmkit.retry`**
+  rather than `llmkit.structured_output` — the per-attempt `WARNING`s always
+  came from `llmkit.retry`, so the pair is now consistent, but a host filtering
+  on the old name loses that line (the old name no longer exists as a module or
+  a logger).
 
 - **`import llmkit` no longer closes a static import cycle.** The call layer
   reaches the LiteLLM transport through `import llmkit._litellm as _litellm`
@@ -44,16 +47,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   With the cycle gone, the package's only file-level pyright rule waiver is
   removed.
 
+- **Two logger names moved with the code that emits on them.** The call
+  surface's messages now come from `llmkit.calls` (was
+  `llmkit.structured_output`, which no longer exists), and the
+  provider-resolution `DEBUG` line — "Could not resolve provider for LLM log" —
+  moved from `llmkit.capture` to `llmkit.calls` along with the function that
+  emits it. `llmkit.logging` and `llmkit.retry` are unchanged. Splitting a
+  module also changes the `module` / `filename` / `lineno` a `LogRecord`
+  carries, since those come from the emitting frame rather than the logger; the
+  logger *names* under `llmkit.logging` are deliberately preserved.
+
+  One related nuance: the *non-streaming* double-wrap `RuntimeWarning` is
+  reported against llmkit's own frame (it always was), and the four call
+  families now reach `with_retries` through one shared helper instead of four
+  separate lines. Python's default filter de-duplicates per warn-site, so a
+  host that double-wraps calls of two different families now sees one warning
+  where it previously saw two. The streaming warning is unaffected: it is
+  reported against the *caller's* line, as before, and is now covered by a test
+  that pins both the attribution and the per-call-site de-duplication.
+
+### Removed
+
+- **`llmkit.structured_output`.** A hard cut, not a re-export shim, matching
+  the deep-import cut recorded under 0.2.0. Its nine public names all still
+  import from `llmkit`; only `from llmkit.structured_output import ...` and
+  `llmkit.structured_output.<name>` stop working.
+
+- **Deep imports of names a split module never exported.** These were reachable
+  only because a monolith happened to bind them at module scope; none was in
+  any `__all__` or in the README. `llmkit.json_schema.JsonDict` (now
+  `llmkit.json_schema.emitted.JsonDict`); `llmkit.capture.resolve_model_and_provider`
+  (now `llmkit.calls._shared.resolve_model_and_provider`);
+  `llmkit.rate_limiting.CircuitOpenError` and `.underlying_provider_error` (both
+  still in `llmkit` / `llmkit.exceptions`); and every private name and
+  incidental re-export under `llmkit.logging` — including `llmkit.logging.yaml`,
+  which a test suite could reach to patch `yaml.dump`, now
+  `llmkit.logging.local_yaml.yaml`.
+
+- **`LLMCallRecord.__module__`** is now `llmkit.logging.record`, so a record
+  pickled by this version cannot be unpickled by an older llmkit. Records
+  pickled by older versions still load here. This only matters if you send
+  records across a process boundary running a different llmkit version.
+
 ### Fixed
 
-- `LLMCallRecord`'s docstring documented nine of its eighteen fields; the tool
-  lane's `tools`, `tool_calls` and `usage` had never been described anywhere,
-  though the YAML body has always written them. `llmkit._types` claimed to
-  import nothing from `llmkit` while importing two TypedDicts from
-  `llmkit.tools`; those two now live in `_types` and `tools` imports them back,
-  so the claim is true and the leaf no longer drags pydantic into its
-  importers. `llmkit.sync` advised callers to "prefer the a-prefixed async
-  variants", which have never existed.
+- `LLMCallRecord`'s docstring described 11 of its 21 fields; the tool lane's
+  `tools`, `tool_calls` and `usage` had never been described anywhere, though
+  the YAML body has always written them, and `prompt` — the field a sink is
+  most likely to render — was never described either. All 21 are now
+  documented. `llmkit._types` claimed to import nothing from `llmkit` while
+  importing two TypedDicts from `llmkit.tools`; those two now live in `_types`
+  and `tools` imports them back, so the claim is true and the leaf no longer
+  drags pydantic into its importers. `llmkit.sync` advised callers to "prefer
+  the a-prefixed async variants", which have never existed.
+
+- **Generated `model_from_json_schema` classes pin their `__module__`.**
+  `pydantic.create_model` reads it off the calling frame, and pydantic
+  disambiguates two `$defs` sharing a `title` using the module path — so
+  without the pin, moving the converter into a submodule would have changed the
+  JSON schema sent to the provider for any schema with colliding titles. The
+  emitted document is unchanged from 0.9.0.
 
 ## [0.9.0] — 2026-08-21
 

@@ -17,7 +17,7 @@ They pin the behaviour the rate limiter promises:
   debit the bucket by each call's measured ``usage.total_tokens``.
 
 The RPM/TPM tests freeze the monotonic clock (monkeypatching
-``rate_limiting._now``) so token-bucket refill is deterministic and nothing
+``rate_limiting._tuning.now``) so token-bucket refill is deterministic and nothing
 sleeps for real.
 
 The limiter is a process-global; the shared ``reset_rate_limiter`` autouse
@@ -867,7 +867,7 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
 # Requests-per-minute (RPM) and tokens-per-minute (TPM): opt-in token buckets.
 #
 # These are pinned with a *frozen* monotonic clock (monkeypatching
-# ``rate_limiting._now``) so refill is deterministic and nothing sleeps for
+# ``rate_limiting._tuning.now``) so refill is deterministic and nothing sleeps for
 # real — the bucket arithmetic is exercised directly, and the limiter wiring is
 # checked through the public acquire path.
 # ---------------------------------------------------------------------------
