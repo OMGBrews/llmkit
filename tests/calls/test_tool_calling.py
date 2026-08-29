@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import cast
 from unittest.mock import patch
@@ -169,6 +170,45 @@ async def test_a_clean_round_carries_no_invalid_calls_and_logs_the_old_shape() -
         )
     assert result.invalid_calls == []
     assert sorted(cast("dict[str, object]", records[0].response)) == ["text", "tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_round_is_recorded_as_cancelled_not_as_an_empty_success() -> None:
+    """``asyncio.CancelledError`` is a ``BaseException``, so it used to skip the
+    error handler while the ``finally`` still wrote a record — leaving
+    ``error=None, response=None``, byte-identical to a successful round that
+    requested nothing. Both halves are asserted: the record exists (the write
+    still happens under cancellation) *and* it names the cancellation, which is
+    the half a test for "an error was recorded" would miss."""
+    definition = ToolDefinition.from_model("weather", _WeatherArgs, "Look up weather")
+    reached_transport = asyncio.Event()
+
+    async def _hang(*_args: object, **_kwargs: object) -> None:
+        reached_transport.set()
+        await asyncio.sleep(3600)
+
+    with (
+        patch("llmkit._litellm.acompletion_tools", side_effect=_hang),
+        capturing_sink() as records,
+    ):
+        call = asyncio.ensure_future(
+            tool_llm_call(
+                "weather?",
+                [definition],
+                feature="assistant",
+                provider=provider_mock(),
+                retry=NO_RETRY,
+            )
+        )
+        _ = await reached_transport.wait()
+        _ = call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+        assert len(records) == 1
+        assert records[0].error == "CancelledError"
+        assert cast("object", records[0].response) is None
+        assert records[0].schema == "tools"
 
 
 @pytest.mark.asyncio

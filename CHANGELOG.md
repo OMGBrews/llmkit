@@ -87,6 +87,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `response` and logged at WARNING, so a round that lost one cannot read as a
   clean round.
 
+- **A cancelled tool round is logged as cancelled.** `asyncio.CancelledError`
+  is a `BaseException`, so an interrupted round skipped the tool lane's error
+  handler while its `finally` still wrote a record — leaving `error: null,
+  response: null`, byte-identical to a successful round that requested nothing
+  and indistinguishable from one in a consumer's eval provenance. The round now
+  records `error: CancelledError` (recorded rather than skipped: it still
+  consumed queue wait and provider time). The exception is re-raised untouched,
+  so cancellation semantics are unchanged. An exception carrying no message now
+  records its bare type name instead of a dangling `"<Type>: "`.
+
 ### Changed
 
 - **The four largest modules are now subpackages, and the import cycle is

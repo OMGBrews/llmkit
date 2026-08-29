@@ -266,8 +266,26 @@ async def tool_llm_call[T: BaseModel](
                     ) from exc
                 result = ToolComposeResult[T](*base, parsed=parsed)
             return result
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+        except BaseException as exc:
+            # ``BaseException``, not ``Exception``: ``asyncio.CancelledError``
+            # is a BaseException, so an interrupted round skipped this handler
+            # while the ``finally`` below still wrote its record — producing
+            # ``error=None, response=None``, which is byte-identical to a
+            # successful round that requested nothing. In a consumer's eval
+            # provenance the two were indistinguishable. The round is recorded
+            # as cancelled instead (recorded, not skipped: it still consumed
+            # queue wait and provider time, and those belong in the log). The
+            # exception itself is re-raised untouched, so control flow —
+            # including cancellation semantics — is unchanged.
+            #
+            # The record still lands: ``record_call_async`` offloads the write
+            # to a thread that runs to completion, and the single delivered
+            # cancellation has already been consumed by the time the
+            # ``finally`` awaits.
+            #
+            # ``str(exc)`` is empty for a bare ``CancelledError``, so the
+            # message is dropped rather than logged as ``"CancelledError: "``.
+            error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             raise
         finally:
             resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)

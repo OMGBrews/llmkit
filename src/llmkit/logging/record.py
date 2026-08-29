@@ -73,10 +73,13 @@ class LLMCallRecord:
     ``started_at`` (UTC, when the attempt began), ``feature`` / ``label`` (the
     caller-supplied telemetry pair that scopes the log filename and the
     ``index.jsonl`` grouping), ``error`` (``"<ExceptionType>: <message>"`` for a
-    failed attempt, ``None`` for a clean one — a streamed call abandoned by its
+    failed attempt, or the bare type name where the exception carries no
+    message; ``None`` for a clean one — a streamed call abandoned by its
     consumer records :data:`~llmkit.STREAM_ABANDONED_ERROR` here rather than
-    ``None``), and ``max_tokens`` / ``reasoning_effort`` (the request-shaping
-    knobs as resolved for this call, ``None`` when not sent).
+    ``None``, and a tool round cancelled mid-flight records ``"CancelledError"``
+    rather than reading as a successful round that requested nothing), and
+    ``max_tokens`` / ``reasoning_effort`` (the request-shaping knobs as resolved
+    for this call, ``None`` when not sent).
 
     Three fields carry the **tool lane** and are ``None`` on every other
     surface: ``tools`` is the tool list as offered to the provider (each entry
