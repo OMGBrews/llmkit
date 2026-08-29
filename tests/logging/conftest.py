@@ -2,7 +2,7 @@
 
 The disk-facing tests use an explicit ``LocalYamlLogSink(tmp_path)`` and so are
 unaffected by the global sink; the few that drive a real call through
-``structured_output`` should not write a stray log. The autouse fixture mutes
+``llmkit.calls`` should not write a stray log. The autouse fixture mutes
 the global sink by default.
 """
 

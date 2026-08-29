@@ -43,7 +43,8 @@ import pytest
 from instructor.core.exceptions import InstructorRetryException
 from litellm.types.utils import ModelResponse, Usage
 
-from llmkit import RetryPolicy, _litellm, structured_output
+from llmkit import RetryPolicy, _litellm
+from llmkit import calls as llm_calls
 from llmkit.exceptions import underlying_provider_error
 from llmkit.retry import _retry_after_seconds
 from tests._support import OkSchema, quiet_logging
@@ -136,7 +137,7 @@ async def test_permanent_error_fails_fast_through_default_policy() -> None:
         patch("llmkit.retry.asyncio.sleep", sleep_mock),
         pytest.raises(InstructorRetryException) as excinfo,
     ):
-        _ = await structured_output.structured_llm_call(
+        _ = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", provider=_fake_provider()
         )
 
@@ -169,7 +170,7 @@ async def test_parse_failure_uses_validation_budget_through_real_loop() -> None:
         patch("llmkit.retry.asyncio.sleep", AsyncMock()),
         pytest.raises(InstructorRetryException),
     ):
-        _ = await structured_output.structured_llm_call(
+        _ = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=policy, provider=_fake_provider()
         )
 

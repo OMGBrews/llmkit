@@ -20,7 +20,9 @@ from llmkit import (
     capture_llm_log_paths,
     capture_llm_records,
     configure_llm_logging,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from tests._support import OkSchema, provider_mock
 
@@ -39,9 +41,7 @@ def test_capture_records_yields_record_with_cost_async() -> None:
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                _ = await structured_output.structured_llm_call(
-                    "hi", OkSchema, feature="extraction"
-                )
+                _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="extraction")
             return records
 
         captured = asyncio.run(_run())
@@ -70,9 +70,7 @@ def test_capture_records_crosses_the_sync_bridge() -> None:
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
     ):
         with capture_llm_records() as records:
-            result = structured_output.structured_llm_call_sync(
-                "hi", OkSchema, feature="classification"
-            )
+            result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="classification")
 
     assert result.ok is True
     assert len(records) == 1
@@ -101,7 +99,7 @@ def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
                 # Called directly (blocking) from inside the running loop, so
                 # run_sync detects it and offloads to a worker thread whose
                 # context must carry this capture buffer.
-                result = structured_output.structured_llm_call_sync(
+                result = llm_calls.structured_llm_call_sync(
                     "hi", OkSchema, feature="classification"
                 )
             return records, result
@@ -126,7 +124,7 @@ def test_capture_records_captures_text_calls() -> None:
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                _ = await structured_output.text_llm_call("hi", feature="summary")
+                _ = await llm_calls.text_llm_call("hi", feature="summary")
             return records
 
         captured = asyncio.run(_run())
@@ -152,9 +150,7 @@ def test_capture_records_records_error_on_failure() -> None:
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
                 with pytest.raises(RuntimeError, match="provider exploded"):
-                    _ = await structured_output.structured_llm_call(
-                        "hi", OkSchema, feature="extraction"
-                    )
+                    _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="extraction")
             return records
 
         captured = asyncio.run(_run())
@@ -176,9 +172,7 @@ def test_capture_records_independent_of_paths_capture() -> None:
         async def _run() -> tuple[list[LLMCallRecord], list[object]]:
             with capture_llm_records() as records:
                 with capture_llm_log_paths() as paths:
-                    _ = await structured_output.structured_llm_call(
-                        "hi", OkSchema, feature="extraction"
-                    )
+                    _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="extraction")
                     return records, list(paths)
 
         captured_records, captured_paths = asyncio.run(_run())
@@ -201,7 +195,7 @@ def test_capture_record_carries_cost_metadata_without_a_sink() -> None:
 
         async def _run() -> LLMCallRecord:
             with capture_llm_records() as records:
-                _ = await structured_output.structured_llm_call(
+                _ = await llm_calls.structured_llm_call(
                     "hi",
                     OkSchema,
                     feature="extraction",

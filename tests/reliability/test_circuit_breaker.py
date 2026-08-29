@@ -41,7 +41,9 @@ from llmkit import (
     CircuitOpenError,
     backpressure_callback,
     configure_rate_limit,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
 from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, _tuning
@@ -512,9 +514,7 @@ async def test_structured_call_does_not_retry_circuit_open_error() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(CircuitOpenError),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
     assert calls[0] == 1
 
 
@@ -534,7 +534,7 @@ async def test_streaming_call_does_not_retry_circuit_open_error() -> None:
         with pytest.raises(CircuitOpenError):
             _ = [
                 chunk
-                async for chunk in structured_output.text_llm_call_stream(
+                async for chunk in llm_calls.text_llm_call_stream(
                     "hi", feature="test", retry=_NO_BACKOFF
                 )
             ]

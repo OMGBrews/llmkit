@@ -43,7 +43,9 @@ from llmkit import (
     LLM_TRANSPORT_ERRORS,
     OutputLimitError,
     _litellm,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.retry import with_retries
 from tests._support import OkSchema, quiet_logging
@@ -161,7 +163,7 @@ async def test_public_call_default_policy_adds_no_attempts_or_backoff() -> None:
         patch("llmkit.retry.asyncio.sleep", sleep_mock),
         pytest.raises(OutputLimitError),
     ):
-        _ = await structured_output.structured_llm_call(
+        _ = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", provider=_fake_provider()
         )
     assert calls == 1

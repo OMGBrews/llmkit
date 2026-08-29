@@ -57,7 +57,9 @@ from llmkit import (
     OutputLimitError,
     RetryPolicy,
     configure_llm_logging,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.capture import capture_llm_log_paths
 from llmkit.exceptions import (
@@ -139,7 +141,7 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
     configure_llm_logging(None)
     try:
         with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-            result = await structured_output.structured_llm_call(
+            result = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", retry=DEFAULT_RETRY_POLICY
             )
     finally:
@@ -268,9 +270,7 @@ async def test_structured_auth_error_is_not_retried() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(openai.AuthenticationError),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 1
 
@@ -287,7 +287,7 @@ async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
+        result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -314,9 +314,7 @@ async def test_structured_litellm_503_is_retried_on_transport_budget() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(litellm.exceptions.ServiceUnavailableError),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 3
 
@@ -333,7 +331,7 @@ async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
+        result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -491,7 +489,7 @@ async def test_nested_with_retries_around_call_function_does_not_multiply() -> N
         raise TimeoutError("always")
 
     async def _wrapped() -> OkSchema:
-        return await structured_output.structured_llm_call(
+        return await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -521,9 +519,7 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
         raise TimeoutError("always")
 
     async def _wrapped() -> OkSchema:
-        return await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=NO_RETRY
-        )
+        return await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
     with warnings.catch_warnings():
         # Any nested-guard RuntimeWarning on this intended path would fail the test.
@@ -551,7 +547,7 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
         return OkSchema(ok=True), None
 
     async def _wrapped() -> OkSchema:
-        return await structured_output.structured_llm_call(
+        return await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -660,7 +656,7 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
         return "done", None
 
     def hook(_result: OkSchema) -> None:
-        _ = structured_output.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
+        _ = llm_calls.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -669,7 +665,7 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
             patch("llmkit._litellm.acompletion_structured", side_effect=_outer_transport),
             patch("llmkit._litellm.acompletion_text", side_effect=_inner_transport),
         ):
-            result = await structured_output.structured_llm_call(
+            result = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="outer", retry=_NO_BACKOFF, on_result=hook
             )
 
@@ -731,9 +727,7 @@ async def test_persistent_validation_error_uses_lower_validation_budget() -> Non
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(ValidationError),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     # validation_max_attempts default is 2 -> two attempts, not three.
     assert calls[0] == 2
@@ -753,9 +747,7 @@ async def test_transport_error_still_uses_full_transport_budget() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 3
 
@@ -780,9 +772,7 @@ async def test_instructor_wrapped_transport_error_uses_full_transport_budget() -
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(InstructorRetryException),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 3
 
@@ -804,9 +794,7 @@ async def test_instructor_wrapped_schema_error_uses_validation_budget() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(InstructorRetryException),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 2
 
@@ -842,9 +830,7 @@ async def test_v2_wrapped_parse_error_uses_validation_budget(
         patch("llmkit._litellm.acompletion_structured", side_effect=_fail),
         pytest.raises(InstructorRetryException),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 2
 
@@ -898,9 +884,7 @@ async def test_instructor_wrapped_permanent_4xx_fails_fast(
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(InstructorRetryException),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 1
 
@@ -1011,7 +995,7 @@ async def test_transiently_malformed_json_gets_one_cross_call_validation_retry()
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
+        result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -1045,9 +1029,7 @@ async def test_no_retry_single_attempt_for_validation_error() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(ValidationError),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=NO_RETRY
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
     assert calls[0] == 1
 
@@ -1066,9 +1048,7 @@ async def test_no_retry_single_attempt_for_transport_error() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="transient"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=NO_RETRY
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
     assert calls[0] == 1
 
@@ -1091,7 +1071,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
             capture_llm_log_paths() as paths,
             pytest.raises(ValidationError),
         ):
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF
             )
     finally:

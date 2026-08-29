@@ -27,9 +27,11 @@ from llmkit import (
     LocalYamlLogSink,
     capture_llm_records,
     configure_llm_logging,
-    structured_output,
 )
-from llmkit.capture import resolve_model_and_provider
+from llmkit import (
+    calls as llm_calls,
+)
+from llmkit.calls._shared import resolve_model_and_provider
 from tests._support import make_record as _record
 from tests._support import provider_mock
 
@@ -89,7 +91,7 @@ def test_structured_call_forwards_provider_override_to_transport() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
-            structured_output.structured_llm_call("hi", _Schema, feature="test", provider=override)
+            llm_calls.structured_llm_call("hi", _Schema, feature="test", provider=override)
         )
     assert result.ok is True
 
@@ -260,7 +262,7 @@ def test_failed_text_call_logs_response_none() -> None:
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
                 with pytest.raises(RuntimeError, match="transport exploded"):
-                    _ = await structured_output.text_llm_call("hi", feature="summary")
+                    _ = await llm_calls.text_llm_call("hi", feature="summary")
             return records
 
         captured = asyncio.run(_run())
@@ -285,7 +287,7 @@ def test_successful_text_call_still_logs_the_text() -> None:
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                result = await structured_output.text_llm_call("hi", feature="summary")
+                result = await llm_calls.text_llm_call("hi", feature="summary")
                 assert result == "hello world"
             return records
 
@@ -319,9 +321,7 @@ def test_mid_stream_failure_still_logs_partial_transcript() -> None:
             chunks: list[str] = []
             with capture_llm_records() as records:
                 with pytest.raises(RuntimeError, match="stream died"):
-                    async for chunk in structured_output.text_llm_call_stream(
-                        "hi", feature="summary"
-                    ):
+                    async for chunk in llm_calls.text_llm_call_stream("hi", feature="summary"):
                         chunks.append(chunk)
             return chunks, records
 
@@ -361,7 +361,7 @@ def test_abandoned_stream_logs_abandonment_marker_not_ok(tmp_path: Path) -> None
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                stream = structured_output.text_llm_call_stream("hi", feature="summary")
+                stream = llm_calls.text_llm_call_stream("hi", feature="summary")
                 async for _chunk in stream:
                     break  # abandon after the first chunk
                 await stream.aclose()
@@ -371,7 +371,7 @@ def test_abandoned_stream_logs_abandonment_marker_not_ok(tmp_path: Path) -> None
 
     assert len(captured) == 1
     assert cast("object", captured[0].response) == "a"  # the partial transcript is kept
-    assert captured[0].error == structured_output.STREAM_ABANDONED_ERROR
+    assert captured[0].error == llm_calls.STREAM_ABANDONED_ERROR
 
     # End to end through the file sink: the head -1 triage line must carry the
     # ERROR verdict, not read like a completed call.
@@ -409,12 +409,12 @@ def test_raising_model_serializer_degrades_logged_response_not_the_call(
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        caplog.at_level("WARNING", logger="llmkit.structured_output"),
+        caplog.at_level("WARNING", logger="llmkit.calls"),
     ):
 
         async def _run() -> tuple[_ExplodingDumpSchema, list[LLMCallRecord]]:
             with capture_llm_records() as records:
-                result = await structured_output.structured_llm_call(
+                result = await llm_calls.structured_llm_call(
                     "hi", _ExplodingDumpSchema, feature="extraction"
                 )
             return result, records

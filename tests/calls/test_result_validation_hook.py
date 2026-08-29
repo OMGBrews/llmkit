@@ -28,7 +28,7 @@ from llmkit import (
     RetryPolicy,
     capture_llm_records,
 )
-from llmkit.structured_output import (
+from llmkit.calls import (
     structured_llm_call,
     text_llm_call,
 )

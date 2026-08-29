@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Generator
 from contextlib import AbstractContextManager, contextmanager
 from unittest.mock import MagicMock, patch
 
-from llmkit import structured_output
+from llmkit import calls as llm_calls
 from tests._support import OkSchema
 
 
@@ -87,7 +87,7 @@ def _patch_stream_seam() -> AbstractContextManager[MagicMock]:
 
 def test_structured_default_path_builds_provider_once() -> None:
     with _count_builds() as build, _patch_structured_seam():
-        result = asyncio.run(structured_output.structured_llm_call("hi", OkSchema, feature="x"))
+        result = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="x"))
     assert result.ok is True
     assert build.call_count == 1
 
@@ -95,9 +95,7 @@ def test_structured_default_path_builds_provider_once() -> None:
 def test_structured_override_path_builds_nothing() -> None:
     with _count_builds() as build, _patch_structured_seam():
         result = asyncio.run(
-            structured_output.structured_llm_call(
-                "hi", OkSchema, feature="x", provider=_seam_provider()
-            )
+            llm_calls.structured_llm_call("hi", OkSchema, feature="x", provider=_seam_provider())
         )
     assert result.ok is True
     assert build.call_count == 0
@@ -105,14 +103,14 @@ def test_structured_override_path_builds_nothing() -> None:
 
 def test_text_default_path_builds_provider_once() -> None:
     with _count_builds() as build, _patch_text_seam():
-        text = asyncio.run(structured_output.text_llm_call("hi", feature="x"))
+        text = asyncio.run(llm_calls.text_llm_call("hi", feature="x"))
     assert text == "ok"
     assert build.call_count == 1
 
 
 def test_stream_default_path_builds_provider_once() -> None:
     async def _drive() -> list[str]:
-        return [chunk async for chunk in structured_output.text_llm_call_stream("hi", feature="x")]
+        return [chunk async for chunk in llm_calls.text_llm_call_stream("hi", feature="x")]
 
     with _count_builds() as build, _patch_stream_seam():
         chunks = asyncio.run(_drive())

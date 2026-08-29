@@ -34,7 +34,8 @@ from unittest.mock import patch
 
 import pytest
 
-from llmkit import DEFAULT_TEMPERATURE, LLMCallOptions, structured_output
+from llmkit import DEFAULT_TEMPERATURE, LLMCallOptions
+from llmkit import calls as llm_calls
 from tests._support import (
     OkSchema,
     capture_stream_provider_kwargs,
@@ -47,12 +48,12 @@ from tests._support import (
 def test_signatures_expose_temperature() -> None:
     """Every public surface carries a ``temperature`` parameter."""
     for surface in (
-        structured_output.structured_llm_call,
-        structured_output.structured_llm_call_sync,
-        structured_output.text_llm_call,
-        structured_output.text_llm_call_sync,
-        structured_output.text_llm_call_stream,
-        structured_output.stream_text_with_log,
+        llm_calls.structured_llm_call,
+        llm_calls.structured_llm_call_sync,
+        llm_calls.text_llm_call,
+        llm_calls.text_llm_call_sync,
+        llm_calls.text_llm_call_stream,
+        llm_calls.stream_text_with_log,
     ):
         assert "temperature" in inspect.signature(surface).parameters
 
@@ -120,7 +121,7 @@ def test_unset_resolves_and_forwards_default_structured() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-        _ = asyncio.run(structured_output.structured_llm_call("hi", OkSchema, feature="test"))
+        _ = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="test"))
 
     assert seen["temperature"] == DEFAULT_TEMPERATURE
 
@@ -134,7 +135,7 @@ def test_unset_resolves_and_forwards_default_text() -> None:
         return "ok", None
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
-        _ = asyncio.run(structured_output.text_llm_call("hi", feature="test"))
+        _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test"))
 
     assert seen["temperature"] == DEFAULT_TEMPERATURE
 
@@ -154,7 +155,7 @@ def test_keyword_none_reaches_transport_structured() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = asyncio.run(
-            structured_output.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
+            llm_calls.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
         )
 
     assert seen["temperature"] is None
@@ -171,7 +172,7 @@ def test_keyword_none_reaches_transport_text() -> None:
         return "ok", None
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
-        _ = asyncio.run(structured_output.text_llm_call("hi", feature="test", temperature=None))
+        _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test", temperature=None))
 
     assert seen["temperature"] is None
 
@@ -195,9 +196,7 @@ def test_keyword_none_omits_key_stream() -> None:
 
     async def _drive() -> list[str]:
         chunks: list[str] = []
-        async for chunk in structured_output.text_llm_call_stream(
-            "hi", feature="test", temperature=None
-        ):
+        async for chunk in llm_calls.text_llm_call_stream("hi", feature="test", temperature=None):
             chunks.append(chunk)
         return chunks
 
@@ -217,9 +216,7 @@ def test_keyword_none_reaches_transport_sync_structured() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-        _ = structured_output.structured_llm_call_sync(
-            "hi", OkSchema, feature="test", temperature=None
-        )
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", temperature=None)
 
     assert seen["temperature"] is None
 
@@ -234,7 +231,7 @@ def test_keyword_none_reaches_transport_sync_text() -> None:
         return "ok", None
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
-        _ = structured_output.text_llm_call_sync("hi", feature="test", temperature=None)
+        _ = llm_calls.text_llm_call_sync("hi", feature="test", temperature=None)
 
     assert seen["temperature"] is None
 
@@ -258,9 +255,7 @@ def test_deprecated_alias_omits_key() -> None:
 
     async def _drive() -> list[str]:
         chunks: list[str] = []
-        async for chunk in structured_output.stream_text_with_log(
-            "hi", feature="test", temperature=None
-        ):
+        async for chunk in llm_calls.stream_text_with_log("hi", feature="test", temperature=None):
             chunks.append(chunk)
         return chunks
 
@@ -283,7 +278,7 @@ def test_options_numeric_still_forwards_when_keyword_unset() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = asyncio.run(
-            structured_output.structured_llm_call(
+            llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", options=LLMCallOptions(temperature=0.6)
             )
         )
@@ -306,7 +301,7 @@ def test_log_record_carries_none_for_omitted_temperature() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
     ):
         _ = asyncio.run(
-            structured_output.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
+            llm_calls.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
         )
 
     assert len(captured) == 1
@@ -324,7 +319,7 @@ def test_log_record_carries_default_for_unset_temperature() -> None:
         capturing_sink() as captured,
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
     ):
-        _ = asyncio.run(structured_output.structured_llm_call("hi", OkSchema, feature="test"))
+        _ = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="test"))
 
     assert len(captured) == 1
     assert captured[0].temperature == DEFAULT_TEMPERATURE

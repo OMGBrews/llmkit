@@ -34,7 +34,9 @@ from llmkit import (
     LocalYamlLogSink,
     RetryPolicy,
     configure_llm_logging,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.capture import capture_llm_log_paths
 from tests._support import OkSchema
@@ -65,7 +67,7 @@ async def test_structured_transient_error_is_retried_then_succeeds() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
+        result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -86,9 +88,7 @@ async def test_structured_non_recoverable_error_is_not_retried() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TypeError, match="programming error"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert calls[0] == 1
 
@@ -106,9 +106,7 @@ async def test_structured_no_retry_opt_out_runs_single_attempt() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="transient"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=NO_RETRY
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
     assert calls[0] == 1
 
@@ -127,9 +125,7 @@ async def test_structured_custom_policy_succeeds_on_last_attempt() -> None:
 
     policy = RetryPolicy(max_attempts=4, backoff_base_seconds=0.0)
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=policy
-        )
+        result = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=policy)
 
     assert result.ok is True
     assert calls[0] == 4
@@ -150,9 +146,7 @@ async def test_structured_custom_policy_exhaustion_re_raises() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=policy
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=policy)
 
     assert calls[0] == 3
 
@@ -175,7 +169,7 @@ async def test_each_attempt_is_its_own_logged_call(tmp_path: Path) -> None:
             patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
             capture_llm_log_paths() as paths,
         ):
-            result = await structured_output.structured_llm_call(
+            result = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF
             )
     finally:
@@ -203,7 +197,7 @@ async def test_text_transient_error_is_retried_then_succeeds() -> None:
     configure_llm_logging(None)
     try:
         with patch("llmkit._litellm.acompletion_text", side_effect=_transport):
-            result = await structured_output.text_llm_call("hi", feature="test", retry=_NO_BACKOFF)
+            result = await llm_calls.text_llm_call("hi", feature="test", retry=_NO_BACKOFF)
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
@@ -226,7 +220,7 @@ async def test_text_no_retry_opt_out_runs_single_attempt() -> None:
             patch("llmkit._litellm.acompletion_text", side_effect=_transport),
             pytest.raises(TimeoutError, match="transient"),
         ):
-            _ = await structured_output.text_llm_call("hi", feature="test", retry=NO_RETRY)
+            _ = await llm_calls.text_llm_call("hi", feature="test", retry=NO_RETRY)
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
@@ -256,7 +250,7 @@ async def test_stream_failure_before_first_chunk_is_retried() -> None:
     try:
         with patch("llmkit._litellm.astream_text", _transport):
             chunks = await _drain(
-                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
+                llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -290,7 +284,7 @@ async def test_stream_each_attempt_is_its_own_logged_call(tmp_path: Path) -> Non
             capture_llm_log_paths() as paths,
         ):
             chunks = await _drain(
-                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
+                llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -319,7 +313,7 @@ async def test_stream_failure_after_first_chunk_is_not_retried() -> None:
             patch("llmkit._litellm.astream_text", _transport),
             pytest.raises(TimeoutError, match="mid-stream"),
         ):
-            async for chunk in structured_output.text_llm_call_stream(
+            async for chunk in llm_calls.text_llm_call_stream(
                 "hi", feature="test", retry=_NO_BACKOFF
             ):
                 delivered.append(chunk)
@@ -349,9 +343,7 @@ async def test_stream_no_retry_opt_out_runs_single_attempt() -> None:
             patch("llmkit._litellm.astream_text", _transport),
             pytest.raises(TimeoutError, match="transient"),
         ):
-            _ = await _drain(
-                structured_output.text_llm_call_stream("hi", feature="test", retry=NO_RETRY)
-            )
+            _ = await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=NO_RETRY))
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
@@ -388,9 +380,7 @@ async def test_custom_max_backoff_propagates_through_call_functions(
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=policy
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=policy)
 
     assert calls[0] == 3
     assert slept == [1.5, 1.5]

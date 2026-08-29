@@ -18,7 +18,7 @@ import asyncio
 import inspect
 from unittest.mock import patch
 
-from llmkit import structured_output
+from llmkit import calls as llm_calls
 from tests._support import (
     OkSchema,
     capture_structured_provider_kwargs,
@@ -29,8 +29,8 @@ from tests._support import (
 
 def test_signatures_expose_max_tokens() -> None:
     """Acceptance: both public functions carry a ``max_tokens`` parameter."""
-    assert "max_tokens" in inspect.signature(structured_output.structured_llm_call).parameters
-    assert "max_tokens" in inspect.signature(structured_output.structured_llm_call_sync).parameters
+    assert "max_tokens" in inspect.signature(llm_calls.structured_llm_call).parameters
+    assert "max_tokens" in inspect.signature(llm_calls.structured_llm_call_sync).parameters
 
 
 def test_sync_call_threads_max_tokens_to_transport() -> None:
@@ -42,9 +42,7 @@ def test_sync_call_threads_max_tokens_to_transport() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-        result = structured_output.structured_llm_call_sync(
-            "hi", OkSchema, feature="test", max_tokens=256
-        )
+        result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", max_tokens=256)
 
     assert seen["max_tokens"] == 256
     # max_tokens does not disturb parsing — a validated instance comes back.
@@ -62,7 +60,7 @@ def test_async_call_threads_max_tokens_to_transport() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
-            structured_output.structured_llm_call("hi", OkSchema, feature="test", max_tokens=42)
+            llm_calls.structured_llm_call("hi", OkSchema, feature="test", max_tokens=42)
         )
 
     assert seen["max_tokens"] == 42
@@ -93,7 +91,7 @@ def test_log_record_carries_max_tokens() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
     ):
         _ = asyncio.run(
-            structured_output.structured_llm_call("hi", OkSchema, feature="test", max_tokens=256)
+            llm_calls.structured_llm_call("hi", OkSchema, feature="test", max_tokens=256)
         )
 
     assert len(captured) == 1

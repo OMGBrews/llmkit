@@ -1,6 +1,6 @@
 """Shared fixtures for the call-surface tests.
 
-Every test here exercises ``structured_output``'s public call functions over a
+Every test here exercises ``llmkit.calls``'s public call functions over a
 faked transport; none should write a real YAML log. The autouse fixture mutes
 logging by default — a test that wants to inspect the written record opts back
 in with :func:`tests._support.capturing_sink`.

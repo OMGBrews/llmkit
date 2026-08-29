@@ -23,7 +23,9 @@ from llmkit import (
     NO_RETRY,
     UNSET,
     LLMCallOptions,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.options import resolve_call_args
 from tests._support import OkSchema, provider_mock
@@ -65,7 +67,7 @@ def test_options_reused_across_calls_supplies_each_call() -> None:
 
         async def _run() -> None:
             for _ in range(3):
-                _ = await structured_output.structured_llm_call(
+                _ = await llm_calls.structured_llm_call(
                     "hi", OkSchema, feature="extraction", options=options
                 )
 
@@ -89,7 +91,7 @@ def test_explicit_keyword_overrides_options_field() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi",
                 OkSchema,
                 feature="extraction",
@@ -120,7 +122,7 @@ def test_explicit_keyword_equal_to_old_default_overrides_options() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi",
                 OkSchema,
                 feature="extraction",
@@ -149,7 +151,7 @@ def test_unset_options_field_falls_through_to_config() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="extraction", options=options
             )
 
@@ -172,7 +174,7 @@ def test_no_options_leaves_flat_kwargs_unchanged() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="extraction", model="flat-model", temperature=0.4
             )
 
@@ -250,13 +252,11 @@ def test_options_threads_through_text_and_sync() -> None:
     ):
 
         async def _run_text() -> None:
-            _ = await structured_output.text_llm_call("hi", feature="summary", options=options)
+            _ = await llm_calls.text_llm_call("hi", feature="summary", options=options)
 
         asyncio.run(_run_text())
-        text_sync_result = structured_output.text_llm_call_sync(
-            "hi", feature="summary", options=options
-        )
-        result = structured_output.structured_llm_call_sync(
+        text_sync_result = llm_calls.text_llm_call_sync("hi", feature="summary", options=options)
+        result = llm_calls.structured_llm_call_sync(
             "hi", OkSchema, feature="classification", options=options
         )
 
@@ -284,7 +284,7 @@ def test_explicit_temperature_none_overrides_options_value() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi",
                 OkSchema,
                 feature="extraction",
@@ -309,7 +309,7 @@ def test_options_temperature_none_overrides_default() -> None:
     ):
 
         async def _run() -> None:
-            _ = await structured_output.structured_llm_call(
+            _ = await llm_calls.structured_llm_call(
                 "hi",
                 OkSchema,
                 feature="extraction",

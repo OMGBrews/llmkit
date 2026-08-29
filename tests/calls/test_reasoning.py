@@ -23,7 +23,9 @@ from llmkit import (
     LLMClientConfig,
     Provider,
     build_provider,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.providers import GoogleProvider, OllamaProvider
 from tests._support import (
@@ -36,12 +38,9 @@ from tests._support import (
 
 def test_signatures_expose_reasoning_effort() -> None:
     """Acceptance: all three public call functions carry the parameter."""
-    assert "reasoning_effort" in inspect.signature(structured_output.structured_llm_call).parameters
-    assert (
-        "reasoning_effort"
-        in inspect.signature(structured_output.structured_llm_call_sync).parameters
-    )
-    assert "reasoning_effort" in inspect.signature(structured_output.text_llm_call).parameters
+    assert "reasoning_effort" in inspect.signature(llm_calls.structured_llm_call).parameters
+    assert "reasoning_effort" in inspect.signature(llm_calls.structured_llm_call_sync).parameters
+    assert "reasoning_effort" in inspect.signature(llm_calls.text_llm_call).parameters
 
 
 def test_config_carries_reasoning_effort() -> None:
@@ -83,7 +82,7 @@ def test_sync_call_threads_reasoning_effort_to_transport() -> None:
         return OkSchema(ok=True), None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
-        result = structured_output.structured_llm_call_sync(
+        result = llm_calls.structured_llm_call_sync(
             "hi", OkSchema, feature="test", reasoning_effort="disable"
         )
 
@@ -102,9 +101,7 @@ def test_async_call_threads_reasoning_effort_to_transport() -> None:
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
-            structured_output.structured_llm_call(
-                "hi", OkSchema, feature="test", reasoning_effort="low"
-            )
+            llm_calls.structured_llm_call("hi", OkSchema, feature="test", reasoning_effort="low")
         )
 
     assert seen["reasoning_effort"] == "low"
@@ -153,7 +150,7 @@ def test_log_record_carries_reasoning_effort() -> None:
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
     ):
         _ = asyncio.run(
-            structured_output.structured_llm_call(
+            llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", reasoning_effort="disable"
             )
         )

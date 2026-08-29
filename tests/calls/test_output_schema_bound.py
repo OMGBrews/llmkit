@@ -14,15 +14,15 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from llmkit import structured_output
+from llmkit import calls as llm_calls
 
 
 def test_structured_call_type_param_is_bounded_to_basemodel() -> None:
     """The async call and the sync wrapper both declare ``[T: BaseModel]``."""
     for func in (
-        structured_output.structured_llm_call,
-        structured_output.structured_llm_call_sync,
-        structured_output.tool_llm_call,
+        llm_calls.structured_llm_call,
+        llm_calls.structured_llm_call_sync,
+        llm_calls.tool_llm_call,
     ):
         (type_param,) = func.__type_params__
         assert isinstance(type_param, TypeVar), f"{func.__name__} has no plain TypeVar"

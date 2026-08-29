@@ -30,6 +30,17 @@ from llmkit._types import (
     ReasoningEffort,
     ToolResultMessage,
 )
+from llmkit.calls import (
+    STREAM_ABANDONED_ERROR,
+    stream_text_with_log,
+    structured_llm_call,
+    structured_llm_call_sync,
+    text_llm_call,
+    text_llm_call_stream,
+    text_llm_call_sync,
+    tool_llm_call,
+    tool_llm_call_sync,
+)
 from llmkit.capture import (
     capture_llm_log_paths,
     capture_llm_records,
@@ -93,17 +104,6 @@ from llmkit.run_scope import (
     get_run_id,
     run_scope,
     set_run_id,
-)
-from llmkit.structured_output import (
-    STREAM_ABANDONED_ERROR,
-    stream_text_with_log,
-    structured_llm_call,
-    structured_llm_call_sync,
-    text_llm_call,
-    text_llm_call_stream,
-    text_llm_call_sync,
-    tool_llm_call,
-    tool_llm_call_sync,
 )
 from llmkit.tools import (
     TokenUsage,

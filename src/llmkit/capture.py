@@ -1,6 +1,6 @@
 """Per-call record/log-path capture, and the record sink seam.
 
-The call functions in :mod:`llmkit.structured_output` funnel every built
+The call functions in :mod:`llmkit.calls` funnel every built
 :class:`~llmkit.logging.LLMCallRecord` through :func:`record_call` — the
 single seam that writes the configured sink and feeds the two opt-in capture
 context managers — usually via :func:`record_call_async`, which runs that
@@ -12,9 +12,11 @@ same seam on a worker thread so sink I/O never blocks the event loop:
 * :func:`capture_llm_log_paths` — yields the per-call log-file paths the file
   sink wrote.
 
-This module owns capture + the record seam only; the option merge lives in
-:mod:`llmkit.options` and the call/streaming surface in
-:mod:`llmkit.structured_output`.
+This module owns capture + the record seam only: with the record's
+model/provider resolution moved to the call layer that builds records
+(:mod:`llmkit.calls`), its whole dependency set is :mod:`llmkit.logging`. The
+option merge lives in :mod:`llmkit.options`, and the call surface itself in
+:mod:`llmkit.calls`.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from llmkit.logging import LLMCallRecord, write_llm_log
-from llmkit.providers import LLMProviderInterface
 
 logger = logging.getLogger(__name__)
 
@@ -89,32 +90,6 @@ async def record_call_async(record: LLMCallRecord) -> Path | None:
     except RuntimeError:
         logger.debug("Log-write offload unavailable; writing synchronously", exc_info=True)
         return record_call(record)
-
-
-def resolve_model_and_provider(
-    model: str | None, provider: LLMProviderInterface | None = None
-) -> tuple[str | None, str | None]:
-    """Resolve the *effective* model + provider name for the log record.
-
-    When the caller passes ``model=None`` the provider's configured
-    default is what actually ran — record that instead of ``null`` so
-    cost attribution is a ``grep | sort | uniq -c`` over the logs, not a
-    code trace. An explicit ``provider`` (the per-call override) is used
-    as-is so the log names the provider that *actually* ran, not the
-    globally-configured one. Best-effort: any failure resolving the
-    provider degrades to ``(model, None)`` rather than breaking the log
-    write — logging must never break the LLM call.
-    """
-    try:
-        if provider is None:
-            from llmkit.providers import build_provider
-
-            provider = build_provider()
-        return (model or provider.model, provider.name)
-    except Exception:
-        # Logging must never break the LLM call; degrade to (model, None).
-        logger.debug("Could not resolve provider for LLM log", exc_info=True)
-        return (model, None)
 
 
 @contextmanager

@@ -27,9 +27,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from llmkit import structured_output
+from llmkit import calls as llm_calls
+from llmkit.calls import STREAM_ABANDONED_ERROR
 from llmkit.rate_limiting import GlobalRateLimiter, configure_rate_limit
-from llmkit.structured_output import STREAM_ABANDONED_ERROR
 from tests._support import capturing_sink, quiet_logging
 
 
@@ -96,7 +96,7 @@ async def test_abandoned_stream_releases_rate_limit_slot() -> None:
         quiet_logging(),
         patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion),
     ):
-        stream = structured_output.text_llm_call_stream("hi", feature="test", provider=provider)
+        stream = llm_calls.text_llm_call_stream("hi", feature="test", provider=provider)
         first: str | None = None
         async for chunk in stream:
             first = chunk
@@ -128,9 +128,7 @@ async def test_cancelled_stream_consumer_releases_rate_limit_slot() -> None:
         return _FakeStream(park=park)
 
     async def _consume() -> None:
-        async for _chunk in structured_output.text_llm_call_stream(
-            "hi", feature="test", provider=provider
-        ):
+        async for _chunk in llm_calls.text_llm_call_stream("hi", feature="test", provider=provider):
             first_arrived.set()  # next pull parks on the unset event in the fake
 
     with (

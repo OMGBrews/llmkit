@@ -24,7 +24,8 @@ from unittest.mock import patch
 
 import pytest
 
-from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging, structured_output
+from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
+from llmkit import calls as llm_calls
 from llmkit.capture import capture_llm_log_paths, record_call_async
 from tests._support import OkSchema, provider_mock
 from tests._support import make_record as _record
@@ -57,7 +58,7 @@ async def test_structured_call_writes_log_off_the_event_loop() -> None:
             patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
-            _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+            _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
     finally:
         configure_llm_logging(LocalYamlLogSink())
     assert len(sink.write_threads) == 1
@@ -78,7 +79,7 @@ async def test_text_call_writes_log_off_the_event_loop() -> None:
             patch("llmkit._litellm.acompletion_text", side_effect=_transport),
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
-            _ = await structured_output.text_llm_call("hi", feature="test")
+            _ = await llm_calls.text_llm_call("hi", feature="test")
     finally:
         configure_llm_logging(LocalYamlLogSink())
     assert sink.write_threads == [w for w in sink.write_threads if w != threading.get_ident()]
@@ -107,9 +108,9 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             # Clean finish → off-loop write.
-            _ = [c async for c in structured_output.text_llm_call_stream("hi", feature="test")]
+            _ = [c async for c in llm_calls.text_llm_call_stream("hi", feature="test")]
             # Abandonment → synchronous write on this (the consumer's) thread.
-            stream = structured_output.text_llm_call_stream("hi", feature="test")
+            stream = llm_calls.text_llm_call_stream("hi", feature="test")
             async for _chunk in stream:
                 break
             await stream.aclose()
@@ -121,7 +122,7 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
     assert clean_thread != threading.get_ident()
     assert abandoned_thread == threading.get_ident()
     assert sink.records[0].error is None
-    assert sink.records[1].error == structured_output.STREAM_ABANDONED_ERROR
+    assert sink.records[1].error == llm_calls.STREAM_ABANDONED_ERROR
 
 
 @pytest.mark.asyncio
@@ -153,7 +154,7 @@ async def test_loop_stays_responsive_during_a_slow_write() -> None:
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             beat = asyncio.create_task(_heartbeat())
-            _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+            _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
             stop.set()
             await beat
     finally:
@@ -178,7 +179,7 @@ async def test_log_path_is_captured_before_the_call_returns(tmp_path: Path) -> N
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             with capture_llm_log_paths() as paths:
-                _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+                _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
                 assert len(paths) == 1
                 assert paths[0].exists()
     finally:
@@ -209,7 +210,7 @@ async def test_cancellation_mid_write_still_lands_the_record(tmp_path: Path) -> 
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             call = asyncio.create_task(
-                structured_output.structured_llm_call("hi", OkSchema, feature="test")
+                llm_calls.structured_llm_call("hi", OkSchema, feature="test")
             )
             while not write_started.is_set():
                 await asyncio.sleep(0.005)
@@ -260,7 +261,7 @@ def test_sync_bridge_call_writes_and_captures_through_the_offload(tmp_path: Path
             patch("llmkit.providers.build_provider", return_value=provider_mock()),
         ):
             with capture_llm_log_paths() as paths:
-                result = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+                result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
         assert result.ok is True
         assert len(paths) == 1
         assert paths[0].exists()

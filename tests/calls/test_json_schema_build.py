@@ -20,7 +20,8 @@ from typing import Literal, get_args, get_origin
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from llmkit import model_from_json_schema, structured_output
+from llmkit import calls as llm_calls
+from llmkit import model_from_json_schema
 from tests._support import model_attr as _attr
 
 # A representative schema: nested objects (inline + via $defs/$ref), an array
@@ -869,7 +870,7 @@ def test_round_trip_through_structured_call() -> None:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
         result = asyncio.run(
-            structured_output.structured_llm_call("Extract the invoice.", model, feature="billing")
+            llm_calls.structured_llm_call("Extract the invoice.", model, feature="billing")
         )
 
     assert _attr(result, "id") == "INV-9"
@@ -904,7 +905,7 @@ def test_build_once_model_reused_across_calls() -> None:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
         for _ in range(3):
-            _ = asyncio.run(structured_output.structured_llm_call("go", model, feature="billing"))
+            _ = asyncio.run(llm_calls.structured_llm_call("go", model, feature="billing"))
 
     assert len(seen) == 3
     assert all(s is model for s in seen)  # the very same object each time

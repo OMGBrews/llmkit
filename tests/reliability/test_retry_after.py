@@ -32,7 +32,8 @@ import openai
 import pytest
 from instructor.core import InstructorRetryException
 
-from llmkit import retry, structured_output
+from llmkit import calls as llm_calls
+from llmkit import retry
 from llmkit.retry import _retry_after_seconds, with_retries
 from tests._support import OkSchema, quiet_logging
 
@@ -320,7 +321,7 @@ async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.Monkey
         return OkSchema(ok=True), None
 
     with quiet_logging(), patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-        result = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+        result = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert result.ok is True
     assert calls[0] == 2
@@ -350,7 +351,7 @@ async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyP
             yield delta
 
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
-        chunks = await _drain(structured_output.text_llm_call_stream("hi", feature="test"))
+        chunks = await _drain(llm_calls.text_llm_call_stream("hi", feature="test"))
 
     assert chunks == ["he", "llo"]
     assert calls[0] == 2

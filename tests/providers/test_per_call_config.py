@@ -30,7 +30,7 @@ from llmkit import (
     configure_llm_logging,
     make_provider,
 )
-from llmkit.structured_output import structured_llm_call, text_llm_call
+from llmkit.calls import structured_llm_call, text_llm_call
 
 
 class _Schema(BaseModel):

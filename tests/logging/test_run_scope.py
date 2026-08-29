@@ -40,7 +40,9 @@ from llmkit import (
     get_run_id,
     run_scope,
     set_run_id,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.run_scope import RUN_ID_ENV_VAR
 from tests._support import OkSchema, provider_mock
@@ -242,7 +244,7 @@ async def test_structured_call_stamps_the_active_run_id() -> None:
         run_scope("eval-sweep"),
         capture_llm_records() as records,
     ):
-        _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert [r.run_id for r in records] == ["eval-sweep"]
 
@@ -260,7 +262,7 @@ async def test_text_call_stamps_the_active_run_id() -> None:
         run_scope("eval-sweep"),
         capture_llm_records() as records,
     ):
-        _ = await structured_output.text_llm_call("hi", feature="test")
+        _ = await llm_calls.text_llm_call("hi", feature="test")
 
     assert [r.run_id for r in records] == ["eval-sweep"]
 
@@ -269,11 +271,11 @@ def test_sequential_process_scopes_never_cross_tag() -> None:
     """Two runs in one process, tagged with their own ids and nothing else's."""
     with patch_transport(), capture_llm_records() as records:
         set_run_id("run-a")
-        _ = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
         set_run_id("run-b")
-        _ = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
         set_run_id(None)
-        _ = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     assert [r.run_id for r in records] == ["run-a", "run-b", None]
 
@@ -282,7 +284,7 @@ def test_scope_crosses_the_sync_bridge() -> None:
     """``run_sync`` copies the calling thread's context onto the persistent
     loop, so a ContextVar-held scope reaches records built there."""
     with patch_transport(), run_scope("scoped"), capture_llm_records() as records:
-        _ = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     assert [r.run_id for r in records] == ["scoped"]
 
@@ -307,7 +309,7 @@ def test_env_scoped_sync_call_tags_every_index_line_including_retries(
         return OkSchema(ok=True), None
 
     with patch_transport(_flaky):
-        result = structured_output.structured_llm_call_sync(
+        result = llm_calls.structured_llm_call_sync(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -372,7 +374,7 @@ def test_run_id_composes_with_the_log_dir_env_var(
     configure_llm_logging(LocalYamlLogSink())
 
     with patch_transport():
-        _ = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     (line,) = _index_lines(tmp_path)
     assert line["run_id"] == "both-set"

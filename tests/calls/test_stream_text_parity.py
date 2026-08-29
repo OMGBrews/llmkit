@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llmkit import structured_output
+from llmkit import calls as llm_calls
 from tests._support import capture_stream_provider_kwargs, capturing_sink
 
 
@@ -32,7 +32,7 @@ async def _drain(stream: AsyncIterator[str]) -> list[str]:
 
 def test_signature_exposes_max_tokens_and_reasoning_effort() -> None:
     """Acceptance: the stream call function carries both parameters."""
-    params = inspect.signature(structured_output.text_llm_call_stream).parameters
+    params = inspect.signature(llm_calls.text_llm_call_stream).parameters
     assert "max_tokens" in params
     assert "reasoning_effort" in params
 
@@ -50,7 +50,7 @@ def test_stream_threads_kwargs_to_transport() -> None:
     with patch("llmkit._litellm.astream_text", _fake_astream):
         chunks = asyncio.run(
             _drain(
-                structured_output.text_llm_call_stream(
+                llm_calls.text_llm_call_stream(
                     "hi", feature="test", max_tokens=5, reasoning_effort="low"
                 )
             )
@@ -100,7 +100,7 @@ def test_log_record_carries_kwargs() -> None:
     ):
         _ = asyncio.run(
             _drain(
-                structured_output.text_llm_call_stream(
+                llm_calls.text_llm_call_stream(
                     "hi", feature="test", max_tokens=128, reasoning_effort="disable"
                 )
             )
@@ -127,14 +127,12 @@ def test_deprecated_alias_warns_at_call_time_and_matches_new_name() -> None:
         capturing_sink(),
         patch("llmkit._litellm.astream_text", _fake_astream),
     ):
-        canonical = asyncio.run(
-            _drain(structured_output.text_llm_call_stream("hi", feature="test"))
-        )
+        canonical = asyncio.run(_drain(llm_calls.text_llm_call_stream("hi", feature="test")))
         # The warning fires when the alias is *called*, before any chunk is
         # pulled — so wrapping only the call (not the drain) captures it, which
         # is exactly the eager-at-call-time contract.
         with pytest.warns(DeprecationWarning, match="text_llm_call_stream"):
-            stream = structured_output.stream_text_with_log("hi", feature="test")
+            stream = llm_calls.stream_text_with_log("hi", feature="test")
         aliased = asyncio.run(_drain(stream))
 
     assert aliased == canonical == ["he", "llo"]

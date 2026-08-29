@@ -23,7 +23,8 @@ from unittest.mock import patch
 
 import pytest
 
-from llmkit import NO_RETRY, RetryPolicy, structured_output
+from llmkit import NO_RETRY, RetryPolicy
+from llmkit import calls as llm_calls
 from llmkit.retry import _retry_scope, _RetryScope, with_retries
 from tests._support import quiet_logging
 
@@ -54,9 +55,7 @@ async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
         yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     async def _wrapped() -> list[str]:
-        return await _drain(
-            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
-        )
+        return await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF))
 
     with (
         quiet_logging(),
@@ -85,9 +84,7 @@ async def test_no_retry_inner_under_outer_wrapper_stays_silent() -> None:
         yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     async def _wrapped() -> list[str]:
-        return await _drain(
-            structured_output.text_llm_call_stream("hi", feature="test", retry=NO_RETRY)
-        )
+        return await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=NO_RETRY))
 
     with warnings.catch_warnings():
         # Any nested-guard RuntimeWarning on this intended path fails the test.
@@ -115,9 +112,7 @@ async def test_mid_stream_failure_under_outer_wrapper_does_not_warn() -> None:
         raise TimeoutError("mid-stream")
 
     async def _wrapped() -> list[str]:
-        return await _drain(
-            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
-        )
+        return await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF))
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
@@ -154,7 +149,7 @@ async def test_stream_retries_normally_without_outer_loop() -> None:
         warnings.simplefilter("error", RuntimeWarning)
         with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
             chunks = await _drain(
-                structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
+                llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
 
     assert chunks == ["he", "llo"]
@@ -180,9 +175,7 @@ async def test_stream_exhausts_full_budget_without_outer_loop() -> None:
         patch("llmkit._litellm.astream_text", _transport),
         pytest.raises(TimeoutError, match="always"),
     ):
-        _ = await _drain(
-            structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
-        )
+        _ = await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF))
 
     assert calls[0] == 3
     assert _retry_scope.get() is None
@@ -203,9 +196,7 @@ async def test_guard_flag_not_visible_to_consumer_between_chunks() -> None:
 
     seen_between_chunks: list[_RetryScope | None] = []
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
-        async for _chunk in structured_output.text_llm_call_stream(
-            "hi", feature="test", retry=_NO_BACKOFF
-        ):
+        async for _chunk in llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF):
             seen_between_chunks.append(_retry_scope.get())
 
     assert seen_between_chunks == [None, None]
@@ -224,7 +215,7 @@ async def test_guard_flag_clear_after_early_break() -> None:
     with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
         # The public annotation is AsyncGenerator, so aclose() — the
         # early-abandonment path under test — is on the surface directly.
-        stream = structured_output.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
+        stream = llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
         async for _chunk in stream:
             break
         assert _retry_scope.get() is None

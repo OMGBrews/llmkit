@@ -41,7 +41,8 @@ import openai
 import pytest
 from instructor.core import InstructorRetryException
 
-from llmkit import CircuitOpenError, _litellm, structured_output
+from llmkit import CircuitOpenError, _litellm
+from llmkit import calls as llm_calls
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
     RateLimitSlot,
@@ -832,7 +833,7 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     provider.reasoning_effort = None
 
     def _text_call() -> None:
-        _ = structured_output.text_llm_call_sync("hi", feature="test", provider=provider)
+        _ = llm_calls.text_llm_call_sync("hi", feature="test", provider=provider)
 
     with (
         quiet_logging(),

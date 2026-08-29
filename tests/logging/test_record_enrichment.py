@@ -33,7 +33,9 @@ from llmkit import (
     LocalYamlLogSink,
     RetryPolicy,
     capture_llm_records,
-    structured_output,
+)
+from llmkit import (
+    calls as llm_calls,
 )
 from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.rate_limiting._observability import _queue_wait_ms
@@ -63,7 +65,7 @@ async def test_retried_structured_call_shares_call_id_and_numbers_attempts() -> 
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        result = await structured_output.structured_llm_call(
+        result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
@@ -87,8 +89,8 @@ async def test_separate_logical_calls_get_distinct_call_ids() -> None:
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
-        _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert len(records) == 2
     assert records[0].call_id != records[1].call_id
@@ -107,7 +109,7 @@ async def test_text_call_records_correlation() -> None:
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        _ = await structured_output.text_llm_call("hi", feature="test")
+        _ = await llm_calls.text_llm_call("hi", feature="test")
 
     assert len(records) == 1
     assert records[0].call_id is not None
@@ -140,7 +142,7 @@ async def test_stream_retry_shares_call_id_across_attempts() -> None:
     ):
         chunks = [
             chunk
-            async for chunk in structured_output.text_llm_call_stream(
+            async for chunk in llm_calls.text_llm_call_stream(
                 "hi", feature="test", retry=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0)
             )
         ]
@@ -164,7 +166,7 @@ def test_sync_bridge_carries_correlation() -> None:
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        result = structured_output.structured_llm_call_sync("hi", OkSchema, feature="test")
+        result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     assert result.ok is True
     assert len(records) == 1
@@ -189,7 +191,7 @@ async def test_queue_wait_recorded_when_transport_acquires() -> None:
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        _ = await structured_output.structured_llm_call("hi", OkSchema, feature="test")
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert len(records) == 1
     assert records[0].queue_wait_ms is not None
@@ -215,9 +217,7 @@ async def test_queue_wait_is_reset_between_attempts_never_stale() -> None:
         capture_llm_records() as records,
         pytest.raises(RuntimeError, match="before any acquire"),
     ):
-        _ = await structured_output.structured_llm_call(
-            "hi", OkSchema, feature="test", retry=_NO_BACKOFF
-        )
+        _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
     assert len(records) == 2
     assert records[0].queue_wait_ms is not None
