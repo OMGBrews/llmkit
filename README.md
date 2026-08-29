@@ -132,6 +132,36 @@ else:
 
 Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior; their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
 
+### Tool schemas: hand them over unprocessed
+
+**`ToolDefinition.from_model()` output works on every supported provider as-is. Do not pre-process it.** A Pydantic model with a nested model or an enum renders `$defs` and `$ref` in its JSON Schema, and llmkit forwards `parameters` verbatim — but the transport normalises per provider on the way to the wire. On the Gemini routes (Vertex AI and Google AI Studio) that means `additionalProperties` is stripped, `$defs` is popped, `$ref` targets are inlined, and keywords outside Gemini's `Schema` subset are filtered, so a schema Gemini's API rejects outright when posted raw is accepted through llmkit. Writing your own normalisation layer on top duplicates that work and will drift from it.
+
+The same applies to a **tool that takes no arguments**: `{"type": "object", "properties": {}}` is the portable schema, sent to Gemini as a bare `OBJECT` declaration. You do not need a dummy parameter.
+
+```python
+class Unit(StrEnum):
+    CELSIUS = "celsius"
+    FAHRENHEIT = "fahrenheit"
+
+class Location(BaseModel):
+    city: str
+    country: str
+
+class ForecastArgs(BaseModel):        # renders $defs + $ref …
+    where: Location
+    unit: Unit
+    days: int
+
+tools = [
+    ToolDefinition.from_model("forecast", ForecastArgs, "Look up a forecast"),
+    ToolDefinition("current_time", "Get the current time", {"type": "object", "properties": {}}),
+]                                     # … and both go over unchanged
+```
+
+**Where the guarantee stops.** It is delivery in the provider's accepted subset, not lossless translation: a construct the subset cannot express is *dropped, not errored*. The one to know about is that Gemini accepts `enum` only on string-typed fields, so an enum on an integer or float field is silently discarded and the model sees an unconstrained number. Keep enums as string enums when a Gemini route is in play, or validate the range yourself — `from_model()` validates the model's arguments locally either way, so a value outside the enum still fails validation on our side.
+
+Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transport.py` asserts the transform's output offline (so a transport upgrade that stopped normalising fails the suite), and `test_vertex_tool_schema_roundtrip_live` asserts live Vertex accepts it.
+
 **Type-check migration.** `prompt` was previously `str | list[dict[str, str]]`, so a call site passing a *variable* annotated `list[dict[str, str]]` now fails the type check — re-annotate it `list[Message]`. Inline message-dict literals are unaffected, and runtime behaviour is identical either way (a `TypedDict` is a plain `dict`).
 
 > **Deprecated alias.** `stream_text_with_log` is the old name for

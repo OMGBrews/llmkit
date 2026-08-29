@@ -31,7 +31,29 @@ type ToolChoice = Literal["auto", "none", "required"] | ToolName
 
 @dataclass(frozen=True)
 class ToolDefinition:
-    """A callable function offered to a model, described with JSON Schema."""
+    """A callable function offered to a model, described with JSON Schema.
+
+    ``parameters`` is forwarded to the transport **verbatim** — llmkit does not
+    rewrite it — and it does not need to be pre-processed for any supported
+    provider. LiteLLM normalises per provider on the way to the wire: on the
+    Gemini routes (``vertex_ai/``, ``gemini/``) it strips ``additionalProperties``,
+    pops ``$defs``, inlines ``$ref`` targets, and filters keywords outside
+    Gemini's ``Schema`` subset, so schemas that API rejects when posted raw are
+    accepted through llmkit. Writing a normalisation layer on top of this
+    duplicates it and will drift from it.
+
+    A tool that takes **no arguments** is ``{"type": "object", "properties": {}}``
+    — the portable spelling, sent to Gemini as a bare ``OBJECT``. No dummy
+    parameter is needed.
+
+    The guarantee is delivery in the provider's accepted subset, not lossless
+    translation: a construct the subset cannot express is *dropped, not errored*.
+    Notably Gemini accepts ``enum`` only on string-typed fields, so an enum on an
+    integer field is silently discarded and the model sees an unconstrained
+    number — :meth:`from_model` still validates the returned arguments locally.
+    ``tests/providers/test_gemini_tool_schema_transport.py`` pins the transform;
+    ``test_vertex_tool_schema_roundtrip_live`` pins that Vertex accepts its output.
+    """
 
     name: str
     description: str
@@ -42,7 +64,12 @@ class ToolDefinition:
     def from_model(
         cls, name: str, model: type[BaseModel], description: str | None = None
     ) -> ToolDefinition:
-        """Build a definition whose arguments are validated by *model*."""
+        """Build a definition whose arguments are validated by *model*.
+
+        A nested model or an enum renders ``$defs``/``$ref`` here, which is
+        correct: the transport inlines them per provider (see the class
+        docstring). Hand the result straight to ``tool_llm_call``.
+        """
         return cls(
             name, description or (model.__doc__ or "").strip(), model.model_json_schema(), model
         )

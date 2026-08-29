@@ -88,6 +88,7 @@ Vertex Gemini is *measured*, not trusted.
 
 from __future__ import annotations
 
+import enum
 import os
 import socket
 from typing import NoReturn, Protocol, TypedDict, assert_never, cast
@@ -173,6 +174,31 @@ class _AdditionArgs(BaseModel):
 
 class _ToolAnswer(BaseModel):
     total: int
+
+
+class _TemperatureUnit(enum.StrEnum):
+    """A string enum: the one enum shape Gemini's ``Schema`` subset accepts."""
+
+    CELSIUS = "celsius"
+    FAHRENHEIT = "fahrenheit"
+
+
+class _ForecastLocation(BaseModel):
+    city: str
+    country: str
+
+
+class _ForecastArgs(BaseModel):
+    """A nested model plus a string enum — the shape that carries ``$defs``.
+
+    ``model_json_schema()`` renders ``where`` and ``unit`` as ``$ref``s into a
+    ``$defs`` block, and llmkit forwards ``parameters`` verbatim, so this is the
+    schema whose survival to the wire the Gemini guarantee is about.
+    """
+
+    where: _ForecastLocation
+    unit: _TemperatureUnit
+    days: int
 
 
 # Cheap, broadly-available default models per provider. Override via the
@@ -429,6 +455,70 @@ async def _assert_tool_roundtrip(provider: LLMProviderInterface) -> None:
     assert "5" in finished.text
 
 
+async def _assert_unnormalised_schema_roundtrip(provider: LLMProviderInterface) -> None:
+    """Two schemas llmkit does *not* pre-process still reach the provider intact.
+
+    The tool lane forwards ``ToolDefinition.parameters`` verbatim, so a
+    ``from_model()`` schema arrives at the transport carrying ``$defs``,
+    ``$ref`` and ``additionalProperties`` — none of which Gemini's ``Schema``
+    subset accepts. ``tests/providers/test_gemini_tool_schema_transport.py``
+    pins that LiteLLM normalises them; this asserts the *provider* accepts the
+    result, which is the half no offline test can prove. Both tools are offered
+    in one request, so the no-argument declaration and the nested-model one are
+    measured on the same wire payload.
+
+    A regression here is a 400 from the provider, not a wrong answer — the
+    assertions are deliberately about the call being made, not about forecasting.
+    """
+    forecast = ToolDefinition.from_model(
+        "forecast", _ForecastArgs, "Look up a weather forecast for a city."
+    )
+    # The portable no-argument schema, documented in the README: an empty
+    # ``properties`` map, which the transport reduces to a bare OBJECT.
+    clock = ToolDefinition(
+        "current_time", "Get the current time.", {"type": "object", "properties": {}}
+    )
+
+    requested = await tool_llm_call(
+        [
+            {
+                "role": "user",
+                "content": ("Use the forecast tool for Ottawa, Canada, in celsius, for 3 days."),
+            }
+        ],
+        [forecast, clock],
+        feature="integration-tool-schema-smoke",
+        label=provider.name,
+        provider=provider,
+        tool_choice=ToolName("forecast"),
+        max_tokens=256,
+    )
+
+    assert len(requested.tool_calls) == 1
+    call = requested.tool_calls[0]
+    assert call.name == "forecast"
+    # The nested model and the enum survived the transform semantically: the
+    # provider filled both, and llmkit validated the result against the model.
+    assert isinstance(call.validated, _ForecastArgs)
+    assert call.validated.where.city.lower() == "ottawa"
+    assert call.validated.unit is _TemperatureUnit.CELSIUS
+
+    # The no-arg tool travelled in the same payload; ask for it explicitly to
+    # prove its bare OBJECT declaration is callable, not merely accepted.
+    history: list[ChatMessage] = [{"role": "user", "content": "What time is it right now?"}]
+    timed = await tool_llm_call(
+        history,
+        [forecast, clock],
+        feature="integration-tool-schema-smoke",
+        label=provider.name,
+        provider=provider,
+        tool_choice=ToolName("current_time"),
+        max_tokens=256,
+    )
+    assert [requested_call.name for requested_call in timed.tool_calls] == ["current_time"]
+    assert timed.tool_calls[0].arguments == {}
+
+
 async def _assert_compose_roundtrip(provider: LLMProviderInterface) -> None:
     """One request can ask for a tool or return a validated final answer."""
     add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
@@ -642,3 +732,19 @@ async def test_vertex_tool_roundtrip_live() -> None:
         Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
     )
     await _assert_tool_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_vertex_tool_schema_roundtrip_live() -> None:
+    """Gemini accepts a ``from_model`` schema and a no-arg tool, unprocessed.
+
+    The Vertex leg of the guarantee README states: a consumer hands llmkit a
+    Pydantic model with a nested model and an enum, or a no-argument tool, and
+    needs no schema pre-processing of their own. Measured on the provider family
+    that would reject the raw schema, rather than inferred from Anthropic/OpenAI,
+    which accept ``$ref``/``$defs`` natively and so prove nothing here.
+    """
+    provider = make_provider(
+        Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    await _assert_unnormalised_schema_roundtrip(provider)
