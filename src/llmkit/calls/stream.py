@@ -14,16 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 import warnings
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
-from llmkit.calls._shared import build_call_provider, build_text_record
+from llmkit.calls._shared import build_text_record, prepare_call
 from llmkit.capture import record_call, record_call_async
-from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
 from llmkit.retry import RetryPolicy, with_retries_stream
@@ -88,7 +87,7 @@ async def text_llm_call_stream(
     keyword** precedence (see :func:`structured_llm_call`); ``None`` leaves
     the flat-keyword path unchanged.
     """
-    resolved = resolve_call_args(
+    args, provider, call_id = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -97,33 +96,21 @@ async def text_llm_call_stream(
         retry=retry,
         provider=provider,
     )
-    temperature = resolved.temperature
-    model = resolved.model
-    max_tokens = resolved.max_tokens
-    reasoning_effort = resolved.reasoning_effort
-    retry = resolved.retry
-    # Build the provider once for this call; every streaming attempt reuses
-    # this instance for both the transport and the per-attempt log record
-    # rather than constructing a second one.
-    provider = build_call_provider(resolved.provider)
     tag = label or feature
-    # Per-logical-call correlation id shared by every streaming attempt.
-    # Passed to ``_stream_once`` as a plain parameter — NEVER a ContextVar: an
-    # async generator's body runs in its *consumer's* context, so a
-    # ContextVar set here would leak the stream's identity into the
-    # consumer's own llmkit calls between chunks (the exact hazard the
-    # ``_retry_scope`` reset-around-every-yield dance below exists to solve).
-    call_id = uuid.uuid4().hex
+    # ``call_id`` reaches ``_stream_once`` as a plain parameter — NEVER a
+    # ContextVar: an async generator's body runs in its *consumer's* context, so
+    # a ContextVar set here would leak the stream's identity into the consumer's
+    # own llmkit calls between chunks.
 
     def _attempt(attempt: int) -> AsyncGenerator[str]:
         return _stream_once(
             prompt,
             feature=feature,
             label=label,
-            temperature=temperature,
-            model=model,
-            max_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
+            temperature=args.temperature,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            reasoning_effort=args.reasoning_effort,
             provider=provider,
             call_id=call_id,
             attempt=attempt,
@@ -135,7 +122,7 @@ async def text_llm_call_stream(
     # to the attempt generator while these frames are still live, so the
     # abandoned-stream record is written deterministically rather than at GC.
     async with aclosing(
-        with_retries_stream(_attempt, policy=retry, label=tag, surface="text_llm_call_stream")
+        with_retries_stream(_attempt, policy=args.retry, label=tag, surface="text_llm_call_stream")
     ) as stream:
         async for chunk in stream:
             yield chunk

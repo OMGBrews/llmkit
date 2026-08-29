@@ -28,15 +28,18 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
+from typing import NamedTuple
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
+from llmkit.options import LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import current_queue_wait_ms
-from llmkit.retry import RetryPolicy
+from llmkit.retry import RetryPolicy, with_retries
 from llmkit.run_scope import get_run_id
 
 # One logger for the whole call surface, named explicitly rather than via
@@ -90,6 +93,84 @@ def build_call_provider(
         # error (logged + retried per attempt) and the log degrade to None.
         logger.debug("Could not pre-resolve provider for LLM call", exc_info=True)
         return None
+
+
+class PreparedCall(NamedTuple):
+    """What a call resolves once, before its first attempt.
+
+    Attributes:
+        args: the merged per-call arguments (config < options < keyword).
+        provider: the provider instance this call runs on, built exactly once
+            so the transport and every attempt's log record share it.
+        call_id: one ``uuid4`` hex per *logical* call. Every retry attempt
+            shares it and numbers itself, so the N records a retried call
+            produces join on ``call_id`` rather than on feature + timestamp
+            proximity, which breaks under concurrent same-feature fan-out.
+    """
+
+    args: ResolvedCallArgs
+    provider: LLMProviderInterface | None
+    call_id: str
+
+
+def prepare_call(
+    options: LLMCallOptions | None,
+    *,
+    temperature: float | None | Unset,
+    model: str | None | Unset,
+    max_tokens: int | None | Unset,
+    reasoning_effort: ReasoningEffort | None | Unset,
+    retry: RetryPolicy | Unset,
+    provider: LLMProviderInterface | None | Unset,
+) -> PreparedCall:
+    """Resolve everything a call decides once, before any attempt runs.
+
+    The preamble all four families share. Each keyword arrives exactly as the
+    call function received it — :data:`~llmkit.UNSET` when the caller did not
+    pass it — and is merged by :func:`~llmkit.options.resolve_call_args`.
+
+    Building the provider here rather than per attempt is what lets the
+    transport and the log record name the same instance; it is config plus
+    cached SDK checks with no I/O, so once per call is both correct and cheap.
+    """
+    args = resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+    )
+    return PreparedCall(args, build_call_provider(args.provider), uuid.uuid4().hex)
+
+
+async def run_with_policy[T](
+    attempt: Callable[[], Awaitable[T]],
+    *,
+    policy: RetryPolicy,
+    tag: str,
+    validation_retry_on: tuple[type[BaseException], ...],
+) -> T:
+    """Run *attempt* under the call's retry budget.
+
+    The families differ only in which errors are charged to the *validation*
+    budget, so that is the one parameter; everything else comes off the policy.
+    Note that this is one pass of the retry loop, not one attempt: each attempt
+    is its own logged call, because the loop wraps the logging call functions
+    rather than living inside them.
+    """
+    return await with_retries(
+        attempt,
+        max_attempts=policy.max_attempts,
+        label=tag,
+        backoff_base_seconds=policy.backoff_base_seconds,
+        max_backoff_seconds=policy.max_backoff_seconds,
+        retry_after_cap=policy.retry_after_cap,
+        retry_on=policy.retry_on,
+        validation_max_attempts=policy.validation_max_attempts,
+        validation_retry_on=validation_retry_on,
+    )
 
 
 def resolve_model_and_provider(

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import cast, overload
@@ -23,18 +22,19 @@ from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
-    build_call_provider,
+    prepare_call,
     resolve_model_and_provider,
     result_validation_budget,
+    run_with_policy,
     tool_validation_budget,
 )
 from llmkit.capture import record_call_async
 from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
-from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
-from llmkit.retry import RetryPolicy, with_retries
+from llmkit.retry import RetryPolicy
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
 from llmkit.tools import (
@@ -145,7 +145,7 @@ async def tool_llm_call[T: BaseModel](
     output_schema: type[T] | None = None,
 ) -> ToolCallResult | ToolComposeResult[T]:
     """Run one tool-enabled turn, optionally accepting a schema-validated final answer."""
-    resolved = resolve_call_args(
+    args, provider, call_id = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -154,7 +154,6 @@ async def tool_llm_call[T: BaseModel](
         retry=retry,
         provider=provider,
     )
-    provider = build_call_provider(resolved.provider)
     if output_schema is not None:
         if provider is None or not provider.compose_tools_schema:
             name = "the configured provider" if provider is None else provider.name
@@ -162,9 +161,8 @@ async def tool_llm_call[T: BaseModel](
                 f"{name} does not support combining tools with an output schema; use the "
                 + "portable two-step pattern (tool loop, then structured_llm_call)."
             )
-        provider.guard_compose_tools_schema(resolved.model)
+        provider.guard_compose_tools_schema(args.model)
     definitions = {definition.name: definition for definition in tools}
-    call_id = uuid.uuid4().hex
     attempt_count = 0
 
     async def _attempt() -> ToolCallResult | ToolComposeResult[T]:
@@ -183,10 +181,10 @@ async def tool_llm_call[T: BaseModel](
                 prompt,
                 tools,
                 tool_choice=tool_choice,
-                temperature=resolved.temperature,
-                model=resolved.model,
-                max_tokens=resolved.max_tokens,
-                reasoning_effort=resolved.reasoning_effort,
+                temperature=args.temperature,
+                model=args.model,
+                max_tokens=args.max_tokens,
+                reasoning_effort=args.reasoning_effort,
                 provider=provider,
                 response_format=(
                     {
@@ -226,7 +224,7 @@ async def tool_llm_call[T: BaseModel](
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            resolved_model, resolved_provider = resolve_model_and_provider(resolved.model, provider)
+            resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
             _ = await record_call_async(
                 LLMCallRecord(
                     started_at=started_at,
@@ -234,7 +232,7 @@ async def tool_llm_call[T: BaseModel](
                     label=label,
                     model=resolved_model,
                     provider=resolved_provider,
-                    temperature=resolved.temperature,
+                    temperature=args.temperature,
                     duration_ms=(time.monotonic() - start_t) * 1000,
                     schema=(
                         "tools" if output_schema is None else f"tools+{output_schema.__name__}"
@@ -243,8 +241,8 @@ async def tool_llm_call[T: BaseModel](
                     response=result.to_log_dict() if result is not None else None,
                     error=error,
                     approximate_cost=cost,
-                    max_tokens=resolved.max_tokens,
-                    reasoning_effort=resolved.reasoning_effort,
+                    max_tokens=args.max_tokens,
+                    reasoning_effort=args.reasoning_effort,
                     call_id=call_id,
                     attempt=attempt_count,
                     queue_wait_ms=current_queue_wait_ms(),
@@ -265,19 +263,14 @@ async def tool_llm_call[T: BaseModel](
                 )
             )
 
-    completed = await with_retries(
+    completed = await run_with_policy(
         _attempt,
-        max_attempts=resolved.retry.max_attempts,
-        label=label or feature,
-        backoff_base_seconds=resolved.retry.backoff_base_seconds,
-        max_backoff_seconds=resolved.retry.max_backoff_seconds,
-        retry_after_cap=resolved.retry.retry_after_cap,
-        retry_on=resolved.retry.retry_on,
-        validation_max_attempts=resolved.retry.validation_max_attempts,
+        policy=args.retry,
+        tag=label or feature,
         validation_retry_on=(
-            tool_validation_budget(resolved.retry)
+            tool_validation_budget(args.retry)
             if output_schema is None
-            else result_validation_budget(resolved.retry)
+            else result_validation_budget(args.retry)
         ),
     )
     return completed

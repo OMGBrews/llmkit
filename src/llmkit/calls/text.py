@@ -10,17 +10,21 @@ its partial transcript instead.
 from __future__ import annotations
 
 import time
-import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
-from llmkit.calls._shared import build_call_provider, build_text_record, result_validation_budget
+from llmkit.calls._shared import (
+    build_text_record,
+    prepare_call,
+    result_validation_budget,
+    run_with_policy,
+)
 from llmkit.capture import record_call_async
-from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
-from llmkit.retry import RetryPolicy, with_retries
+from llmkit.retry import RetryPolicy
 from llmkit.sync import run_sync
 
 
@@ -92,7 +96,7 @@ async def text_llm_call(
         propagate immediately. The log is still written on every attempt
         with the error recorded.
     """
-    resolved = resolve_call_args(
+    args, provider, call_id = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -101,18 +105,6 @@ async def text_llm_call(
         retry=retry,
         provider=provider,
     )
-    temperature = resolved.temperature
-    model = resolved.model
-    max_tokens = resolved.max_tokens
-    reasoning_effort = resolved.reasoning_effort
-    retry = resolved.retry
-    # Build the provider once for this call; the transport reuses this
-    # instance (no rebuild) and the per-attempt log reads its model/name
-    # from it rather than constructing a second one.
-    provider = build_call_provider(resolved.provider)
-    # Per-logical-call correlation, mirroring ``structured_llm_call`` (see
-    # the comment there for why closure state, not a ContextVar).
-    call_id = uuid.uuid4().hex
     attempt_count = 0
 
     async def _attempt() -> str:
@@ -135,10 +127,10 @@ async def text_llm_call(
         try:
             text, cost = await _litellm.acompletion_text(
                 prompt,
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
+                temperature=args.temperature,
+                model=args.model,
+                max_tokens=args.max_tokens,
+                reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
             if on_result is not None:
@@ -158,29 +150,24 @@ async def text_llm_call(
                     prompt=prompt,
                     text=text,
                     start_t=start_t,
-                    temperature=temperature,
-                    model=model,
+                    temperature=args.temperature,
+                    model=args.model,
                     provider=provider,
                     error=error,
                     approximate_cost=cost,
                     schema="text",
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
+                    max_tokens=args.max_tokens,
+                    reasoning_effort=args.reasoning_effort,
                     call_id=call_id,
                     attempt=attempt,
                 )
             )
 
-    return await with_retries(
+    return await run_with_policy(
         _attempt,
-        max_attempts=retry.max_attempts,
-        label=label or feature,
-        backoff_base_seconds=retry.backoff_base_seconds,
-        max_backoff_seconds=retry.max_backoff_seconds,
-        retry_after_cap=retry.retry_after_cap,
-        retry_on=retry.retry_on,
-        validation_max_attempts=retry.validation_max_attempts,
-        validation_retry_on=result_validation_budget(retry),
+        policy=args.retry,
+        tag=label or feature,
+        validation_retry_on=result_validation_budget(args.retry),
     )
 
 

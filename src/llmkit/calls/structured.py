@@ -8,7 +8,6 @@ schema failure would be.
 from __future__ import annotations
 
 import time
-import uuid
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import cast
@@ -17,17 +16,18 @@ from pydantic import BaseModel, JsonValue
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
-    build_call_provider,
     logger,
+    prepare_call,
     resolve_model_and_provider,
     result_validation_budget,
+    run_with_policy,
 )
 from llmkit.capture import record_call_async
 from llmkit.logging import LLMCallRecord
-from llmkit.options import UNSET, LLMCallOptions, Unset, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
-from llmkit.retry import RetryPolicy, with_retries
+from llmkit.retry import RetryPolicy
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
 
@@ -138,7 +138,7 @@ async def structured_llm_call[T: BaseModel](
         immediately. The log is still written on every attempt with the
         error recorded.
     """
-    resolved = resolve_call_args(
+    args, provider, call_id = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -147,22 +147,6 @@ async def structured_llm_call[T: BaseModel](
         retry=retry,
         provider=provider,
     )
-    temperature = resolved.temperature
-    model = resolved.model
-    max_tokens = resolved.max_tokens
-    reasoning_effort = resolved.reasoning_effort
-    retry = resolved.retry
-    # Build the provider once for this call; the transport reuses this
-    # instance (no rebuild) and the per-attempt log reads its model/name
-    # from it rather than constructing a second one.
-    provider = build_call_provider(resolved.provider)
-    # One id per *logical* call; every retry attempt shares it and numbers
-    # itself via the closure counter, so the N records of one call join on
-    # ``call_id`` instead of feature + timestamp proximity. Deliberately
-    # closure state, not a ContextVar: this coroutine runs entirely inside
-    # one task, and closures cannot leak into a consumer's context the way
-    # generator-set ContextVars do (see ``_retry_scope`` in the stream path).
-    call_id = uuid.uuid4().hex
     attempt_count = 0
 
     async def _attempt() -> T:
@@ -184,10 +168,10 @@ async def structured_llm_call[T: BaseModel](
             response, cost = await _litellm.acompletion_structured(
                 prompt,
                 output_schema,
-                temperature=temperature,
-                model=model,
-                max_tokens=max_tokens,
-                reasoning_effort=reasoning_effort,
+                temperature=args.temperature,
+                model=args.model,
+                max_tokens=args.max_tokens,
+                reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
             if on_result is not None:
@@ -201,7 +185,7 @@ async def structured_llm_call[T: BaseModel](
             raise
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
-            resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
+            resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
             # ``T`` is bounded to ``BaseModel``, so every parsed result dumps;
             # the cast only launders ``model_dump``'s ``dict[str, Any]``.
             response_dump: dict[str, JsonValue] | None = None
@@ -228,15 +212,15 @@ async def structured_llm_call[T: BaseModel](
                     label=label,
                     model=resolved_model,
                     provider=resolved_provider,
-                    temperature=temperature,
+                    temperature=args.temperature,
                     duration_ms=duration_ms,
                     schema=output_schema.__name__,
                     prompt=prompt,
                     response=response_dump,
                     error=error,
                     approximate_cost=cost,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
+                    max_tokens=args.max_tokens,
+                    reasoning_effort=args.reasoning_effort,
                     call_id=call_id,
                     attempt=attempt,
                     queue_wait_ms=current_queue_wait_ms(),
@@ -244,16 +228,11 @@ async def structured_llm_call[T: BaseModel](
                 )
             )
 
-    return await with_retries(
+    return await run_with_policy(
         _attempt,
-        max_attempts=retry.max_attempts,
-        label=label or feature,
-        backoff_base_seconds=retry.backoff_base_seconds,
-        max_backoff_seconds=retry.max_backoff_seconds,
-        retry_after_cap=retry.retry_after_cap,
-        retry_on=retry.retry_on,
-        validation_max_attempts=retry.validation_max_attempts,
-        validation_retry_on=result_validation_budget(retry),
+        policy=args.retry,
+        tag=label or feature,
+        validation_retry_on=result_validation_budget(args.retry),
     )
 
 

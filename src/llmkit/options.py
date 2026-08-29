@@ -6,9 +6,9 @@ A feature module builds one :class:`LLMCallOptions` and passes it as
 sync wrappers) instead of repeating the same per-call keyword block at each
 site. This module owns only the *merge*: collapsing the three precedence
 layers — the configured client, a shared ``LLMCallOptions``, and the explicit
-per-call keywords — into the single :class:`_ResolvedCallArgs` shape every call
+per-call keywords — into the single :class:`ResolvedCallArgs` shape every call
 function forwards to the transport. It carries no logging or transport concern;
-those live in :mod:`llmkit.capture` and :mod:`llmkit.structured_output`.
+those live in :mod:`llmkit.capture` and :mod:`llmkit.calls`.
 
 "Explicitly passed" is a structural fact here, not a guess: every mergeable
 call-function keyword defaults to :data:`UNSET`, so a keyword that arrives as
@@ -133,12 +133,13 @@ class LLMCallOptions:
 
 
 @dataclass(frozen=True, slots=True)
-class _ResolvedCallArgs:
+class ResolvedCallArgs:
     """The per-call arguments after merging ``options`` with the keywords.
 
     The single shape every call function forwards to the transport once the
     three-layer precedence (config < options < explicit keyword) has been
-    collapsed. Internal to the call-function module.
+    collapsed. Public-named because it crosses a module boundary into
+    :mod:`llmkit.calls`; it is not part of the package's public surface.
     """
 
     temperature: float | None
@@ -158,7 +159,7 @@ def resolve_call_args(
     reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
     provider: LLMProviderInterface | None | Unset,
-) -> _ResolvedCallArgs:
+) -> ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
     The shared seam all the call functions funnel through, so the
@@ -185,7 +186,7 @@ def resolve_call_args(
     not copies of the defaults, so the two can never drift.
     """
     opts = options if options is not None else _ALL_UNSET_OPTIONS
-    return _ResolvedCallArgs(
+    return ResolvedCallArgs(
         temperature=_pick(temperature, opts.temperature, DEFAULT_TEMPERATURE),
         model=_pick(model, opts.model, None),
         max_tokens=_pick(max_tokens, opts.max_tokens, None),
