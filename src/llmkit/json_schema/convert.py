@@ -234,6 +234,258 @@ def _with_constraints(annotation: object, c: _FieldConstraints) -> object:
     ]
 
 
+# --- Pure schema helpers ---------------------------------------------------
+#
+# These read a schema fragment and return a value; none of them touches
+# converter state. They were methods purely for namespacing, which made a
+# 643-line class look like it held more coupling than it does. As free
+# functions the boundary is visible: everything below this point can be read
+# and tested without a ``_Converter`` at all.
+
+
+def _ref_name(ref: str) -> str:
+    prefix_defs = "#/$defs/"
+    prefix_definitions = "#/definitions/"
+    if ref.startswith(prefix_defs):
+        return ref[len(prefix_defs) :]
+    if ref.startswith(prefix_definitions):
+        return ref[len(prefix_definitions) :]
+    raise ValueError(
+        f"Unsupported $ref {ref!r}: only local references into "
+        + "'#/$defs/' or '#/definitions/' are supported."
+    )
+
+
+def _unwrap_nullable(schema: JsonDict, field_path: str) -> tuple[JsonDict, bool]:
+    """Split a possibly-nullable schema into (inner schema, is_nullable).
+
+    Handles the two shapes real consumers emit: ``type: ["string",
+    "null"]`` and ``anyOf: [{...}, {"type": "null"}]``.
+
+    Nullable-merge precedence: for the ``anyOf``/``oneOf`` shape, the OUTER
+    field-level keys win on conflict — they are the field's declared intent,
+    while the union merely expresses nullability — and the non-null branch
+    supplies ``type`` plus any keys the outer does not define. Example: an
+    outer ``description`` beats a branch ``description``, while the branch
+    supplies the ``type``.
+
+    Multi-variant (discriminated) unions are unsupported: an ``anyOf`` or
+    ``oneOf`` with more than one non-null branch is rejected loudly.
+    """
+    type_field = schema.get("type")
+    if isinstance(type_field, list):
+        non_null = [t for t in type_field if t != "null"]
+        nullable = "null" in type_field
+        if len(non_null) != 1:
+            raise ValueError(
+                f"Unsupported union type {type_field!r}: only a single non-null "
+                + "type (optionally with 'null') is supported."
+            )
+        return {**schema, "type": non_null[0]}, nullable
+
+    if schema.get("anyOf") and schema.get("oneOf"):
+        raise ValueError(
+            "A field declares both 'anyOf' and 'oneOf'; only one is supported "
+            + "at a time. Combine them into a single union or drop one."
+        )
+    keyword = "anyOf" if schema.get("anyOf") else "oneOf" if schema.get("oneOf") else None
+    any_of = schema.get("anyOf") or schema.get("oneOf")
+    if isinstance(any_of, list):
+        branches: list[JsonDict] = []
+        for branch in cast("list[JsonValue]", any_of):
+            if not isinstance(branch, dict):
+                raise ValueError(
+                    f"Unsupported {keyword} branch at {field_path!r}: each branch must "
+                    + f"be a schema object, got {type(branch).__name__}."
+                )
+            branches.append(cast("JsonDict", branch))
+        non_null = [b for b in branches if b.get("type") != "null"]
+        nullable = any(b.get("type") == "null" for b in branches)
+        if len(non_null) != 1:
+            raise ValueError(
+                f"Unsupported {keyword} with {len(non_null)} non-null branches: "
+                + "only a single non-null branch (optionally with a 'null' branch) "
+                + "is supported. Multi-variant (discriminated) unions are unsupported."
+            )
+        merged = {k: v for k, v in schema.items() if k not in ("anyOf", "oneOf")}
+        # Outer field-level keys win on conflict; the non-null branch
+        # supplies ``type`` and any keys the outer does not define.
+        return {**non_null[0], **merged}, nullable
+
+    return schema, False
+
+
+def _reject_structural_ref_siblings(siblings: JsonDict, target: JsonDict, field_path: str) -> None:
+    """Fail loud if a structural keyword beside a ``$ref`` would redefine the target.
+
+    A structural sibling (``type`` / ``enum`` / ``items`` / ``properties`` /
+    ...) is a Draft 2020-12 *conjunction* with the referenced schema, not an
+    override: folding it in last-writer-wins would silently *replace* the
+    target's structure — most visibly, a ``$ref``-sibling ``enum`` would
+    widen the field to an unconstrained scalar by discarding the referenced
+    member set. That silent widening is the defect this rejects. The sibling
+    is allowed only when it restates the target's own value for that keyword
+    (a redundant no-op some generators emit); anything else must move into
+    the referenced ``$def`` or inline the schema.
+    """
+    for key, value in siblings.items():
+        if key in _STRUCTURAL_REF_SIBLINGS and value != target.get(key):
+            raise ValueError(
+                f"Unsupported $ref sibling {key!r} at {field_path!r}: a {key!r} "
+                + "keyword beside a '$ref' would redefine the referenced schema's "
+                + "structure, which is not supported (JSON Schema applies it as an "
+                + "intersection, not an override, so merging it would silently drop "
+                + f"or widen the reference). Move {key!r} into the referenced $def, "
+                + "or inline the schema instead of referencing it."
+            )
+
+
+def _reject_unsupported_applicators(schema: JsonDict, field_path: str) -> None:
+    """Fail loud on a subschema applicator the converter cannot honour.
+
+    A generated field is one annotation plus a fixed set of ``Field`` bounds,
+    so an applicator (see :data:`_UNSUPPORTED_APPLICATORS`) has nowhere to
+    land. Dropping one is wrong in BOTH directions: a dropped ``allOf`` bound
+    makes the model accept a value the schema forbids, and a dropped
+    ``prefixItems`` makes the sibling ``items`` mean "every element" instead
+    of "every element after the prefix", so the model *rejects* a response the
+    schema permits. Unlike a dropped leaf constraint (``pattern`` / ``format``
+    — documented as unenforced), neither loss is visible to the caller.
+
+    Distinct from :meth:`_reject_structural_ref_siblings`, which fires only
+    beside a ``$ref`` and only for a sibling that redefines the target. This
+    runs at every site — including a bare ``$ref`` whose *target body* carries
+    an applicator, which the sibling guard structurally cannot see.
+    """
+    offender = next((k for k in sorted(schema) if k in _UNSUPPORTED_APPLICATORS), None)
+    if offender is None:
+        return
+    raise ValueError(
+        f"Unsupported keyword {offender!r} at {field_path!r}: subschema applicators "
+        + "(allOf / not / if / then / else / contains / prefixItems / patternProperties "
+        + "/ propertyNames / dependentSchemas / dependentRequired / unevaluated*) "
+        + "constrain by composition and cannot be carried into a generated field, so "
+        + "they would be silently dropped — changing what the model accepts. Express "
+        + f"{offender!r} with a supported keyword, or validate it outside the model."
+    )
+
+
+def _constraints_from_resolved(resolved: JsonDict) -> _FieldConstraints:
+    """Pull the supported per-field bounds off an already-resolved schema node.
+
+    The ``$ref`` / nullable resolution happens once in :meth:`_resolve_field`,
+    so this is a pure extractor over the effective node — a bound declared on
+    the non-null branch of an ``anyOf`` or inside a referenced ``$def`` has
+    already been folded in. Returns a :class:`_FieldConstraints` carrying the
+    resolved Pydantic ``Field`` bounds (``ge`` / ``le`` / ``gt`` / ``lt`` /
+    ``min_length`` / ``max_length``).
+
+    Constraints outside the supported set (see the module docstring and the
+    ``_FieldConstraints`` fields) are silently dropped — no partial
+    enforcement. ``minLength`` (strings) and ``minItems`` (arrays) never
+    co-occur on one field, so mapping both onto ``min_length`` is safe.
+
+    A bound is also dropped when it does **not match the field's resolved
+    JSON type** — a numeric bound (``minimum`` …) on a non-numeric field, or
+    a length bound (``minLength`` / ``minItems`` …) on a non-string/array
+    field. Pydantic rejects such a mismatched constraint with a ``TypeError``
+    at *validation* time (not build time), so applying it unconditionally
+    would turn a stray keyword in an otherwise-valid schema into an opaque
+    crash on the first response. Gating by type keeps the drop-the-
+    unsupported promise instead of crashing.
+    """
+    raw_type = resolved.get("type")
+    types: set[str] = (
+        {raw_type}
+        if isinstance(raw_type, str)
+        else {t for t in raw_type if isinstance(t, str)}
+        if isinstance(raw_type, list)
+        else set()
+    )
+    # Numeric bounds (ge/le/gt/lt) apply only to integer/number; length
+    # bounds (min_length/max_length) only to string/array. A field whose
+    # type is absent or anything else gets no bounds — drop, never crash.
+    numeric_field = bool(types & {"integer", "number"})
+    sized_field = bool(types & {"string", "array"})
+
+    def _number(key: str) -> float | None:
+        value = resolved.get(key)
+        # ``bool`` is an ``int`` subclass — exclude it. A non-numeric (or
+        # missing) bound silently drops, matching the drop-the-unsupported
+        # contract rather than erroring.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+
+    def _length(key: str) -> int | None:
+        value = resolved.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+
+    return _FieldConstraints(
+        ge=_number("minimum") if numeric_field else None,
+        le=_number("maximum") if numeric_field else None,
+        gt=_number("exclusiveMinimum") if numeric_field else None,
+        lt=_number("exclusiveMaximum") if numeric_field else None,
+        # minLength (string) and minItems (array) both map to min_length;
+        # at most one is present for a given field, so the ``or`` picks the
+        # one that applies without conflict.
+        min_length=(
+            (_length("minLength") if "minLength" in resolved else _length("minItems"))
+            if sized_field
+            else None
+        ),
+        max_length=(
+            (_length("maxLength") if "maxLength" in resolved else _length("maxItems"))
+            if sized_field
+            else None
+        ),
+    )
+
+
+def _build_enum(schema: JsonDict, field_path: str) -> object:
+    """Build the ``Literal[...]`` annotation for an ``enum``-bearing node.
+
+    A ``Literal`` rather than a generated ``Enum`` class: pydantic inlines
+    it into the property schema, so the per-field ``description`` lands
+    beside an inline ``enum`` (legal everywhere) instead of beside a
+    ``$ref`` (rejected by OpenAI's strict validator), and a validated
+    instance holds the raw scalar with no member-name machinery in
+    between. One deliberate strictness delta versus the former int-based
+    ``Enum``: a numeric *string* (``"2"``) no longer coerces to the
+    integer member — strict providers guarantee a real integer on the
+    wire, and a weak model's quoted number should re-ask, not slide.
+    """
+    values = schema.get("enum")
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"Unsupported enum at {field_path!r}: 'enum' must be a non-empty list.")
+    members: list[str | int] = []
+    all_int = True
+    any_int = False
+    for value in cast("list[JsonValue]", values):
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError(
+                f"Unsupported enum value {value!r} at {field_path!r}: only string and "
+                + "integer enum members are supported."
+            )
+        if isinstance(value, int):
+            any_int = True
+        else:
+            all_int = False
+        members.append(value)
+    # ``Literal`` could carry a mixed string/integer enum, but the
+    # supported subset stays homogeneous for parity with every prior
+    # release (the Enum-based build had no faithful single base for a
+    # mix). Relaxing this is a deliberate follow-up, not a side effect.
+    if any_int and not all_int:
+        raise ValueError(
+            f"Unsupported mixed-type enum at {field_path!r}: enum members must be all "
+            + "strings or all integers, not a mix of both."
+        )
+    return _as_literal(members)
+
+
 class _Converter:
     """One conversion pass over a single root schema and its ``$defs``.
 
@@ -260,82 +512,12 @@ class _Converter:
         self._in_progress: set[str] = set()
         self._counter: int = 0
 
-    def _ref_name(self, ref: str) -> str:
-        prefix_defs = "#/$defs/"
-        prefix_definitions = "#/definitions/"
-        if ref.startswith(prefix_defs):
-            return ref[len(prefix_defs) :]
-        if ref.startswith(prefix_definitions):
-            return ref[len(prefix_definitions) :]
-        raise ValueError(
-            f"Unsupported $ref {ref!r}: only local references into "
-            + "'#/$defs/' or '#/definitions/' are supported."
-        )
-
     def _resolve_ref(self, ref: str) -> tuple[str, JsonDict]:
-        name = self._ref_name(ref)
+        name = _ref_name(ref)
         target = self._defs.get(name)
         if not isinstance(target, dict):
             raise ValueError(f"Unresolvable $ref {ref!r}: no '{name}' in $defs/definitions.")
         return name, cast("JsonDict", target)
-
-    def _unwrap_nullable(self, schema: JsonDict, field_path: str) -> tuple[JsonDict, bool]:
-        """Split a possibly-nullable schema into (inner schema, is_nullable).
-
-        Handles the two shapes real consumers emit: ``type: ["string",
-        "null"]`` and ``anyOf: [{...}, {"type": "null"}]``.
-
-        Nullable-merge precedence: for the ``anyOf``/``oneOf`` shape, the OUTER
-        field-level keys win on conflict — they are the field's declared intent,
-        while the union merely expresses nullability — and the non-null branch
-        supplies ``type`` plus any keys the outer does not define. Example: an
-        outer ``description`` beats a branch ``description``, while the branch
-        supplies the ``type``.
-
-        Multi-variant (discriminated) unions are unsupported: an ``anyOf`` or
-        ``oneOf`` with more than one non-null branch is rejected loudly.
-        """
-        type_field = schema.get("type")
-        if isinstance(type_field, list):
-            non_null = [t for t in type_field if t != "null"]
-            nullable = "null" in type_field
-            if len(non_null) != 1:
-                raise ValueError(
-                    f"Unsupported union type {type_field!r}: only a single non-null "
-                    + "type (optionally with 'null') is supported."
-                )
-            return {**schema, "type": non_null[0]}, nullable
-
-        if schema.get("anyOf") and schema.get("oneOf"):
-            raise ValueError(
-                "A field declares both 'anyOf' and 'oneOf'; only one is supported "
-                + "at a time. Combine them into a single union or drop one."
-            )
-        keyword = "anyOf" if schema.get("anyOf") else "oneOf" if schema.get("oneOf") else None
-        any_of = schema.get("anyOf") or schema.get("oneOf")
-        if isinstance(any_of, list):
-            branches: list[JsonDict] = []
-            for branch in cast("list[JsonValue]", any_of):
-                if not isinstance(branch, dict):
-                    raise ValueError(
-                        f"Unsupported {keyword} branch at {field_path!r}: each branch must "
-                        + f"be a schema object, got {type(branch).__name__}."
-                    )
-                branches.append(cast("JsonDict", branch))
-            non_null = [b for b in branches if b.get("type") != "null"]
-            nullable = any(b.get("type") == "null" for b in branches)
-            if len(non_null) != 1:
-                raise ValueError(
-                    f"Unsupported {keyword} with {len(non_null)} non-null branches: "
-                    + "only a single non-null branch (optionally with a 'null' branch) "
-                    + "is supported. Multi-variant (discriminated) unions are unsupported."
-                )
-            merged = {k: v for k, v in schema.items() if k not in ("anyOf", "oneOf")}
-            # Outer field-level keys win on conflict; the non-null branch
-            # supplies ``type`` and any keys the outer does not define.
-            return {**non_null[0], **merged}, nullable
-
-        return schema, False
 
     def _resolve_field(self, schema: JsonDict, field_path: str) -> _ResolvedField:
         """Resolve a property schema's ``$ref`` chain and nullable wrappers once.
@@ -374,13 +556,13 @@ class _Converter:
                     )
                 seen_refs.add(resolved_name)
                 siblings = {k: v for k, v in inner.items() if k != "$ref"}
-                self._reject_structural_ref_siblings(siblings, target, field_path)
+                _reject_structural_ref_siblings(siblings, target, field_path)
                 # Draft 2020-12: siblings apply together with the target's
                 # keywords; outer (property-level) keys win on conflict, matching
                 # the nullable-merge precedence in ``_unwrap_nullable``.
                 ref_name, inner = resolved_name, {**target, **siblings}
                 continue
-            unwrapped, inner_nullable = self._unwrap_nullable(inner, field_path)
+            unwrapped, inner_nullable = _unwrap_nullable(inner, field_path)
             nullable = nullable or inner_nullable
             if unwrapped is inner:
                 break
@@ -392,63 +574,8 @@ class _Converter:
         # The ``$ref``-sibling guard above already ran inside the loop, so a
         # sibling applicator still gets the more specific "Unsupported $ref
         # sibling" message rather than this one.
-        self._reject_unsupported_applicators(inner, field_path)
+        _reject_unsupported_applicators(inner, field_path)
         return _ResolvedField(inner, nullable, ref_name)
-
-    def _reject_structural_ref_siblings(
-        self, siblings: JsonDict, target: JsonDict, field_path: str
-    ) -> None:
-        """Fail loud if a structural keyword beside a ``$ref`` would redefine the target.
-
-        A structural sibling (``type`` / ``enum`` / ``items`` / ``properties`` /
-        ...) is a Draft 2020-12 *conjunction* with the referenced schema, not an
-        override: folding it in last-writer-wins would silently *replace* the
-        target's structure — most visibly, a ``$ref``-sibling ``enum`` would
-        widen the field to an unconstrained scalar by discarding the referenced
-        member set. That silent widening is the defect this rejects. The sibling
-        is allowed only when it restates the target's own value for that keyword
-        (a redundant no-op some generators emit); anything else must move into
-        the referenced ``$def`` or inline the schema.
-        """
-        for key, value in siblings.items():
-            if key in _STRUCTURAL_REF_SIBLINGS and value != target.get(key):
-                raise ValueError(
-                    f"Unsupported $ref sibling {key!r} at {field_path!r}: a {key!r} "
-                    + "keyword beside a '$ref' would redefine the referenced schema's "
-                    + "structure, which is not supported (JSON Schema applies it as an "
-                    + "intersection, not an override, so merging it would silently drop "
-                    + f"or widen the reference). Move {key!r} into the referenced $def, "
-                    + "or inline the schema instead of referencing it."
-                )
-
-    def _reject_unsupported_applicators(self, schema: JsonDict, field_path: str) -> None:
-        """Fail loud on a subschema applicator the converter cannot honour.
-
-        A generated field is one annotation plus a fixed set of ``Field`` bounds,
-        so an applicator (see :data:`_UNSUPPORTED_APPLICATORS`) has nowhere to
-        land. Dropping one is wrong in BOTH directions: a dropped ``allOf`` bound
-        makes the model accept a value the schema forbids, and a dropped
-        ``prefixItems`` makes the sibling ``items`` mean "every element" instead
-        of "every element after the prefix", so the model *rejects* a response the
-        schema permits. Unlike a dropped leaf constraint (``pattern`` / ``format``
-        — documented as unenforced), neither loss is visible to the caller.
-
-        Distinct from :meth:`_reject_structural_ref_siblings`, which fires only
-        beside a ``$ref`` and only for a sibling that redefines the target. This
-        runs at every site — including a bare ``$ref`` whose *target body* carries
-        an applicator, which the sibling guard structurally cannot see.
-        """
-        offender = next((k for k in sorted(schema) if k in _UNSUPPORTED_APPLICATORS), None)
-        if offender is None:
-            return
-        raise ValueError(
-            f"Unsupported keyword {offender!r} at {field_path!r}: subschema applicators "
-            + "(allOf / not / if / then / else / contains / prefixItems / patternProperties "
-            + "/ propertyNames / dependentSchemas / dependentRequired / unevaluated*) "
-            + "constrain by composition and cannot be carried into a generated field, so "
-            + "they would be silently dropped — changing what the model accepts. Express "
-            + f"{offender!r} with a supported keyword, or validate it outside the model."
-        )
 
     def _annotation_from_resolved(self, resolved: _ResolvedField, field_path: str) -> object:
         """Build a field's Python annotation from an already-resolved schema node.
@@ -478,7 +605,7 @@ class _Converter:
                         + "at least one non-null member — 'enum' contains only null."
                     )
                 inner = {**inner, "enum": cast("JsonValue", non_null_members)}
-            return self._build_enum(inner, field_path)
+            return _build_enum(inner, field_path)
 
         jtype = inner.get("type")
         if jtype is None:
@@ -502,131 +629,13 @@ class _Converter:
             # on the element annotation — the list field's own ``Field`` only
             # carries ``minItems``/``maxItems``. Wrap BEFORE the nullable
             # union so a ``null`` element still passes unbounded.
-            element = _with_constraints(
-                element, self._constraints_from_resolved(item_resolved.schema)
-            )
+            element = _with_constraints(element, _constraints_from_resolved(item_resolved.schema))
             if item_resolved.nullable:
                 element = _nullable(element)
             return _as_list(element)
         if isinstance(jtype, str) and jtype in _SCALAR_TYPES:
             return _SCALAR_TYPES[jtype]
         raise ValueError(f"Unsupported JSON-schema type {jtype!r} at {field_path!r}.")
-
-    def _constraints_from_resolved(self, resolved: JsonDict) -> _FieldConstraints:
-        """Pull the supported per-field bounds off an already-resolved schema node.
-
-        The ``$ref`` / nullable resolution happens once in :meth:`_resolve_field`,
-        so this is a pure extractor over the effective node — a bound declared on
-        the non-null branch of an ``anyOf`` or inside a referenced ``$def`` has
-        already been folded in. Returns a :class:`_FieldConstraints` carrying the
-        resolved Pydantic ``Field`` bounds (``ge`` / ``le`` / ``gt`` / ``lt`` /
-        ``min_length`` / ``max_length``).
-
-        Constraints outside the supported set (see the module docstring and the
-        ``_FieldConstraints`` fields) are silently dropped — no partial
-        enforcement. ``minLength`` (strings) and ``minItems`` (arrays) never
-        co-occur on one field, so mapping both onto ``min_length`` is safe.
-
-        A bound is also dropped when it does **not match the field's resolved
-        JSON type** — a numeric bound (``minimum`` …) on a non-numeric field, or
-        a length bound (``minLength`` / ``minItems`` …) on a non-string/array
-        field. Pydantic rejects such a mismatched constraint with a ``TypeError``
-        at *validation* time (not build time), so applying it unconditionally
-        would turn a stray keyword in an otherwise-valid schema into an opaque
-        crash on the first response. Gating by type keeps the drop-the-
-        unsupported promise instead of crashing.
-        """
-        raw_type = resolved.get("type")
-        types: set[str] = (
-            {raw_type}
-            if isinstance(raw_type, str)
-            else {t for t in raw_type if isinstance(t, str)}
-            if isinstance(raw_type, list)
-            else set()
-        )
-        # Numeric bounds (ge/le/gt/lt) apply only to integer/number; length
-        # bounds (min_length/max_length) only to string/array. A field whose
-        # type is absent or anything else gets no bounds — drop, never crash.
-        numeric_field = bool(types & {"integer", "number"})
-        sized_field = bool(types & {"string", "array"})
-
-        def _number(key: str) -> float | None:
-            value = resolved.get(key)
-            # ``bool`` is an ``int`` subclass — exclude it. A non-numeric (or
-            # missing) bound silently drops, matching the drop-the-unsupported
-            # contract rather than erroring.
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return value
-            return None
-
-        def _length(key: str) -> int | None:
-            value = resolved.get(key)
-            if isinstance(value, int) and not isinstance(value, bool):
-                return value
-            return None
-
-        return _FieldConstraints(
-            ge=_number("minimum") if numeric_field else None,
-            le=_number("maximum") if numeric_field else None,
-            gt=_number("exclusiveMinimum") if numeric_field else None,
-            lt=_number("exclusiveMaximum") if numeric_field else None,
-            # minLength (string) and minItems (array) both map to min_length;
-            # at most one is present for a given field, so the ``or`` picks the
-            # one that applies without conflict.
-            min_length=(
-                (_length("minLength") if "minLength" in resolved else _length("minItems"))
-                if sized_field
-                else None
-            ),
-            max_length=(
-                (_length("maxLength") if "maxLength" in resolved else _length("maxItems"))
-                if sized_field
-                else None
-            ),
-        )
-
-    def _build_enum(self, schema: JsonDict, field_path: str) -> object:
-        """Build the ``Literal[...]`` annotation for an ``enum``-bearing node.
-
-        A ``Literal`` rather than a generated ``Enum`` class: pydantic inlines
-        it into the property schema, so the per-field ``description`` lands
-        beside an inline ``enum`` (legal everywhere) instead of beside a
-        ``$ref`` (rejected by OpenAI's strict validator), and a validated
-        instance holds the raw scalar with no member-name machinery in
-        between. One deliberate strictness delta versus the former int-based
-        ``Enum``: a numeric *string* (``"2"``) no longer coerces to the
-        integer member — strict providers guarantee a real integer on the
-        wire, and a weak model's quoted number should re-ask, not slide.
-        """
-        values = schema.get("enum")
-        if not isinstance(values, list) or not values:
-            raise ValueError(
-                f"Unsupported enum at {field_path!r}: 'enum' must be a non-empty list."
-            )
-        members: list[str | int] = []
-        all_int = True
-        any_int = False
-        for value in cast("list[JsonValue]", values):
-            if isinstance(value, bool) or not isinstance(value, (str, int)):
-                raise ValueError(
-                    f"Unsupported enum value {value!r} at {field_path!r}: only string and "
-                    + "integer enum members are supported."
-                )
-            if isinstance(value, int):
-                any_int = True
-            else:
-                all_int = False
-            members.append(value)
-        # ``Literal`` could carry a mixed string/integer enum, but the
-        # supported subset stays homogeneous for parity with every prior
-        # release (the Enum-based build had no faithful single base for a
-        # mix). Relaxing this is a deliberate follow-up, not a side effect.
-        if any_int and not all_int:
-            raise ValueError(
-                f"Unsupported mixed-type enum at {field_path!r}: enum members must be all "
-                + "strings or all integers, not a mix of both."
-            )
-        return _as_literal(members)
 
     def _build_object(
         self, schema: JsonDict, field_path: str, *, ref_name: str | None = None
@@ -775,7 +784,7 @@ class _Converter:
             desc = description if isinstance(description, str) else None
             # Per-field value bounds (ge/le/gt/lt/min_length/max_length). Only
             # the supported keywords cross over; everything else is dropped.
-            c = self._constraints_from_resolved(resolved.schema)
+            c = _constraints_from_resolved(resolved.schema)
             optional = prop_name not in required
             if optional:
                 optional_fields.add(prop_name)
@@ -842,12 +851,12 @@ class _Converter:
         if "$ref" in root:
             siblings = {k: v for k, v in root.items() if k != "$ref"}
             root_ref, target = self._resolve_ref(cast("str", root["$ref"]))
-            self._reject_structural_ref_siblings(siblings, target, "$")
+            _reject_structural_ref_siblings(siblings, target, "$")
             root = {**target, **siblings}
         # Outside the ``$ref`` branch on purpose: the root reaches
         # ``_build_object`` directly and never passes through ``_resolve_field``,
         # so without this call a root-level ``if`` / ``allOf`` stays silent.
-        self._reject_unsupported_applicators(root, "$")
+        _reject_unsupported_applicators(root, "$")
         jtype = root.get("type")
         if jtype not in (None, "object"):
             raise ValueError(
