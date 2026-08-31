@@ -4,16 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- **Gemini Flash-Lite defaults now use Gemini 3.1.** Google AI Studio and
-  Vertex now default to `gemini-3.1-flash-lite`; OpenRouter defaults to
-  `google/gemini-3.1-flash-lite`. Vertex's default route requires the
-  `global`, `us`, or `eu` multi-region endpoint, and llmkit's maintained live
-  configuration now uses `us`. This replaces the Gemini 2.5 Flash-Lite default
-  before Vertex retires that model on 2026-10-20.
+## [0.10.0] — 2026-08-31
 
 ### Added
 
@@ -146,6 +137,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and in the `prompt` the log records. New export: `TOOL_ERROR_PREFIX`.
 
 ### Changed
+
+- **Gemini Flash-Lite defaults now use Gemini 3.1.** Google AI Studio and
+  Vertex now default to `gemini-3.1-flash-lite`; OpenRouter defaults to
+  `google/gemini-3.1-flash-lite`. Vertex's default route requires the
+  `global`, `us`, or `eu` multi-region endpoint, and llmkit's maintained live
+  configuration now uses `us`. This replaces the Gemini 2.5 Flash-Lite default
+  before Vertex retires that model on 2026-10-20.
 
 - **The minimum `litellm` is now 1.95.0**, up from 1.87.1 (raised with the
   tool-calling lane, which needs it). If you pin llmkit's dependencies
@@ -1988,7 +1986,8 @@ Initial public release.
 - Approximate per-call cost (`approximate_cost`) sourced from LiteLLM's response
   estimate, for budget visibility.
 
-[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.9.0...main
+[Unreleased]: https://github.com/OMGBrews/llmkit/compare/v0.10.0...main
+[0.10.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.10.0
 [0.9.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.9.0
 [0.8.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.8.0
 [0.7.0]: https://github.com/OMGBrews/llmkit/releases/tag/v0.7.0
