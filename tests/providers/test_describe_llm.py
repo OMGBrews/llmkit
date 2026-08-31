@@ -24,7 +24,7 @@ def test_describe_llm_resolves_provider_default_model() -> None:
     assert isinstance(info, LLMInfo)
     assert info.provider == Provider.GOOGLE
     assert info.provider_name == "Google AI Studio"
-    assert info.model == "gemini-2.5-flash-lite"
+    assert info.model == "gemini-3.1-flash-lite"
     assert info.is_local is False
     assert info.compose_tools_schema is False
 
@@ -59,5 +59,5 @@ def test_describe_llm_snapshots_vertex() -> None:
     assert isinstance(info, LLMInfo)
     assert info.provider == Provider.VERTEX
     assert info.provider_name == "Google Vertex AI"
-    assert info.model == "gemini-2.5-flash-lite"
+    assert info.model == "gemini-3.1-flash-lite"
     assert info.is_local is False

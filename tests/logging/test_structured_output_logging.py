@@ -38,17 +38,17 @@ from tests._support import provider_mock
 
 def test_resolve_substitutes_provider_default_when_model_none() -> None:
     fake_provider = MagicMock()
-    fake_provider.model = "gemini-2.5-flash-lite"
+    fake_provider.model = "gemini-3.1-flash-lite"
     fake_provider.name = "Google AI Studio"
     with patch("llmkit.providers.build_provider", return_value=fake_provider):
         resolved, provider = resolve_model_and_provider(None)
-    assert resolved == "gemini-2.5-flash-lite"
+    assert resolved == "gemini-3.1-flash-lite"
     assert provider == "Google AI Studio"
 
 
 def test_resolve_keeps_explicit_model_and_records_provider() -> None:
     fake_provider = MagicMock()
-    fake_provider.model = "gemini-2.5-flash-lite"
+    fake_provider.model = "gemini-3.1-flash-lite"
     fake_provider.name = "Google AI Studio"
     with patch("llmkit.providers.build_provider", return_value=fake_provider):
         resolved, provider = resolve_model_and_provider("gemini-2.5-flash")
@@ -116,7 +116,7 @@ def test_local_yaml_sink_records_model_and_provider(tmp_path: Path) -> None:
     path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
     assert path is not None
     doc = cast("dict[str, object]", yaml.safe_load(path.read_text()))
-    assert doc["model"] == "gemini-2.5-flash-lite"
+    assert doc["model"] == "gemini-3.1-flash-lite"
     assert doc["provider"] == "Google AI Studio"
 
 
@@ -198,7 +198,7 @@ def test_summary_header_is_verdict_first(tmp_path: Path) -> None:
     ok_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(approximate_cost=5.9e-06))
     assert ok_path is not None
     first_line = ok_path.read_text().splitlines()[0]
-    assert first_line.startswith("# ok | extraction/summary | gemini-2.5-flash-lite | Schema |")
+    assert first_line.startswith("# ok | extraction/summary | gemini-3.1-flash-lite | Schema |")
     assert "$5.9e-06" in first_line
 
     err_path = LocalYamlLogSink(tmp_path).write_returning_path(_record(error="APIError: boom"))
@@ -235,7 +235,7 @@ def test_index_jsonl_appends_one_line_per_call(tmp_path: Path) -> None:
     assert first["file"] == p1.name
     assert first["feature"] == "extraction"
     assert first["label"] == "first"
-    assert first["model"] == "gemini-2.5-flash-lite"
+    assert first["model"] == "gemini-3.1-flash-lite"
     assert first["approximate_cost"] == 1e-06
     assert first["error"] is None
     # The big prompt/response blobs are deliberately NOT in the index.

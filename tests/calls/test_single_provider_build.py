@@ -27,7 +27,7 @@ def _seam_provider() -> MagicMock:
     provider.instructor_mode = "json"
     provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = None
-    provider.model = "gemini-2.5-flash-lite"
+    provider.model = "gemini-3.1-flash-lite"
     provider.name = "Google AI Studio"
     return provider
 

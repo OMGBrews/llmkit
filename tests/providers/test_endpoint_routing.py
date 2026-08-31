@@ -113,7 +113,7 @@ _ALL_ENDPOINT_ENV_VARS: Final[tuple[str, ...]] = (
 _MEASURED_DEFAULT_BASE: Final[dict[Provider, str]] = {
     Provider.OPENAI: "https://api.openai.com/v1",
     Provider.ANTHROPIC: "https://api.anthropic.com",
-    Provider.GOOGLE: "https://generativelanguage.googleapis.com/v1beta",
+    Provider.GOOGLE: "https://generativelanguage.googleapis.com/v1alpha",
     Provider.DEEPSEEK: "https://api.deepseek.com/beta",
 }
 
@@ -125,8 +125,8 @@ _MEASURED_DEFAULT_URL: Final[dict[Provider, str]] = {
     Provider.OPENAI: "https://api.openai.com/v1/chat/completions",
     Provider.ANTHROPIC: "https://api.anthropic.com/v1/messages",
     Provider.GOOGLE: (
-        "https://generativelanguage.googleapis.com/v1beta"
-        + "/models/gemini-2.5-flash-lite:generateContent"
+        "https://generativelanguage.googleapis.com/v1alpha"
+        + "/models/gemini-3.1-flash-lite:generateContent"
     ),
     Provider.DEEPSEEK: "https://api.deepseek.com/beta/chat/completions",
 }
@@ -378,7 +378,7 @@ def test_default_endpoint_matches_the_measured_literal(
     ("model", "expected_version"),
     [
         ("gemini-2.5-flash-lite", "v1beta"),
-        ("gemini-3-pro-preview", "v1alpha"),
+        ("gemini-3.1-flash-lite", "v1alpha"),
     ],
 )
 def test_gemini_api_version_still_follows_the_model(

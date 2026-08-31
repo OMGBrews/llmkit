@@ -896,16 +896,16 @@ path, since the project id comes from ADC.
 
 **The cost is scoped, and it is sharper here than elsewhere, because these are
 the two providers whose region knob is a residency control.** An ambient
-endpoint value overrides the region you pinned. Measured against litellm 1.92.0
-(2026-07-23), with the region/location explicitly pinned in *both* arms:
+endpoint value overrides the region you pinned. With the current default and
+the `us` multi-region location explicitly pinned in both arms:
 
 ```
 BEDROCK, aws_region_name="eu-central-1"
   nothing set   -> https://bedrock-runtime.eu-central-1.amazonaws.com/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
   with the var  -> https://hijacked.invalid/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
 
-VERTEX, vertex_location="europe-west4"
-  nothing set   -> https://europe-west4-aiplatform.googleapis.com/v1/projects/<p>/locations/europe-west4/publishers/google/models/gemini-2.5-flash-lite:generateContent
+VERTEX, vertex_location="us"
+  nothing set   -> https://aiplatform.us.rep.googleapis.com/v1/projects/<p>/locations/us/publishers/google/models/gemini-3.1-flash-lite:generateContent
   with the var  -> https://hijacked.invalid/v1:generateContent
 ```
 
@@ -938,11 +938,11 @@ Four things that matter if you pin residency:
 **Vertex has a second residency override with no environment variable
 involved.** LiteLLM reroutes a pinned `vertex_location` to a model's first
 `supported_regions` entry when its shipped cost map lists regions that exclude
-yours, warning only on the verbose logger. llmkit's `gemini-2.5-flash-lite`
-default carries no such restriction today, but that is data in a dependency, not
-a guarantee — so treat `vertex_location` as pinning residency *for models the
-installed LiteLLM does not constrain*, and check a region-sensitive workload
-against the endpoint it actually reaches.
+yours, warning only on the verbose logger. llmkit's `gemini-3.1-flash-lite`
+default requires the `global`, `us`, or `eu` multi-region endpoint; the
+maintained configuration uses `us`. The installed cost map is dependency data,
+not a guarantee — so check a region-sensitive workload against the endpoint it
+actually reaches.
 
 `aws_region_name` is the only AWS-shaped field, and it carries **only** the region. AWS Bedrock authenticates through the standard **AWS credential chain** (environment, shared config, or instance/role), so Bedrock secrets never pass through `LLMClientConfig`; leave the region `None` too and it resolves from the chain (`AWS_REGION_NAME` / `AWS_REGION`). Bedrock routing needs `boto3` for request signing — install it with the opt-in extra:
 
@@ -958,9 +958,9 @@ The default model is Claude Haiku 4.5 via its **cross-region inference profile**
 pip install "omg-llmkit[vertex]"
 ```
 
-**`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 2.5 Flash-Lite (parity with the AI Studio provider). As with AI Studio, Gemini 2.5 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
+**`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 3.1 Flash-Lite (parity with the AI Studio provider) and requires `global`, `us`, or `eu`; the maintained configuration uses `us`. As with AI Studio, Gemini 3.1 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
 
-> **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host every model — including the `gemini-2.5-flash-lite` default. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a `model` the region actually serves (e.g. some regions offer `gemini-2.5-flash` but not `-flash-lite`). Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
+> **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host the `gemini-3.1-flash-lite` default; it requires the `global`, `us`, or `eu` multi-region endpoint. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a model your region actually serves. Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
 
 **`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
 

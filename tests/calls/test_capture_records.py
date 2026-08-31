@@ -51,7 +51,7 @@ def test_capture_records_yields_record_with_cost_async() -> None:
     assert isinstance(record, LLMCallRecord)
     assert record.approximate_cost == 0.0042
     assert record.feature == "extraction"
-    assert record.model == "gemini-2.5-flash-lite"
+    assert record.model == "gemini-3.1-flash-lite"
     assert record.provider == "Google AI Studio"
     assert record.error is None
 

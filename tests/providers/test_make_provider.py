@@ -252,14 +252,14 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
 @pytest.mark.parametrize(
     ("provider", "expected_prefix", "expected_model", "key"),
     [
-        (Provider.OPENROUTER, "openrouter/", "google/gemini-2.5-flash-lite", "k"),
+        (Provider.OPENROUTER, "openrouter/", "google/gemini-3.1-flash-lite", "k"),
         (Provider.OLLAMA, "ollama_chat/", "llama3.2", None),
-        (Provider.GOOGLE, "gemini/", "gemini-2.5-flash-lite", "k"),
+        (Provider.GOOGLE, "gemini/", "gemini-3.1-flash-lite", "k"),
         (Provider.ANTHROPIC, "anthropic/", "claude-sonnet-4-6", "k"),
         (Provider.OPENAI, "openai/", "gpt-4.1-mini", "k"),
         (Provider.DEEPSEEK, "deepseek/", "deepseek-chat", "k"),
         (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0", None),
-        (Provider.VERTEX, "vertex_ai/", "gemini-2.5-flash-lite", None),
+        (Provider.VERTEX, "vertex_ai/", "gemini-3.1-flash-lite", None),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(
@@ -355,7 +355,7 @@ def test_config_model_defaults_to_none() -> None:
     assert config.model is None
     provider = build_provider(config)
     assert isinstance(provider, GoogleProvider)
-    assert provider.litellm_model() == "gemini/gemini-2.5-flash-lite"
+    assert provider.litellm_model() == "gemini/gemini-3.1-flash-lite"
 
 
 def test_explicit_model_still_wins() -> None:

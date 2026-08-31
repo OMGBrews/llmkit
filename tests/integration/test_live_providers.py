@@ -220,7 +220,7 @@ class _ForecastArgs(BaseModel):
 # provider's own default model is covered separately, and on purpose is NOT
 # overridable from the environment.
 _OPENROUTER_MODEL = os.getenv("OPENROUTER_SMOKE_MODEL", "mistralai/mistral-nemo")
-_GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-2.5-flash-lite")
+_GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-3.1-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
 _OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
 _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
@@ -230,7 +230,7 @@ _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
 _BEDROCK_MODEL = os.getenv("BEDROCK_SMOKE_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 # Gemini on Vertex: same model family as the AI Studio smoke model. Override
 # with another Vertex-available Gemini id if the project lacks access.
-_VERTEX_MODEL = os.getenv("VERTEX_SMOKE_MODEL", "gemini-2.5-flash-lite")
+_VERTEX_MODEL = os.getenv("VERTEX_SMOKE_MODEL", "gemini-3.1-flash-lite")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 # Where the Ollama server lives. Default is an in-process localhost server; in
 # the maintainer devcontainer Ollama runs on the *host*, so the container sets
@@ -690,13 +690,14 @@ async def test_openrouter_live() -> None:
 async def test_openrouter_reasoning_effort_live() -> None:
     """OpenRouter accepts native translated disable controls on Gemini.
 
-    The ids are deliberately hard-coded: Gemini 3.5 Flash is the
-    mandatory-thinking incident model, while Gemini 2.5 Flash-Lite exercises
-    OpenRouter's true ``none`` branch. The offline routing tests capture the
-    corresponding outgoing native bodies; this smoke proves each reaches the
-    gateway and returns visible structured output under the small shared cap.
+    The ids are deliberately hard-coded: Gemini 3.1 Flash-Lite exercises the
+    current default's mandatory-thinking ``minimal`` branch, while Gemini 2.5
+    Flash-Lite exercises OpenRouter's true ``none`` branch. The offline routing
+    tests capture the corresponding outgoing native bodies; this smoke proves
+    each reaches the gateway and returns visible structured output under the
+    small shared cap.
     """
-    for model in ("google/gemini-3.5-flash", "google/gemini-2.5-flash-lite"):
+    for model in ("google/gemini-3.1-flash-lite", "google/gemini-2.5-flash-lite"):
         provider = make_provider(
             Provider.OPENROUTER, model=model, **_live_credentials(Provider.OPENROUTER)
         )

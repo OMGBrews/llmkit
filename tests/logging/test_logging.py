@@ -46,7 +46,7 @@ def test_header_is_verdict_first_for_success(tmp_path: Path) -> None:
     path = LocalYamlLogSink(tmp_path).write_returning_path(_record(approximate_cost=0.0123))
     assert path is not None
     first_line = path.read_text().splitlines()[0]
-    assert first_line.startswith("# ok | extraction/summary | gemini-2.5-flash-lite | Schema |")
+    assert first_line.startswith("# ok | extraction/summary | gemini-3.1-flash-lite | Schema |")
     assert "ms" in first_line
     assert "$0.0123" in first_line
 
@@ -111,7 +111,7 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
     assert first["file"] == p1.name
     assert first["feature"] == "extraction"
     assert first["label"] == "first"
-    assert first["model"] == "gemini-2.5-flash-lite"
+    assert first["model"] == "gemini-3.1-flash-lite"
     assert first["provider"] == "Google AI Studio"
     assert first["schema"] == "Schema"
     assert first["approximate_cost"] == 1e-06

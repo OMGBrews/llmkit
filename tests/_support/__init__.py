@@ -45,7 +45,7 @@ def model_attr(instance: BaseModel, name: str) -> object:
 
 
 def provider_mock(
-    *, model: str = "gemini-2.5-flash-lite", name: str = "Google AI Studio", **overrides: object
+    *, model: str = "gemini-3.1-flash-lite", name: str = "Google AI Studio", **overrides: object
 ) -> MagicMock:
     """A fake provider as ``build_provider`` would return.
 
@@ -66,7 +66,7 @@ def make_record(**overrides: object) -> LLMCallRecord:
         "started_at": datetime(2026, 5, 31, 12, 0, 0, tzinfo=UTC),
         "feature": "extraction",
         "label": "summary",
-        "model": "gemini-2.5-flash-lite",
+        "model": "gemini-3.1-flash-lite",
         "provider": "Google AI Studio",
         "temperature": 0.0,
         "duration_ms": 12.3,

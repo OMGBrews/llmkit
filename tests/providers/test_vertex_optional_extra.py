@@ -65,4 +65,4 @@ def test_vertex_provider_builds_when_google_auth_present() -> None:
     """With google-auth installed (the dev extra), construction succeeds (sanity)."""
     provider = VertexProvider()
     assert provider.name == "Google Vertex AI"
-    assert provider.litellm_model() == "vertex_ai/gemini-2.5-flash-lite"
+    assert provider.litellm_model() == "vertex_ai/gemini-3.1-flash-lite"

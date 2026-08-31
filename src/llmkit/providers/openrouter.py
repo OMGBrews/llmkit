@@ -67,7 +67,7 @@ class OpenRouterProvider(BaseProvider):
     #: "No endpoints found". The live smoke suite now drives this default with no
     #: ``model=`` override (``test_openrouter_live_default_model``), so the next
     #: retirement fails the release gate instead of shipping.
-    _default_model: ClassVar[str] = "google/gemini-2.5-flash-lite"
+    _default_model: ClassVar[str] = "google/gemini-3.1-flash-lite"
     _strict_json_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "OPENROUTER_API_KEY"
     _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"api_key", "base_url"})

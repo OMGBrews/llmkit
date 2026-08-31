@@ -45,8 +45,11 @@ class VertexProvider(BaseProvider):
     Pass a regional value (e.g. ``"europe-west4"``,
     ``"asia-northeast1"``) to pin in-region processing; the ``"global"`` endpoint
     gives no residency guarantee. Note Gemini availability is **region-specific**,
-    so a region chosen for residency may not host every model — including the
-    ``gemini-2.5-flash-lite`` default. A model not deployed in the region fails
+    so a region chosen for residency may not host every model. The
+    ``gemini-3.1-flash-lite`` default is served through the ``"global"``,
+    ``"us"``, and ``"eu"`` multi-region endpoints; use ``"us"`` for the
+    maintained default configuration when a global endpoint is unsuitable. A
+    model not deployed in the region fails
     with a Vertex ``400 FAILED_PRECONDITION`` ("Precondition check failed."), an
     *availability* error distinct from auth/permission failures; pass a ``model``
     the region actually serves.
@@ -64,12 +67,11 @@ class VertexProvider(BaseProvider):
     resolved value does not swap the host into the derived URL — it **replaces
     the URL**, composed as ``"{value}:{action}"`` — so project, location and
     model all vanish, and the ADC-minted ``Authorization: Bearer ya29.…`` rides
-    to the new host. Measured against litellm 1.92.0 on 2026-07-23, with
-    ``vertex_location="europe-west4"`` pinned in both arms::
+    to the new host. With the current default and ``vertex_location="us"``::
 
-        nothing ambient     -> https://europe-west4-aiplatform.googleapis.com/v1
-                               /projects/<p>/locations/europe-west4/publishers
-                               /google/models/gemini-2.5-flash-lite:generateContent
+        nothing ambient     -> https://aiplatform.us.rep.googleapis.com/v1
+                               /projects/<p>/locations/us/publishers
+                               /google/models/gemini-3.1-flash-lite:generateContent
         VERTEXAI_API_BASE=https://hijacked.invalid/v1
                             -> https://hijacked.invalid/v1:generateContent
 
@@ -83,9 +85,10 @@ class VertexProvider(BaseProvider):
     *(2) LiteLLM may itself move the call out of the pinned location*, with no
     ambient value involved: it reroutes to a model's first ``supported_regions``
     entry when its shipped cost map lists regions excluding the pinned one,
-    warning only on the verbose logger. The ``gemini-2.5-flash-lite`` default
-    carries no such restriction in litellm 1.92.0 — but that is dependency data,
-    not a guarantee.
+    warning only on the verbose logger. The ``gemini-3.1-flash-lite`` default
+    must use a supported multi-region endpoint (``"global"``, ``"us"`, or
+    ``"eu"``); the installed LiteLLM cost map remains dependency data, not a
+    guarantee.
 
     Structured output defaults to ``instructor.Mode.JSON_SCHEMA`` — Gemini's
     native JSON-schema mode, the same mode the direct ``GoogleProvider`` pins,
@@ -124,7 +127,7 @@ class VertexProvider(BaseProvider):
 
     ``reasoning_effort`` is forwarded to LiteLLM for Vertex Gemini models that
     support thinking and is harmless on those that don't. As with Google AI
-    Studio, Gemini 2.5 models think by default, spending reasoning tokens
+    Studio, Gemini 3.1 models think by default, spending reasoning tokens
     against ``max_tokens``; pass ``reasoning_effort="disable"`` to turn it off
     so a small ``max_tokens`` cap doesn't truncate structured output.
 
@@ -145,7 +148,7 @@ class VertexProvider(BaseProvider):
     # shadowed through ``self`` (which would fail basedpyright and break the
     # ``_mode`` → ``instructor_mode`` pattern for the other six providers).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
-    _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
+    _default_model: ClassVar[str] = "gemini-3.1-flash-lite"
     _accepted_config_fields: ClassVar[frozenset[str]] = frozenset(
         {"vertex_project", "vertex_location", "gemini_structured_output"}
     )

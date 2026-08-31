@@ -63,8 +63,8 @@ def test_completion_kwargs_without_project_or_location() -> None:
 
 def test_default_model() -> None:
     """A current, structured-output-capable default when none is given: Gemini
-    2.5 Flash-Lite (parity with the direct Google AI Studio provider)."""
-    assert VertexProvider().model == "gemini-2.5-flash-lite"
+    3.1 Flash-Lite (parity with the direct Google AI Studio provider)."""
+    assert VertexProvider().model == "gemini-3.1-flash-lite"
 
 
 def test_not_local() -> None:

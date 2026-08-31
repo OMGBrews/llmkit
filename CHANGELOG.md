@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Gemini Flash-Lite defaults now use Gemini 3.1.** Google AI Studio and
+  Vertex now default to `gemini-3.1-flash-lite`; OpenRouter defaults to
+  `google/gemini-3.1-flash-lite`. Vertex's default route requires the
+  `global`, `us`, or `eu` multi-region endpoint, and llmkit's maintained live
+  configuration now uses `us`. This replaces the Gemini 2.5 Flash-Lite default
+  before Vertex retires that model on 2026-10-20.
+
 ### Added
 
 - **A streaming tool turn: `tool_llm_call_stream`.** The tool lane returns a
@@ -910,7 +919,7 @@ permissions. The typed surface goes public (`Message`, `ReasoningEffort`,
   (i.e. constructed the provider, or set `LLMClientConfig.model = None`, without
   naming a model) failed with `NotFoundError: "No endpoints found for
   google/gemini-2.0-flash-001"`. The default is now
-  `google/gemini-2.5-flash-lite`: the same family as the retired id, the same
+  `google/gemini-2.5-flash-lite` (the then-current default): the same family as the retired id, the same
   model the `GOOGLE` and `VERTEX` providers already default to, and measured
   live at 10/10 valid strict-`json_schema` structured round-trips through the
   public surface (2026-07-14). Callers who pass an explicit `model` were never

@@ -97,7 +97,7 @@ class GoogleProvider(BaseProvider):
     # effective mode is resolved per instance and returned by ``instructor_mode``
     # (see the Vertex provider for the same pattern and why the ClassVar stays).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
-    _default_model: ClassVar[str] = "gemini-2.5-flash-lite"
+    _default_model: ClassVar[str] = "gemini-3.1-flash-lite"
     _api_key_env_var: ClassVar[str] = "GEMINI_API_KEY"
     #: The endpoint variable LiteLLM consulted for this route (measured, not read
     #: off the source). Read here so a host that relies on it keeps working —
