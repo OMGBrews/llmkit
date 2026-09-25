@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The copyright holder is now Ontario Microbrewed Games, Inc.** The MIT
+  licence previously named "OMGBrews", the studio's GitHub organization rather
+  than its legal name. The licence terms are unchanged.
+
 ## [0.10.0] — 2026-08-31
 
 ### Added
