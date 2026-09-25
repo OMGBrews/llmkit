@@ -16,7 +16,7 @@ from tests._support import quiet_logging
 
 
 @pytest.fixture(autouse=True)
-def _quiet_logging() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse fixture, invoked by pytest
+def _quiet_logging() -> Iterator[None]:
     """Point logging at a no-op sink so call tests don't touch the disk."""
     with quiet_logging():
         yield

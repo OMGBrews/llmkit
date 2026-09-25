@@ -104,7 +104,7 @@ dev = [
     # non-published group is conventional — the audit's objection was the pin on
     # the *public* surface, which the group migration removes, not the pin itself.
     "ruff==0.15.0",
-    "basedpyright>=1.39",
+    "basedpyright>=1.40.1",
     # The offline suite imports the Bedrock and Vertex providers and exercises
     # their construction, which eagerly checks for boto3 (Bedrock) and
     # google-auth (Vertex). uv resolves this project's own name to the workspace
