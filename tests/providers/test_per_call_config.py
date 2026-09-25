@@ -38,7 +38,7 @@ class _Schema(BaseModel):
 
 
 @pytest.fixture
-def _no_global_config(  # pyright: ignore[reportUnusedFunction]  # pytest fixture, injected by name
+def _no_global_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
     """Unset the module-level config source for the duration of the test.

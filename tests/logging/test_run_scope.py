@@ -71,7 +71,7 @@ _LEGACY_INDEX_KEYS = [
 
 
 @pytest.fixture(autouse=True)
-def _reset_run_scope() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]  # autouse fixture, invoked by pytest
+def _reset_run_scope() -> Iterator[None]:
     """Clear the process-wide run id around every test in this module.
 
     ``set_run_id`` writes a module global, so without this a test that sets one
@@ -86,7 +86,7 @@ def _reset_run_scope() -> Iterator[None]:  # pyright: ignore[reportUnusedFunctio
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_run_id(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]  # autouse fixture, invoked by pytest
+def _no_ambient_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """Drop any real ``LLMKIT_RUN_ID`` so the suite behaves the same everywhere."""
     monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
 
