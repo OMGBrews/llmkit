@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: llmkit no longer sends a default `temperature`, on any
+  provider.** `DEFAULT_TEMPERATURE` is now `None` (it was `0.2`), so a call
+  that sets no temperature anywhere sends no `temperature` field and the
+  provider's own default sampling applies. Google has announced that its
+  upcoming Gemini models will reject requests carrying `temperature`, `top_p`
+  or `top_k` with an error, and the old default would have made every default
+  Gemini call fail. **If you relied on `0.2`, pass `temperature=0.2`** (or set
+  it on your `LLMCallOptions`). An explicit temperature is still forwarded
+  unchanged on every provider, Gemini included — llmkit neither drops it nor
+  warns, so a model that rejects it fails loudly. `temperature=None` stays
+  accepted and now means the same as leaving it unset, and
+  `LLMCallRecord.temperature` is `None` (`temperature: null` in the YAML sink)
+  for a default call. On Gemini 3 via Google AI Studio or Vertex AI, LiteLLM
+  still re-inserts `temperature = 1.0` when none is sent, so a default call's
+  wire value moves from `0.2` to `1.0` (Google's recommended value, and a no-op
+  since Gemini 3.6) and LiteLLM's per-call `DeprecationWarning` disappears.
+  Callers that pass `temperature=1.0` only to follow Gemini 3 guidance —
+  PIA-Maker's `stop-sending-temperature-to-gemini-3x` task, for one — can now
+  stop passing it.
+- **LiteLLM floor raised to `litellm>=1.104.0`.** It is the first release that
+  picks Gemini's `thinkingLevel` for every generation after 2.x rather than
+  only names containing `gemini-3`; earlier releases would send a future
+  `gemini-4-*` model `thinkingBudget`, which Google's upcoming models reject
+  with `400 INVALID_ARGUMENT`.
+- **OpenRouter: `reasoning_effort="disable"` maps to `minimal` on every Gemini
+  generation after 2.x**, not only `google/gemini-3*` ids, so a future
+  `google/gemini-4-*` model is not sent `none` (Gemini 3 and later cannot turn
+  thinking off). The rule mirrors LiteLLM 1.104.0's.
 - **Calls re-run by your own `with_retries` loop now share one `call_id`.**
   The documented wrapper pattern — `with_retries(fn, ...)` around a call made
   with `retry=NO_RETRY` — used to log every pass as a new `call_id` at
