@@ -67,12 +67,12 @@ async def structured_llm_call[T: BaseModel](
         label: Optional finer-grained identifier (e.g. ``"risk_register"``);
             used in the log filename.
         temperature: Sampling temperature passed to the LLM provider.
-            Resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when
-            neither this keyword nor ``options`` supplies a value; an
-            explicit ``None`` forwards **no** ``temperature`` kwarg at all,
-            leaving the provider's default sampling in effect (the escape
-            hatch for providers whose guidance says to omit it — e.g.
-            Gemini 3.x).
+            When neither this keyword nor ``options`` supplies a value it
+            resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``): no
+            ``temperature`` kwarg is forwarded and the provider's default
+            sampling applies. An explicit ``None`` does the same. An explicit
+            number is forwarded unchanged, so a model that rejects sampling
+            parameters (Google's upcoming Gemini models) fails loudly.
         model: Optional model override (provider default when it resolves to
             ``None``). *Dual-homed* — also settable on
             :class:`~llmkit.LLMClientConfig`; this per-call value overrides

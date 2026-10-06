@@ -113,7 +113,9 @@ def test_explicit_keyword_equal_to_old_default_overrides_options() -> None:
     Detection is structural (the ``UNSET`` sentinel), not value equality, so
     ``max_tokens=None`` and ``temperature=0.2`` — both former signature
     defaults — override the matching options fields, exactly as the README's
-    **config < options < explicit keyword** promises."""
+    **config < options < explicit keyword** promises. (The explicit-``None``
+    temperature counterpart is
+    ``test_explicit_temperature_none_overrides_options_value`` below.)"""
     fake, calls = _structured_recorder()
     options = LLMCallOptions(max_tokens=512, temperature=0.9, model="options-model")
     with (
@@ -127,7 +129,7 @@ def test_explicit_keyword_equal_to_old_default_overrides_options() -> None:
                 OkSchema,
                 feature="extraction",
                 max_tokens=None,  # explicit -> wins despite equalling the old default
-                temperature=DEFAULT_TEMPERATURE,  # explicit 0.2 -> wins over 0.9
+                temperature=0.2,  # explicit former default -> wins over 0.9
                 model=None,  # explicit None -> provider default, not options-model
                 options=options,
             )
@@ -135,7 +137,7 @@ def test_explicit_keyword_equal_to_old_default_overrides_options() -> None:
         asyncio.run(_run())
 
     assert calls[0]["max_tokens"] is None
-    assert calls[0]["temperature"] == DEFAULT_TEMPERATURE
+    assert calls[0]["temperature"] == 0.2
     assert calls[0]["model"] is None
 
 
@@ -216,7 +218,8 @@ def test_all_unset_resolves_to_true_defaults() -> None:
         provider=UNSET,
     )
 
-    assert resolved.temperature == DEFAULT_TEMPERATURE
+    assert resolved.temperature is None
+    assert resolved.temperature is DEFAULT_TEMPERATURE
     assert resolved.model is None
     assert resolved.max_tokens is None
     assert resolved.reasoning_effort is None
@@ -297,12 +300,12 @@ def test_explicit_temperature_none_overrides_options_value() -> None:
     assert calls[0]["temperature"] is None
 
 
-def test_options_temperature_none_overrides_default() -> None:
-    """``LLMCallOptions(temperature=None)`` wins over
-    ``DEFAULT_TEMPERATURE`` when the keyword is unset — the options field
-    resolves to ``None`` (the transport then omits the key)."""
+def test_options_temperature_overrides_unset_default() -> None:
+    """A numeric ``LLMCallOptions(temperature=0.5)`` wins over the unset
+    default (``DEFAULT_TEMPERATURE``, ``None``) when the keyword is unset, and
+    is forwarded to the transport."""
     fake, calls = _structured_recorder()
-    options = LLMCallOptions(temperature=None)
+    options = LLMCallOptions(temperature=0.5)
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=fake),
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
@@ -319,4 +322,4 @@ def test_options_temperature_none_overrides_default() -> None:
 
         asyncio.run(_run())
 
-    assert calls[0]["temperature"] is None
+    assert calls[0]["temperature"] == 0.5

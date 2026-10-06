@@ -57,11 +57,12 @@ async def text_llm_call(
             Required as a telemetry forcing function (see
             :func:`structured_llm_call`); not part of :class:`LLMCallOptions`.
         label: Optional finer-grained identifier for the log filename.
-        temperature: Sampling temperature passed to the provider. Resolves
-            to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) when neither
-            this keyword nor ``options`` supplies a value; an explicit
-            ``None`` forwards **no** ``temperature`` kwarg at all, leaving
-            the provider's default sampling in effect.
+        temperature: Sampling temperature passed to the provider. When
+            neither this keyword nor ``options`` supplies a value it resolves
+            to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``): no
+            ``temperature`` kwarg is forwarded and the provider's default
+            sampling applies. An explicit ``None`` does the same; an
+            explicit number is forwarded unchanged.
         model: Optional model override (provider default when it resolves
             to ``None``). *Dual-homed* with
             :class:`~llmkit.LLMClientConfig`: per-call overrides

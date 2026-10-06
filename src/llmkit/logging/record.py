@@ -56,12 +56,11 @@ class LLMCallRecord:
     ``duration_ms - queue_wait_ms``. All four default ``None`` for
     directly-constructed records.
 
-    ``temperature`` is ``None`` exactly when the call requested the
-    provider's default sampling (``temperature=None`` — no ``temperature``
-    kwarg sent); an unset call resolves llmkit's
-    :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``) and records that value.
-    Custom sinks that read ``record.temperature`` must handle the ``None``
-    state (the YAML sink writes it as ``null``).
+    ``temperature`` is ``None`` exactly when no ``temperature`` kwarg was
+    sent and the provider's default sampling applied — an unset call
+    (llmkit's :data:`~llmkit.DEFAULT_TEMPERATURE` is ``None``) or an explicit
+    ``temperature=None``. Custom sinks that read ``record.temperature`` must
+    handle the ``None`` state (the YAML sink writes it as ``null``).
 
     ``run_id`` is the *outer* scope ``call_id`` does not provide: the run —
     an eval sweep, a rehearsal, an incident replay — that this call belonged

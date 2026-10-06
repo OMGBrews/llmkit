@@ -2,7 +2,7 @@
 
 The design principles behind `llmkit` — the durable promises the library makes to the people who call it. Read this to understand *why* llmkit behaves the way it does; for the API itself, see the [README](README.md). This describes the library as it ships today.
 
-`llmkit` is opinionated on purpose: it decides the boring-but-easy-to-get-wrong things — which structured-output mode each provider needs, where logs go, a sane default temperature — so you don't have to. These principles are what that buys you.
+`llmkit` is opinionated on purpose: it decides the boring-but-easy-to-get-wrong things — which structured-output mode each provider needs, where logs go, how retries and rate limits behave — so you don't have to. These principles are what that buys you.
 
 ## Validated structured output is the contract
 

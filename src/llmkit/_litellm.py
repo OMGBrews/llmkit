@@ -465,10 +465,10 @@ async def acompletion_structured[T: BaseModel](
     per-provider branching is needed.
 
     ``temperature`` is forwarded the same way: only when not ``None``. A
-    resolved ``None`` sends no ``temperature`` key at all (the provider's
-    default sampling applies) — the escape hatch from llmkit's
-    :data:`~llmkit.DEFAULT_TEMPERATURE` for providers whose guidance says to
-    omit the field (Gemini 3.x deprecates it).
+    resolved ``None`` — llmkit's :data:`~llmkit.DEFAULT_TEMPERATURE` — sends
+    no ``temperature`` key at all, so the provider's default sampling applies
+    (Google is retiring sampling parameters on Gemini). An explicit number is
+    forwarded unchanged.
 
     ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
     ``"disable"`` turns Gemini thinking off). When ``None``, the provider's

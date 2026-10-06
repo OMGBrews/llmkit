@@ -97,10 +97,10 @@ class LLMCallOptions:
 
     Attributes:
         temperature: Sampling temperature. Unset defers to the per-call
-            ``temperature`` keyword (:data:`DEFAULT_TEMPERATURE`, ``0.2``,
-            when that is also unset); an explicit ``None`` forwards no
-            ``temperature`` kwarg at all, leaving the provider's default
-            sampling in effect.
+            ``temperature`` keyword, then to :data:`DEFAULT_TEMPERATURE`
+            (``None``): no ``temperature`` kwarg is forwarded and the
+            provider's default sampling stands. An explicit ``None`` means
+            the same; a number is forwarded unchanged.
         model: Model override. Unset defers to the per-call ``model``
             keyword, then to the provider default.
         max_tokens: Completion-length cap. Unset defers to the per-call
@@ -177,11 +177,10 @@ def resolve_call_args(
       :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``None`` for the rest — the
       ``None``s the transport then resolves against the configured client).
 
-    For ``temperature`` specifically, an explicit ``None`` is a real,
-    resolved value: it forwards **no** ``temperature`` kwarg to the provider,
-    so the provider's default sampling applies — the requested escape hatch
-    from :data:`DEFAULT_TEMPERATURE` (``0.2``), which still stands whenever
-    neither the keyword nor ``options`` supplies a value.
+    For ``temperature`` specifically, the default is ``None``: llmkit
+    chooses no temperature, the transport forwards **no** ``temperature``
+    kwarg, and the provider's default sampling applies. An explicit ``None``
+    resolves the same way; an explicit number is forwarded unchanged.
 
     ``options=None`` is simply an all-unset options, so the flat-kwarg path
     resolves to the same values as before options existed. The true defaults
@@ -215,10 +214,13 @@ def _pick[V](keyword: V | Unset, option: V | Unset, default: V) -> V:
 
 #: The shared default sampling temperature for the call functions — the value
 #: a call resolves to when neither the ``temperature`` keyword nor ``options``
-#: supplies one. Public so callers can reference the real default; applied in
-#: :func:`resolve_call_args` (the signatures carry :data:`UNSET` instead), so
-#: it has exactly one definition site.
-DEFAULT_TEMPERATURE = 0.2
+#: supplies one. ``None``: llmkit chooses no temperature, so no
+#: ``temperature`` kwarg is forwarded and the provider's default stands
+#: (Google is retiring sampling parameters on Gemini, and a default value
+#: would make every call fail there). Public so callers can reference the
+#: real default; applied in :func:`resolve_call_args` (the signatures carry
+#: :data:`UNSET` instead), so it has exactly one definition site.
+DEFAULT_TEMPERATURE: float | None = None
 
 # Shared all-unset instance for the ``options=None`` path, so resolving the
 # flat-keyword call doesn't allocate a throwaway options object per call.

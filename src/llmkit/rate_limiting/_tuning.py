@@ -51,7 +51,7 @@ THROTTLE_STATUS_CODES: frozenset[int] = frozenset({429, 503, 529})
 #: AIMD tuning. These are deliberately **internal** constants, not public knobs:
 #: the host owns the *ceiling* (``max_concurrent``) and the RPM/TPM numbers; the
 #: library owns *how the limit moves beneath them* — mechanism it should own, like
-#: the temperature default and the burst-depth choice (see opinions.md §6.4/§8).
+#: the burst-depth choice (see opinions.md §6.4/§8).
 #:
 #: * ``AIMD_DECREASE_FACTOR`` — multiplicative decrease on a throttle: the limit
 #:   halves (floored at 1).

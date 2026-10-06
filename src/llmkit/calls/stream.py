@@ -66,9 +66,9 @@ async def text_llm_call_stream(
     resolved against the configured :class:`~llmkit.LLMClientConfig` value
     when ``None``) and is recorded on the call's
     :class:`~llmkit.logging.LLMCallRecord`. ``temperature`` follows the same
-    rule: an explicit ``None`` forwards **no** ``temperature`` kwarg at all
-    (the provider's default sampling applies), while the unset path still
-    resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``0.2``).
+    rule: unset resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``),
+    and a resolved ``None`` forwards **no** ``temperature`` kwarg at all (the
+    provider's default sampling applies).
 
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. Streamed responses
