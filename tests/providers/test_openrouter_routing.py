@@ -44,6 +44,7 @@ from llmkit.providers import (
     OpenRouterProvider,
     Provider,
     build_provider,
+    openrouter,
 )
 
 _ROUTING_PREF = {"provider": {"require_parameters": True}}
@@ -78,12 +79,39 @@ def test_reasoning_kwargs_use_openrouter_native_effort() -> None:
     assert provider.reasoning_kwargs("disable", "google/gemini-3.5-flash") == {
         "extra_body": {"reasoning": {"effort": "minimal"}}
     }
+    assert provider.reasoning_kwargs("disable", "google/gemini-4-flash") == {
+        "extra_body": {"reasoning": {"effort": "minimal"}}
+    }
     assert provider.reasoning_kwargs("disable", "google/gemini-2.5-flash-lite") == {
         "extra_body": {"reasoning": {"effort": "none"}}
     }
     assert provider.reasoning_kwargs("xhigh", "google/gemini-2.5-flash-lite") == {
         "extra_body": {"reasoning": {"effort": "xhigh"}}
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("google/gemini-3.1-flash-lite", True),
+        ("google/gemini-3.8-flash:batch", True),
+        ("google/gemini-4-flash", True),
+        ("google/gemini-pro-latest", True),
+        ("google/gemini-flash-lite-latest", True),
+        ("google/Gemini-4-Pro", True),
+        ("google/gemini-2.5-flash", False),
+        ("google/gemini-2.0-flash-001", False),
+        ("google/gemini-1.5-pro", False),
+        ("google/gemini-exp-1206", False),
+        ("google/gemini-pro", False),
+        ("google/gemma-3-27b-it", False),
+        ("anthropic/claude-sonnet-4", False),
+    ],
+)
+def test_gemini_generation_check_mirrors_litellm(model: str, expected: bool) -> None:
+    """The local predicate excludes only pre-Gemini-3 names, as LiteLLM does,
+    so a later generation counts without a code change."""
+    assert openrouter._is_gemini_3_or_newer(model) is expected
 
 
 def test_routing_preference_threads_into_litellm_call() -> None:
