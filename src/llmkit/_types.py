@@ -53,7 +53,7 @@ class ToolResultMessage(_ToolResultMessageFields, total=False):
     It is llmkit's own field, not a wire field. No provider accepts it on the
     OpenAI-normalized ``{"role": "tool"}`` shape: LiteLLM's Anthropic
     translation builds its ``tool_result`` block from the id and the content
-    alone (measured against litellm 1.95.0, the declared floor —
+    alone (measured against litellm 1.95.0 —
     ``convert_to_anthropic_tool_result``, whose own comment records that the
     OpenAI shape cannot express the distinction), and an OpenAI-compatible
     route would forward the unknown key to a provider that may reject it. So

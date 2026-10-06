@@ -130,8 +130,7 @@ def test_litellm_discards_an_is_error_key_on_an_openai_shaped_tool_message() -> 
     ``is_error`` field on a ``tool_result`` block, but LiteLLM's translation
     from the OpenAI shape cannot express it (its own source comment says so),
     so passing the key through would reach Anthropic as nothing at all and
-    every other route as an unknown key. Measured against the declared floor,
-    litellm>=1.95.0."""
+    every other route as an unknown key. Measured against litellm 1.95.0."""
     # Both casts route through ``object``: the key under test is precisely the
     # one neither LiteLLM TypedDict declares, so the two shapes do not overlap
     # and pyright asks for the explicit hop it recommends for that case.

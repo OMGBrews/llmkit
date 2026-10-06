@@ -11,7 +11,7 @@ runs each ``parameters`` object through ``_build_vertex_schema`` (popping
 
 That means **a consumer needs no schema pre-processing of their own** — the
 guarantee stated in the README's tool-calling section. This module is its
-tripwire: LiteLLM is a floor-pinned dependency (``litellm>=1.95.0``) and CI
+tripwire: LiteLLM is a floor-pinned dependency (``litellm>=1.104.0``) and CI
 resolves both the floor and the newest release, so a transport version that
 stopped normalising would otherwise reach a consumer as provider-side 400s with
 nothing in our suite going red.

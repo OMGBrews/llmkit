@@ -179,7 +179,7 @@ def _wire_message(message: ChatMessage) -> ChatMessage:
     Today that is exactly one: :class:`~llmkit.ToolResultMessage`'s optional
     ``is_error``. It has no wire equivalent — LiteLLM's Anthropic translation
     builds its ``tool_result`` block from the id and content alone (measured
-    against litellm 1.95.0, the declared floor), and an OpenAI-compatible route
+    against litellm 1.95.0), and an OpenAI-compatible route
     would forward the unknown key to a provider that may reject it — so the
     flag becomes a :data:`~llmkit._types.TOOL_ERROR_PREFIX` prefix on the
     content, which every provider receives identically, and the key is dropped.
@@ -414,8 +414,7 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
 
     ``Delta.content`` needed the same treatment until litellm 1.95.0 annotated
     it as ``str | None``; the cast is now redundant and ``reportUnnecessaryCast``
-    rejects it. The declared floor is older (``litellm>=1.87.1``), but only the
-    newest-resolution ``check`` job type-checks, so the floor is unaffected.
+    rejects it.
     """
     if not chunk.choices:
         # Metadata-only / keepalive frames carry no choice to index — e.g. the

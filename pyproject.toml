@@ -24,7 +24,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "litellm>=1.95.0",
+    # 1.104.0 is the first release whose `_is_gemini_3_or_newer` counts every
+    # Gemini generation after 2.x (not only names containing "gemini-3"), so a
+    # future gemini-4 model gets `thinkingLevel` rather than the
+    # `thinkingBudget` Google's upcoming models reject with 400.
+    # tests/providers/test_gemini_thinking_level.py fails below it.
+    "litellm>=1.104.0",
     # instructor's `from_litellm` validates the provider mode pins against its
     # LiteLLM mode registry at client construction (1.15.3 removed the
     # non-core modes from that registry, which broke three providers with
