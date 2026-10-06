@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Calls re-run by your own `with_retries` loop now share one `call_id`.**
+  The documented wrapper pattern — `with_retries(fn, ...)` around a call made
+  with `retry=NO_RETRY` — used to log every pass as a new `call_id` at
+  `attempt=1`, so a refused-then-recovered call looked like two unrelated
+  calls. Each pass now rejoins its logical call: the records share one
+  `call_id` and `attempt` rises 1, 2, 3, exactly as when llmkit retries the
+  call itself. This covers every call family, the sync bridge
+  (`run_sync(with_retries(fn))`), and streams that fail after their first
+  item. Calls are matched across passes by `feature`, `label` and their order
+  within the pass, so two calls per pass stay two logical calls; a call made
+  from another task (`create_task`, `asyncio.gather`) never joins. **If you
+  count logical calls as distinct `call_id`s, those counts drop** for any code
+  that wraps llmkit calls in `with_retries`: each retried pass used to count
+  as its own call. Calls outside a `with_retries` loop are unchanged, and the
+  record schema is unchanged.
 - **The copyright holder is now Ontario Microbrewed Games, Inc.** The MIT
   licence previously named "OMGBrews", the studio's GitHub organization rather
   than its legal name. The licence terms are unchanged.

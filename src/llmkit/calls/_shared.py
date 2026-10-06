@@ -5,8 +5,9 @@ in what one *attempt* is; they agree on everything around it. That agreement
 lives here so the next family added does not become another copy:
 
 * :func:`prepare_call` — the per-call resolution every family does before its
-  first attempt: merge the options, build the provider exactly once, mint the
-  correlation id;
+  first attempt: merge the options, build the provider exactly once, and mint
+  the correlation id — or, inside a :func:`~llmkit.retry.with_retries` loop,
+  join the loop's logical call;
 * :func:`run_with_policy` — the :func:`~llmkit.retry.with_retries` invocation,
   which differs between families only in which errors are charged to the
   validation budget;
@@ -32,7 +33,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import NamedTuple, cast
@@ -43,7 +43,7 @@ from llmkit.logging import LLMCallRecord
 from llmkit.options import LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import current_queue_wait_ms
-from llmkit.retry import RetryPolicy, with_retries
+from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
 from llmkit.run_scope import get_run_id
 from llmkit.tools import ToolCall, ToolDefinition
 
@@ -110,12 +110,19 @@ class PreparedCall(NamedTuple):
         call_id: one ``uuid4`` hex per *logical* call. Every retry attempt
             shares it and numbers itself, so the N records a retried call
             produces join on ``call_id`` rather than on feature + timestamp
-            proximity, which breaks under concurrent same-feature fan-out.
+            proximity, which breaks under concurrent same-feature fan-out. A
+            call re-run by an outer :func:`~llmkit.retry.with_retries` reuses
+            the id its earlier passes recorded.
+        attempt_offset: the attempts this logical call already made on earlier
+            passes of an outer :func:`~llmkit.retry.with_retries` (``0``
+            outside one). Each family records ``attempt_offset`` plus its own
+            1-based attempt number.
     """
 
     args: ResolvedCallArgs
     provider: LLMProviderInterface | None
     call_id: str
+    attempt_offset: int
 
 
 def prepare_call(
@@ -127,6 +134,8 @@ def prepare_call(
     reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
     provider: LLMProviderInterface | None | Unset,
+    feature: str,
+    label: str | None,
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
@@ -137,6 +146,13 @@ def prepare_call(
     Building the provider here rather than per attempt is what lets the
     transport and the log record name the same instance; it is config plus
     cached SDK checks with no I/O, so once per call is both correct and cheap.
+
+    *feature* and *label* identify the call to an enclosing
+    :func:`~llmkit.retry.with_retries` loop owned by this task (see
+    :func:`~llmkit.retry.claim_logical_call`), which is how a call re-run on
+    every pass keeps one ``call_id``. For a stream this runs on the generator's
+    first ``__anext__``, in the consumer's task — a read of the loop's scope,
+    never a write.
     """
     args = resolve_call_args(
         options,
@@ -147,7 +163,8 @@ def prepare_call(
         retry=retry,
         provider=provider,
     )
-    return PreparedCall(args, build_call_provider(args.provider), uuid.uuid4().hex)
+    call_id, attempt_offset = claim_logical_call(feature, label)
+    return PreparedCall(args, build_call_provider(args.provider), call_id, attempt_offset)
 
 
 async def run_with_policy[T](

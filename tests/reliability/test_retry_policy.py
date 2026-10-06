@@ -56,6 +56,7 @@ from llmkit import (
     LocalYamlLogSink,
     OutputLimitError,
     RetryPolicy,
+    capture_llm_records,
     configure_llm_logging,
 )
 from llmkit import (
@@ -537,7 +538,9 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
 async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> None:
     """The nested guard preserves the one-log-per-attempt contract: an outer
     ``with_retries(max_attempts=2)`` around a transient-then-success call
-    function writes one log per real attempt (here: 2)."""
+    function writes one log per real attempt (here: 2). The accidental
+    double-wrap still joins the loop's logical call: both records share one
+    ``call_id`` and number their attempts 1, 2."""
     calls = [0]
 
     async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
@@ -556,6 +559,7 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
         with (
             patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
             capture_llm_log_paths() as paths,
+            capture_llm_records() as records,
             pytest.warns(RuntimeWarning, match="nested"),
         ):
             result = await with_retries(_wrapped, max_attempts=2, retry_on=(TimeoutError,))
@@ -566,6 +570,8 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
     assert calls[0] == 2
     assert len(paths) == 2
     assert all(p.exists() for p in paths)
+    assert [r.attempt for r in records] == [1, 2]
+    assert records[0].call_id == records[1].call_id is not None
 
 
 @pytest.mark.asyncio

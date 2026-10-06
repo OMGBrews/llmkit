@@ -47,7 +47,10 @@ class LLMCallRecord:
     ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
     1-based attempt number within it, so the N records a retried call
     produces join on ``call_id`` instead of feature + timestamp proximity
-    (which breaks under concurrent same-feature fan-out). ``queue_wait_ms``
+    (which breaks under concurrent same-feature fan-out). That holds whether
+    llmkit retries the call itself or an outer
+    :func:`~llmkit.retry.with_retries` re-runs it: each pass of that loop
+    rejoins the logical call, so ``attempt`` keeps rising. ``queue_wait_ms``
     is the time this attempt spent queued behind llmkit's own rate limiter
     — ``duration_ms`` includes it, so provider latency is approximately
     ``duration_ms - queue_wait_ms``. All four default ``None`` for

@@ -119,7 +119,7 @@ async def tool_llm_call_stream(
     keeps the good ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``, exactly as the buffered lane does.
     """
-    args, provider, call_id = prepare_call(
+    args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -127,12 +127,15 @@ async def tool_llm_call_stream(
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
+        feature=feature,
+        label=label,
     )
     tag = label or feature
-    # ``call_id`` reaches ``_stream_tools_once`` as a plain parameter — NEVER a
-    # ContextVar, for the reason ``calls/stream.py`` spells out: an async
-    # generator's body runs in its *consumer's* context, so the stream's
-    # identity would leak into the consumer's own llmkit calls between chunks.
+    # ``call_id`` and ``attempt_offset`` reach ``_stream_tools_once`` as plain
+    # parameters — NEVER a ContextVar, for the reasons ``calls/stream.py``
+    # spells out: an async generator's body runs in its *consumer's* context,
+    # so the stream's identity would leak into the consumer's own llmkit calls
+    # between chunks.
 
     def _attempt(attempt: int) -> AsyncGenerator[TextDeltaEvent | ToolCallResult]:
         return _stream_tools_once(
@@ -147,7 +150,7 @@ async def tool_llm_call_stream(
             reasoning_effort=args.reasoning_effort,
             provider=provider,
             call_id=call_id,
-            attempt=attempt,
+            attempt=attempt_offset + attempt,
         )
 
     # ``with_retries_stream`` is generic in the yield type, so the union flows

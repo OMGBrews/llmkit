@@ -96,7 +96,7 @@ async def text_llm_call(
         propagate immediately. The log is still written on every attempt
         with the error recorded.
     """
-    args, provider, call_id = prepare_call(
+    args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -104,6 +104,8 @@ async def text_llm_call(
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
+        feature=feature,
+        label=label,
     )
     attempt_count = 0
 
@@ -113,7 +115,7 @@ async def text_llm_call(
 
         nonlocal attempt_count
         attempt_count += 1
-        attempt = attempt_count
+        attempt = attempt_offset + attempt_count
         begin_queue_wait()
         started_at = datetime.now(UTC)
         start_t = time.monotonic()

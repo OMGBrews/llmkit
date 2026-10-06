@@ -15,7 +15,10 @@ as either composes with itself.
 
 Audit logging and timing remain the caller's concern: each attempt is its
 own LLM call (and its own log record), because the retry loop wraps the
-logging call functions rather than living inside them.
+logging call functions rather than living inside them. The loop does own one
+piece of logging identity: a call function re-run by :func:`with_retries` joins
+the loop's logical call, so its records share one ``call_id`` and number their
+``attempt`` across passes (see :class:`_CallLedger`).
 
 Two budgets, kept separate: *transport* failures (rate limits, transient
 5xx, network/timeout) get the full :attr:`RetryPolicy.max_attempts` budget;
@@ -43,6 +46,7 @@ import asyncio
 import contextvars
 import logging
 import random
+import uuid
 import warnings
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from contextlib import aclosing, contextmanager
@@ -321,6 +325,51 @@ NO_RETRY = RetryPolicy(max_attempts=1, validation_max_attempts=1)
 
 
 @final
+class _CallLedger:
+    """The logical calls one :func:`with_retries` loop re-runs, across passes.
+
+    ``LLMCallRecord`` promises one ``call_id`` per *logical* call and a 1-based
+    ``attempt`` within it. A call function opted out of its own retries and
+    re-run by an outer :func:`with_retries` is invoked afresh on every pass, so
+    left alone it would mint a new id each time; the ledger is what lets it
+    rejoin the logical call it belongs to instead.
+
+    A call is identified by its ``(feature, label)`` and the occurrence index of
+    that pair within the current pass — not by raw position, so a conditional
+    call that runs on only some passes cannot shift every later call onto the
+    wrong id. ``attempt`` counts tries *of that logical call*: one first reached
+    on pass 2 records attempt 1.
+
+    Only the non-nested path of :func:`with_retries` installs one. The stream
+    loop's scopes carry none, because a stream's own attempts already share an
+    id by parameter and no call is prepared under them.
+    """
+
+    __slots__ = ("_entries", "_seen")
+
+    def __init__(self) -> None:
+        # (feature, label, occurrence) -> (call_id, attempts claimed so far).
+        self._entries: dict[tuple[str, str | None, int], tuple[str, int]] = {}
+        # (feature, label) -> occurrences claimed in the current pass.
+        self._seen: dict[tuple[str, str | None], int] = {}
+
+    def begin_pass(self) -> None:
+        """Start a new pass: occurrence counting restarts from zero."""
+        self._seen.clear()
+
+    def claim(self, feature: str, label: str | None) -> tuple[str, int]:
+        """Return the ``call_id`` and attempt offset for the next call with
+        this ``(feature, label)`` in the current pass, recording the claim."""
+        occurrence = self._seen.get((feature, label), 0)
+        self._seen[(feature, label)] = occurrence + 1
+        key = (feature, label, occurrence)
+        entry = self._entries.get(key)
+        call_id, claimed = entry if entry is not None else (uuid.uuid4().hex, 0)
+        self._entries[key] = (call_id, claimed + 1)
+        return call_id, claimed
+
+
+@final
 class _RetryScope:
     """Identity of one running llmkit retry loop: the task that owns it.
 
@@ -333,12 +382,17 @@ class _RetryScope:
     inherited the context across a task boundary (``create_task`` copies it; the
     sync bridge captures ``copy_context()`` onto a new task) from wrongly
     collapsing: it runs in its own task, so it keeps its own retry budget.
+
+    The same ownership test decides which calls join the loop's logical calls:
+    *ledger* is the :class:`_CallLedger` a non-nested :func:`with_retries`
+    installs, read through :func:`claim_logical_call`; ``None`` everywhere else.
     """
 
-    __slots__ = ("task",)
+    __slots__ = ("ledger", "task")
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: _CallLedger | None = None) -> None:
         self.task: asyncio.Task[object] | None = asyncio.current_task()
+        self.ledger: _CallLedger | None = ledger
 
 
 #: Identifies the llmkit retry loop active in this dynamic scope by the task
@@ -361,6 +415,22 @@ def _in_active_retry_scope() -> bool:
     """
     scope = _retry_scope.get()
     return scope is not None and scope.task is asyncio.current_task()
+
+
+def claim_logical_call(feature: str, label: str | None) -> tuple[str, int]:
+    """The ``call_id`` and attempt offset for a call about to be prepared.
+
+    Inside a :func:`with_retries` loop owned by the current task, the call joins
+    the loop's logical call through its :class:`_CallLedger`: the same id as the
+    matching call on earlier passes, and an offset of the attempts already made
+    under it. Anywhere else — no loop, or a loop owned by another task, which is
+    the same ownership rule the nested-retry guard applies — it gets a fresh
+    ``uuid4`` hex and offset 0.
+    """
+    scope = _retry_scope.get()
+    if scope is None or scope.ledger is None or scope.task is not asyncio.current_task():
+        return uuid.uuid4().hex, 0
+    return scope.ledger.claim(feature, label)
 
 
 class RetryProgressCallback(Protocol):
@@ -489,11 +559,12 @@ async def with_retries_stream[T](
 
     *attempt_factory* is called with the 1-based attempt number and returns one
     attempt's async generator; each attempt is a distinct call (and, for the
-    call functions, its own log record). *surface* names the caller in the
-    double-wrap warning, and *label* is the tag used for the warning and the
-    exhaustion log line — the same ``"%s: all %d attempts failed: %s"`` message
-    :func:`with_retries` emits, from the same logger, so an operator greps the
-    streaming and non-streaming surfaces identically.
+    call functions, its own log record, sharing the stream's ``call_id``).
+    *surface* names the caller in the double-wrap warning, and *label* is the
+    tag used for the warning and the exhaustion log line — the same
+    ``"%s: all %d attempts failed: %s"`` message :func:`with_retries` emits,
+    from the same logger, so an operator greps the streaming and non-streaming
+    surfaces identically.
 
     Two things about async generators drive the shape of the body, and neither
     is optional:
@@ -628,6 +699,9 @@ async def with_retries[T](
         is one shared budget, not the product. An *accidental* double-wrap (an
         inner layer that would itself have retried) also emits a
         ``RuntimeWarning`` (de-duplicated by Python's default warning filter).
+        Either way, a call function re-run by the outer loop joins its logical
+        call: every pass's record carries the same ``call_id`` and a rising
+        ``attempt``, as an internally retried call's records do.
         This guard only fires when there *is* an active llmkit retry loop in
         scope: wrapping a plain (non-llmkit) awaitable retries normally. To drive
         retries entirely from your wrapper, opt the inner call out with
@@ -745,9 +819,11 @@ async def with_retries[T](
     transport_attempt = 0
     validation_attempt = 0
 
-    token = _retry_scope.set(_RetryScope())
+    ledger = _CallLedger()
+    token = _retry_scope.set(_RetryScope(ledger))
     try:
         while True:
+            ledger.begin_pass()
             try:
                 return await fn()
             except Exception as e:

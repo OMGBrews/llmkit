@@ -108,7 +108,7 @@ async def tool_llm_call[T: BaseModel](
     :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
     budget. See :class:`~llmkit.ToolCallResult`.
     """
-    args, provider, call_id = prepare_call(
+    args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -116,6 +116,8 @@ async def tool_llm_call[T: BaseModel](
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
+        feature=feature,
+        label=label,
     )
     if output_schema is not None:
         if provider is None or not provider.compose_tools_schema:
@@ -226,7 +228,7 @@ async def tool_llm_call[T: BaseModel](
                     max_tokens=args.max_tokens,
                     reasoning_effort=args.reasoning_effort,
                     call_id=call_id,
-                    attempt=attempt_count,
+                    attempt=attempt_offset + attempt_count,
                     queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
                     tools=[definition.to_litellm() for definition in tools],

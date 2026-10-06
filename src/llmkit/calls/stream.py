@@ -87,7 +87,7 @@ async def text_llm_call_stream(
     keyword** precedence (see :func:`structured_llm_call`); ``None`` leaves
     the flat-keyword path unchanged.
     """
-    args, provider, call_id = prepare_call(
+    args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -95,12 +95,16 @@ async def text_llm_call_stream(
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
+        feature=feature,
+        label=label,
     )
     tag = label or feature
-    # ``call_id`` reaches ``_stream_once`` as a plain parameter — NEVER a
-    # ContextVar: an async generator's body runs in its *consumer's* context, so
-    # a ContextVar set here would leak the stream's identity into the consumer's
-    # own llmkit calls between chunks.
+    # ``call_id`` and ``attempt_offset`` reach ``_stream_once`` as plain
+    # parameters — NEVER a ContextVar: an async generator's body runs in its
+    # *consumer's* context, so a ContextVar set here would leak the stream's
+    # identity into the consumer's own llmkit calls between chunks. Nor is the
+    # offset re-read from the retry scope per attempt: an abandoned stream's
+    # record is written during cleanup, possibly from another task.
 
     def _attempt(attempt: int) -> AsyncGenerator[str]:
         return _stream_once(
@@ -113,7 +117,7 @@ async def text_llm_call_stream(
             reasoning_effort=args.reasoning_effort,
             provider=provider,
             call_id=call_id,
-            attempt=attempt,
+            attempt=attempt_offset + attempt,
         )
 
     # The retry loop itself lives in :mod:`llmkit.retry` beside the awaitable
