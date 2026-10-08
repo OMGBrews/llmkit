@@ -40,7 +40,12 @@ dependencies = [
     # fails CI, not production.
     "instructor>=1.15.4,<2",
     "openai>=2.20.0",
-    "pydantic>=2.8.0",
+    # 2.11.0 is the lowest pydantic that litellm>=1.104.0 allows below Python
+    # 3.14, so it is the lowest version the CI floors job (Python 3.12) can
+    # install and test; llmkit itself needs nothing newer. On 3.14 litellm
+    # requires >=2.12.0 itself, and the resolver applies that without a marker
+    # here. Re-measure this floor whenever the litellm floor moves.
+    "pydantic>=2.11.0",
     # 6.0.0/6.0.1 ship no cp313 wheel and their sdist fails to build on 3.13
     # (their pinned Cython predates the 3.13 C API); 6.0.2 is the first release
     # with a 3.13 wheel, so 6.0.2 is the floor that installs on every supported

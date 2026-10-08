@@ -90,7 +90,7 @@ class _DumpJsonKwargs(TypedDict, total=False):
 
 
 class _ModelJsonSchemaExtra(TypedDict, total=False):
-    """``model_json_schema`` keywords newer than the pydantic floor (2.8).
+    """``model_json_schema`` keywords newer than the pydantic floor (2.11).
 
     The ``model_json_schema`` override below names the four parameters every
     supported pydantic has and takes the rest through ``Unpack`` of this

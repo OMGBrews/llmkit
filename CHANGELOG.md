@@ -53,6 +53,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only names containing `gemini-3`; earlier releases would send a future
   `gemini-4-*` model `thinkingBudget`, which Google's upcoming models reject
   with `400 INVALID_ARGUMENT`.
+- **pydantic floor raised to `pydantic>=2.11.0`.** LiteLLM 1.104.0 already
+  requires pydantic 2.11.0 or newer (2.12.0 on Python 3.14), so the old
+  `>=2.8.0` could no longer be installed; the declared floor now matches the
+  version that is actually installed and tested. No llmkit code changed.
 - **OpenRouter: `reasoning_effort="disable"` maps to `minimal` on every Gemini
   generation after 2.x**, not only `google/gemini-3*` ids, so a future
   `google/gemini-4-*` model is not sent `none` (Gemini 3 and later cannot turn
