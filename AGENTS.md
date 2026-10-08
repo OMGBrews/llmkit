@@ -33,12 +33,11 @@ where it is kept.
 uv sync            # installs the dev group; the [bedrock]/[vertex] extras come with it
 ```
 
-## Gates — all four must pass before a PR
+## Checks before a PR
 
-CI runs these four gates on every push and pull request — the ones to run
-before opening a PR (it also runs a lowest-versions resolution job, a wheel
-smoke test, and a weekly unlocked-resolution run that rarely concern a PR
-author; [CONTRIBUTING.md](CONTRIBUTING.md) has the full context):
+[docs/work/definition-of-done.md](docs/work/definition-of-done.md) is the single
+list of required checks — what each applies to, the CI status that reports it,
+and the docs-only lane. The four every code change needs:
 
 ```bash
 uv run ruff check .
@@ -61,14 +60,10 @@ Notes that bite agents:
 
 The live tests make real provider calls and run **only** under
 `pytest --run-live`, which needs provider credentials you almost certainly
-don't have. Two rules protect the suite's design — do not "fix" either as if
-it were a bug:
-
-- Live tests never run merely because a key is present in the environment;
-  only the explicit `--run-live` flag selects them.
-- Under `--run-live`, a missing key is a **hard failure, not a skip**. The
-  only allowed skips are structural (`importorskip` on an absent optional
-  extra: Bedrock, Vertex). This fail-loud behavior is deliberate.
+don't have. Two rules protect the suite's design, and the definition of done
+states both — do not "fix" either as if it were a bug: live tests are selected
+by the flag alone, never by a key being present, and under the flag a missing
+key is a hard failure, not a skip.
 
 Provider behavior (mode pins, default model ids) is measured against live
 APIs, not assumed — a change to a pin needs a live measurement behind it,

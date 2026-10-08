@@ -1,5 +1,5 @@
 {
-  "include": ["src", "tests"],
+  "include": ["src", "tests", "scripts"],
   "exclude": ["**/__pycache__"],
   "pythonVersion": "3.12",
   "venvPath": ".",
