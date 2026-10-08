@@ -152,6 +152,32 @@ async def test_a_round_of_only_malformed_calls_still_raises_for_the_whole_round(
 
 
 @pytest.mark.asyncio
+async def test_compose_re_asks_a_round_of_only_malformed_calls() -> None:
+    """Compose keeps the tool lane's re-ask contract: an all-malformed round is
+    charged to the validation budget and re-asked, not raised on the first
+    attempt because the final-answer budget happened to omit
+    ``ToolArgumentError``."""
+    bad = _RawCall("call_bad", _Function("weather", "{not json"))
+    with patch(
+        "llmkit._litellm.acompletion_tools",
+        side_effect=[
+            (None, [bad], "tool_calls", (None, None, None), None),
+            ('{"summary":"sunny"}', [], "stop", (None, None, None), None),
+        ],
+    ) as transport:
+        result = await tool_llm_call(
+            "weather?",
+            [ToolDefinition.from_model("weather", _WeatherArgs)],
+            feature="assistant",
+            provider=provider_mock(compose_tools_schema=True),
+            output_schema=_Forecast,
+        )
+    assert transport.call_count == 2
+    assert isinstance(result, ToolComposeResult)
+    assert result.parsed == _Forecast(summary="sunny")
+
+
+@pytest.mark.asyncio
 async def test_a_clean_round_carries_no_invalid_calls_and_logs_the_old_shape() -> None:
     """The negative half of the pair: the new field is empty and the record's
     ``response`` keeps exactly the keys it had, so the salvage path cannot be

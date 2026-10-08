@@ -55,6 +55,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   licence previously named "OMGBrews", the studio's GitHub organization rather
   than its legal name. The licence terms are unchanged.
 
+### Fixed
+
+- **`tool_llm_call(..., output_schema=...)` re-asks a round of only malformed
+  tool calls again.** Compose turns were documented to keep the tool lane's
+  retry behaviour, but they charged only a malformed final answer to the
+  validation budget, so a round whose every call was malformed raised
+  `ToolArgumentError` on the first attempt. Compose now charges both to
+  `validation_max_attempts`, as the plain tool lane does.
+
 ## [0.10.0] — 2026-08-31
 
 ### Added
