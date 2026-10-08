@@ -208,13 +208,16 @@ jobs:
         run: python3 scripts/check_doc_links.py
 
   ci-ok:
-    # The single context branch protection requires. `check` is a matrix job, so
-    # it never reports under that bare name — it reports as `check (ubuntu-latest,
-    # 3.12)` and four siblings — and a ruleset requiring `check` waits forever on
-    # a context nothing produces. Every PR then sits BLOCKED on a green tree and
-    # merges only by admin bypass, which is indistinguishable from a gate that
-    # works. One aggregator name is also stable across matrix edits: adding a
-    # Python version here never needs a matching edit in repo settings.
+    # The single context a required-status rule would name. No such rule is
+    # configured today — `main`'s only ruleset blocks deletion and force pushes
+    # (docs/work/definition-of-done.md records the observation) — so a red
+    # `ci-ok` reports a failure without blocking a merge. `check` is a matrix
+    # job, so it never reports under that bare name — it reports as
+    # `check (ubuntu-latest, 3.12)` and four siblings — and a rule requiring
+    # `check` would wait forever on a context nothing produces, leaving every PR
+    # BLOCKED on a green tree and mergeable only by admin bypass. One aggregator
+    # name is also stable across matrix edits: adding a Python version here
+    # never needs a matching edit in repo settings.
     needs: [check, floors, package, docs-links]
     # `always()` is load-bearing. Without it a failed dependency skips this job,
     # and GitHub counts a skipped required check as satisfied — the misconfigured
