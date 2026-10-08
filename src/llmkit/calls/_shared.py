@@ -11,8 +11,8 @@ lives here so the next family added does not become another copy:
 * :func:`run_with_policy` — the :func:`~llmkit.retry.with_retries` invocation,
   which differs between families only in which errors are charged to the
   validation budget;
-* :func:`result_validation_budget` / :func:`tool_validation_budget` — the two
-  augmented validation sets;
+* :func:`result_validation_budget` / :func:`tool_validation_budget` /
+  :func:`compose_validation_budget` — the three augmented validation sets;
 * :func:`build_text_record` and :func:`resolve_model_and_provider` — record
   construction shared by the text and streaming surfaces, and the effective
   model/provider resolution every family records;
@@ -68,6 +68,17 @@ def result_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], .
 def tool_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], ...]:
     """Tool argument errors use the same bounded repair budget as schemas."""
     return (*retry.validation_retry_on, ToolArgumentError)
+
+
+def compose_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], ...]:
+    """A compose turn can fail either way, so it is charged for both.
+
+    A turn that requested tools keeps the tool lane's contract — a round whose
+    every call is malformed raises :class:`ToolArgumentError` and is re-asked —
+    and a turn that answered is validated locally, raising
+    :class:`ResultValidationError` when the final answer does not parse.
+    """
+    return (*tool_validation_budget(retry), ResultValidationError)
 
 
 def build_call_provider(

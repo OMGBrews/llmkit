@@ -21,10 +21,10 @@ from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    compose_validation_budget,
     parse_tool_calls,
     prepare_call,
     resolve_model_and_provider,
-    result_validation_budget,
     run_with_policy,
     tool_validation_budget,
 )
@@ -254,7 +254,7 @@ async def tool_llm_call[T: BaseModel](
         validation_retry_on=(
             tool_validation_budget(args.retry)
             if output_schema is None
-            else result_validation_budget(args.retry)
+            else compose_validation_budget(args.retry)
         ),
     )
     return completed

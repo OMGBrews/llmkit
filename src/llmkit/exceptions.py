@@ -7,7 +7,7 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into four subsets the retry layer budgets
+The recoverable set is split into five subsets the retry layer budgets
 **separately** (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
@@ -32,7 +32,7 @@ The recoverable set is split into four subsets the retry layer budgets
   breaker while it is open). It is recoverable in the catch-set sense — a host
   that degrades on ``LLM_RECOVERABLE_ERRORS`` keeps catching it (a fast
   fallback) instead of crashing on a new uncaught type — but it is deliberately
-  **not** retried under any configuration: it lives outside the transport set,
+  **not** retried by default: it lives outside the transport set,
   and ``with_retries`` additionally carves it out as a zero-budget fail-fast
   signal, so neither ``with_retries`` (even on its ``retry_on=None`` default)
   nor the streaming loop (which keys off the transport/schema subsets, never
@@ -41,10 +41,16 @@ The recoverable set is split into four subsets the retry layer budgets
 * :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
   (:class:`OutputLimitError`, raised when a structured completion is cut off
   by the output-token limit). Recoverable in the same catch-set sense as the
-  breaker, but **never retried** on either budget under any configuration:
-  re-asking with an identical token budget can only truncate again.
+  breaker, but **never retried** on either budget by default:
+  re-asking with an identical token budget can only truncate again — unless
+  a caller explicitly lists the type in ``retry_on``.
+* :data:`LLM_TOOL_ERRORS` — a tool round the model got wrong
+  (:class:`ToolArgumentError`: an unknown tool, or arguments that are not
+  valid JSON or fail the tool's model). The tool lanes charge it to the
+  **validation** budget, so a round whose every call is malformed is re-asked
+  like a malformed schema response.
 
-``LLM_RECOVERABLE_ERRORS`` is the **union** of the four, preserved as the
+``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
 single documented ``except``-clause catch-set so existing callers keep
 catching exactly what they did before. The 503 case deserves a note:
 litellm's own ``ServiceUnavailableError`` cannot be listed statically
@@ -407,10 +413,11 @@ class OutputLimitError(Exception):
 # degrading gracefully) while the retry layer never retries it on any budget.
 LLM_OUTPUT_LIMIT_ERRORS: tuple[type[Exception], ...] = (OutputLimitError,)
 
-# The full recoverable set is the union of the four subsets — preserved as the
+# The full recoverable set is the union of the five subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
 # exactly what they did before even though the retry layer now budgets the
-# subsets separately (and never retries the backpressure/output-limit subsets).
+# subsets separately (and, unless a caller opts in through ``retry_on``, never
+# retries the backpressure/output-limit subsets).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
