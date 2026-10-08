@@ -95,6 +95,20 @@ class LLMCallRecord:
     may be ``None`` when the provider did not report it). The YAML body carries
     all three; ``index.jsonl`` deliberately does not, so the compact scan line
     keeps its fixed shape.
+
+    Two fields carry a **structured call cut off by its output limit** and are
+    ``None`` on every other attempt: ``output_limit`` is the truncated
+    completion's ``finish_reason`` / ``prompt_tokens`` /
+    ``completion_tokens`` / ``total_tokens`` / ``reasoning_tokens``
+    (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`; any value may be
+    ``None`` when the completion did not report it, so a truncation that
+    reported nothing is a mapping of nulls, never a ``None`` mapping), and
+    ``partial_text`` is the unfinished answer text. ``response`` stays
+    ``None`` on such an attempt — unfinished text is not a validated
+    structured response — and ``completion_tokens`` may include reasoning
+    tokens that never appear in ``partial_text``. ``usage`` stays tool-lane
+    only: structured-lane token counts appear here, and only on truncation.
+    The YAML body carries both; ``index.jsonl`` carries neither.
     """
 
     started_at: datetime
@@ -118,3 +132,5 @@ class LLMCallRecord:
     tools: list[dict[str, object]] | None = None
     tool_calls: list[dict[str, object]] | None = None
     usage: dict[str, int | None] | None = None
+    output_limit: dict[str, int | str | None] | None = None
+    partial_text: str | None = None

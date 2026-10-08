@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Output-limit truncations keep their evidence.** When a structured call is
+  cut off by its output-token limit, the raised `OutputLimitError` now carries
+  `diagnostics`, a new `OutputLimitDiagnostics` holding the unfinished answer
+  (`partial_text`), `finish_reason`, and `prompt_tokens` /
+  `completion_tokens` / `total_tokens` / `reasoning_tokens`; any of them is
+  `None` when the completion did not report it. The call log records the same
+  values: `LLMCallRecord` gains `output_limit` (the finish reason and token
+  counts) and `partial_text`, written to the per-call YAML as an
+  `output_limit:` mapping beside `usage` and a `partial_text:` key just before
+  `response`. Both are `null` on every attempt that was not truncated, and
+  `response` stays `null` on one that was. To investigate a truncation, find
+  the `OutputLimitError` lines in `index.jsonl` (which does not carry the new
+  fields), open each attempt's YAML and read `partial_text` to judge whether
+  the answer needed more room or the model was looping. `completion_tokens`
+  can include reasoning tokens, and a `reasoning_tokens` of `0` may mean the
+  provider did not break them out. The guidance no longer says a count at the
+  cap means "raise it". `OutputLimitError(...)` keeps its constructor, and
+  fail-fast stays the default.
+
 ### Changed
 
 - **Breaking: llmkit no longer sends a default `temperature`, on any

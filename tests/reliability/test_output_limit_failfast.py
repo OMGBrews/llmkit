@@ -8,7 +8,9 @@ re-ask. These tests pin the whole contract:
 
 * the in-call instructor loop refuses the length re-ask — one generation,
   surfaced as :class:`~llmkit.OutputLimitError` with the cause chain and
-  diagnostics (``model`` / ``max_tokens`` / ``completion_tokens``);
+  diagnostics (``model`` / ``max_tokens`` / ``completion_tokens``, plus the
+  partial text and usage on ``diagnostics``, read from every completion
+  shape without ever raising);
 * the outer retry layer (:func:`~llmkit.retry.with_retries`) propagates it
   immediately under the default policy *and* under ``retry_on=None`` ("retry
   anything") — only an explicit ``retry_on`` listing the type opts back in;
@@ -28,6 +30,7 @@ over the faked ``ModelResponse``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,6 +44,7 @@ from llmkit import (
     LLM_RECOVERABLE_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
+    OutputLimitDiagnostics,
     OutputLimitError,
     _litellm,
 )
@@ -134,6 +138,99 @@ async def test_truncation_error_carries_cause_and_diagnostics() -> None:
     assert err.model == "fake/model"
     assert err.max_tokens == 64
     assert err.completion_tokens == 64
+
+
+async def test_truncation_error_carries_partial_text_and_usage() -> None:
+    """The unfinished answer, finish reason and token counts ride on
+    ``err.diagnostics`` (not the message), so the failure can be read without
+    re-running it. The fixture reports no reasoning breakdown, yet
+    ``reasoning_tokens`` reads ``0``: instructor's usage accumulator rewrites
+    the response's usage and fills the missing breakdown with its zeroed
+    total, so on this path ``0`` cannot be told apart from "not reported"."""
+    err, _calls = await _drive_truncated(max_tokens=64)
+    assert err.diagnostics == OutputLimitDiagnostics(
+        partial_text='{"ok": tru',
+        finish_reason="length",
+        prompt_tokens=7,
+        completion_tokens=64,
+        total_tokens=71,
+        reasoning_tokens=0,
+    )
+    assert '{"ok": tru' not in str(err)
+
+
+def test_directly_constructed_error_has_no_diagnostics() -> None:
+    """The pre-existing keyword constructor still works and carries none."""
+    err = OutputLimitError(model="m", max_tokens=8, completion_tokens=8)
+    assert err.diagnostics is None
+
+
+def _completion(content: object, *, usage: object = None) -> SimpleNamespace:
+    """A litellm-shaped response stand-in. ``ModelResponse`` rejects list
+    content at construction, so the odd shapes are built from namespaces."""
+    message = SimpleNamespace(content=content)
+    choice = SimpleNamespace(finish_reason="length", message=message)
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+_USAGE = SimpleNamespace(prompt_tokens=3, completion_tokens=9, total_tokens=12)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("partial", "partial"),
+        ("", ""),
+        (None, None),
+        ([{"type": "text", "text": "a"}, SimpleNamespace(text="b")], "ab"),
+        ([{"type": "image_url"}], ""),
+        (42, None),
+    ],
+    ids=["str", "empty", "none", "blocks", "blocks-without-text", "unfamiliar"],
+)
+def test_diagnostics_content_shapes(content: object, expected: str | None) -> None:
+    """Each content shape has one answer, and the token counts are read
+    regardless of whether any text could be."""
+    diag = _litellm._output_limit_diagnostics(_completion(content, usage=_USAGE))
+    assert diag.partial_text == expected
+    assert diag.finish_reason == "length"
+    assert (diag.prompt_tokens, diag.completion_tokens, diag.total_tokens) == (3, 9, 12)
+
+
+def test_diagnostics_bare_choice_and_missing_usage() -> None:
+    """instructor's Anthropic handler passes ``choices[0]`` itself: the text
+    is still read, and the absent usage leaves every count ``None``."""
+    choice = SimpleNamespace(finish_reason="length", message=SimpleNamespace(content="x"))
+    assert _litellm._output_limit_diagnostics(choice) == OutputLimitDiagnostics(
+        partial_text="x", finish_reason="length"
+    )
+
+
+def test_diagnostics_reasoning_tokens() -> None:
+    """A provider that breaks out reasoning tokens has them preserved
+    separately from the (reasoning-inclusive) completion count."""
+    usage = SimpleNamespace(
+        prompt_tokens=3,
+        completion_tokens=9,
+        total_tokens=12,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=6),
+    )
+    diag = _litellm._output_limit_diagnostics(_completion("p", usage=usage))
+    assert diag.reasoning_tokens == 6
+    assert diag.completion_tokens == 9
+
+
+def test_diagnostics_never_raise() -> None:
+    """``None`` and a shape that raises mid-read both degrade to an all-``None``
+    payload instead of masking the ``OutputLimitError``."""
+
+    class Exploding:
+        @property
+        def choices(self) -> list[object]:
+            raise RuntimeError("odd shape")
+
+    assert _litellm._output_limit_diagnostics(None) == OutputLimitDiagnostics()
+    assert _litellm._output_limit_diagnostics(Exploding()) == OutputLimitDiagnostics()
 
 
 async def test_truncation_without_cap_reports_none() -> None:

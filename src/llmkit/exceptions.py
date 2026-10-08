@@ -71,6 +71,7 @@ carve-out that a length truncation is never re-asked and surfaces as
 """
 
 import sys
+from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import override
 
@@ -357,6 +358,48 @@ class CircuitOpenError(Exception):
 LLM_BACKPRESSURE_ERRORS: tuple[type[Exception], ...] = (CircuitOpenError,)
 
 
+@dataclass(frozen=True)
+class OutputLimitDiagnostics:
+    """What a truncated structured completion reported, best-effort.
+
+    Carried by :attr:`OutputLimitError.diagnostics` and written to the call
+    log: ``partial_text`` as the record's ``partial_text`` field, the rest as
+    its ``output_limit`` mapping (:meth:`to_log_dict`). Every field is
+    ``None`` when the completion did not report it; an empty ``partial_text``
+    (``""``) means the model returned content with no text in it.
+
+    Attributes:
+        partial_text: The unfinished answer text, unparsed — not a validated
+            response.
+        finish_reason: The provider's stop reason (``"length"`` for an
+            OpenAI-shaped truncation).
+        prompt_tokens: Input tokens, from the completion's usage.
+        completion_tokens: Generated tokens, from the completion's usage. May
+            include reasoning tokens that never appear in ``partial_text``.
+        total_tokens: Prompt plus completion tokens, as reported.
+        reasoning_tokens: The reasoning share of ``completion_tokens`` when
+            the provider breaks it out. ``0`` is ambiguous: instructor's usage
+            accumulator writes ``0`` when the provider reported no breakdown.
+    """
+
+    partial_text: str | None = None
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def to_log_dict(self) -> dict[str, int | str | None]:
+        """The non-text fields as the call record's ``output_limit`` mapping."""
+        return {
+            "finish_reason": self.finish_reason,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+        }
+
+
 class OutputLimitError(Exception):
     """A structured completion was truncated by the output-token limit.
 
@@ -371,11 +414,16 @@ class OutputLimitError(Exception):
     it immediately under every configuration, unless a caller explicitly lists
     the type in ``retry_on`` (an explicit opt-in wins).
 
-    Carries diagnostics so the fix is legible from the error alone:
-    ``completion_tokens`` at/near a ``max_tokens`` you set means "cap too snug
-    — raise it"; a huge ``completion_tokens`` under no cap
-    (``max_tokens=None``, the provider ceiling) means "the prompt induces
-    runaway output."
+    Carries what the truncated completion reported, so the failure can be
+    investigated without paying to reproduce it — but a truncation does not
+    say *why* it happened. The answer may legitimately need more room, the
+    model may have been repeating itself, reasoning may have consumed the
+    budget, or the prompt may have lacked the evidence to finish; read
+    :attr:`diagnostics` (the partial text above all) before deciding.
+    ``completion_tokens`` may include reasoning tokens the provider does not
+    surface as text, so a count at the cap is not proof the visible answer
+    filled it. Fail-fast is the default; retrying is an explicit
+    ``retry_on`` opt-in.
 
     Follows the :class:`CircuitOpenError` precedent — a distinct fail-fast
     type, kept **out** of :data:`LLM_TRANSPORT_ERRORS` (a fresh connection
@@ -392,10 +440,20 @@ class OutputLimitError(Exception):
         completion_tokens: Tokens actually generated before truncation,
             best-effort from the truncated completion's usage (``None`` when
             the provider reported none).
+        diagnostics: The truncated completion's partial text, finish reason
+            and token counts as an :class:`OutputLimitDiagnostics`, or
+            ``None`` when the error was constructed without them. Any field
+            inside may itself be ``None`` when the completion did not report
+            it. The partial text is never put into the message.
     """
 
     def __init__(
-        self, *, model: str, max_tokens: int | None, completion_tokens: int | None
+        self,
+        *,
+        model: str,
+        max_tokens: int | None,
+        completion_tokens: int | None,
+        diagnostics: OutputLimitDiagnostics | None = None,
     ) -> None:
         cap = "provider ceiling" if max_tokens is None else f"max_tokens={max_tokens}"
         super().__init__(
@@ -406,6 +464,7 @@ class OutputLimitError(Exception):
         self.model: str = model
         self.max_tokens: int | None = max_tokens
         self.completion_tokens: int | None = completion_tokens
+        self.diagnostics: OutputLimitDiagnostics | None = diagnostics
 
 
 # llmkit's own fail-fast truncation signal — same pattern as the backpressure

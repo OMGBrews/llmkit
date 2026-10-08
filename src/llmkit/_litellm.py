@@ -54,6 +54,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 from llmkit._types import TOOL_ERROR_PREFIX, ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
+    OutputLimitDiagnostics,
     OutputLimitError,
     normalize_service_unavailable,
 )
@@ -315,6 +316,57 @@ def _completion_tokens(raw: object) -> int | None:
     return tokens if isinstance(tokens, int) else None
 
 
+def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics:
+    """Best-effort :class:`OutputLimitDiagnostics` from a truncated completion.
+
+    ``last_completion`` is whatever instructor attached to its
+    ``IncompleteOutputException``: normally the whole litellm
+    ``ModelResponse`` (the OpenAI JSON / JSON-schema handlers every shipped
+    provider reaches), but one handler passes a bare ``choices[0]`` and it can
+    be ``None``. Pure ``getattr`` like :func:`_usage_counts`, and it never
+    raises — the diagnostics degrade, never break or mask the
+    :class:`OutputLimitError`. Shape rules: string content is kept as-is
+    (``""`` stays ``""``); list-of-blocks content joins its text blocks as
+    :func:`_coerce_text_content` does (``""`` when none carry text); absent,
+    ``None`` or any other content yields ``partial_text=None`` while the token
+    counts are still read; a shape that raises mid-extraction blanks every
+    field. A third-party provider in instructor's tool mode puts the partial
+    answer in tool-call arguments, which are not read: its ``partial_text`` is
+    ``None``.
+    """
+    try:
+        choices = getattr(last_completion, "choices", None)
+        choice: object = (
+            cast("list[object]", choices)[0]
+            if isinstance(choices, list) and choices
+            else last_completion
+        )
+        finish_reason = getattr(choice, "finish_reason", None)
+        content = getattr(getattr(choice, "message", None), "content", None)
+        partial_text = (
+            _coerce_text_content(cast("object", content))
+            if isinstance(content, str | list)
+            else None
+        )
+        prompt, completion, total = _usage_counts(last_completion)
+        reasoning = getattr(
+            getattr(getattr(last_completion, "usage", None), "completion_tokens_details", None),
+            "reasoning_tokens",
+            None,
+        )
+        return OutputLimitDiagnostics(
+            partial_text=partial_text,
+            finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total,
+            reasoning_tokens=reasoning if isinstance(reasoning, int) else None,
+        )
+    except Exception:
+        logger.debug("Could not read output-limit diagnostics", exc_info=True)
+        return OutputLimitDiagnostics()
+
+
 def _schema_repair_retrying() -> AsyncRetrying:
     """instructor's in-call repair budget: one schema-repair re-ask, for a
     genuine parse failure only.
@@ -529,13 +581,16 @@ async def acompletion_structured[T: BaseModel](
         except IncompleteOutputException as e:
             # The declined re-ask propagates instructor's exception bare (no
             # InstructorRetryException wrap) — re-own it at the boundary so
-            # callers see one llmkit type carrying the diagnostics that make
-            # the fix legible ("cap too snug" vs "prompt causes runaway
-            # output"), with the instructor original on the cause chain.
+            # callers see one llmkit type carrying what the truncated
+            # completion reported (partial text, finish reason, token counts)
+            # for the caller and the call log to judge — a truncation alone
+            # does not say whether the budget or the output was at fault —
+            # with the instructor original on the cause chain.
             raise OutputLimitError(
                 model=litellm_model,
                 max_tokens=max_tokens,
                 completion_tokens=_completion_tokens(e.last_completion),
+                diagnostics=_output_limit_diagnostics(e.last_completion),
             ) from e
         # instructor types the raw completion half of the tuple as Any; it is a
         # litellm ModelResponse. Narrow once so cost/usage read a real type.

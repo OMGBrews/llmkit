@@ -57,8 +57,8 @@ class LocalYamlLogSink:
     The per-call YAML is laid out **verdict-first** — a one-line summary
     comment header (status / feature / model / schema / duration / cost),
     then the small metadata fields (including the request-shaping knobs:
-    temperature, max_tokens, reasoning_effort), with the large ``response``
-    and ``prompt`` blobs last — so a reader (a human, but in practice mostly
+    temperature, max_tokens, reasoning_effort), with the large
+    ``partial_text``, ``response`` and ``prompt`` blobs last — so a reader (a human, but in practice mostly
     a coding agent) learns what happened from the head of the file without
     paying to scan the whole prompt. The body is dumped with
     :class:`LogSafeDumper`, so the file is always ``yaml.safe_load``-able —
@@ -262,9 +262,10 @@ class LocalYamlLogSink:
             safe_label = safe_path_component(record.label or "unlabeled")
 
             # Verdict-first order: cheap, high-signal metadata up top; the
-            # large ``response``/``prompt`` blobs last (``response`` first —
-            # it's what a debugger usually wants), so the head of the file
-            # is the whole story for most reads.
+            # large ``partial_text``/``response``/``prompt`` blobs last
+            # (``partial_text`` — null unless an output limit cut the answer
+            # off — then ``response``, what a debugger usually wants), so the
+            # head of the file is the whole story for most reads.
             doc: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # raw-llm — YAML log body dict
                 "timestamp": record.started_at.isoformat(),
                 "feature": record.feature,
@@ -281,12 +282,14 @@ class LocalYamlLogSink:
                 "tools": record.tools,
                 "tool_calls": record.tool_calls,
                 "usage": record.usage,
+                "output_limit": record.output_limit,
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
                 ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
+                "partial_text": record.partial_text,
                 "response": cast("object", record.response),
                 "prompt": record.prompt,
             }

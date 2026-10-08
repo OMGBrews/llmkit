@@ -23,6 +23,7 @@ from llmkit.calls._shared import (
     run_with_policy,
 )
 from llmkit.capture import record_call_async
+from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
@@ -166,6 +167,7 @@ async def structured_llm_call[T: BaseModel](
         response: T | None = None
         cost: float | None = None
         error: str | None = None
+        diagnostics: OutputLimitDiagnostics | None = None
         try:
             response, cost = await _litellm.acompletion_structured(
                 prompt,
@@ -184,6 +186,9 @@ async def structured_llm_call[T: BaseModel](
             return response
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, OutputLimitError):
+                # ``None`` for a directly constructed error: no fields logged.
+                diagnostics = exc.diagnostics
             raise
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
@@ -227,6 +232,8 @@ async def structured_llm_call[T: BaseModel](
                     attempt=attempt,
                     queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
+                    output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
+                    partial_text=diagnostics.partial_text if diagnostics is not None else None,
                 )
             )
 
