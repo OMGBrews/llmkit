@@ -153,9 +153,11 @@ work environment, not in this repository.
 
 - **Live provider suite at the release candidate**
   - Command: `uv run pytest tests/integration --run-live`
-  - Pass condition: every live test passes at the commit to be tagged, with every
-    provider's credentials loaded.
-  - Applies to: every release.
+  - Pass condition: exit 0 at the commit to be tagged, with every provider's credentials
+    loaded and **no live test skipped** — the summary line shows passes only. A skip means
+    an optional extra was not installed, which leaves that provider unverified.
+  - Applies to: every release. There is no partial-coverage exception: a provider that
+    cannot be run blocks the release until it can.
   - Evidence type: automated
   - Enforcement: procedural
   - Evidence state: available to maintainers
@@ -184,9 +186,8 @@ deployments.
 
 ## Known gaps
 
-- No landing requirement is platform-enforced. The `ci-ok` comments in
-  `.github/workflows/ci.yml` describe it as the context branch protection requires, but as
-  of 2026-10-08 no rule requires it (see the enforcement evidence above).
+- No landing requirement is platform-enforced: as of 2026-10-08 no rule requires a pull
+  request or any status, including `ci-ok` (see the enforcement evidence above).
 - `scripts/check_doc_links.py` checks relative file targets only: `#heading` anchors and
   external URLs are not validated.
 - The live provider suite does not run in this repository's CI, because it needs provider
