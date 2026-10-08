@@ -73,9 +73,10 @@ siblings), and `ci-ok` succeeds only when every CI job does.
   - Evidence state: available
   - CI status: `check (…)` matrix cells, `ci-ok`
 - **Dependency floors**
-  - Command: `uv sync --resolution lowest-direct && uv run pytest`
+  - Command: `uv sync --resolution lowest-direct && uv run --no-sync pytest`
   - Pass condition: exit 0, testing against the lowest declared versions of the direct
-    dependencies.
+    dependencies. Keep `--no-sync`: without it `uv run` re-resolves at the highest
+    versions and reinstalls them before the tests run.
   - Applies to: any change to `pyproject.toml` or to code that may rely on a newer
     `litellm`, `instructor` or `pydantic` API than the declared floor.
   - Evidence type: automated

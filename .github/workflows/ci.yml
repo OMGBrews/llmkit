@@ -112,7 +112,11 @@ jobs:
         run: uv sync --resolution lowest-direct
 
       - name: Tests
-        run: uv run pytest
+        # --no-sync is load-bearing: a plain `uv run` sees the lockfile was
+        # resolved lowest-direct, re-resolves at the default highest versions
+        # and reinstalls them before pytest starts, so the floors would never
+        # be what is tested.
+        run: uv run --no-sync pytest
 
   package:
     # Builds the wheel and smoke-tests the *installed artifact* in a clean
