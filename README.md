@@ -4,11 +4,50 @@ A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/Ber
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
+## Contents
+
+- [Why llmkit](#why-llmkit)
+- [Install](#install)
+- [Quick start](#quick-start)
+  - [Tool calls with a structured final answer](#tool-calls-with-a-structured-final-answer)
+  - [Choosing which tool the model calls](#choosing-which-tool-the-model-calls)
+  - [Streaming a tool turn](#streaming-a-tool-turn)
+  - [When a call doesn't parse](#when-a-call-doesnt-parse)
+  - [Telling the model a tool failed](#telling-the-model-a-tool-failed)
+  - [Tool schemas: hand them over unprocessed](#tool-schemas-hand-them-over-unprocessed)
+  - [Reusing call options](#reusing-call-options)
+  - [Contracts as JSON-schema dicts](#contracts-as-json-schema-dicts)
+- [Rate limiting](#rate-limiting)
+  - [Adaptive concurrency](#adaptive-concurrency)
+  - [Observing backpressure](#observing-backpressure)
+  - [Circuit breaker](#circuit-breaker)
+  - [Joining the global rate limit directly](#joining-the-global-rate-limit-directly)
+- [Logging: agent-readable by default](#logging-agent-readable-by-default)
+  - [Grouping calls by run](#grouping-calls-by-run)
+  - [Where the logs go](#where-the-logs-go)
+  - [Retention: bounded by default](#retention-bounded-by-default)
+  - [Capturing call records](#capturing-call-records)
+  - [Write your own `LogSink`](#write-your-own-logsink)
+- [Configuration](#configuration)
+  - [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints)
+  - [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override)
+  - [OpenRouter: schema-honoring routing](#openrouter-schema-honoring-routing)
+- [Retries](#retries)
+  - [Automatic retries, on by default](#automatic-retries-on-by-default)
+  - [Backoff and `Retry-After`](#backoff-and-retry-after)
+  - [Tuning or opting out per call](#tuning-or-opting-out-per-call)
+  - [Wrapping your own work: `with_retries()`](#wrapping-your-own-work-with_retries)
+  - [instructor's in-call schema repair](#instructors-in-call-schema-repair)
+  - [Re-rolling on a semantically-bad result](#re-rolling-on-a-semantically-bad-result)
+- [Development](#development)
+- [Status & support](#status--support)
+- [License](#license)
+
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
 - **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
-- **Logging tuned for coding agents.** Every call is logged verdict-first (see below) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
+- **Logging tuned for coding agents.** Every call is logged verdict-first (see [Logging](#logging-agent-readable-by-default)) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
 These four are the headline; [`PRINCIPLES.md`](PRINCIPLES.md) states the full set of design principles behind the library.
@@ -56,8 +95,7 @@ extra pulls only `google-auth` (LiteLLM mints the Vertex OAuth token through
 it), and constructing the `VertexProvider` without it raises a clear `install
 omg-llmkit[vertex]` error — a non-Vertex host takes on no Google dependency.
 Direct Anthropic routing needs no SDK at all: LiteLLM speaks the Anthropic
-HTTP API itself, so the `[anthropic]` extra that existed through 0.6.x is
-gone.
+HTTP API itself, so there is no `[anthropic]` extra.
 
 ## Quick start
 
@@ -89,14 +127,24 @@ result: Summary = await structured_llm_call(
 )
 ```
 
+The call functions are async: run the snippet inside an event loop (an async
+framework, or `asyncio.run(...)` around an `async def main()`), or call
+`structured_llm_call_sync(...)` with the same arguments from synchronous code.
+The call's log record lands under `data/llm-logs/` in your project by default —
+see [Where the logs go](#where-the-logs-go).
+
+> **Two defaults worth knowing up front.**
+> - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded unchanged. Google is retiring sampling parameters on Gemini, so an explicit value will fail on models that reject it, and LiteLLM itself still adds one on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
+> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
+
 The public call surface:
 
 | Function | Use |
 |----------|-----|
 | `structured_llm_call(prompt, output_schema, feature, label, ...)` | Async, returns a validated Pydantic instance |
-| `structured_llm_call_sync(...)` | Synchronous wrapper around the above |
+| `structured_llm_call_sync(...)` | Synchronous wrapper around `structured_llm_call` |
 | `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
-| `text_llm_call_sync(...)` | Synchronous wrapper around the above |
+| `text_llm_call_sync(...)` | Synchronous wrapper around `text_llm_call` |
 | `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
 | `tool_llm_call(prompt, tools, feature, ..., output_schema=...)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
 | `tool_llm_call_sync(...)` | Synchronous wrapper around the tool turn |
@@ -107,7 +155,17 @@ bridges a coroutine; an async generator is not one, and there is no way to hand
 a synchronous caller a lazily-produced stream without inventing a thread-backed
 iterator llmkit deliberately does not own. Consume them from async code.
 
-`prompt` is typed `str | list[Message]` on all call functions. A plain string is sent as-is; the list form is a list of `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim. `Message` is exported so your own prompt builders can be annotated against it rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected.
+> **Deprecated alias.** `stream_text_with_log` is the old name for
+> `text_llm_call_stream`; it still works (same signature and behaviour) but
+> warns `DeprecationWarning` and is removed in 1.0. Switch the call.
+
+`prompt` is typed `str | Sequence[ChatMessage]` on all call functions. A plain string is sent as-is; the sequence form is a conversation, where `ChatMessage` is `Message | AssistantToolMessage | ToolResultMessage`:
+
+- `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim;
+- `AssistantToolMessage` — an assistant turn that requested tools, as `result.to_message()` returns it;
+- `ToolResultMessage` — a tool's answer, as `tool_result_message(...)` builds it.
+
+All three are exported so your own prompt builders can be annotated against them rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected. Annotate a plain conversation `list[Message]`, and a tool-loop history — which gains assistant tool turns and tool results as it runs — `list[ChatMessage]`.
 
 ### Tool calls with a structured final answer
 
@@ -119,12 +177,16 @@ For a measured compose-capable route, pass `output_schema=` to the tool call ins
 from pydantic import BaseModel
 from llmkit import ToolDefinition, tool_llm_call
 
+class AddArgs(BaseModel):
+    a: int
+    b: int
+
 class Answer(BaseModel):
     total: int
 
 result = await tool_llm_call(
     "Calculate 2 + 3; use the tool if needed.",
-    [ToolDefinition("add", "Add values", {"type": "object"})],
+    [ToolDefinition.from_model("add", AddArgs, "Add two integers")],
     output_schema=Answer,
     feature="calculator",
 )
@@ -136,7 +198,16 @@ else:
     assert result.parsed.total == 5
 ```
 
-Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior; their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
+Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
+
+### Choosing which tool the model calls
+
+`tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream` take a
+`tool_choice=` keyword. Leave it `None` (the default) for the provider's own
+behaviour, or pass `"auto"`, `"none"`, `"required"`, or `ToolName("weather")` to
+force one named tool (`ToolName` is exported; `ToolChoice` is the union type). A
+route whose provider does not support `tool_choice` — Ollama — raises
+`ValueError` before any request rather than silently ignoring the setting.
 
 ### Streaming a tool turn
 
@@ -223,7 +294,7 @@ else:
 
 Without a standard flag every application invents its own convention — a JSON wrapper, a bare traceback, a sentence in the result — and the same model recovers differently depending on which one it meets. This is the convention, so it doesn't.
 
-**What the model actually receives.** The flag is llmkit's, not the wire's. There is no field to carry it: LiteLLM's Anthropic translation builds its `tool_result` block from the call id and the content alone (measured against `litellm` 1.95.0 — its own source comment records that the OpenAI-normalized shape cannot express the distinction), and an OpenAI-compatible route would forward an unknown key straight to a provider that may reject it. So the transport prefixes the content with `TOOL_ERROR_PREFIX` (`"ERROR: "`, exported so you can recognise or strip it) and drops the key — one rendering, identical on every provider. The flag itself stays on the message you hold and in the `prompt` the log records, so your provenance keeps the distinction structurally even though the wire cannot. Omitting `is_error` sends exactly the three-key message it always did.
+**What the model actually receives.** The flag is llmkit's, not the wire's. There is no field to carry it: LiteLLM's Anthropic translation builds its `tool_result` block from the call id and the content alone (LiteLLM's Anthropic translation still leaves `is_error` commented out at 1.104.0, the supported floor — its own source comment records that the OpenAI-normalized shape cannot express the distinction), and an OpenAI-compatible route would forward an unknown key straight to a provider that may reject it. So the transport prefixes the content with `TOOL_ERROR_PREFIX` (`"ERROR: "`, exported so you can recognise or strip it) and drops the key — one rendering, identical on every provider. The flag itself stays on the message you hold and in the `prompt` the log records, so your provenance keeps the distinction structurally even though the wire cannot. Omitting `is_error` sends exactly the three-key message it always did.
 
 ### Tool schemas: hand them over unprocessed
 
@@ -254,16 +325,6 @@ tools = [
 **Where the guarantee stops.** It is delivery in the provider's accepted subset, not lossless translation: a construct the subset cannot express is *dropped, not errored*. The one to know about is that Gemini accepts `enum` only on string-typed fields, so an enum on an integer or float field is silently discarded and the model sees an unconstrained number. Keep enums as string enums when a Gemini route is in play, or validate the range yourself — `from_model()` validates the model's arguments locally either way, so a value outside the enum still fails validation on our side.
 
 Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transport.py` asserts the transform's output offline (so a transport upgrade that stopped normalising fails the suite), and `test_vertex_tool_schema_roundtrip_live` asserts live Vertex accepts it.
-
-**Type-check migration.** `prompt` was previously `str | list[dict[str, str]]`, so a call site passing a *variable* annotated `list[dict[str, str]]` now fails the type check — re-annotate it `list[Message]`. Inline message-dict literals are unaffected, and runtime behaviour is identical either way (a `TypedDict` is a plain `dict`).
-
-> **Deprecated alias.** `stream_text_with_log` is the old name for
-> `text_llm_call_stream`; it still works (same signature and behaviour) but
-> warns `DeprecationWarning` and is removed in 1.0. Switch the call.
-
-> **Two defaults worth knowing up front.**
-> - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere sends **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded unchanged. (Earlier releases defaulted to `0.2`.) Google is retiring sampling parameters on Gemini, so an explicit value will fail on models that reject it — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
-> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
 ### Reusing call options
 
@@ -312,9 +373,13 @@ llmkit chooses no temperature of its own (`DEFAULT_TEMPERATURE` is `None`), so t
 | `temperature=None` | the same as passing nothing | **no `temperature` key at all** |
 | `temperature=0.5` (any number, incl. `0.0`) | your value, forwarded unchanged | `temperature: 0.5` |
 
-`None` is accepted on every call surface — structured, plain-text, streaming, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
+"Wire" is what llmkit hands LiteLLM. On every route but one that is also what
+reaches the provider; the exception is Gemini 3 on Google AI Studio and Vertex
+AI, where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
-**Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded unchanged on every provider, Gemini included: llmkit neither drops it nor warns, so on a model that rejects it the call fails loudly with the provider's error. One wrinkle remains on the Google AI Studio and Vertex AI routes: with every *released* LiteLLM, `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
+`None` is accepted on every call surface — structured, plain-text, streaming, tool calls, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
+
+**Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded unchanged on every provider, Gemini included: llmkit neither drops it nor warns, so on a model that rejects it the call fails loudly with the provider's error. One wrinkle remains on the Google AI Studio and Vertex AI routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
 
 ### Contracts as JSON-schema dicts
 
@@ -465,7 +530,7 @@ the supported subset — a subschema applicator, a multi-variant union, a typed
 silently changes the shape the model validates rather than merely leaving a
 value unchecked.
 
-### Rate limiting
+## Rate limiting
 
 Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions:
 
@@ -482,9 +547,9 @@ from llmkit import configure_rate_limit
 configure_rate_limit(rpm=3_500, tpm=2_000_000)
 ```
 
-RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset sends a request **byte-identical** to the pre-feature behaviour (no throttle on those dimensions). The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A plain *text* streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for those calls. `tool_llm_call_stream` is the exception: it asks the provider for usage on the stream, so it debits TPM like a buffered call.)
+RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A plain *text* streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for those calls. `tool_llm_call_stream` is the exception: it asks the provider for usage on the stream, so it debits TPM like a buffered call.)
 
-#### Adaptive concurrency
+### Adaptive concurrency
 
 The per-provider concurrency limit is **adaptive by default**: when a provider pushes back with an overload signal (HTTP **429 / 503 / 529**), llmkit lowers that provider's in-flight limit, and raises it back toward `max_concurrent` once the provider stops pushing back — a TCP-style additive-increase / multiplicative-decrease (AIMD) loop, with **zero per-account tuning**. It *discovers* a safe concurrency under a sustained-overload window that a fixed cap cannot ride out, and is the library-side generalization of a hand-tuned RPM ceiling.
 
@@ -494,10 +559,10 @@ It only ever lowers the limit *below* `max_concurrent`, never above, so a provid
 from llmkit import configure_rate_limit
 
 configure_rate_limit(max_concurrent=8)             # adaptive (the default)
-configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, pre-feature behaviour
+configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, never adjusted
 ```
 
-#### Observing backpressure
+### Observing backpressure
 
 Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` each time a provider's limit changes (`reason` is `"throttle"` or `"recover"`) or — when the circuit breaker is armed, [below](#circuit-breaker) — the breaker changes state (`"breaker_open"`, `"breaker_half_open"`, `"breaker_closed"`). It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
 
@@ -513,7 +578,7 @@ with backpressure_callback(on_backpressure):
 
 A callback that raises is swallowed and logged — observability can never break a call.
 
-#### Circuit breaker
+### Circuit breaker
 
 Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** is the "limit is effectively 0 while the provider is down" case it cannot express. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Once a provider's throttle rate over a rolling window (the last 20 real outcomes, at least half of them throttled) trips it, llmkit **fails fast** for that provider: every call raises `CircuitOpenError` *immediately* — holding no concurrency slot and deducting no RPM token — for a cooldown, instead of letting each call burn its retry budget into the storm (the load-*adding* pathology of retries under sustained overload). After the cooldown a single probe tests recovery: a clean success closes the breaker, any failure re-opens it for another cooldown.
 
@@ -528,9 +593,9 @@ except CircuitOpenError as exc:
     ...  # the breaker is open for exc.provider — fall back fast, don't hammer it
 ```
 
-It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it** — retrying a circuit you already know is open would defeat the point. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and three switches" (`enabled` / `adaptive` / `breaker`).
+It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it by default** — retrying a circuit you already know is open would defeat the point. A caller that lists `CircuitOpenError` explicitly in a `retry_on` opts back in. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and three switches" (`enabled` / `adaptive` / `breaker`).
 
-#### Joining the global rate limit directly
+### Joining the global rate limit directly
 
 llmkit's own call functions already pass every provider call through the
 global, per-provider limit (concurrency on by default; RPM/TPM when
@@ -574,10 +639,9 @@ if get_rate_limit_config().enabled:
     ...
 ```
 
-`get_rate_limit_config().enabled` is the public replacement for the old
-`GlobalRateLimiter.is_enabled()` check; `GlobalRateLimiter` itself is no longer
-part of the headline surface (it remains importable from `llmkit.rate_limiting`
-for internal use).
+`get_rate_limit_config().enabled` is the public way to ask whether limiting is
+on; `GlobalRateLimiter` in `llmkit.rate_limiting` is internal machinery, not
+part of the public surface.
 
 ## Logging: agent-readable by default
 
@@ -586,7 +650,7 @@ for internal use).
 1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call — including passes of your own `with_retries` loop — are joinable from the file heads alone). Small metadata is next; the large `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
 2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
-```
+```yaml
 # ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 1840ms | $0.0007
 # 2026-06-05T14:22:31.004512 | call=9f3c21ab attempt=1
 
@@ -599,9 +663,12 @@ schema: Summary
 run_id: nightly-eval-2026-06-05
 call_id: 9f3c21ab54d64f1f8f2c14febc03a7d1
 attempt: 1
-temperature: 0.0
+temperature: null
 max_tokens: null
 reasoning_effort: null
+tools: null
+tool_calls: null
+usage: null
 duration_ms: 1840.2
 queue_wait_ms: 0.4
 approximate_cost: 0.0007
@@ -610,7 +677,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. plain-text streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, or `temperature=None`) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. plain-text streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, or `temperature=None`) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present: the tool lanes fill them with the offered tools, the returned calls, and the token counts, and every other call writes `null`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
 
 ### Grouping calls by run
 
@@ -639,7 +706,7 @@ llmkit.get_run_id()                            # what's in force right now
 LLMKIT_RUN_ID=nightly-eval-2026-06-05 python -m your_eval_sweep
 ```
 
-The environment variable is the lowest layer, so an explicit `set_run_id` or `run_scope` overrides it; a blank one counts as unset. A blank *programmatic* value raises instead — pass `None` to mean "no run id". With nothing set, `run_id` is `null` and records are otherwise exactly what llmkit wrote before this existed.
+The environment variable is the lowest layer, so an explicit `set_run_id` or `run_scope` overrides it; a blank one counts as unset. A blank *programmatic* value raises instead — pass `None` to mean "no run id". With nothing set, `run_id` is `null` and the rest of each record is unchanged.
 
 Which of the two programmatic setters you want depends on your concurrency, because they fail in opposite directions. `run_scope` is context-scoped: it survives the sync bridge (a `*_sync` call runs on llmkit's persistent loop inside a copy of your context), but a `threading.Thread` you start yourself gets a *fresh* context and will not see it. `set_run_id` is a process global — visible from every thread and every loop, but a single value, so it cannot express two runs overlapping in one process. Use `set_run_id` for "this process is one run" (including a thread-pool fan-out), `run_scope` for a host driving several runs at once.
 
@@ -653,13 +720,13 @@ The default directory is resolved **lazily at the first write** and then frozen 
 2. `data/llm-logs/` under the nearest ancestor directory carrying a `pyproject.toml` or `.git` (nearest wins) — and when the sink creates that directory it also seeds a `.gitignore`, so prompt logs never land in your repository's history;
 3. otherwise a per-user state directory (`$XDG_STATE_HOME/llmkit/llm-logs` on Linux, `~/Library/Logs/llmkit` on macOS, `%LOCALAPPDATA%\llmkit\logs` on Windows) — never a CWD-relative path.
 
-The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=...)` is used as given, made absolute at construction so that a *relative* path (or a relative `LLMKIT_LOG_DIR`) names one directory for the sink's lifetime instead of following the process around. Pass `configure_llm_logging(None)` to disable logging entirely.
+The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=Path(...))` — a `pathlib.Path`; a plain string raises `TypeError` — is used as given, made absolute at construction so that a *relative* path (or a relative `LLMKIT_LOG_DIR`) names one directory for the sink's lifetime instead of following the process around. Pass `configure_llm_logging(None)` to disable logging entirely.
 
 On POSIX, a sink-created directory is `0o700` and log files are `0o600` — prompt data is owner-only by default. A pre-existing directory is never re-chmodded: pre-create the directory yourself to share logs with other readers.
 
 ### Retention: bounded by default
 
-Long-running services no longer accumulate unbounded prompt data. By default the sink prunes per-call YAML files older than **30 days** and rotates `index.jsonl` past **50 MiB** to a date-stamped sibling (which ages out under the same policy). Housekeeping runs on the write path, throttled to once per hour, off the event loop.
+Long-running services do not accumulate unbounded prompt data: by default the sink prunes per-call YAML files older than **30 days** and rotates `index.jsonl` past **50 MiB** to a date-stamped sibling (which ages out under the same policy). Housekeeping runs on the write path, throttled to once per hour, off the event loop.
 
 ```python
 LocalYamlLogSink(retention_days=None)                  # keep everything forever
@@ -778,10 +845,9 @@ ignored.** Each provider declares which provider-shaped fields it honours, and
 `build_provider` / `make_provider` raise a clear `ValueError` if the config
 carries any other populated one — an `api_key` for Bedrock/Vertex, a `base_url`
 for a fixed-endpoint provider, a non-default `gemini_structured_output` for a
-non-Gemini provider. Populate only the fields the active provider uses. (This
-closes a silent-misconfiguration footgun: a config generically filled from a
-settings object no longer *looks* like it pinned a credential or endpoint that
-was in fact dropped.)
+non-Gemini provider. Populate only the fields the active provider uses. A config
+generically filled from a settings object therefore cannot *look* like it pinned
+a credential or endpoint that was in fact dropped.
 
 **`api_key` is masked in the config's `repr`.** A set key renders as
 `api_key=<redacted>`, so a stray `print(config)`, log line, or traceback never
@@ -801,7 +867,7 @@ fallback to an ambient key:
 | `GOOGLE` (AI Studio) | `GEMINI_API_KEY` |
 
 `OLLAMA` needs no key; `BEDROCK` and `VERTEX` authenticate through their ambient
-AWS / Google credential chains (below), so none of the three accepts an
+AWS / Google credential chains ([see below](#bedrock-and-vertex-do-not-own-their-endpoints)), so none of the three accepts an
 `api_key`.
 
 **Endpoint resolution is explicit too.** Every provider that accepts a
@@ -838,7 +904,8 @@ it costs.
 deliberate: its base is the one that cannot be a constant. The AI Studio base
 carries an API *version* that LiteLLM derives **from the model** — `v1alpha` for
 Gemini 3 and newer, `v1beta` otherwise — and it applies that only when no
-`api_base` is given; a base that *is* given is used verbatim. Measured against
+`api_base` is given; a base that *is* given is used verbatim (that derivation
+is unchanged at litellm 1.104.0, the supported floor). Measured against
 litellm 1.92.0 (2026-07-21): pinning
 `https://generativelanguage.googleapis.com/v1beta` sent `gemini-3-pro-preview`
 to `/v1beta` where it had gone to `/v1alpha`, and pinning the bare host dropped
@@ -853,24 +920,24 @@ endpoint can still come from a source llmkit does not read — notably the
 `litellm.api_base` module global. Naming a `base_url` or setting
 `GEMINI_API_BASE` closes it.
 
-**The listed variables are still honoured** — llmkit now reads them itself, in
-the order shown (LiteLLM's own measured precedence), so a host that points its
-endpoint with one of them is unaffected. What changed is the *closure*, and it
-covers `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, and a `GOOGLE` that has a `base_url`
-or `GEMINI_API_BASE`: for those, sources llmkit does not read can no longer
-choose the endpoint — the `litellm.api_base` module global, a LiteLLM
-key-management backend serving one of these names, or an alias some future
-LiteLLM release adds. That is a closed fix rather than a blocklist chasing an
-unversioned dependency, and it is the same bargain `api_key` already strikes:
-make the ambient fallback explicit, documented, and tested rather than delete
-it. With nothing configured, the outbound request is byte-identical to before.
+**llmkit reads the listed variables itself**, in the order shown (LiteLLM's own
+measured precedence), so a host can point its endpoint with one of them. The
+resolution is *closed* for `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, and a `GOOGLE`
+that has a `base_url` or `GEMINI_API_BASE`: for those, sources llmkit does not
+read cannot choose the endpoint — the `litellm.api_base` module global, a
+LiteLLM key-management backend serving one of these names, or an alias some
+future LiteLLM release adds. That is a closed list rather than a blocklist
+chasing an unversioned dependency, and it is the same bargain `api_key`
+strikes: make the ambient fallback explicit, documented, and tested rather than
+delete it.
 
 Two cases sit **outside** that closure. `GOOGLE` with neither `base_url` nor
 `GEMINI_API_BASE` set is one, per the paragraph above. `OLLAMA` is the other,
 and structurally so: both of its LiteLLM dispatch arms order the chain
 `litellm.api_base or api_base or …` — inverted relative to every other route —
 so for Ollama alone the module global outranks even the `api_base`
-llmkit sends (measured against litellm 1.92.0, 2026-07-21). That is accepted
+llmkit sends (measured against litellm 1.92.0, 2026-07-21; the same ordering is
+in litellm 1.104.0, the supported floor). That is accepted
 rather than fixed: it is a global a host has to set deliberately inside its own
 process, not something the ambient environment or a stray `.env` can reach, and
 closing it would mean reaching into a dependency's globals.
@@ -899,7 +966,7 @@ the two providers whose region knob is a residency control.** An ambient
 endpoint value overrides the region you pinned. With the current default and
 the `us` multi-region location explicitly pinned in both arms:
 
-```
+```text
 BEDROCK, aws_region_name="eu-central-1"
   nothing set   -> https://bedrock-runtime.eu-central-1.amazonaws.com/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
   with the var  -> https://hijacked.invalid/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse
@@ -973,7 +1040,7 @@ configure_llm_client(lambda: LLMClientConfig(
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
-`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit translates the portable setting to its native `reasoning.effort` object: Gemini 3.x receives `"minimal"` because it requires thinking, while other models receive `"none"`. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning.
+`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning.
 
 Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
 
@@ -1038,9 +1105,6 @@ The accessor verbs are split by intent:
   `get_rate_limit_config()` **read** effective state — a snapshot for
   display/telemetry; they construct nothing you keep.
 
-`describe_llm` replaces the old `get_llm_config`, and `build_provider` replaces
-`get_provider`; both old names are gone from the public surface.
-
 ### OpenRouter: schema-honoring routing
 
 OpenRouter is a *router* — it forwards your request to one of several **serving
@@ -1074,65 +1138,87 @@ Routing stays on for the config-driven path (`configure_llm_client` /
 
 ## Retries
 
-Two retry layers, kept deliberately separate:
+Two retry layers, kept deliberately separate: llmkit's own [automatic
+retries](#automatic-retries-on-by-default) across attempts, and
+[instructor's in-call schema repair](#instructors-in-call-schema-repair) within
+one attempt.
 
-- **Transient-provider retries, on by default.** Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable set splits into two budgets the policy counts **separately**:
-  - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
-  - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
-  - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget — never retried**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, so the fix is legible from the error alone: `completion_tokens` at a cap you set means *raise the cap*; a huge count under no cap means *the prompt induces runaway output*. A caller that genuinely wants the resample can opt back in by listing `OutputLimitError` explicitly in `retry_on`.
+### Automatic retries, on by default
 
-  `LLM_RECOVERABLE_ERRORS` remains the documented single catch-set — now the **union of four** subsets: the three above plus `LLM_BACKPRESSURE_ERRORS` (llmkit's own fail-fast `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)). Keep using `LLM_RECOVERABLE_ERRORS` in `except` clauses; the split only changes how the *retry layer* budgets them — and the backpressure/output-limit subsets are deliberately **never retried** (re-asking a known-open circuit or a same-budget truncation is doomed by construction). One footnote on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. If you previously caught `litellm.exceptions.ServiceUnavailableError` directly around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple) instead; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded. Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly. **`Retry-After` is honoured first:** when a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
 
-  Tune or opt out per call with the `retry=` argument:
+- **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
+- **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
+- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. `tool_llm_call_stream` does not re-ask them — see the streaming caveat below.
+- **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, so the fix is legible from the error alone: `completion_tokens` at a cap you set means *raise the cap*; a huge count under no cap means *the prompt induces runaway output*.
+- **Backpressure** (`LLM_BACKPRESSURE_ERRORS`: llmkit's own `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)) also gets **zero budget**: re-asking a circuit already known to be open is doomed by construction.
 
-  ```python
-  from llmkit import structured_llm_call, RetryPolicy, NO_RETRY
+The two zero-budget subsets are fail-fast *defaults*, not prohibitions: a caller that genuinely wants the retry opts back in by listing `OutputLimitError` or `CircuitOpenError` explicitly in a `retry_on`. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
-  # Opt this one call out of automatic retries (e.g. latency-sensitive):
-  result = await structured_llm_call(
-      prompt="Summarize the attached report.",
-      output_schema=Summary,
-      feature="reports",
-      label="exec_summary",
-      retry=NO_RETRY,
-  )
+**`LLM_RECOVERABLE_ERRORS` is the single catch-set** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
 
-  # Or tune the budget / backoff for this call:
-  result = await structured_llm_call(
-      prompt="Summarize the attached report.",
-      output_schema=Summary,
-      feature="reports",
-      label="exec_summary",
-      retry=RetryPolicy(max_attempts=5, backoff_base_seconds=1.0),
-  )
-  ```
+### Backoff and `Retry-After`
 
-  **Streaming caveat:** `text_llm_call_stream` and `tool_llm_call_stream` can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
+Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly.
 
-  **`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) remains the explicit, composable advanced path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**); the previously-deprecated `max_retries` alias has been removed outright, so passing it now raises `TypeError`. Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+**`Retry-After` is honoured first.** When a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call, plus a random jitter of up to `backoff_base_seconds` so a fan-out doesn't retry in lockstep. The sleep can therefore exceed the cap by up to `backoff_base_seconds`; with a base of 0 it is exactly the capped server value. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged.
 
-  ```python
-  from llmkit.retry import with_retries
-  from llmkit import LLM_TRANSPORT_ERRORS
+### Tuning or opting out per call
 
-  result = await with_retries(
-      lambda: do_some_work(),
-      max_attempts=3,
-      backoff_base_seconds=0.5,
-      retry_on=LLM_TRANSPORT_ERRORS,
-  )
-  ```
+Pass `retry=` to any call function:
 
-  A `RetryProgressCallback` is invoked once per non-final failed attempt with keyword arguments `label`, `attempt`, `max_attempts`, and `error` — the callback keyword is `max_attempts` (it was previously `max_retries`; rename it):
+```python
+from llmkit import structured_llm_call, RetryPolicy, NO_RETRY
 
-  ```python
-  def on_retry(*, label: str, attempt: int, max_attempts: int, error: BaseException) -> None:
-      print(f"{label}: attempt {attempt}/{max_attempts} failed: {error}")
-  ```
+# Opt this one call out of automatic retries (e.g. latency-sensitive):
+result = await structured_llm_call(
+    prompt="Summarize the attached report.",
+    output_schema=Summary,
+    feature="reports",
+    label="exec_summary",
+    retry=NO_RETRY,
+)
 
-  > **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active llmkit retry loop **owned by the current `asyncio` task** and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. The task scoping bounds the guard to the pattern it warns about: a nested loop awaited inline in the same task, whose failure really does propagate out to the outer loop. A *distinct* llmkit call that merely inherited the scope across a task boundary keeps its full retry budget — an `on_result` hook calling `structured_llm_call_sync` / `text_llm_call_sync` (the sync bridge drives the coroutine as a new task on llmkit's persistent loop), or a call spawned with `asyncio.create_task` from inside an attempt. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`. Either way the call joins the loop's logical call: each pass's record carries the same `call_id` and the next `attempt`.
+# Or tune the budget / backoff for this call:
+result = await structured_llm_call(
+    prompt="Summarize the attached report.",
+    output_schema=Summary,
+    feature="reports",
+    label="exec_summary",
+    retry=RetryPolicy(max_attempts=5, backoff_base_seconds=1.0),
+)
+```
 
-- **instructor's own in-call schema repair** re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError` (a failing async field validator included), or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the cross-call layer above, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the cross-call retry layer above: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
+**Streaming caveat:** `text_llm_call_stream` and `tool_llm_call_stream` can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
+
+### Wrapping your own work: `with_retries()`
+
+**`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) is the explicit, composable path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**). Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+
+```python
+from llmkit.retry import with_retries
+from llmkit import LLM_TRANSPORT_ERRORS
+
+result = await with_retries(
+    lambda: do_some_work(),
+    max_attempts=3,
+    backoff_base_seconds=0.5,
+    retry_on=LLM_TRANSPORT_ERRORS,
+)
+```
+
+A `RetryProgressCallback` is invoked once per non-final failed attempt with keyword arguments `label`, `attempt`, `max_attempts`, and `error`:
+
+```python
+def on_retry(*, label: str, attempt: int, max_attempts: int, error: BaseException) -> None:
+    print(f"{label}: attempt {attempt}/{max_attempts} failed: {error}")
+```
+
+> **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active llmkit retry loop **owned by the current `asyncio` task** and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. The task scoping bounds the guard to the pattern it warns about: a nested loop awaited inline in the same task, whose failure really does propagate out to the outer loop. A *distinct* llmkit call that merely inherited the scope across a task boundary keeps its full retry budget — an `on_result` hook calling `structured_llm_call_sync` / `text_llm_call_sync` (the sync bridge drives the coroutine as a new task on llmkit's persistent loop), or a call spawned with `asyncio.create_task` from inside an attempt. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`. Either way the call joins the loop's logical call: each pass's record carries the same `call_id` and the next `attempt`.
+
+### instructor's in-call schema repair
+
+instructor re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError` (a failing async field validator included), or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the automatic layer, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the automatic layer: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ### Re-rolling on a semantically-bad result
 
@@ -1163,6 +1249,14 @@ uv run basedpyright          # recommended tier; clean with no baseline
 uv run pytest
 ```
 
+These four are the offline checks CI runs on every push and pull request; plain
+`uv run pytest` needs no network and no credentials. A change to provider
+behaviour (a structured-output mode pin, a default model, an adapter) also needs
+the live provider suite, `uv run pytest tests/integration --run-live`, which
+makes real calls and needs every provider's credentials. The full requirements
+are in [`docs/work/definition-of-done.md`](docs/work/definition-of-done.md), and
+the contribution workflow is in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Status & support
 
 `llmkit` is a small, opinionated, **best-effort** project, extracted from a real
@@ -1170,6 +1264,13 @@ application and maintained in the open. It is used in production by its author
 but carries no support SLA. Bug reports and focused pull requests are welcome —
 see [CONTRIBUTING.md](CONTRIBUTING.md). For security issues, see
 [SECURITY.md](SECURITY.md).
+
+Releases follow [Semantic Versioning](https://semver.org/). While the version is
+below 1.0, a minor release can carry breaking changes; every one is called out
+under **Breaking** in [CHANGELOG.md](CHANGELOG.md), along with migration notes
+for renamed or removed APIs. This README describes the code on `main`, so it can
+run ahead of the latest release on PyPI — check the changelog's `[Unreleased]`
+section for what has not shipped yet.
 
 ## License
 
