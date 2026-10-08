@@ -194,6 +194,19 @@ jobs:
           print("wheel smoke test passed")
           PY
 
+  docs-links:
+    # Relative links in every tracked Markdown file must resolve. The docs-only
+    # lane in docs/work/definition-of-done.md skips every other job here, so
+    # this is the one check a prose-only change still has to pass — moving or
+    # renaming a document breaks links in files the diff never touched.
+    # Standard library only: no uv sync, no matrix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check relative Markdown links
+        run: python3 scripts/check_doc_links.py
+
   ci-ok:
     # The single context branch protection requires. `check` is a matrix job, so
     # it never reports under that bare name — it reports as `check (ubuntu-latest,
@@ -202,7 +215,7 @@ jobs:
     # merges only by admin bypass, which is indistinguishable from a gate that
     # works. One aggregator name is also stable across matrix edits: adding a
     # Python version here never needs a matching edit in repo settings.
-    needs: [check, floors, package]
+    needs: [check, floors, package, docs-links]
     # `always()` is load-bearing. Without it a failed dependency skips this job,
     # and GitHub counts a skipped required check as satisfied — the misconfigured
     # state this job exists to end, arrived at from the other direction.
@@ -217,8 +230,8 @@ jobs:
         # from the list, leaving the survivors to report a unanimous success.
         # Bump EXPECTED when adding a job to `needs`.
         env:
-          RESULTS: ${{ needs.check.result }} ${{ needs.floors.result }} ${{ needs.package.result }}
-          EXPECTED: "3"
+          RESULTS: ${{ needs.check.result }} ${{ needs.floors.result }} ${{ needs.package.result }} ${{ needs.docs-links.result }}
+          EXPECTED: "4"
         run: |
           echo "upstream results: ${RESULTS}"
           seen=0

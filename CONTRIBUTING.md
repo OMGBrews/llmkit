@@ -14,7 +14,7 @@ uv sync
 
 ## Checks must pass
 
-CI runs the same four gates on every push and pull request:
+Before opening a PR, run the four checks every code change needs:
 
 ```bash
 uv run ruff check .
@@ -23,10 +23,10 @@ uv run basedpyright          # recommended tier, clean with no baseline
 uv run pytest
 ```
 
-CI additionally runs a lowest-versions resolution job (`--resolution
-lowest-direct`), a wheel smoke test, and a weekly unlocked-resolution cron —
-those rarely concern a PR author, so the four gates above are what to run before
-opening a PR.
+The complete list — the dependency-floors and wheel smoke-test jobs CI adds, the
+documentation link check, the docs-only lane, and when a change also needs the
+live provider suite — is in
+[`docs/work/definition-of-done.md`](docs/work/definition-of-done.md).
 
 basedpyright runs in its `recommended` tier (stricter than the `standard`
 default, and at least as strict as the editor extension's defaults) and is clean
@@ -134,5 +134,6 @@ uv run pytest tests/integration --run-live -k vertex
 
 - [`README.md`](README.md) — what `llmkit` is, how to use it, and its scope.
 - [`PRINCIPLES.md`](PRINCIPLES.md) — the design principles behind the library.
+- [`docs/work/definition-of-done.md`](docs/work/definition-of-done.md) — every required check and when it applies.
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability.
 - [`CHANGELOG.md`](CHANGELOG.md) — release history.
