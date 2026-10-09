@@ -112,11 +112,13 @@ async def test_truncated_call_yaml_keeps_partial_text_and_usage(log_dir: Path) -
     assert doc["response"] is None
     assert doc["call_id"] is not None
     assert doc["attempt"] == 1
-    assert doc["usage"] is None  # tool-lane only; unchanged
+    # The truncated completion's counts are in ``usage`` too, so every attempt
+    # that reported usage logs it in the same field.
+    assert doc["usage"] == {"prompt_tokens": 7, "completion_tokens": 64, "total_tokens": 71}
 
     [line] = _index_lines(log_dir)
     entry = cast("dict[str, object]", json.loads(line))
-    assert not {"partial_text", "output_limit"} & entry.keys()
+    assert not {"partial_text", "output_limit", "usage"} & entry.keys()
     assert all('{"ok": tru' not in str(value) for value in entry.values())
 
 

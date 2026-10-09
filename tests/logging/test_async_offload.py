@@ -29,7 +29,7 @@ import pytest
 from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
 from llmkit import calls as llm_calls
 from llmkit.capture import capture_llm_log_paths, record_call_async
-from tests._support import OkSchema, provider_mock
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
 from tests._support import make_record as _record
 
 
@@ -50,8 +50,10 @@ async def test_structured_call_writes_log_off_the_event_loop() -> None:
     """The structured path's sink write runs on a worker thread, not the
     thread driving the event loop."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
@@ -71,8 +73,10 @@ async def test_structured_call_writes_log_off_the_event_loop() -> None:
 async def test_text_call_writes_log_off_the_event_loop() -> None:
     """Same off-loop guarantee for the buffered text path."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "hello", None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "hello", None, NO_USAGE
 
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
@@ -210,8 +214,10 @@ async def test_loop_stays_responsive_during_a_slow_write() -> None:
 
             time.sleep(0.15)
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     ticks = [0]
     stop = asyncio.Event()
@@ -243,8 +249,10 @@ async def test_log_path_is_captured_before_the_call_returns(tmp_path: Path) -> N
     """The documented capture contract survives the offload: the written
     path is in the capture list at the moment the call returns."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
@@ -274,8 +282,10 @@ async def test_cancellation_mid_write_still_lands_the_record(tmp_path: Path) -> 
             _ = release_write.wait(timeout=5)
             return super().write_returning_path(record)
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     configure_llm_logging(_BlockingSink(tmp_path))
     try:
@@ -325,8 +335,10 @@ def test_sync_bridge_call_writes_and_captures_through_the_offload(tmp_path: Path
     YAML and captures its path before returning — the offload composes with
     the bridge's context propagation."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:

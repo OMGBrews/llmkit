@@ -39,7 +39,7 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.capture import capture_llm_log_paths
-from tests._support import OkSchema
+from tests._support import NO_USAGE, OkSchema, UsageCounts
 
 # Backoff set to 0.0 so these tests retry without real sleeps (the default
 # backoff itself is pinned in test_retry_policy.py).
@@ -60,11 +60,13 @@ async def test_structured_transient_error_is_retried_then_succeeds() -> None:
     succeeds with no caller wrapping; the transport is invoked twice."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await llm_calls.structured_llm_call(
@@ -117,11 +119,13 @@ async def test_structured_custom_policy_succeeds_on_last_attempt() -> None:
     failures before a success on the final attempt."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] < 4:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     policy = RetryPolicy(max_attempts=4, backoff_base_seconds=0.0)
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
@@ -157,11 +161,13 @@ async def test_each_attempt_is_its_own_logged_call(tmp_path: Path) -> None:
     ``capture_llm_log_paths`` the two attempts yield two captured paths."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
@@ -188,11 +194,13 @@ async def test_text_transient_error_is_retried_then_succeeds() -> None:
     """``text_llm_call`` retries a transient error then returns the text."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return "hello", None
+        return "hello", None, NO_USAGE
 
     configure_llm_logging(None)
     try:

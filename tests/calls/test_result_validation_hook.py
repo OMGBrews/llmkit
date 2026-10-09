@@ -32,6 +32,7 @@ from llmkit.calls import (
     structured_llm_call,
     text_llm_call,
 )
+from tests._support import NO_USAGE, UsageCounts
 
 
 class _Schema(BaseModel):
@@ -56,9 +57,9 @@ async def test_structured_on_result_rejects_then_accepts() -> None:
     """A bad-then-good result re-rolls and returns the accepted one."""
     calls = [0]
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
         calls[0] += 1
-        return _Schema(n=calls[0]), None
+        return _Schema(n=calls[0]), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await structured_llm_call(
@@ -76,9 +77,9 @@ async def test_persistent_rejection_uses_validation_budget_not_transport() -> No
     the full transport budget on doomed re-rolls."""
     calls = [0]
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
         calls[0] += 1
-        return _Schema(n=0), None
+        return _Schema(n=0), None, NO_USAGE
 
     def _always_reject(_r: _Schema) -> None:
         raise ResultValidationError("never good enough")
@@ -101,9 +102,9 @@ async def test_on_result_that_accepts_does_not_re_roll() -> None:
     calls = [0]
     seen: list[int] = []
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
         calls[0] += 1
-        return _Schema(n=5), None
+        return _Schema(n=5), None, NO_USAGE
 
     def _accept(result: _Schema) -> None:
         seen.append(result.n)
@@ -123,9 +124,9 @@ async def test_no_retry_makes_rejection_propagate_after_one_attempt() -> None:
     """``retry=NO_RETRY`` disables the re-roll: one attempt, then propagate."""
     calls = [0]
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
         calls[0] += 1
-        return _Schema(n=0), None
+        return _Schema(n=0), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
@@ -143,9 +144,9 @@ async def test_text_on_result_rejects_then_accepts() -> None:
     """The hook re-rolls a plain-text call too (e.g. reject empty output)."""
     calls = [0]
 
-    async def _transport(*_a: object, **_k: object) -> tuple[str, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
         calls[0] += 1
-        return ("" if calls[0] == 1 else "ok"), None
+        return ("" if calls[0] == 1 else "ok"), None, NO_USAGE
 
     def _reject_empty(text: str) -> None:
         if not text:
@@ -165,9 +166,9 @@ async def test_rejected_attempt_is_its_own_logged_record() -> None:
     the response that was rejected, the second clean."""
     calls = [0]
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
         calls[0] += 1
-        return _Schema(n=calls[0]), None
+        return _Schema(n=calls[0]), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),

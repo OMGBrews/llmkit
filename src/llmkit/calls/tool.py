@@ -7,7 +7,7 @@ a permanent reading hazard even though absolute imports make it legal.
 The only family with two result shapes — :class:`~llmkit.ToolCallResult`, or
 :class:`~llmkit.ToolComposeResult` when an ``output_schema`` is supplied on a
 route measured to support composing — and the only one that records the tool
-list, the requested calls and the turn's token usage.
+list and the requested calls.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from llmkit.calls._shared import (
     resolve_model_and_provider,
     run_with_policy,
     tool_validation_budget,
+    usage_log_dict,
 )
 from llmkit.capture import record_call_async
 from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError
@@ -235,15 +236,7 @@ async def tool_llm_call[T: BaseModel](
                     tool_calls=[call.to_wire() for call in result.tool_calls]
                     if result is not None
                     else None,
-                    usage=(
-                        None
-                        if result is None
-                        else {
-                            "prompt_tokens": result.usage.prompt_tokens,
-                            "completion_tokens": result.usage.completion_tokens,
-                            "total_tokens": result.usage.total_tokens,
-                        }
-                    ),
+                    usage=usage_log_dict(result.usage if result is not None else None),
                 )
             )
 

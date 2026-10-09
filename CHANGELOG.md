@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Structured and buffered text calls log their token usage.** The call
+  log's `usage` field (`prompt_tokens` / `completion_tokens` /
+  `total_tokens`, each `null` when the provider did not report it) was filled
+  only by the tool lanes; `structured_llm_call` and `text_llm_call` (and their
+  `_sync` forms) now fill it from the same response they already read to debit
+  the tokens-per-minute limiter, so a successful call no longer logs fewer
+  token facts than a truncated one. A truncated structured attempt carries the
+  same counts in `usage` as in `output_limit`; an attempt whose result an
+  `on_result` hook rejected keeps its counts; any other failed attempt still
+  writes `null`. `text_llm_call_stream` does not ask the provider for usage
+  and still writes `null`. `index.jsonl` is unchanged and does not carry
+  `usage`.
+
 ## [0.11.0] — 2026-10-08
 
 ### Added

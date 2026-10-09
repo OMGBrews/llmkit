@@ -31,6 +31,7 @@ from llmkit import (
     make_provider,
 )
 from llmkit.calls import structured_llm_call, text_llm_call
+from tests._support import NO_USAGE, UsageCounts
 
 
 class _Schema(BaseModel):
@@ -63,8 +64,8 @@ async def test_structured_per_call_only_runs_and_logs_effective_provider(
     """A structured call with only a per-call ``provider=`` (no global source)
     runs, and the log records the effective per-call provider + model."""
 
-    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None]:
-        return _Schema(ok=True), 0.0
+    async def _transport(*_a: object, **_k: object) -> tuple[_Schema, float | None, UsageCounts]:
+        return _Schema(ok=True), 0.0, NO_USAGE
 
     provider = make_provider(Provider.OPENAI, api_key="sk-test", model="gpt-4.1")
 
@@ -88,8 +89,8 @@ async def test_text_per_call_only_runs_and_logs_effective_provider(
 ) -> None:
     """The text path is per-call-only too: it runs and logs the per-call provider."""
 
-    async def _transport(*_a: object, **_k: object) -> tuple[str, float | None]:
-        return "hello", 0.0
+    async def _transport(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
+        return "hello", 0.0, NO_USAGE
 
     provider = make_provider(Provider.OPENROUTER, api_key="sk-test", model="x/y")
 

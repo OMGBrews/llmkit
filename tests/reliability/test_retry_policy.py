@@ -72,7 +72,13 @@ from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
 )
 from llmkit.retry import with_retries
-from tests._support import OkSchema, capture_structured_provider_kwargs, quiet_logging
+from tests._support import (
+    NO_USAGE,
+    OkSchema,
+    UsageCounts,
+    capture_structured_provider_kwargs,
+    quiet_logging,
+)
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
 
@@ -133,11 +139,13 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
 
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     configure_llm_logging(None)
     try:
@@ -281,11 +289,13 @@ async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
     """A 429 ``RateLimitError`` is transient: retried once, then succeeds."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise _status_error(openai.RateLimitError, 429)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await llm_calls.structured_llm_call(
@@ -325,11 +335,13 @@ async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
     """A transient litellm 503 is recovered: retried once, then succeeds."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise _litellm_503()
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await llm_calls.structured_llm_call(
@@ -543,11 +555,13 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
     ``call_id`` and number their attempts 1, 2."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     async def _wrapped() -> OkSchema:
         return await llm_calls.structured_llm_call(
@@ -651,15 +665,19 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
     outer_calls = [0]
     inner_calls = [0]
 
-    async def _outer_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _outer_transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         outer_calls[0] += 1
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
-    async def _inner_transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+    async def _inner_transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         inner_calls[0] += 1
         if inner_calls[0] < 3:
             raise TimeoutError("transient")
-        return "done", None
+        return "done", None, NO_USAGE
 
     def hook(_result: OkSchema) -> None:
         _ = llm_calls.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
@@ -994,11 +1012,13 @@ async def test_transiently_malformed_json_gets_one_cross_call_validation_retry()
     is still recovered: the one validation retry yields a clean parse."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise _make_validation_error()
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await llm_calls.structured_llm_call(

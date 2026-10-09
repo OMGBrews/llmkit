@@ -39,7 +39,7 @@ from llmkit import (
 )
 from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.rate_limiting._observability import _queue_wait_ms
-from tests._support import OkSchema, provider_mock
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
 from tests._support import make_record as _record
 
 _NO_BACKOFF = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
@@ -54,11 +54,13 @@ async def test_retried_structured_call_shares_call_id_and_numbers_attempts() -> 
     ``call_id``, with attempts numbered 1..3."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] < 3:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
@@ -81,8 +83,10 @@ async def test_retried_structured_call_shares_call_id_and_numbers_attempts() -> 
 async def test_separate_logical_calls_get_distinct_call_ids() -> None:
     """Two calls — even identical ones — never share a ``call_id``."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
@@ -101,8 +105,10 @@ async def test_separate_logical_calls_get_distinct_call_ids() -> None:
 async def test_text_call_records_correlation() -> None:
     """The buffered text surface carries the same correlation fields."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "hello", None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "hello", None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_text", side_effect=_transport),
@@ -158,8 +164,10 @@ def test_sync_bridge_carries_correlation() -> None:
     """``structured_llm_call_sync`` records ``call_id``/``attempt`` exactly
     like the async path — the fields cross the ``run_sync`` bridge."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
@@ -182,9 +190,11 @@ async def test_queue_wait_recorded_when_transport_acquires() -> None:
     """An attempt whose transport passed through the limiter records a
     non-``None`` ``queue_wait_ms`` (≈0 when uncontended)."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         async with GlobalRateLimiter.acquire_async("Google AI Studio"):
-            return OkSchema(ok=True), None
+            return OkSchema(ok=True), None, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_transport),

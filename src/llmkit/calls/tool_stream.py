@@ -34,7 +34,12 @@ from contextlib import aclosing
 from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
-from llmkit.calls._shared import parse_tool_calls, prepare_call, resolve_model_and_provider
+from llmkit.calls._shared import (
+    parse_tool_calls,
+    prepare_call,
+    resolve_model_and_provider,
+    usage_log_dict,
+)
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
 from llmkit.capture import record_call, record_call_async
 from llmkit.logging import LLMCallRecord
@@ -295,15 +300,7 @@ async def _stream_tools_once(
             tool_calls=[call.to_wire() for call in result.tool_calls]
             if result is not None
             else None,
-            usage=(
-                None
-                if result is None
-                else {
-                    "prompt_tokens": result.usage.prompt_tokens,
-                    "completion_tokens": result.usage.completion_tokens,
-                    "total_tokens": result.usage.total_tokens,
-                }
-            ),
+            usage=usage_log_dict(result.usage if result is not None else None),
         )
         if error == STREAM_ABANDONED_ERROR:
             # Abandonment unwinds via GeneratorExit / a re-deliverable

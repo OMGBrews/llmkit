@@ -226,7 +226,7 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
         patch.object(GlobalRateLimiter, "acquire_async", _record),
         patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion),
     ):
-        text, _cost = await _litellm.acompletion_text(
+        text, _cost, _usage = await _litellm.acompletion_text(
             "hi",
             temperature=0.0,
             model=None,
@@ -1454,7 +1454,7 @@ async def test_call_layer_debits_tpm_from_response_usage(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
-        text, _cost = await _litellm.acompletion_text(
+        text, _cost, _usage = await _litellm.acompletion_text(
             "hi",
             temperature=0.0,
             model=None,

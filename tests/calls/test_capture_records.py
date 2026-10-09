@@ -24,11 +24,13 @@ from llmkit import (
 from llmkit import (
     calls as llm_calls,
 )
-from tests._support import OkSchema, provider_mock
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
 
 
-async def _fake_structured(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-    return OkSchema(ok=True), 0.0042
+async def _fake_structured(
+    *_args: object, **_kwargs: object
+) -> tuple[OkSchema, float | None, UsageCounts]:
+    return OkSchema(ok=True), 0.0042, NO_USAGE
 
 
 def test_capture_records_yields_record_with_cost_async() -> None:
@@ -114,8 +116,10 @@ def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
 def test_capture_records_captures_text_calls() -> None:
     """``text_llm_call`` records flow into the capture buffer too."""
 
-    async def _fake_text(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "hello", 0.001
+    async def _fake_text(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "hello", 0.001, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
