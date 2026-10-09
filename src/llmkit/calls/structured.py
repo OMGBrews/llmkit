@@ -20,6 +20,7 @@ from llmkit.calls._shared import (
     prepare_call,
     resolve_model_and_provider,
     result_validation_budget,
+    run_cached,
     run_with_policy,
     usage_log_dict,
 )
@@ -47,6 +48,7 @@ async def structured_llm_call[T: BaseModel](
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -107,6 +109,12 @@ async def structured_llm_call[T: BaseModel](
             :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
             its own logged call; this layer stays separate from instructor's
             in-call schema-repair budget.
+        cache: Whether this call reads and writes the response cache
+            configured with :func:`~llmkit.configure_llm_cache` (a no-op when
+            none is). Unset defers to ``options``, then to ``True``. ``False``
+            bypasses lookup, request coalescing and store — pass it when
+            re-sending the same prompt to get a different sample, since a
+            cache returns the first sample of an identical request.
         on_result: Optional semantic-validation hook. Called with the parsed
             result of each attempt; raise
             :class:`~llmkit.ResultValidationError` from it to **reject** a
@@ -119,10 +127,11 @@ async def structured_llm_call[T: BaseModel](
             :class:`~llmkit.ResultValidationError` propagates. ``None`` (the
             default) leaves the call unchanged. Folds an
             LLM-then-validate-then-re-roll loop the caller would otherwise
-            hand-roll into the call itself.
+            hand-roll into the call itself. A cached answer is passed through it
+            too, and a rejection makes that answer a miss for this call.
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
-            ``retry``/``provider`` once for reuse across many calls.
+            ``retry``/``provider``/``cache`` once for reuse across many calls.
             Precedence is **config < options < explicit keyword**, exactly:
             every mergeable keyword above defaults to :data:`~llmkit.UNSET`,
             so any keyword you pass — including ``None``, including a value
@@ -132,7 +141,8 @@ async def structured_llm_call[T: BaseModel](
             flat-keyword path unchanged.
 
     Returns:
-        An instance of *output_schema* populated by the LLM.
+        An instance of *output_schema* populated by the LLM, or decoded from
+        the response cache when an identical request was answered before.
 
     Raises:
         Any exception from the LLM provider or output parser — transient
@@ -141,7 +151,7 @@ async def structured_llm_call[T: BaseModel](
         immediately. The log is still written on every attempt with the
         error recorded.
     """
-    args, provider, call_id, attempt_offset = prepare_call(
+    prepared = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -151,7 +161,9 @@ async def structured_llm_call[T: BaseModel](
         provider=provider,
         feature=feature,
         label=label,
+        cache=cache,
     )
+    args, provider, call_id, attempt_offset = prepared
     attempt_count = 0
 
     async def _attempt() -> T:
@@ -205,25 +217,7 @@ async def structured_llm_call[T: BaseModel](
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
             resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
-            # ``T`` is bounded to ``BaseModel``, so every parsed result dumps;
-            # the cast only launders ``model_dump``'s ``dict[str, Any]``.
-            response_dump: dict[str, JsonValue] | None = None
-            if response is not None:
-                try:
-                    response_dump = cast("dict[str, JsonValue]", response.model_dump())
-                except Exception:
-                    # A custom @field_serializer/@model_serializer on the
-                    # schema raised. The dump exists only for the log, so it
-                    # degrades to None — logging must never break the call
-                    # (success path) or mask the real provider error (error
-                    # path). Same warn pattern as the sink failures in
-                    # llmkit.logging.
-                    logger.warning(
-                        "Failed to serialize LLM response for log %s/%s; recording response as None",
-                        feature,
-                        label,
-                        exc_info=True,
-                    )
+            response_dump = _dump_for_log(response, feature, label)
             _ = await record_call_async(
                 LLMCallRecord(
                     started_at=started_at,
@@ -250,12 +244,83 @@ async def structured_llm_call[T: BaseModel](
                 )
             )
 
-    return await run_with_policy(
-        _attempt,
-        policy=args.retry,
-        tag=label or feature,
-        validation_retry_on=result_validation_budget(args.retry),
+    async def _run() -> T:
+        return await run_with_policy(
+            _attempt,
+            policy=args.retry,
+            tag=label or feature,
+            validation_retry_on=result_validation_budget(args.retry),
+        )
+
+    async def _record_hit(
+        response: T, source_call_id: str | None, started_at: datetime, start_t: float
+    ) -> None:
+        resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
+        _ = await record_call_async(
+            LLMCallRecord(
+                started_at=started_at,
+                feature=feature,
+                label=label,
+                model=resolved_model,
+                provider=resolved_provider,
+                temperature=args.temperature,
+                duration_ms=(time.monotonic() - start_t) * 1000,
+                schema=output_schema.__name__,
+                prompt=prompt,
+                response=_dump_for_log(response, feature, label),
+                error=None,
+                approximate_cost=0.0,
+                max_tokens=args.max_tokens,
+                reasoning_effort=args.reasoning_effort,
+                call_id=call_id,
+                # The hit is this logical call's pass, so an enclosing
+                # ``with_retries`` ledger has already counted it.
+                attempt=attempt_offset + 1,
+                # Never queued: the queue-wait stamp would still hold the
+                # previous attempt's value, so it is not read.
+                queue_wait_ms=None,
+                run_id=get_run_id(),
+                usage=None,
+                cache_hit=True,
+                source_call_id=source_call_id,
+            )
+        )
+
+    return await run_cached(
+        _run,
+        prepared=prepared,
+        prompt=prompt,
+        output_schema=output_schema,
+        # By alias, because ``model_validate_json`` reads aliases back.
+        encode=lambda response: response.model_dump_json(by_alias=True),
+        decode=output_schema.model_validate_json,
+        on_result=on_result,
+        record_hit=_record_hit,
     )
+
+
+def _dump_for_log(
+    response: BaseModel | None, feature: str, label: str | None
+) -> dict[str, JsonValue] | None:
+    """The log record's ``response``: the parsed result's ``model_dump``, or ``None``."""
+    if response is None:
+        return None
+    try:
+        # The cast only launders ``model_dump``'s ``dict[str, Any]``.
+        return cast("dict[str, JsonValue]", response.model_dump())
+    except Exception:
+        # A custom @field_serializer/@model_serializer on the schema raised.
+        # The dump exists only for the log, so it degrades to None — logging
+        # must never break the call (success path) or mask the real provider
+        # error (error path). Same warn pattern as the sink failures in
+        # llmkit.logging.
+        logger.warning(
+            "Failed to serialize LLM response for log %s/%s; recording response as None",
+            feature,
+            label,
+            exc_info=True,
+        )
+        return None
 
 
 def structured_llm_call_sync[T: BaseModel](
@@ -270,6 +335,7 @@ def structured_llm_call_sync[T: BaseModel](
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     on_result: Callable[[T], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -288,7 +354,8 @@ def structured_llm_call_sync[T: BaseModel](
     forwarded identically (unset defers to the configured
     :class:`~llmkit.LLMClientConfig` value). ``retry`` is the transient-error
     budget, inherited from the async path (default-on; pass
-    :data:`~llmkit.NO_RETRY` to opt out). ``on_result`` is the same
+    :data:`~llmkit.NO_RETRY` to opt out). ``cache`` is the same response-cache
+    opt-out (``False`` bypasses lookup and store). ``on_result`` is the same
     semantic-validation re-roll hook the async call takes (raise
     :class:`~llmkit.ResultValidationError` to reject a result and re-roll on the
     validation budget). ``options`` is the same opt-in :class:`LLMCallOptions`
@@ -307,6 +374,7 @@ def structured_llm_call_sync[T: BaseModel](
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,
+            cache=cache,
             on_result=on_result,
             options=options,
         )

@@ -200,6 +200,7 @@ def test_options_retry_applied_when_keyword_unset() -> None:
         reasoning_effort=UNSET,
         retry=UNSET,
         provider=UNSET,
+        cache=UNSET,
     )
 
     assert resolved.retry is NO_RETRY
@@ -216,6 +217,7 @@ def test_all_unset_resolves_to_true_defaults() -> None:
         reasoning_effort=UNSET,
         retry=UNSET,
         provider=UNSET,
+        cache=UNSET,
     )
 
     assert resolved.temperature is None
@@ -225,6 +227,7 @@ def test_all_unset_resolves_to_true_defaults() -> None:
     assert resolved.reasoning_effort is None
     assert resolved.retry is DEFAULT_RETRY_POLICY
     assert resolved.provider is None
+    assert resolved.cache is True
 
 
 def test_repr_shows_only_set_fields_and_sentinel_reads_clean() -> None:

@@ -11,6 +11,8 @@ lives here so the next family added does not become another copy:
 * :func:`run_with_policy` — the :func:`~llmkit.retry.with_retries` invocation,
   which differs between families only in which errors are charged to the
   validation budget;
+* :func:`run_cached` — the response-cache read-through around that pass, for
+  the two buffered families that read the cache;
 * :func:`result_validation_budget` / :func:`tool_validation_budget` /
   :func:`compose_validation_budget` — the three augmented validation sets;
 * :func:`build_text_record` and :func:`resolve_model_and_provider` — record
@@ -34,13 +36,17 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import NamedTuple, cast
 
+from pydantic import BaseModel
+
 from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit.cache import LLMCacheEntry, get_llm_cache
+from llmkit.cache.read_through import cache_key_or_none, read_through
 from llmkit.exceptions import ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
-from llmkit.options import LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
+from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
@@ -147,6 +153,7 @@ def prepare_call(
     provider: LLMProviderInterface | None | Unset,
     feature: str,
     label: str | None,
+    cache: bool | Unset = UNSET,
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
@@ -164,6 +171,9 @@ def prepare_call(
     every pass keeps one ``call_id``. For a stream this runs on the generator's
     first ``__anext__``, in the consumer's task — a read of the loop's scope,
     never a write.
+
+    *cache* is passed only by the buffered families, the ones that read the
+    response cache; the others leave it unset.
     """
     args = resolve_call_args(
         options,
@@ -173,6 +183,7 @@ def prepare_call(
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
+        cache=cache,
     )
     call_id, attempt_offset = claim_logical_call(feature, label)
     return PreparedCall(args, build_call_provider(args.provider), call_id, attempt_offset)
@@ -203,6 +214,79 @@ async def run_with_policy[T](
         retry_on=policy.retry_on,
         validation_max_attempts=policy.validation_max_attempts,
         validation_retry_on=validation_retry_on,
+    )
+
+
+async def run_cached[T](
+    run: Callable[[], Awaitable[T]],
+    *,
+    prepared: PreparedCall,
+    prompt: str | Sequence[ChatMessage],
+    output_schema: type[BaseModel] | None,
+    encode: Callable[[T], str],
+    decode: Callable[[str], T],
+    on_result: Callable[[T], object] | None,
+    record_hit: Callable[[T, str | None, datetime, float], Awaitable[None]],
+) -> T:
+    """Run *run* (the call's whole retry pass) through the response cache.
+
+    The cache participates only when the call did not opt out
+    (``args.cache``), a cache is configured, and the provider resolved — a
+    ``None`` provider means the build failed and the transport must be left to
+    raise the real error. Otherwise, and whenever the request cannot be
+    fingerprinted, this is exactly ``await run()``: the request is
+    byte-identical to a library without a cache.
+
+    A hit sits above :func:`run_with_policy` and therefore above the rate
+    limiter, so it spends no retry budget and takes no slot. It still runs the
+    caller's *on_result* on the decoded answer — a rejection there makes it a
+    miss for this caller — and writes its own record through *record_hit*,
+    called with the decoded answer, the ``call_id`` of the call that paid for
+    it, and the hit's start time (wall clock, then monotonic).
+
+    *encode* and *decode* turn a result into the stored string and back.
+    """
+    args, provider, call_id, attempt_offset = prepared
+    cache = get_llm_cache() if args.cache else None
+    if cache is None or provider is None:
+        return await run()
+    key = cache_key_or_none(
+        provider=provider,
+        prompt=prompt,
+        output_schema=output_schema,
+        model=args.model,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+    )
+    if key is None:
+        return await run()
+    started_at = datetime.now(UTC)
+    start_t = time.monotonic()
+    model, provider_name = resolve_model_and_provider(args.model, provider)
+    schema = output_schema.__name__ if output_schema is not None else "text"
+
+    def _encode(result: T) -> LLMCacheEntry:
+        return LLMCacheEntry(
+            response=encode(result),
+            schema=schema,
+            provider=provider_name,
+            model=model,
+            call_id=call_id,
+        )
+
+    async def _accept(entry: LLMCacheEntry) -> T:
+        result = decode(entry.response)
+        if on_result is not None:
+            _ = on_result(result)
+        await record_hit(result, entry.call_id, started_at, start_t)
+        return result
+
+    # A pass re-run by an enclosing ``with_retries`` loop exists because the
+    # host rejected the earlier answer; serving it the stored answer again
+    # would make the documented re-roll pattern a fixed point.
+    return await read_through(
+        cache, key, lookup=attempt_offset == 0, run=run, encode=_encode, accept=_accept
     )
 
 
@@ -355,6 +439,8 @@ def build_text_record(
     call_id: str | None = None,
     attempt: int | None = None,
     usage: TokenUsage | None = None,
+    cache_hit: bool = False,
+    source_call_id: str | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -373,7 +459,10 @@ def build_text_record(
     too (both default ``None`` — absent from the request and unset on the
     record). ``usage`` is the buffered call's token counts; the streaming
     surface leaves it ``None``, because a plain text stream does not ask the
-    provider for usage.
+    provider for usage. ``cache_hit`` marks a response-cache hit, whose
+    ``queue_wait_ms`` is ``None`` because it never queued (the queue-wait
+    stamp would still hold the previous attempt's value), and
+    ``source_call_id`` names the call that paid for its answer.
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
@@ -399,7 +488,9 @@ def build_text_record(
         reasoning_effort=reasoning_effort,
         call_id=call_id,
         attempt=attempt,
-        queue_wait_ms=current_queue_wait_ms(),
+        queue_wait_ms=None if cache_hit else current_queue_wait_ms(),
         run_id=get_run_id(),
         usage=usage_log_dict(usage),
+        cache_hit=cache_hit,
+        source_call_id=source_call_id,
     )

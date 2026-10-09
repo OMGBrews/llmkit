@@ -102,6 +102,7 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
         "run_id",
         "call_id",
         "attempt",
+        "cache_hit",
         "duration_ms",
         "queue_wait_ms",
         "approximate_cost",
@@ -113,6 +114,7 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
     assert first["label"] == "first"
     assert first["model"] == "gemini-3.1-flash-lite"
     assert first["provider"] == "Google AI Studio"
+    assert first["cache_hit"] is False
     assert first["schema"] == "Schema"
     assert first["approximate_cost"] == 1e-06
     assert first["error"] is None
