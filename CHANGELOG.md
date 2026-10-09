@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **An opt-in, host-pluggable response cache for the buffered calls.**
+  `configure_llm_cache(cache)` installs a store, and `structured_llm_call`,
+  `text_llm_call` and their `_sync` forms then answer a request whose
+  fingerprint an earlier successful call stored, without a provider call, a
+  rate-limiter slot or any retry budget. Identical requests in flight at once
+  in one process share one provider call; if that call fails or is
+  cancelled, each waiting call goes to the provider itself. Only an answer
+  that comes back cleanly is stored — never a raised attempt, an answer
+  `on_result` rejected, or a truncated one. A stored answer still passes
+  through `on_result`, and a rejection there sends the call to the provider.
+  A pass an enclosing `with_retries` loop re-runs skips the lookup, so the
+  re-roll pattern keeps getting new samples. Opt one call out with
+  `cache=False`, on the call or on the new `LLMCallOptions.cache` field. The
+  host supplies the store: `LLMCache` is a protocol of two async methods,
+  `get(key)` and `set(key, entry)`, over a plain-string `LLMCacheEntry`, and
+  `InMemoryLLMCache` is the bounded in-process LRU reference store.
+  `llm_cache_key` is the public fingerprint: a sha256 over the provider name,
+  the routed model, the provider's endpoint settings (`api_base`,
+  `extra_body`, `aws_region_name`, `vertex_project`, `vertex_location`; never
+  a credential), the messages as sent, the output schema's JSON schema
+  (field order included) or `"text"`, `temperature`, `max_tokens`, the
+  effective reasoning effort, and for a structured call the structured-output
+  mode and strict-schema flag, versioned by
+  `llmkit.cache.LLM_CACHE_KEY_VERSION`. A store that raises, or a request
+  that cannot be fingerprinted, never fails a call: it proceeds as a miss
+  with one warning on the `llmkit.cache` logger. With no cache configured,
+  the default, every request is unchanged.
+- **The call log shows cache hits.** `LLMCallRecord` gains `cache_hit`
+  (`False` by default) and `source_call_id` (the paid call a hit's answer
+  came from). A hit record has its own `call_id`, `approximate_cost` `0.0`,
+  and `usage` and `queue_wait_ms` `null`. The per-call YAML writes both
+  fields, its second header line ends `cache=hit` on a hit (the first line
+  is unchanged), and every `index.jsonl` line gains a `cache_hit` key — a
+  parser that pins the line's exact key set needs to admit it.
+
 ### Changed
 
 - **Structured and buffered text calls log their token usage.** The call
