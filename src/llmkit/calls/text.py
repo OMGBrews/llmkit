@@ -18,6 +18,7 @@ from llmkit.calls._shared import (
     build_text_record,
     prepare_call,
     result_validation_budget,
+    run_cached,
     run_with_policy,
 )
 from llmkit.capture import record_call_async
@@ -40,6 +41,7 @@ async def text_llm_call(
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
@@ -80,17 +82,22 @@ async def text_llm_call(
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
             opt out. Each attempt is its own logged call.
+        cache: Response-cache participation (see
+            :func:`structured_llm_call`): unset defers to ``options``, then to
+            ``True``; ``False`` bypasses lookup, coalescing and store.
         on_result: Optional semantic-validation re-roll hook (see
             :func:`structured_llm_call`). Called with the response *text*; raise
             :class:`~llmkit.ResultValidationError` from it to reject a
             structurally-fine-but-wrong answer (e.g. text that fails to parse as
-            the JSON you asked for) and re-roll on the validation budget.
+            the JSON you asked for) and re-roll on the validation budget. A
+            cached answer is passed through it too.
         options: Optional :class:`LLMCallOptions` bundle (see
             :func:`structured_llm_call`); explicit keywords here override it,
             it overrides config, and ``None`` leaves the flat path unchanged.
 
     Returns:
-        The model's textual response.
+        The model's textual response, or the stored text when the response
+        cache answered an identical earlier request.
 
     Raises:
         Any exception from the LLM provider — transient ones
@@ -98,7 +105,7 @@ async def text_llm_call(
         propagate immediately. The log is still written on every attempt
         with the error recorded.
     """
-    args, provider, call_id, attempt_offset = prepare_call(
+    prepared = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -108,7 +115,9 @@ async def text_llm_call(
         provider=provider,
         feature=feature,
         label=label,
+        cache=cache,
     )
+    args, provider, call_id, attempt_offset = prepared
     attempt_count = 0
 
     async def _attempt() -> str:
@@ -170,11 +179,50 @@ async def text_llm_call(
                 )
             )
 
-    return await run_with_policy(
-        _attempt,
-        policy=args.retry,
-        tag=label or feature,
-        validation_retry_on=result_validation_budget(args.retry),
+    async def _run() -> str:
+        return await run_with_policy(
+            _attempt,
+            policy=args.retry,
+            tag=label or feature,
+            validation_retry_on=result_validation_budget(args.retry),
+        )
+
+    async def _record_hit(
+        text: str, source_call_id: str | None, started_at: datetime, start_t: float
+    ) -> None:
+        _ = await record_call_async(
+            build_text_record(
+                started_at=started_at,
+                feature=feature,
+                label=label,
+                prompt=prompt,
+                text=text,
+                start_t=start_t,
+                temperature=args.temperature,
+                model=args.model,
+                provider=provider,
+                error=None,
+                approximate_cost=0.0,
+                schema="text",
+                max_tokens=args.max_tokens,
+                reasoning_effort=args.reasoning_effort,
+                call_id=call_id,
+                # The hit is this logical call's pass (see structured.py).
+                attempt=attempt_offset + 1,
+                cache_hit=True,
+                source_call_id=source_call_id,
+            )
+        )
+
+    return await run_cached(
+        _run,
+        prepared=prepared,
+        prompt=prompt,
+        output_schema=None,
+        encode=lambda text: text,
+        decode=lambda text: text,
+        on_result=on_result,
+        record_hit=_record_hit,
     )
 
 
@@ -189,6 +237,7 @@ def text_llm_call_sync(
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     on_result: Callable[[str], object] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
@@ -212,6 +261,7 @@ def text_llm_call_sync(
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,
+            cache=cache,
             on_result=on_result,
             options=options,
         )

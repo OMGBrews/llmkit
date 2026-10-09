@@ -22,11 +22,11 @@ OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS
 
 ## Local-first, zero infrastructure
 
-Getting full value from llmkit requires nothing but a provider key — no collector, no account, no service to stand up. The only network call is to the provider you chose; nothing phones home. Logs are plain local files, and Ollama gives you a fully-local option where no data leaves the host. You can plug in external systems later (a custom `LogSink` ships records anywhere), but you never have to.
+Getting full value from llmkit requires nothing but a provider key — no collector, no account, no service to stand up. The only network call is to the provider you chose; nothing phones home. Logs are plain local files, and Ollama gives you a fully-local option where no data leaves the host. You can plug in external systems later (a custom `LogSink` ships records anywhere; a custom `LLMCache` stores responses wherever you keep them), but you never have to. The response cache follows the same rule: off until a host configures one, the shipped store is in-process memory, and llmkit owns only what needs the resolved request — the fingerprint, the hook placement, coalescing of identical in-flight requests, and the hit record — while the host owns the store.
 
 ## Logging is on by default — and written for an AI agent
 
-Every call is logged with zero setup; opt out with `configure_llm_logging(None)`. Each per-call log is laid out verdict-first: a two-line `#` header — a verdict line (`ok`/`ERROR`, feature/label, model, schema, duration, approximate cost) plus a second line carrying the timestamp and a `call=<id> attempt=<n>` correlation suffix — on top, the prompt and response below, plus an append-only `index.jsonl` for cross-call scans. The assumed reader is a coding agent like Claude Code debugging a run — so it can see at a glance what was sent, what came back, and what failed, and use that to diagnose problems and improve prompts.
+Every call is logged with zero setup; opt out with `configure_llm_logging(None)`. Each per-call log is laid out verdict-first: a two-line `#` header — a verdict line (`ok`/`ERROR`, feature/label, model, schema, duration, approximate cost) plus a second line carrying the timestamp, a `call=<id> attempt=<n>` correlation suffix, and `cache=hit` when the response cache answered the call — on top, the prompt and response below, plus an append-only `index.jsonl` for cross-call scans. The assumed reader is a coding agent like Claude Code debugging a run — so it can see at a glance what was sent, what came back, and what failed, and use that to diagnose problems and improve prompts.
 
 ## Async-first; sync is one call away
 

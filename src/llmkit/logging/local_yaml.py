@@ -19,7 +19,7 @@ from typing import Any, cast
 
 import yaml
 
-from llmkit.logging._latch import OnceLatch
+from llmkit._latch import OnceLatch
 from llmkit.logging._paths import (
     MAX_FILENAME_ATTEMPTS,
     oneline,
@@ -64,8 +64,9 @@ class LocalYamlLogSink:
     :class:`LogSafeDumper`, so the file is always ``yaml.safe_load``-able —
     plain tags only, never ``!!python/object``. ``index.jsonl`` carries one
     short line per call (file, timestamp, feature, label, model, provider,
-    schema, duration, cost, error) so cross-call questions — "which calls
-    errored / were slowest / most expensive / the last call for feature X" —
+    schema, duration, cost, error, whether the response cache answered it) so
+    cross-call questions — "which calls errored / were slowest / most
+    expensive / served from cache / the last call for feature X" —
     are a single small scan instead of globbing and parsing every YAML. The
     index is deliberately compact: per-call request knobs (temperature,
     max_tokens, reasoning_effort) live only in the per-call YAML.
@@ -276,6 +277,8 @@ class LocalYamlLogSink:
                 "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
+                "cache_hit": record.cache_hit,
+                "source_call_id": record.source_call_id,
                 "temperature": record.temperature,
                 "max_tokens": record.max_tokens,
                 "reasoning_effort": record.reasoning_effort,
@@ -391,8 +394,9 @@ class LocalYamlLogSink:
         second line is the ISO ``started_at`` stamp — machine-built, no
         newlines — plus, when the record carries correlation fields, a
         ``call=<id[:8]> attempt=<n>`` suffix so retries of one logical call
-        are joinable from the file heads alone. The first line's shape is
-        pinned (``head -1`` tooling greps it); only line 2 gains the suffix.
+        are joinable from the file heads alone, and ``cache=hit`` after that
+        when the response cache answered the call. The first line's shape is
+        pinned (``head -1`` tooling greps it); only line 2 gains suffixes.
         """
         status = "ERROR" if record.error else "ok"
         cost = f"${record.approximate_cost:.3g}" if record.approximate_cost is not None else "$?"
@@ -405,6 +409,8 @@ class LocalYamlLogSink:
             correlation = f" | call={oneline(record.call_id)[:8]}"
             if record.attempt is not None:
                 correlation += f" attempt={record.attempt}"
+        if record.cache_hit:
+            correlation += " cache=hit"
         return (
             f"# {status} | {feature}/{label} | "
             f"{model} | {schema} | "
@@ -424,12 +430,13 @@ class LocalYamlLogSink:
         A single ``write`` of a sub-4KB line under ``O_APPEND`` is atomic on
         POSIX, so concurrent calls don't interleave lines.
 
-        The line carries only the cross-call triage fields; request-shaping
-        knobs (temperature, max_tokens, reasoning_effort) are deliberately
-        omitted to keep the index compact — they live in the per-call YAML.
+        The line carries only the cross-call triage fields, ``cache_hit``
+        among them; request-shaping knobs (temperature, max_tokens,
+        reasoning_effort) and ``source_call_id`` are deliberately omitted to
+        keep the index compact — they live in the per-call YAML.
         """
         try:
-            line: dict[str, str | float | None] = {
+            line: dict[str, str | float | bool | None] = {
                 "file": filepath.name,
                 "timestamp": record.started_at.isoformat(),
                 "feature": record.feature,
@@ -440,6 +447,7 @@ class LocalYamlLogSink:
                 "run_id": record.run_id,
                 "call_id": record.call_id,
                 "attempt": record.attempt,
+                "cache_hit": record.cache_hit,
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None

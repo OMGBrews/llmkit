@@ -42,7 +42,8 @@ class LLMCallRecord:
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
     per-response cost (no local price table) and is ``None`` when the
-    provider does not report it (e.g. streamed calls).
+    provider does not report it (e.g. streamed calls). A cache hit records
+    ``0.0``: nothing was paid for it.
 
     ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
     1-based attempt number within it, so the N records a retried call
@@ -55,6 +56,19 @@ class LLMCallRecord:
     — ``duration_ms`` includes it, so provider latency is approximately
     ``duration_ms - queue_wait_ms``. All four default ``None`` for
     directly-constructed records.
+
+    ``cache_hit`` is ``True`` when the response cache
+    (:func:`~llmkit.configure_llm_cache`) answered the call instead of a
+    provider, and it is the field that disambiguates every other one on such
+    a record: one record is still one pass of the call (``attempt`` counts
+    it), but no provider attempt was made, so ``approximate_cost`` is
+    ``0.0``, ``usage`` and ``queue_wait_ms`` are ``None`` (no tokens spent, no
+    rate-limiter slot taken — a ``None`` ``queue_wait_ms`` otherwise means an
+    attempt failed before acquiring one), and ``duration_ms`` is the lookup
+    plus any wait on an identical request in flight. A hit has its own
+    ``call_id``; ``source_call_id`` names the paid call whose answer it
+    returned (``None`` on every record that is not a hit). The YAML body
+    carries both; ``index.jsonl`` carries ``cache_hit`` only.
 
     ``temperature`` is ``None`` exactly when no ``temperature`` kwarg was
     sent and the provider's default sampling applied — an unset call
@@ -94,7 +108,8 @@ class LLMCallRecord:
     ``usage`` is the attempt's provider-reported token counts
     (``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, any of which
     may be ``None`` when the provider did not report it). It is filled on
-    every successful attempt, on a structured or text attempt whose result an
+    every successful provider attempt (a cache hit spent no tokens and logs
+    ``None``), on a structured or text attempt whose result an
     ``on_result`` hook then rejected (the tokens were spent, as its
     ``approximate_cost`` already shows), and on a truncated structured
     attempt, whose counts it shares with ``output_limit``; any other failed
@@ -140,3 +155,5 @@ class LLMCallRecord:
     usage: dict[str, int | None] | None = None
     output_limit: dict[str, int | str | None] | None = None
     partial_text: str | None = None
+    cache_hit: bool = False
+    source_call_id: str | None = None

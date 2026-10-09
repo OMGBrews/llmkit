@@ -1,4 +1,4 @@
-"""A warn-once latch, shared by the sink and the sink registry."""
+"""A warn-once latch, shared by the log sinks, the sink registry, and the response cache."""
 
 from __future__ import annotations
 

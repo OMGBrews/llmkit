@@ -12,6 +12,7 @@ This package provides:
 - A process-global async rate limiter shared across all calls
 - Default-on transient-error retries with full-jitter backoff (RetryPolicy)
 - Per-call invocation logging via a pluggable sink (with approximate cost)
+- An opt-in, host-pluggable response cache with in-process request coalescing
 - Run scoping, so every record and index line is filterable by run id
 
 The headline surface below is what a typical consumer needs. Lower-level
@@ -31,6 +32,14 @@ from llmkit._types import (
     Message,
     ReasoningEffort,
     ToolResultMessage,
+)
+from llmkit.cache import (
+    InMemoryLLMCache,
+    LLMCache,
+    LLMCacheEntry,
+    configure_llm_cache,
+    get_llm_cache,
+    llm_cache_key,
 )
 from llmkit.calls import (
     STREAM_ABANDONED_ERROR,
@@ -146,6 +155,13 @@ __all__ = [
     "configure_llm_logging",
     "get_log_sink",
     "default_log_dir",
+    # Response cache (host-pluggable; off until configured)
+    "LLMCache",
+    "LLMCacheEntry",
+    "InMemoryLLMCache",
+    "configure_llm_cache",
+    "get_llm_cache",
+    "llm_cache_key",
     # Run scoping (tag every record + index line with a run id)
     "RUN_ID_ENV_VAR",
     "get_run_id",

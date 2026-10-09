@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -28,6 +28,10 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
   - [Retention: bounded by default](#retention-bounded-by-default)
   - [Capturing call records](#capturing-call-records)
   - [Write your own `LogSink`](#write-your-own-logsink)
+- [Response cache](#response-cache)
+  - [What counts as the same request](#what-counts-as-the-same-request)
+  - [What a hit looks like in the log](#what-a-hit-looks-like-in-the-log)
+  - [Write your own store](#write-your-own-store)
 - [Configuration](#configuration)
   - [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints)
   - [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override)
@@ -347,7 +351,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider`. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `cache` (the last read by the buffered families only; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -647,8 +651,8 @@ part of the public surface.
 
 `LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
-1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call — including passes of your own `with_retries` loop — are joinable from the file heads alone). Small metadata is next; the large `partial_text`, `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
-2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
+1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call — including passes of your own `with_retries` loop — are joinable from the file heads alone, and ends `cache=hit` when the [response cache](#response-cache) answered the call). Small metadata is next; the large `partial_text`, `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
+2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, cache_hit, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
 ```yaml
 # ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 1840ms | $0.0007
@@ -663,6 +667,8 @@ schema: Summary
 run_id: nightly-eval-2026-06-05
 call_id: 9f3c21ab54d64f1f8f2c14febc03a7d1
 attempt: 1
+cache_hit: false
+source_call_id: null
 temperature: null
 max_tokens: null
 reasoning_effort: null
@@ -682,7 +688,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. plain-text streamed calls). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot, so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, or `temperature=None`) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful attempt, on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured attempt (the same counts as `output_limit`); any other failed attempt writes `null`. The plain text stream does not ask the provider for usage, so it always writes `null`; `tool_llm_call_stream` asks and fills it. `output_limit` and `partial_text` are always present too, and `null` unless a **structured call was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on that attempt, because unfinished text is not a validated structured response; the streamed lanes differ, logging their partial transcript under `response` because a transcript is all they ever return. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the text and tool lanes pass `finish_reason` through instead and never raise this error. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when the provider does not report it, e.g. plain-text streamed calls; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, or `temperature=None`) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured attempt (the same counts as `output_limit`); any other failed attempt writes `null`. The plain text stream does not ask the provider for usage, so it always writes `null`; `tool_llm_call_stream` asks and fills it. `output_limit` and `partial_text` are always present too, and `null` unless a **structured call was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on that attempt, because unfinished text is not a validated structured response; the streamed lanes differ, logging their partial transcript under `response` because a transcript is all they ever return. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the text and tool lanes pass `finish_reason` through instead and never raise this error. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
 
 ### Grouping calls by run
 
@@ -826,6 +832,77 @@ Restoring the returned value is what makes this correct in the two starting stat
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 
 An OpenTelemetry exporter (e.g. to Langfuse/Phoenix) is a natural future `llmkit[otel]` extra; the pluggable seam makes it a non-breaking addition.
+
+## Response cache
+
+When an application sends the same request twice, the second one is normally paid for and waited on all over again. Configure a response cache and llmkit answers the repeat from the stored answer instead — no provider call, no rate-limiter slot, no retry budget — and still writes the call's log record, marked as a hit:
+
+```python
+from llmkit import InMemoryLLMCache, configure_llm_cache
+
+configure_llm_cache(InMemoryLLMCache(max_entries=1024))   # None (the default) turns it off
+```
+
+The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers; the streamed and tool families do not read it. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
+
+What a configured cache does on each buffered call:
+
+- **Hit.** When an earlier successful call stored an answer for the same request, the call returns it. A structured answer is validated into a fresh instance of your schema, and your `on_result` hook still runs on it; if the hook rejects the stored answer, this call goes to the provider as if nothing were stored, and the new answer replaces the old one.
+- **Identical requests in flight at once.** Requests that start before an identical one has finished share its provider call: the first runs, the rest wait for its answer and record hits. If the first fails or is cancelled, each waiting call goes to the provider on its own retry budget. This works within one process; requests from separate processes each reach the store on their own.
+- **Miss.** The call runs exactly as it would without a cache. Only an answer that comes back cleanly is stored — never an attempt that raised, an answer your `on_result` rejected, or a truncated answer (`OutputLimitError`).
+
+A cache returns the *first* sample for a request. That is the point, but it changes behaviour for a caller that re-sends a prompt to get a different draft. Opt such a call out with `cache=False`, on the call or on `LLMCallOptions`; it then neither reads, waits on, nor writes the cache:
+
+```python
+draft = await text_llm_call(prompt, feature="drafting", temperature=1.0, cache=False)
+```
+
+The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_retries) needs no opt-out: a pass that an enclosing `with_retries` loop re-runs, because your code rejected the previous answer, skips the lookup, asks the provider for a new sample, and stores it in place of the rejected one.
+
+### What counts as the same request
+
+llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature`; `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
+
+Credentials are never part of the key, so rotating an API key keeps your hits. `feature` and `label` are telemetry, not part of the request, so two features asking the identical question share one answer. Two schemas with the same fields in a different order are different requests, because the order is sent to the model and steers the order it writes fields in. A request that cannot be fingerprinted — a content part that is not JSON-serialisable, a third-party provider missing an attribute the key reads — skips the cache and runs normally.
+
+### What a hit looks like in the log
+
+A hit writes one record like any call, with `cache_hit: true`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
+
+```text
+# ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 2ms | $0
+# 2026-06-05T14:25:02.118204 | call=4be0d913 attempt=1 cache=hit
+```
+
+### Write your own store
+
+`InMemoryLLMCache` is a bounded, in-process LRU (256 entries by default): right for a script or a test run, and gone when the process exits. For persistence, sharing between workers, tenant scoping or time-based expiry, supply your own store — any object with two async methods:
+
+```python
+import dataclasses
+import json
+
+from llmkit import LLMCacheEntry, configure_llm_cache
+
+class RedisLLMCache:
+    def __init__(self, client, ttl_seconds: int) -> None:
+        self._client = client          # e.g. a redis.asyncio.Redis
+        self._ttl = ttl_seconds
+
+    async def get(self, key: str) -> LLMCacheEntry | None:
+        raw = await self._client.get(f"llm:{key}")
+        return None if raw is None else LLMCacheEntry(**json.loads(raw))
+
+    async def set(self, key: str, entry: LLMCacheEntry) -> None:
+        payload = json.dumps(dataclasses.asdict(entry))
+        await self._client.set(f"llm:{key}", payload, ex=self._ttl)
+
+configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
+```
+
+`LLMCacheEntry` is a frozen dataclass of plain strings — `response` (a structured answer as JSON, or the text), `schema`, `provider`, `model`, and the `call_id` of the call that stored it — so any store can persist it. It has no expiry field: retention is the store's policy, as it is a log sink's.
+
+`configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. A store that raises never fails a call: the call proceeds as a miss, and llmkit logs one warning on the `llmkit.cache` logger, with repeats of the same failure at DEBUG until the cache is reconfigured.
 
 ## Configuration
 
@@ -1219,7 +1296,7 @@ def on_retry(*, label: str, attempt: int, max_attempts: int, error: BaseExceptio
     print(f"{label}: attempt {attempt}/{max_attempts} failed: {error}")
 ```
 
-> **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active llmkit retry loop **owned by the current `asyncio` task** and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. The task scoping bounds the guard to the pattern it warns about: a nested loop awaited inline in the same task, whose failure really does propagate out to the outer loop. A *distinct* llmkit call that merely inherited the scope across a task boundary keeps its full retry budget — an `on_result` hook calling `structured_llm_call_sync` / `text_llm_call_sync` (the sync bridge drives the coroutine as a new task on llmkit's persistent loop), or a call spawned with `asyncio.create_task` from inside an attempt. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`. Either way the call joins the loop's logical call: each pass's record carries the same `call_id` and the next `attempt`.
+> **Don't double-wrap the call functions.** They already retry internally, so `with_retries(structured_llm_call, ...)` would otherwise multiply the budgets (the `3 × 3 = 9` trap). `with_retries` guards against this — it detects an active llmkit retry loop **owned by the current `asyncio` task** and collapses the inner layer to a single pass (warning once), so the budgets don't multiply. The task scoping bounds the guard to the pattern it warns about: a nested loop awaited inline in the same task, whose failure really does propagate out to the outer loop. A *distinct* llmkit call that merely inherited the scope across a task boundary keeps its full retry budget — an `on_result` hook calling `structured_llm_call_sync` / `text_llm_call_sync` (the sync bridge drives the coroutine as a new task on llmkit's persistent loop), or a call spawned with `asyncio.create_task` from inside an attempt. To drive retries entirely from your own wrapper instead, opt the inner call out with `retry=NO_RETRY`. Either way the call joins the loop's logical call: each pass's record carries the same `call_id` and the next `attempt`. With a [response cache](#response-cache) configured, every pass after the first skips the cache lookup, so a pass your code re-runs because it rejected the previous answer gets a new sample rather than the stored one.
 
 ### instructor's in-call schema repair
 

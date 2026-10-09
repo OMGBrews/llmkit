@@ -111,6 +111,12 @@ class LLMCallOptions:
             ``retry`` keyword (:data:`~llmkit.DEFAULT_RETRY_POLICY`).
         provider: Per-call provider override. Unset defers to the per-call
             ``provider`` keyword (the globally-configured provider).
+        cache: Whether the call reads and writes the configured response
+            cache (:func:`~llmkit.configure_llm_cache`). Unset defers to the
+            per-call ``cache`` keyword, then to ``True``; ``False`` bypasses
+            both lookup and store. Read by the buffered families
+            (:func:`structured_llm_call`, :func:`text_llm_call` and their sync
+            wrappers) only; the streamed and tool families ignore it.
     """
 
     temperature: float | None | Unset = UNSET
@@ -119,11 +125,12 @@ class LLMCallOptions:
     reasoning_effort: ReasoningEffort | None | Unset = UNSET
     retry: RetryPolicy | Unset = UNSET
     provider: LLMProviderInterface | None | Unset = UNSET
+    cache: bool | Unset = UNSET
 
     @override
     def __repr__(self) -> str:
         # Only the fields actually set: ``LLMCallOptions(temperature=0.9)``,
-        # not six ``=UNSET`` entries drowning the one value a user debugging
+        # not seven ``=UNSET`` entries drowning the one value a user debugging
         # a merge is looking for. (Generated repr suppressed via
         # ``repr=False``; ``field(repr=False)`` would wrongly hide set
         # fields too.)
@@ -151,6 +158,7 @@ class ResolvedCallArgs:
     reasoning_effort: ReasoningEffort | None
     retry: RetryPolicy
     provider: LLMProviderInterface | None
+    cache: bool
 
 
 def resolve_call_args(
@@ -162,6 +170,7 @@ def resolve_call_args(
     reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
     provider: LLMProviderInterface | None | Unset,
+    cache: bool | Unset,
 ) -> ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
@@ -174,8 +183,9 @@ def resolve_call_args(
       whatever its value (highest precedence);
     * otherwise a field that is *set* on ``options`` is used;
     * otherwise the true default stands (:data:`DEFAULT_TEMPERATURE`,
-      :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``None`` for the rest — the
-      ``None``s the transport then resolves against the configured client).
+      :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``True`` for ``cache``, ``None``
+      for the rest — the ``None``s the transport then resolves against the
+      configured client).
 
     For ``temperature`` specifically, the default is ``None``: llmkit
     chooses no temperature, the transport forwards **no** ``temperature``
@@ -195,6 +205,7 @@ def resolve_call_args(
         reasoning_effort=_pick(reasoning_effort, opts.reasoning_effort, None),
         retry=_pick(retry, opts.retry, DEFAULT_RETRY_POLICY),
         provider=_pick(provider, opts.provider, None),
+        cache=_pick(cache, opts.cache, True),
     )
 
 

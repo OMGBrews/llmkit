@@ -51,7 +51,8 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
-from llmkit._types import TOOL_ERROR_PREFIX, ChatMessage, ReasoningEffort
+from llmkit._messages import resolve_reasoning_effort, wire_messages
+from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitDiagnostics,
@@ -172,54 +173,6 @@ async def drain_async_logging(*, timeout: float | None) -> None:
         logger.debug("LiteLLM async-logging drain timed out after %ss", timeout)
     except Exception:  # pragma: no cover - best-effort drain
         logger.debug("LiteLLM async-logging drain failed", exc_info=True)
-
-
-def _wire_message(message: ChatMessage) -> ChatMessage:
-    """Render llmkit's own message extensions into what LiteLLM can send.
-
-    Today that is exactly one: :class:`~llmkit.ToolResultMessage`'s optional
-    ``is_error``. It has no wire equivalent — LiteLLM's Anthropic translation
-    builds its ``tool_result`` block from the id and content alone (measured
-    against litellm 1.95.0), and an OpenAI-compatible route
-    would forward the unknown key to a provider that may reject it — so the
-    flag becomes a :data:`~llmkit._types.TOOL_ERROR_PREFIX` prefix on the
-    content, which every provider receives identically, and the key is dropped.
-
-    Returns a **new** dict for a message it rewrites: the caller's history is
-    theirs, is what the log records as ``prompt``, and is fed back into the
-    next turn — flattening it in place would strip the flag from the record and
-    double the prefix on the following call.
-    """
-    if message["role"] != "tool" or not message.get("is_error", False):
-        return message
-    return {
-        "role": "tool",
-        "tool_call_id": message["tool_call_id"],
-        "content": f"{TOOL_ERROR_PREFIX}{message['content']}",
-    }
-
-
-def _messages(prompt: str | Sequence[ChatMessage]) -> list[ChatMessage]:
-    """Normalise a prompt into LiteLLM's message-list shape."""
-    if isinstance(prompt, str):
-        return [{"role": "user", "content": prompt}]
-    return [_wire_message(message) for message in prompt]
-
-
-def _resolve_reasoning_effort(
-    override: ReasoningEffort | None, provider: LLMProviderInterface
-) -> ReasoningEffort | None:
-    """Resolve the effective reasoning effort for a call.
-
-    A per-call ``override`` wins when set; otherwise the provider's
-    configured value (from :class:`~llmkit.LLMClientConfig`) applies. Both
-    ``None`` means no reasoning kwarg is forwarded — byte-identical to the
-    pre-feature request. ``getattr`` keeps third-party providers that predate
-    the ``reasoning_effort`` property working (they degrade to ``None``).
-    """
-    if override is not None:
-        return override
-    return getattr(provider, "reasoning_effort", None)
 
 
 def _reasoning_request_kwargs(
@@ -538,7 +491,7 @@ async def acompletion_structured[T: BaseModel](
     :func:`_usage_counts` (each ``None`` when not reported) for the call log.
     """
     provider = provider if provider is not None else build_provider()
-    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    effort = resolve_reasoning_effort(reasoning_effort, provider)
     litellm_model = provider.litellm_model(model)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     # The completion callable is the library's seam under instructor: providers
@@ -562,7 +515,7 @@ async def acompletion_structured[T: BaseModel](
         try:
             result = await client.chat.completions.create_with_completion(
                 model=litellm_model,
-                messages=_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
+                messages=wire_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
                 response_model=output_schema,
                 # instructor's in-call schema-repair budget: two total attempts
                 # = exactly one schema-repair re-ask, and only for a genuine
@@ -627,12 +580,12 @@ async def acompletion_text(
     when the provider returns none).
     """
     provider = provider if provider is not None else build_provider()
-    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
-            messages=_messages(prompt),
+            messages=wire_messages(prompt),
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
@@ -694,7 +647,7 @@ async def acompletion_tools(
     provider = provider if provider is not None else build_provider()
     if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
         raise ValueError(f"{provider.name} does not support tool_choice on this route")
-    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     if response_format is not None and provider.strict_json_schema:
         _stricten_json_schema_response_format({"response_format": response_format})
@@ -704,7 +657,7 @@ async def acompletion_tools(
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
-            messages=_messages(prompt),
+            messages=wire_messages(prompt),
             tools=[definition.to_litellm() for definition in tools],
             **({"response_format": response_format} if response_format is not None else {}),
             **({"tool_choice": choice} if choice is not None else {}),
@@ -877,7 +830,7 @@ async def astream_tools(
     provider = provider if provider is not None else build_provider()
     if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
         raise ValueError(f"{provider.name} does not support tool_choice on this route")
-    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
@@ -889,7 +842,7 @@ async def astream_tools(
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
-            messages=_messages(prompt),
+            messages=wire_messages(prompt),
             tools=[definition.to_litellm() for definition in tools],
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
@@ -960,12 +913,12 @@ async def astream_text(
     ``temperature`` key at all (the provider's default sampling applies).
     """
     provider = provider if provider is not None else build_provider()
-    effort = _resolve_reasoning_effort(reasoning_effort, provider)
+    effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         resp = await _acompletion(
             model=provider.litellm_model(model),
-            messages=_messages(prompt),
+            messages=wire_messages(prompt),
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
