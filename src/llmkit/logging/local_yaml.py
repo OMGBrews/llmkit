@@ -19,7 +19,7 @@ from typing import Any, cast
 
 import yaml
 
-from llmkit.logging._latch import OnceLatch
+from llmkit._latch import OnceLatch
 from llmkit.logging._paths import (
     MAX_FILENAME_ATTEMPTS,
     oneline,

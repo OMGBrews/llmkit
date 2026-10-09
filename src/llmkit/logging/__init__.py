@@ -25,7 +25,8 @@ they own:
   :func:`get_log_sink` reader, and :func:`write_llm_log`;
 * ``_paths`` — log-directory resolution and filename safety;
 * ``_yaml`` — the safe-load-able dumper;
-* ``_latch`` — the warn-once latch both the sink and the registry use.
+* the warn-once latch both the sink and the registry use lives one level up,
+  in ``llmkit._latch``, because the response cache shares it.
 """
 
 from llmkit.logging._paths import LOG_DIR_ENV_VAR, default_log_dir

@@ -15,7 +15,7 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from llmkit.logging._latch import OnceLatch
+from llmkit._latch import OnceLatch
 from llmkit.logging.local_yaml import LocalYamlLogSink
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
