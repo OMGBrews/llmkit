@@ -10,8 +10,8 @@ The provider transport lives in :mod:`llmkit._litellm` (LiteLLM, with
 retry and cost-recording contract *around* it. Four adjacent concerns are
 factored out: the three-layer option merge in :mod:`llmkit.options`, the record
 sink seam and capture context managers in :mod:`llmkit.capture`, the retry
-loops in :mod:`llmkit.retry`, and the response cache the buffered families read
-through in :mod:`llmkit.cache`.
+loops in :mod:`llmkit.retry`, and the response cache the buffered families and
+the text stream read through in :mod:`llmkit.cache`.
 
 The families:
 

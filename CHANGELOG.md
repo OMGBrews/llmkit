@@ -8,19 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **An opt-in, host-pluggable response cache for the buffered calls.**
-  `configure_llm_cache(cache)` installs a store, and `structured_llm_call`,
-  `text_llm_call` and their `_sync` forms then answer a request whose
-  fingerprint an earlier successful call stored, without a provider call, a
-  rate-limiter slot or any retry budget. Identical requests in flight at once
-  in one process share one provider call; if that call fails or is
+- **An opt-in, host-pluggable response cache for the buffered calls and the
+  plain text stream.** `configure_llm_cache(cache)` installs a store, and
+  `structured_llm_call`, `text_llm_call`, their `_sync` forms and
+  `text_llm_call_stream` then answer a request whose fingerprint an earlier
+  successful call stored, without a provider call, a rate-limiter slot or any
+  retry budget. A streamed and a buffered text request share one key, so
+  either answers the other; a streamed hit replays the stored text as a
+  single chunk, and a stream is stored only when it runs to completion — one
+  its consumer abandons stores nothing. Identical buffered requests in flight
+  at once in one process share one provider call (streams take no part, so
+  identical streams each pay and a stream never holds up a buffered call); if that call fails or is
   cancelled, each waiting call goes to the provider itself. Only an answer
   that comes back cleanly is stored — never a raised attempt, an answer
   `on_result` rejected, or a truncated one. A stored answer still passes
   through `on_result`, and a rejection there sends the call to the provider.
   A pass an enclosing `with_retries` loop re-runs skips the lookup, so the
   re-roll pattern keeps getting new samples. Opt one call out with
-  `cache=False`, on the call or on the new `LLMCallOptions.cache` field. The
+  `cache=False`, on the call or on the new `LLMCallOptions.cache` field —
+  for a stream, which has no `on_result`, the way to ask for a fresh sample. The
   host supplies the store: `LLMCache` is a protocol of two async methods,
   `get(key)` and `set(key, entry)`, over a plain-string `LLMCacheEntry`, and
   `InMemoryLLMCache` is the bounded in-process LRU reference store.

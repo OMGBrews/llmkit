@@ -1,8 +1,11 @@
-"""The cache hook the buffered call families share, written once.
+"""The cache hook the call families share, written once.
 
 Both buffered lanes reach the store through :func:`read_through`, parameterised
 by what differs between them (how to run the call, how to encode an answer, how
-to accept a stored one), so the structured and text paths cannot drift. Every
+to accept a stored one), so the structured and text paths cannot drift. The
+streamed text lane cannot be an awaitable *run* — its answer is complete only
+when its consumer pulls the last chunk — so it takes no part in the single
+flight and calls :func:`cached_entry` and :func:`store_entry` directly. Every
 cache-side failure degrades to a miss and reports to the one warn-once latch in
 :mod:`llmkit.cache.registry`.
 """
@@ -83,7 +86,7 @@ async def read_through[T](
     """
     if not lookup:
         return await _run_and_store(cache, key, run, encode)
-    stored = await _get(cache, key)
+    stored = await cached_entry(cache, key)
     if stored is not None:
         hit = await _accept(accept, stored)
         if hit is not None:
@@ -108,7 +111,7 @@ async def read_through[T](
         # Followers must never be left waiting on a leader that is gone.
         land(key, flight, entry)
     if entry is not None:
-        await _set(cache, key, entry)
+        await store_entry(cache, key, entry)
     return result
 
 
@@ -121,11 +124,12 @@ async def _run_and_store[T](
     result = await run()
     entry = _encode(encode, result)
     if entry is not None:
-        await _set(cache, key, entry)
+        await store_entry(cache, key, entry)
     return result
 
 
-async def _get(cache: LLMCache, key: str) -> LLMCacheEntry | None:
+async def cached_entry(cache: LLMCache, key: str) -> LLMCacheEntry | None:
+    """The entry *cache* holds for *key*, or ``None`` on a miss or any failure."""
     try:
         entry = await cache.get(key)
         # A structural protocol match promises the method exists, never that it
@@ -140,7 +144,8 @@ async def _get(cache: LLMCache, key: str) -> LLMCacheEntry | None:
     return entry
 
 
-async def _set(cache: LLMCache, key: str, entry: LLMCacheEntry) -> None:
+async def store_entry(cache: LLMCache, key: str, entry: LLMCacheEntry) -> None:
+    """Store *entry* under *key*; a failing store is reported, never raised."""
     try:
         await cache.set(key, entry)
     except Exception as exc:

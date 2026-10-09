@@ -116,7 +116,8 @@ class LLMCallOptions:
             per-call ``cache`` keyword, then to ``True``; ``False`` bypasses
             both lookup and store. Read by the buffered families
             (:func:`structured_llm_call`, :func:`text_llm_call` and their sync
-            wrappers) only; the streamed and tool families ignore it.
+            wrappers) and :func:`text_llm_call_stream`; the tool families
+            ignore it.
     """
 
     temperature: float | None | Unset = UNSET

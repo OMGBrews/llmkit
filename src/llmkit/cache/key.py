@@ -47,11 +47,13 @@ def llm_cache_key(
     max_tokens: int | None,
     reasoning_effort: ReasoningEffort | None,
 ) -> str:
-    """Fingerprint a buffered request as a sha256 hex digest.
+    """Fingerprint a request as a sha256 hex digest.
 
     Takes the call's *resolved* values: ``model`` and ``reasoning_effort`` as
     the call resolved them (``None`` defers to the provider, exactly as the
-    transport resolves it), and ``output_schema=None`` for a plain-text call.
+    transport resolves it), and ``output_schema=None`` for a plain-text call,
+    buffered or streamed — the stream flag is not part of the request's
+    content, so either lane answers the other.
     The digest covers, in this fixed order: :data:`LLM_CACHE_KEY_VERSION`; the
     provider's name; the model as routed to LiteLLM; the provider's endpoint
     kwargs (``api_base``, ``extra_body``, ``aws_region_name``,

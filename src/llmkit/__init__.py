@@ -12,7 +12,8 @@ This package provides:
 - A process-global async rate limiter shared across all calls
 - Default-on transient-error retries with full-jitter backoff (RetryPolicy)
 - Per-call invocation logging via a pluggable sink (with approximate cost)
-- An opt-in, host-pluggable response cache with in-process request coalescing
+- An opt-in, host-pluggable response cache, with in-process coalescing of
+  identical buffered requests
 - Run scoping, so every record and index line is filterable by run id
 
 The headline surface below is what a typical consumer needs. Lower-level
