@@ -38,7 +38,9 @@ from llmkit import DEFAULT_TEMPERATURE, LLMCallOptions, Provider, make_provider
 from llmkit import calls as llm_calls
 from llmkit.providers import LLMProviderInterface
 from tests._support import (
+    NO_USAGE,
     OkSchema,
+    UsageCounts,
     capture_stream_provider_kwargs,
     capture_structured_provider_kwargs,
     capture_text_provider_kwargs,
@@ -122,9 +124,11 @@ def test_unset_resolves_to_none_structured() -> None:
     ``None``, which its gating turns into an absent key."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="test"))
@@ -137,9 +141,11 @@ def test_unset_resolves_to_none_text() -> None:
     """The plain-text path resolves an unset temperature to ``None`` too."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[str, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         seen.update(kwargs)
-        return "ok", None
+        return "ok", None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
         _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test"))
@@ -235,9 +241,11 @@ def test_keyword_none_reaches_transport_structured() -> None:
     real wire seam by ``capture_structured_provider_kwargs``)."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = asyncio.run(
@@ -253,9 +261,11 @@ def test_keyword_none_reaches_transport_text() -> None:
     seam by ``capture_text_provider_kwargs``)."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[str, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         seen.update(kwargs)
-        return "ok", None
+        return "ok", None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
         _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test", temperature=None))
@@ -297,9 +307,11 @@ def test_keyword_none_reaches_transport_sync_structured() -> None:
     """The sync wrapper propagates ``temperature=None`` to the transport."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", temperature=None)
@@ -312,9 +324,11 @@ def test_keyword_none_reaches_transport_sync_text() -> None:
     the transport."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[str, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         seen.update(kwargs)
-        return "ok", None
+        return "ok", None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
         _ = llm_calls.text_llm_call_sync("hi", feature="test", temperature=None)
@@ -358,9 +372,11 @@ def test_options_numeric_still_forwards_when_keyword_unset() -> None:
     keyword is unset."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         _ = asyncio.run(
@@ -379,8 +395,10 @@ def test_log_record_carries_none_for_omitted_temperature() -> None:
     """An explicitly-omitted temperature is recorded as ``None`` on the
     ``LLMCallRecord``."""
 
-    async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _fake_transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         capturing_sink() as captured,
@@ -398,8 +416,10 @@ def test_log_record_carries_none_for_unset_temperature() -> None:
     """An unset temperature sends none, so it is recorded as ``None`` — the
     same state as an explicit ``temperature=None``."""
 
-    async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _fake_transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         capturing_sink() as captured,

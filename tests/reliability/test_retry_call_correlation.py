@@ -33,7 +33,7 @@ from llmkit import calls as llm_calls
 from llmkit._litellm import StreamedToolTurn
 from llmkit.retry import with_retries
 from llmkit.sync import run_sync
-from tests._support import OkSchema, provider_mock, quiet_logging
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock, quiet_logging
 
 
 def _assert_one_logical_call(records: list[LLMCallRecord], attempts: int) -> None:
@@ -77,8 +77,8 @@ async def _tool() -> object:
 
 
 _BUFFERED_FAMILIES: list[tuple[str, object, Callable[[], Awaitable[object]]]] = [
-    ("acompletion_structured", (OkSchema(ok=True), None), _structured),
-    ("acompletion_text", ("hello", None), _text),
+    ("acompletion_structured", (OkSchema(ok=True), None, NO_USAGE), _structured),
+    ("acompletion_text", ("hello", None, NO_USAGE), _text),
     ("acompletion_tools", ("done", [], "stop", (None, None, None), None), _tool),
 ]
 
@@ -115,7 +115,7 @@ def test_outer_with_retries_joins_passes_through_the_sync_bridge() -> None:
         quiet_logging(),
         patch(
             "llmkit._litellm.acompletion_structured",
-            side_effect=_failing_twice((OkSchema(ok=True), None)),
+            side_effect=_failing_twice((OkSchema(ok=True), None, NO_USAGE)),
         ),
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
@@ -206,8 +206,10 @@ async def test_call_from_another_task_keeps_its_own_call_id() -> None:
     label as the call that does."""
     passes = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     async def _fn() -> OkSchema:
         passes[0] += 1
@@ -245,11 +247,13 @@ async def test_two_calls_per_pass_stay_two_logical_calls() -> None:
     logical calls, matched across passes by occurrence within the pass."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 2:
             raise TimeoutError("second call of pass 1")
-        return "ok", None
+        return "ok", None, NO_USAGE
 
     async def _fn() -> None:
         _ = await llm_calls.text_llm_call("first", feature="test", retry=NO_RETRY)
@@ -279,8 +283,10 @@ async def test_call_first_reached_on_a_later_pass_starts_at_attempt_one() -> Non
     labelled call that runs on only some passes does not shift the others."""
     passes = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "ok", None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "ok", None, NO_USAGE
 
     async def _fn() -> None:
         passes[0] += 1

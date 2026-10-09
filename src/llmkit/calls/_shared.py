@@ -45,7 +45,7 @@ from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
 from llmkit.run_scope import get_run_id
-from llmkit.tools import ToolCall, ToolDefinition
+from llmkit.tools import TokenUsage, ToolCall, ToolDefinition
 
 # One logger for the whole call surface, named explicitly rather than via
 # ``__name__`` so every family module shares a single greppable name.
@@ -321,6 +321,21 @@ def resolve_model_and_provider(
         return (model, None)
 
 
+def usage_log_dict(usage: TokenUsage | None) -> dict[str, int | None] | None:
+    """The log record's ``usage`` mapping, ``None`` when no usage was received.
+
+    One builder for every lane that logs token counts, so the structured, text
+    and tool records cannot drift on key names.
+    """
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
 def build_text_record(
     *,
     started_at: datetime,
@@ -339,6 +354,7 @@ def build_text_record(
     reasoning_effort: ReasoningEffort | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    usage: TokenUsage | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -355,7 +371,9 @@ def build_text_record(
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the
-    record).
+    record). ``usage`` is the buffered call's token counts; the streaming
+    surface leaves it ``None``, because a plain text stream does not ask the
+    provider for usage.
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
@@ -383,4 +401,5 @@ def build_text_record(
         attempt=attempt,
         queue_wait_ms=current_queue_wait_ms(),
         run_id=get_run_id(),
+        usage=usage_log_dict(usage),
     )

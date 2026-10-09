@@ -22,6 +22,7 @@ from pydantic import BaseModel, ValidationError
 
 from llmkit import calls as llm_calls
 from llmkit import model_from_json_schema
+from tests._support import NO_USAGE, UsageCounts
 from tests._support import model_attr as _attr
 
 # A representative schema: nested objects (inline + via $defs/$ref), an array
@@ -852,7 +853,7 @@ def test_round_trip_through_structured_call() -> None:
 
     async def _fake_transport(
         _prompt: object, output_schema: type[BaseModel], **_kwargs: object
-    ) -> tuple[BaseModel, float | None]:
+    ) -> tuple[BaseModel, float | None, UsageCounts]:
         # The seam receives exactly the generated model and parses into it,
         # the way instructor would from the model-derived JSON schema.
         assert output_schema is model
@@ -865,7 +866,7 @@ def test_round_trip_through_structured_call() -> None:
                 "lines": [{"sku": "Z", "qty": 3}],
             }
         )
-        return parsed, 0.001
+        return parsed, 0.001, NO_USAGE
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
@@ -889,7 +890,7 @@ def test_build_once_model_reused_across_calls() -> None:
 
     async def _fake_transport(
         _prompt: object, output_schema: type[BaseModel], **_kwargs: object
-    ) -> tuple[BaseModel, float | None]:
+    ) -> tuple[BaseModel, float | None, UsageCounts]:
         seen.append(output_schema)
         parsed = output_schema.model_validate(
             {
@@ -900,7 +901,7 @@ def test_build_once_model_reused_across_calls() -> None:
                 "lines": [],
             }
         )
-        return parsed, None
+        return parsed, None, NO_USAGE
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)

@@ -32,8 +32,8 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.calls._shared import resolve_model_and_provider
+from tests._support import NO_USAGE, UsageCounts, provider_mock
 from tests._support import make_record as _record
-from tests._support import provider_mock
 
 
 def test_resolve_substitutes_provider_default_when_model_none() -> None:
@@ -85,9 +85,11 @@ def test_structured_call_forwards_provider_override_to_transport() -> None:
     override.model = "some-model"
     override.name = "OpenRouter"
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[_Schema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[_Schema, float | None, UsageCounts]:
         assert kwargs["provider"] is override
-        return _Schema(ok=True), None
+        return _Schema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
@@ -277,8 +279,10 @@ def test_successful_text_call_still_logs_the_text() -> None:
     """Regression for the ``None``-sentinel fix: a successful text call
     records the actual completion text, exactly as before."""
 
-    async def _fake_text(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "hello world", 0.001
+    async def _fake_text(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "hello world", 0.001, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
@@ -403,8 +407,8 @@ def test_raising_model_serializer_degrades_logged_response_not_the_call(
 
     async def _fake_structured(
         *_args: object, **_kwargs: object
-    ) -> tuple[_ExplodingDumpSchema, float | None]:
-        return _ExplodingDumpSchema(ok=True), 0.001
+    ) -> tuple[_ExplodingDumpSchema, float | None, UsageCounts]:
+        return _ExplodingDumpSchema(ok=True), 0.001, NO_USAGE
 
     with (
         patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),

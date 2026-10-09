@@ -35,7 +35,7 @@ from instructor.core import InstructorRetryException
 from llmkit import calls as llm_calls
 from llmkit import retry
 from llmkit.retry import _retry_after_seconds, with_retries
-from tests._support import OkSchema, quiet_logging
+from tests._support import NO_USAGE, OkSchema, UsageCounts, quiet_logging
 
 
 def _request() -> httpx.Request:
@@ -314,11 +314,13 @@ async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.Monkey
     monkeypatch.setattr(random, "uniform", _no_jitter)
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] == 1:
             raise _rate_limit({"retry-after": "4"})
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with quiet_logging(), patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
         result = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")

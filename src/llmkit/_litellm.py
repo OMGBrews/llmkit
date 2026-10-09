@@ -489,7 +489,7 @@ async def acompletion_structured[T: BaseModel](
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
-) -> tuple[T, float | None]:
+) -> tuple[T, float | None, tuple[int | None, int | None, int | None]]:
     """Structured completion via instructor pinned to the provider's mode.
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
@@ -533,7 +533,9 @@ async def acompletion_structured[T: BaseModel](
     single call route through a different provider family without changing
     the app-wide registration.
 
-    Returns ``(parsed, approximate_cost)``.
+    Returns ``(parsed, approximate_cost, usage)``, where ``usage`` is the
+    completion's ``(prompt_tokens, completion_tokens, total_tokens)`` from
+    :func:`_usage_counts` (each ``None`` when not reported) for the call log.
     """
     provider = provider if provider is not None else build_provider()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
@@ -596,7 +598,7 @@ async def acompletion_structured[T: BaseModel](
         # litellm ModelResponse. Narrow once so cost/usage read a real type.
         parsed, completion = cast("tuple[T, ModelResponse]", result)
         slot.record_tokens(_total_tokens(completion))
-    return parsed, _response_cost(completion)
+    return parsed, _response_cost(completion), _usage_counts(completion)
 
 
 async def acompletion_text(
@@ -607,7 +609,7 @@ async def acompletion_text(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
-) -> tuple[str, float | None]:
+) -> tuple[str, float | None, tuple[int | None, int | None, int | None]]:
     """Plain-text completion via LiteLLM.
 
     ``reasoning_effort`` controls provider thinking tokens, resolved against
@@ -618,10 +620,11 @@ async def acompletion_text(
     default sampling applies). ``provider`` overrides the configured
     provider for this call only (``None`` uses the globally-configured one).
 
-    Returns ``(text, approximate_cost)``. The text is the first choice's
-    message content coerced to a string via :func:`_coerce_text_content`
-    (list content blocks joined; an empty string when the provider returns
-    none).
+    Returns ``(text, approximate_cost, usage)``, ``usage`` being the
+    :func:`_usage_counts` triple the call log records. The text is the first
+    choice's message content coerced to a string via
+    :func:`_coerce_text_content` (list content blocks joined; an empty string
+    when the provider returns none).
     """
     provider = provider if provider is not None else build_provider()
     effort = _resolve_reasoning_effort(reasoning_effort, provider)
@@ -652,7 +655,7 @@ async def acompletion_text(
     # OpenAI-compatible proxy returning ``{"choices": []}``) would otherwise raise
     # ``IndexError`` here, bypassing the ``None`` -> "" coercion below.
     content = response.choices[0].message.content if response.choices else None
-    return _coerce_text_content(content), _response_cost(response)
+    return _coerce_text_content(content), _response_cost(response), _usage_counts(response)
 
 
 def _usage_counts(response: object) -> tuple[int | None, int | None, int | None]:

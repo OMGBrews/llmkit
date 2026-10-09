@@ -28,10 +28,10 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.options import resolve_call_args
-from tests._support import OkSchema, provider_mock
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
 
 type _CallKwargs = dict[str, object]
-type _StructuredFake = Callable[..., Awaitable[tuple[OkSchema, float | None]]]
+type _StructuredFake = Callable[..., Awaitable[tuple[OkSchema, float | None, UsageCounts]]]
 
 
 def _structured_recorder() -> tuple[_StructuredFake, list[_CallKwargs]]:
@@ -43,9 +43,9 @@ def _structured_recorder() -> tuple[_StructuredFake, list[_CallKwargs]]:
     """
     calls: list[_CallKwargs] = []
 
-    async def _fake(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None, UsageCounts]:
         calls.append(dict(kwargs))
-        return OkSchema(ok=True), 0.0
+        return OkSchema(ok=True), 0.0, NO_USAGE
 
     return _fake, calls
 
@@ -242,9 +242,9 @@ def test_options_threads_through_text_and_sync() -> None:
     """``options`` is honored by text and structured sync wrappers."""
     text_recorder: list[dict[str, object]] = []
 
-    async def _fake_text(*_args: object, **kwargs: object) -> tuple[str, float | None]:
+    async def _fake_text(*_args: object, **kwargs: object) -> tuple[str, float | None, UsageCounts]:
         text_recorder.append(dict(kwargs))
-        return "hello", None
+        return "hello", None, NO_USAGE
 
     struct_fake, struct_calls = _structured_recorder()
     options = LLMCallOptions(model="shared-model", max_tokens=128)

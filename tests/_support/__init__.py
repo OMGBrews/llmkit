@@ -25,6 +25,12 @@ from llmkit import (
     configure_llm_logging,
 )
 
+# The usage triple a faked ``acompletion_structured`` / ``acompletion_text``
+# returns beside its cost when the test does not care about token counts:
+# nothing reported, so the log record's ``usage`` is a mapping of nulls.
+type UsageCounts = tuple[int | None, int | None, int | None]
+NO_USAGE: UsageCounts = (None, None, None)
+
 
 class OkSchema(BaseModel):
     """The minimal structured-output target: a single boolean field."""
@@ -165,7 +171,7 @@ def capture_structured_provider_kwargs(
     provider = _transport_provider(reasoning_effort=provider_effort)
 
     with patch("llmkit._litellm.instructor.from_litellm", return_value=fake_client):
-        parsed, _cost = asyncio.run(
+        parsed, _cost, _usage = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 OkSchema,
@@ -208,7 +214,7 @@ def capture_text_provider_kwargs(
     provider = _transport_provider(reasoning_effort=provider_effort)
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
-        text, _cost = asyncio.run(
+        text, _cost, _usage = asyncio.run(
             _litellm.acompletion_text(
                 "hi",
                 temperature=temperature,

@@ -85,7 +85,7 @@ def test_acompletion_text_joins_provider_list_content() -> None:
     provider.reasoning_effort = None
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
-        text, _cost = asyncio.run(
+        text, _cost, _usage = asyncio.run(
             _litellm.acompletion_text("hi", temperature=0.0, model=None, provider=provider)
         )
 

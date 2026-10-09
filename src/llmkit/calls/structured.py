@@ -21,6 +21,7 @@ from llmkit.calls._shared import (
     resolve_model_and_provider,
     result_validation_budget,
     run_with_policy,
+    usage_log_dict,
 )
 from llmkit.capture import record_call_async
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
@@ -31,6 +32,7 @@ from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
+from llmkit.tools import TokenUsage
 
 
 async def structured_llm_call[T: BaseModel](
@@ -166,10 +168,11 @@ async def structured_llm_call[T: BaseModel](
         start_t = time.monotonic()
         response: T | None = None
         cost: float | None = None
+        usage: TokenUsage | None = None
         error: str | None = None
         diagnostics: OutputLimitDiagnostics | None = None
         try:
-            response, cost = await _litellm.acompletion_structured(
+            response, cost, counts = await _litellm.acompletion_structured(
                 prompt,
                 output_schema,
                 temperature=args.temperature,
@@ -178,6 +181,7 @@ async def structured_llm_call[T: BaseModel](
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
+            usage = TokenUsage(*counts)
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this result and
                 # re-rolls within the validation budget; the attempt is still
@@ -189,6 +193,14 @@ async def structured_llm_call[T: BaseModel](
             if isinstance(exc, OutputLimitError):
                 # ``None`` for a directly constructed error: no fields logged.
                 diagnostics = exc.diagnostics
+                if diagnostics is not None:
+                    # The truncated completion's counts also go in ``usage``,
+                    # so every attempt that reported usage logs it there.
+                    usage = TokenUsage(
+                        diagnostics.prompt_tokens,
+                        diagnostics.completion_tokens,
+                        diagnostics.total_tokens,
+                    )
             raise
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
@@ -232,6 +244,7 @@ async def structured_llm_call[T: BaseModel](
                     attempt=attempt,
                     queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
+                    usage=usage_log_dict(usage),
                     output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
                     partial_text=diagnostics.partial_text if diagnostics is not None else None,
                 )

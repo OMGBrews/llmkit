@@ -26,6 +26,7 @@ from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
 from llmkit.retry import RetryPolicy
 from llmkit.sync import run_sync
+from llmkit.tools import TokenUsage
 
 
 async def text_llm_call(
@@ -126,9 +127,10 @@ async def text_llm_call(
         # path differs on purpose — it logs the partial transcript.
         text: str | None = None
         cost: float | None = None
+        usage: TokenUsage | None = None
         error: str | None = None
         try:
-            text, cost = await _litellm.acompletion_text(
+            text, cost, counts = await _litellm.acompletion_text(
                 prompt,
                 temperature=args.temperature,
                 model=args.model,
@@ -136,6 +138,7 @@ async def text_llm_call(
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
+            usage = TokenUsage(*counts)
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this text and re-rolls
                 # within the validation budget; the attempt is still logged below.
@@ -163,6 +166,7 @@ async def text_llm_call(
                     reasoning_effort=args.reasoning_effort,
                     call_id=call_id,
                     attempt=attempt,
+                    usage=usage,
                 )
             )
 

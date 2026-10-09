@@ -20,7 +20,9 @@ from unittest.mock import patch
 
 from llmkit import calls as llm_calls
 from tests._support import (
+    NO_USAGE,
     OkSchema,
+    UsageCounts,
     capture_structured_provider_kwargs,
     capture_text_provider_kwargs,
     capturing_sink,
@@ -37,9 +39,11 @@ def test_sync_call_threads_max_tokens_to_transport() -> None:
     """``structured_llm_call_sync(..., max_tokens=256)`` forwards the cap."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", max_tokens=256)
@@ -54,9 +58,11 @@ def test_async_call_threads_max_tokens_to_transport() -> None:
     """The async ``structured_llm_call(..., max_tokens=N)`` does the same."""
     seen: dict[str, object] = {}
 
-    async def _fake_transport(*_args: object, **kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _fake_transport(
+        *_args: object, **kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         seen.update(kwargs)
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
@@ -83,8 +89,10 @@ def test_transport_includes_max_tokens_when_set() -> None:
 def test_log_record_carries_max_tokens() -> None:
     """The ``LLMCallRecord`` built for a structured call records the cap."""
 
-    async def _fake_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        return OkSchema(ok=True), None
+    async def _fake_transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
+        return OkSchema(ok=True), None, NO_USAGE
 
     with (
         capturing_sink() as captured,

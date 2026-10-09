@@ -36,7 +36,7 @@ def _run_text(provider: VertexProvider) -> dict[str, object]:
         return fake_resp
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
-        text, _cost = asyncio.run(
+        text, _cost, _usage = asyncio.run(
             _litellm.acompletion_text("hi", temperature=0.0, model=None, provider=provider)
         )
     assert text == "ok"
@@ -93,7 +93,7 @@ def test_structured_call_pins_json_schema_and_forwards_residency() -> None:
         return fake_client
 
     with patch("llmkit._litellm.instructor.from_litellm", side_effect=_capture_from_litellm):
-        parsed, _cost = asyncio.run(
+        parsed, _cost, _usage = asyncio.run(
             _litellm.acompletion_structured(
                 "hi", OkSchema, temperature=0.0, model=None, provider=provider
             )

@@ -45,7 +45,7 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.run_scope import RUN_ID_ENV_VAR
-from tests._support import OkSchema, provider_mock
+from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
 from tests._support import make_record as _record
 
 _NO_BACKOFF = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
@@ -91,12 +91,14 @@ def _no_ambient_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
 
 
-async def _ok_transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-    return OkSchema(ok=True), None
+async def _ok_transport(
+    *_args: object, **_kwargs: object
+) -> tuple[OkSchema, float | None, UsageCounts]:
+    return OkSchema(ok=True), None, NO_USAGE
 
 
-_StructuredTransport = Callable[..., Awaitable[tuple[OkSchema, float | None]]]
-_TextTransport = Callable[..., Awaitable[tuple[str, float | None]]]
+_StructuredTransport = Callable[..., Awaitable[tuple[OkSchema, float | None, UsageCounts]]]
+_TextTransport = Callable[..., Awaitable[tuple[str, float | None, UsageCounts]]]
 
 
 @contextmanager
@@ -254,8 +256,10 @@ async def test_text_call_stamps_the_active_run_id() -> None:
     """So does the buffered plain-text surface, which builds its record through
     a different helper (``_build_text_record``)."""
 
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
-        return "hello", None
+    async def _transport(
+        *_args: object, **_kwargs: object
+    ) -> tuple[str, float | None, UsageCounts]:
+        return "hello", None, NO_USAGE
 
     with (
         patch_text_transport(_transport),
@@ -302,11 +306,13 @@ def test_env_scoped_sync_call_tags_every_index_line_including_retries(
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     calls = [0]
 
-    async def _flaky(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    async def _flaky(
+        *_args: object, **_kwargs: object
+    ) -> tuple[OkSchema, float | None, UsageCounts]:
         calls[0] += 1
         if calls[0] < 3:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None
+        return OkSchema(ok=True), None, NO_USAGE
 
     with patch_transport(_flaky):
         result = llm_calls.structured_llm_call_sync(
