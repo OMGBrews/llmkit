@@ -12,7 +12,9 @@ lives here so the next family added does not become another copy:
   which differs between families only in which errors are charged to the
   validation budget;
 * :func:`run_cached` — the response-cache read-through around that pass, for
-  the two buffered families that read the cache;
+  the two buffered families that read the cache, and :func:`cache_and_key` —
+  whether a call reads the cache at all, which the streamed text family shares
+  with them;
 * :func:`result_validation_budget` / :func:`tool_validation_budget` /
   :func:`compose_validation_budget` — the three augmented validation sets;
 * :func:`build_text_record` and :func:`resolve_model_and_provider` — record
@@ -42,7 +44,7 @@ from typing import NamedTuple, cast
 from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
-from llmkit.cache import LLMCacheEntry, get_llm_cache
+from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import cache_key_or_none, read_through
 from llmkit.exceptions import ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
@@ -172,8 +174,9 @@ def prepare_call(
     first ``__anext__``, in the consumer's task — a read of the loop's scope,
     never a write.
 
-    *cache* is passed only by the buffered families, the ones that read the
-    response cache; the others leave it unset.
+    *cache* is passed by the families that read the response cache — the two
+    buffered ones and the streamed text family; the tool families leave it
+    unset.
     """
     args = resolve_call_args(
         options,
@@ -217,6 +220,36 @@ async def run_with_policy[T](
     )
 
 
+def cache_and_key(
+    prepared: PreparedCall,
+    prompt: str | Sequence[ChatMessage],
+    output_schema: type[BaseModel] | None,
+) -> tuple[LLMCache, str] | None:
+    """The configured cache and this request's key, or ``None`` to bypass it.
+
+    The cache participates only when the call did not opt out
+    (``args.cache``), a cache is configured, and the provider resolved — a
+    ``None`` provider means the build failed and the transport must be left to
+    raise the real error — and only when the request can be fingerprinted.
+    Every lane that reads the cache decides here, so they cannot drift on when
+    a request is byte-identical to a library without a cache.
+    """
+    args, provider, _, _ = prepared
+    cache = get_llm_cache() if args.cache else None
+    if cache is None or provider is None:
+        return None
+    key = cache_key_or_none(
+        provider=provider,
+        prompt=prompt,
+        output_schema=output_schema,
+        model=args.model,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+    )
+    return None if key is None else (cache, key)
+
+
 async def run_cached[T](
     run: Callable[[], Awaitable[T]],
     *,
@@ -230,12 +263,9 @@ async def run_cached[T](
 ) -> T:
     """Run *run* (the call's whole retry pass) through the response cache.
 
-    The cache participates only when the call did not opt out
-    (``args.cache``), a cache is configured, and the provider resolved — a
-    ``None`` provider means the build failed and the transport must be left to
-    raise the real error. Otherwise, and whenever the request cannot be
-    fingerprinted, this is exactly ``await run()``: the request is
-    byte-identical to a library without a cache.
+    When :func:`cache_and_key` bypasses the cache this is exactly
+    ``await run()``: the request is byte-identical to a library without a
+    cache.
 
     A hit sits above :func:`run_with_policy` and therefore above the rate
     limiter, so it spends no retry budget and takes no slot. It still runs the
@@ -247,20 +277,10 @@ async def run_cached[T](
     *encode* and *decode* turn a result into the stored string and back.
     """
     args, provider, call_id, attempt_offset = prepared
-    cache = get_llm_cache() if args.cache else None
-    if cache is None or provider is None:
+    participation = cache_and_key(prepared, prompt, output_schema)
+    if participation is None:
         return await run()
-    key = cache_key_or_none(
-        provider=provider,
-        prompt=prompt,
-        output_schema=output_schema,
-        model=args.model,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        reasoning_effort=args.reasoning_effort,
-    )
-    if key is None:
-        return await run()
+    cache, key = participation
     started_at = datetime.now(UTC)
     start_t = time.monotonic()
     model, provider_name = resolve_model_and_provider(args.model, provider)
@@ -459,10 +479,11 @@ def build_text_record(
     too (both default ``None`` — absent from the request and unset on the
     record). ``usage`` is the buffered call's token counts; the streaming
     surface leaves it ``None``, because a plain text stream does not ask the
-    provider for usage. ``cache_hit`` marks a response-cache hit, whose
-    ``queue_wait_ms`` is ``None`` because it never queued (the queue-wait
-    stamp would still hold the previous attempt's value), and
-    ``source_call_id`` names the call that paid for its answer.
+    provider for usage. ``cache_hit`` marks a response-cache hit — buffered or
+    streamed, whichever lane answered — whose ``queue_wait_ms`` is ``None``
+    because it never queued (the queue-wait stamp would still hold the
+    previous attempt's value), and ``source_call_id`` names the call that paid
+    for its answer.
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)

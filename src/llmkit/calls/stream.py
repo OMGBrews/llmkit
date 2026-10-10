@@ -8,6 +8,12 @@ The record this family writes is honest about how the stream ended: a provider
 error logs that error, and a consumer that abandons the stream mid-flight logs
 :data:`STREAM_ABANDONED_ERROR` — never a clean ``ok`` over a truncated
 transcript.
+
+It reads the response cache, with the same key as a buffered text call, but
+takes no part in the single flight: a stream's answer is complete only when its
+consumer pulls the last chunk, so an identical caller waiting on it would wait
+on a consumer that may never move. A hit replays the stored text as one chunk
+outside the retry loop; a miss stores only a stream that ran to completion.
 """
 
 from __future__ import annotations
@@ -20,7 +26,14 @@ from contextlib import aclosing
 from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
-from llmkit.calls._shared import build_text_record, prepare_call
+from llmkit.cache import LLMCacheEntry
+from llmkit.cache.read_through import cached_entry, store_entry
+from llmkit.calls._shared import (
+    build_text_record,
+    cache_and_key,
+    prepare_call,
+    resolve_model_and_provider,
+)
 from llmkit.capture import record_call, record_call_async
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
@@ -45,6 +58,7 @@ async def text_llm_call_stream(
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
@@ -82,12 +96,25 @@ async def text_llm_call_stream(
     once any chunk has reached the caller, a mid-stream error propagates
     unretried. Each attempt is its own logged call.
 
+    ``cache`` is response-cache participation (see
+    :func:`structured_llm_call`): unset defers to ``options``, then to
+    ``True``; ``False`` bypasses lookup and store. With a cache configured, a
+    request identical to one answered before — streamed or buffered, the two
+    share a key — is replayed from the store as a **single chunk**, with no
+    provider call, no rate-limiter slot and no retry loop, and logged with
+    ``cache_hit=True`` and ``approximate_cost=0.0``. A stream is stored only
+    when it runs to completion: one its consumer abandons, or one that raises,
+    stores nothing. A stream has no ``on_result`` hook, so outside an
+    enclosing :func:`~llmkit.retry.with_retries` loop ``cache=False`` is how
+    to ask for a fresh sample. Identical streams in flight at once each pay
+    for their own answer — the single flight is the buffered calls' alone.
+
     ``options`` is the same opt-in :class:`LLMCallOptions` bundle the other
     call functions accept, with the same **config < options < explicit
     keyword** precedence (see :func:`structured_llm_call`); ``None`` leaves
     the flat-keyword path unchanged.
     """
-    args, provider, call_id, attempt_offset = prepare_call(
+    prepared = prepare_call(
         options,
         temperature=temperature,
         model=model,
@@ -97,8 +124,63 @@ async def text_llm_call_stream(
         provider=provider,
         feature=feature,
         label=label,
+        cache=cache,
     )
+    args, provider, call_id, attempt_offset = prepared
     tag = label or feature
+    # The same key a buffered text call computes, so either lane answers the
+    # other. A pass re-run by an enclosing ``with_retries`` loop skips the
+    # lookup (the host rejected the earlier answer), as ``run_cached`` does.
+    participation = cache_and_key(prepared, prompt, output_schema=None)
+    if participation is not None and attempt_offset == 0:
+        started_at = datetime.now(UTC)
+        start_t = time.monotonic()
+        entry = await cached_entry(*participation)
+        if entry is not None:
+            # Inline rather than a helper generator: another generator layer
+            # would need its own ``aclosing`` for the abandoned record to be
+            # written deterministically. The hit never touches the transport,
+            # so it takes no slot and never calls ``begin_queue_wait``.
+            error: str | None = None
+            try:
+                # A stored empty answer yields nothing, as a live empty stream
+                # does; its hit is still recorded.
+                if entry.response:
+                    yield entry.response
+            except (GeneratorExit, asyncio.CancelledError):
+                error = STREAM_ABANDONED_ERROR
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                record = build_text_record(
+                    started_at=started_at,
+                    feature=feature,
+                    label=label,
+                    prompt=prompt,
+                    text=entry.response,
+                    start_t=start_t,
+                    temperature=args.temperature,
+                    model=args.model,
+                    provider=provider,
+                    error=error,
+                    approximate_cost=0.0,
+                    schema="stream",
+                    max_tokens=args.max_tokens,
+                    reasoning_effort=args.reasoning_effort,
+                    call_id=call_id,
+                    attempt=attempt_offset + 1,
+                    cache_hit=True,
+                    source_call_id=entry.call_id,
+                )
+                # The same record-step split as ``_stream_once``, for the same
+                # reason: never suspend while abandonment is unwinding.
+                if error == STREAM_ABANDONED_ERROR:
+                    _ = record_call(record)
+                else:
+                    _ = await record_call_async(record)
+            return
     # ``call_id`` and ``attempt_offset`` reach ``_stream_once`` as plain
     # parameters — NEVER a ContextVar: an async generator's body runs in its
     # *consumer's* context, so a ContextVar set here would leak the stream's
@@ -120,6 +202,7 @@ async def text_llm_call_stream(
             attempt=attempt_offset + attempt,
         )
 
+    accumulated: list[str] = []
     # The retry loop itself lives in :mod:`llmkit.retry` beside the awaitable
     # one, so the two stay reviewable together; this surface owns only what one
     # attempt *is*. ``aclosing`` propagates an abandoning consumer's close down
@@ -138,7 +221,26 @@ async def text_llm_call_stream(
         )
     ) as stream:
         async for chunk in stream:
+            accumulated.append(chunk)
             yield chunk
+    # Reached only when the stream ran out on its own: an abandoning consumer
+    # raises ``GeneratorExit`` at the ``yield`` and a provider error
+    # propagates, so neither stores. Retries happen only before the first
+    # chunk, so *accumulated* holds the one attempt that answered.
+    if participation is not None:
+        resolved_model, provider_name = resolve_model_and_provider(args.model, provider)
+        await store_entry(
+            *participation,
+            LLMCacheEntry(
+                response="".join(accumulated),
+                # The entry is a text answer; which lane produced it is the
+                # record's concern, so a buffered call can serve it as well.
+                schema="text",
+                provider=provider_name,
+                model=resolved_model,
+                call_id=call_id,
+            ),
+        )
 
 
 def stream_text_with_log(
@@ -152,6 +254,7 @@ def stream_text_with_log(
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[str]:
     """Deprecated alias for :func:`text_llm_call_stream`; removed in llmkit 1.0.
@@ -178,6 +281,7 @@ def stream_text_with_log(
         reasoning_effort=reasoning_effort,
         provider=provider,
         retry=retry,
+        cache=cache,
         options=options,
     )
 

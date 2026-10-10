@@ -351,7 +351,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `cache` (the last read by the buffered families only; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -843,15 +843,15 @@ from llmkit import InMemoryLLMCache, configure_llm_cache
 configure_llm_cache(InMemoryLLMCache(max_entries=1024))   # None (the default) turns it off
 ```
 
-The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers; the streamed and tool families do not read it. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
+The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers, and by `text_llm_call_stream`; the tool families do not read it. A streamed and a buffered text request for the same prompt are the same request, so either one answers the other. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
 
-What a configured cache does on each buffered call:
+What a configured cache does on each call that reads it:
 
-- **Hit.** When an earlier successful call stored an answer for the same request, the call returns it. A structured answer is validated into a fresh instance of your schema, and your `on_result` hook still runs on it; if the hook rejects the stored answer, this call goes to the provider as if nothing were stored, and the new answer replaces the old one.
-- **Identical requests in flight at once.** Requests that start before an identical one has finished share its provider call: the first runs, the rest wait for its answer and record hits. If the first fails or is cancelled, each waiting call goes to the provider on its own retry budget. This works within one process; requests from separate processes each reach the store on their own.
-- **Miss.** The call runs exactly as it would without a cache. Only an answer that comes back cleanly is stored — never an attempt that raised, an answer your `on_result` rejected, or a truncated answer (`OutputLimitError`).
+- **Hit.** When an earlier successful call stored an answer for the same request, the call returns it. A structured answer is validated into a fresh instance of your schema, and your `on_result` hook still runs on it; if the hook rejects the stored answer, this call goes to the provider as if nothing were stored, and the new answer replaces the old one. A streamed call replays the stored text as **a single chunk** and then ends — it does not re-create the chunking of the stream that stored it — so code that parses a stream incrementally receives the whole answer at once; to exercise incremental parsing, split the text in your own test double.
+- **Identical requests in flight at once.** Buffered requests that start before an identical one has finished share its provider call: the first runs, the rest wait for its answer and record hits. If the first fails or is cancelled, each waiting call goes to the provider on its own retry budget. This works within one process; requests from separate processes each reach the store on their own. Streams take no part: a stream's answer is complete only when your code has read its last chunk, so an identical stream in flight is neither waited on nor waits, each pays for its own answer, and a stream never holds up a buffered call.
+- **Miss.** The call runs exactly as it would without a cache. Only an answer that comes back cleanly is stored — never an attempt that raised, an answer your `on_result` rejected, a truncated structured answer (`OutputLimitError`), or a stream your code stopped reading before its end. The text lanes do not check why the provider stopped, so a text answer cut off at `max_tokens`, streamed or buffered, completes cleanly and is stored like any other.
 
-A cache returns the *first* sample for a request. That is the point, but it changes behaviour for a caller that re-sends a prompt to get a different draft. Opt such a call out with `cache=False`, on the call or on `LLMCallOptions`; it then neither reads, waits on, nor writes the cache:
+A cache returns the *first* sample for a request. That is the point, but it changes behaviour for a caller that re-sends a prompt to get a different draft. Opt such a call out with `cache=False`, on the call or on `LLMCallOptions`; it then neither reads, waits on, nor writes the cache. A stream has no `on_result` hook, so outside an enclosing `with_retries` loop `cache=False` is how a stream asks for a fresh sample:
 
 ```python
 draft = await text_llm_call(prompt, feature="drafting", temperature=1.0, cache=False)
@@ -867,7 +867,7 @@ Credentials are never part of the key, so rotating an API key keeps your hits. `
 
 ### What a hit looks like in the log
 
-A hit writes one record like any call, with `cache_hit: true`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
+A hit writes one record like any call, with `cache_hit: true`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight — for a streamed hit, also the time your code spends on its one chunk, as every stream record's duration includes the consumer's handling. A streamed hit's `schema` is `stream`, like any stream record. A replay your code abandons before its end logs as any abandoned stream does, `# ERROR` with the abandonment marker, and still carries `cache=hit` and `$0`. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
 
 ```text
 # ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 2ms | $0

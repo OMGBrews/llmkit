@@ -1,18 +1,19 @@
-"""A host-pluggable response cache for the buffered call functions.
+"""A host-pluggable response cache for the buffered calls and the text stream.
 
-With a cache configured, a :func:`~llmkit.structured_llm_call` or
-:func:`~llmkit.text_llm_call` whose resolved request was answered before is
-answered from the store: no provider call, no rate-limiter slot, no retry
-budget — and still one :class:`~llmkit.LLMCallRecord`, marked
-``cache_hit=True``. Identical requests in flight at once in one process share
-one provider call. The host supplies the store; llmkit owns everything that
+With a cache configured, a :func:`~llmkit.structured_llm_call`,
+:func:`~llmkit.text_llm_call` or :func:`~llmkit.text_llm_call_stream` whose
+resolved request was answered before is answered from the store: no provider
+call, no rate-limiter slot, no retry budget — and still one
+:class:`~llmkit.LLMCallRecord`, marked ``cache_hit=True``. A streamed and a
+buffered text request share one key; a streamed hit replays the stored text as
+one chunk. Identical buffered requests in flight at once in one process share
+one provider call; streams take no part in that. The host supplies the store; llmkit owns everything that
 needs the resolved request.
 
 Off by default: with no cache configured every request is byte-identical to a
 library without this package. ``cache=False`` on a call or on
 :class:`~llmkit.LLMCallOptions` opts one call out — for a caller that re-sends
-a prompt to get a different sample. The streamed and tool families do not read
-the cache.
+a prompt to get a different sample. The tool families do not read the cache.
 
 Module layout
 -------------
@@ -24,7 +25,8 @@ Module layout
   failure reports to;
 * :mod:`~llmkit.cache.key` — :func:`llm_cache_key`, the request fingerprint;
 * :mod:`~llmkit.cache.memory` — :class:`InMemoryLLMCache`, the reference store;
-* :mod:`~llmkit.cache.read_through` — the hook both buffered lanes call;
+* :mod:`~llmkit.cache.read_through` — the hook the lanes that read the cache
+  call;
 * ``_flight`` — the per-loop single-flight registry.
 """
 

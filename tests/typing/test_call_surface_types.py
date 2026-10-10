@@ -138,6 +138,17 @@ async def _typecheck_temperature_accepts_none() -> None:
     _ = wrapper
 
 
+async def _typecheck_cache_accepted_on_every_caching_lane() -> None:
+    # ``cache`` reaches the response cache from every lane that reads it — the
+    # streamed text family included — directly and through options.
+    _ = await text_llm_call("hi", feature="t", cache=False)
+    _ = text_llm_call_sync("hi", feature="t", cache=False)
+    _ = await structured_llm_call("hi", _Out, feature="t", cache=False)
+    _ = assert_type(text_llm_call_stream("hi", feature="t", cache=False), AsyncGenerator[str])
+    _ = stream_text_with_log("hi", feature="t", cache=False)
+    _ = text_llm_call_stream("hi", feature="t", options=LLMCallOptions(cache=False))
+
+
 def _typecheck_prompt_rejects_invalid_shapes() -> None:
     # The raw wire shape the fix retired: dict[str, str] permits typo keys and
     # forbids multimodal content, so it is no longer assignable to the prompt.
@@ -177,6 +188,7 @@ def test_typecheck_helpers_exist() -> None:
         _typecheck_prompt_accepts_valid_shapes,
         _typecheck_reasoning_effort_accepts_values,
         _typecheck_temperature_accepts_none,
+        _typecheck_cache_accepted_on_every_caching_lane,
         _typecheck_prompt_rejects_invalid_shapes,
         _typecheck_streaming_tool_lane_rejects_compose,
     ):

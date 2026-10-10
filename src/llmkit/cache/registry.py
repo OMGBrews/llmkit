@@ -29,14 +29,15 @@ _cache_latch = OnceLatch()
 
 
 def configure_llm_cache(cache: LLMCache | None) -> None:
-    """Set the response cache the buffered call functions read through.
+    """Set the response cache the call functions read through.
 
     Pass ``None`` (the default state) to turn caching off. With a cache
-    configured, :func:`~llmkit.structured_llm_call` and
-    :func:`~llmkit.text_llm_call` (and their sync wrappers) answer a request
-    whose fingerprint was stored by an earlier successful call from the store,
-    coalesce identical requests in flight at once into one provider call, and
-    store each new successful answer. ``cache=False`` on a call or on
+    configured, :func:`~llmkit.structured_llm_call`,
+    :func:`~llmkit.text_llm_call` (and their sync wrappers) and
+    :func:`~llmkit.text_llm_call_stream` answer a request whose fingerprint
+    was stored by an earlier successful call from the store and store each new
+    successful answer; the buffered calls also coalesce identical requests in
+    flight at once into one provider call. ``cache=False`` on a call or on
     :class:`~llmkit.LLMCallOptions` opts that call out.
 
     Re-arms the warn-once latch, so a newly configured store gets a fresh loud
