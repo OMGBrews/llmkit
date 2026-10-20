@@ -3,7 +3,8 @@
 Guidance for AI coding agents working in this repository. Everything here is
 harness-agnostic; the human-facing context lives in [README.md](README.md) and
 [CONTRIBUTING.md](CONTRIBUTING.md), which this file points into rather than
-repeats.
+repeats. Claude Code loads this nested guide on Read only, not on Write or Edit;
+read it before changing library files.
 
 ## What this is
 
