@@ -132,7 +132,6 @@ CONTRIBUTING.md
 PRINCIPLES.md
 SECURITY.md
 AGENTS.md
-CLAUDE.md
 <!-- DOCS-ONLY:END -->
 
 Classify a diff with the predicate rather than by eye, from a checkout of the public
