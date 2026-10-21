@@ -76,8 +76,11 @@ async def structured_llm_call[T: BaseModel](
             resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``): no
             ``temperature`` kwarg is forwarded and the provider's default
             sampling applies. An explicit ``None`` does the same. An explicit
-            number is forwarded unchanged, so a model that rejects sampling
-            parameters (Google's upcoming Gemini models) fails loudly.
+            number is forwarded; where LiteLLM or the provider refuses it as
+            unsupported for the model (GPT-5 models with reasoning active,
+            Claude 5.5-era models, Google's upcoming Gemini models), the
+            request is re-issued once without it and the call record shows
+            ``None``.
         model: Optional model override (provider default when it resolves to
             ``None``). *Dual-homed* — also settable on
             :class:`~llmkit.LLMClientConfig`; this per-call value overrides
@@ -183,6 +186,10 @@ async def structured_llm_call[T: BaseModel](
         usage: TokenUsage | None = None
         error: str | None = None
         diagnostics: OutputLimitDiagnostics | None = None
+        # What the transport actually sent, copied right after its await (see
+        # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
+        sent_temperature = args.temperature
+        _litellm.begin_sent_temperature()
         try:
             response, cost, counts = await _litellm.acompletion_structured(
                 prompt,
@@ -193,6 +200,7 @@ async def structured_llm_call[T: BaseModel](
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
+            sent_temperature = _litellm.sent_temperature(args.temperature)
             usage = TokenUsage(*counts)
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this result and
@@ -201,6 +209,9 @@ async def structured_llm_call[T: BaseModel](
                 _ = on_result(response)
             return response
         except Exception as exc:
+            # instructor can raise after a completion returned (a truncation),
+            # in which case the funnel already stamped what it sent.
+            sent_temperature = _litellm.sent_temperature(sent_temperature)
             error = f"{type(exc).__name__}: {exc}"
             if isinstance(exc, OutputLimitError):
                 # ``None`` for a directly constructed error: no fields logged.
@@ -225,7 +236,7 @@ async def structured_llm_call[T: BaseModel](
                     label=label,
                     model=resolved_model,
                     provider=resolved_provider,
-                    temperature=args.temperature,
+                    temperature=sent_temperature,
                     duration_ms=duration_ms,
                     schema=output_schema.__name__,
                     prompt=prompt,

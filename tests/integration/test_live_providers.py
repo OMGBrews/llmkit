@@ -104,8 +104,10 @@ from llmkit import (
     ToolCallResult,
     ToolDefinition,
     ToolName,
+    capture_llm_records,
     model_from_json_schema,
     structured_llm_call,
+    text_llm_call,
     tool_llm_call,
     tool_llm_call_stream,
     tool_result_message,
@@ -890,3 +892,41 @@ async def test_vertex_forced_tool_stream_reports_usage_live() -> None:
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].validated == _AdditionArgs(left=2, right=3)
     assert result.usage.total_tokens is not None and result.usage.total_tokens > 0
+
+
+# The routes on which LiteLLM 1.104 refuses ``temperature=0.0``: a GPT-5 model
+# with reasoning active, either explicitly (``gpt-5.4-mini`` at ``low``) or by
+# the model's own default (``gpt-5-mini`` with no effort passed), and a Claude
+# 5.5-era model, which takes no sampling temperature at all. Hard-coded rather
+# than env-overridable: each id is the refusal it exists to exercise.
+_TEMPERATURE_REFUSING_ROUTES = [
+    pytest.param(Provider.OPENAI, "gpt-5.4-mini", "low", id="openai-gpt-5.4-mini-low"),
+    pytest.param(Provider.OPENAI, "gpt-5-mini", None, id="openai-gpt-5-mini-default-effort"),
+    pytest.param(Provider.ANTHROPIC, "claude-sonnet-5-5", None, id="anthropic-sonnet-5-5"),
+    pytest.param(
+        Provider.BEDROCK, "global.anthropic.claude-sonnet-5-5", None, id="bedrock-sonnet-5-5"
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider", "model", "effort"), _TEMPERATURE_REFUSING_ROUTES)
+async def test_refused_temperature_zero_is_dropped_live(
+    provider: Provider, model: str, effort: str | None
+) -> None:
+    """``temperature=0.0`` runs on a model that refuses it, and the log says none was sent."""
+    built = make_provider(provider, model=model, **_live_credentials(provider))
+    with capture_llm_records() as records:
+        text = await text_llm_call(
+            "Reply with the single word: ok",
+            feature="integration-temperature-smoke",
+            provider=built,
+            temperature=0.0,
+            reasoning_effort=effort,
+            max_tokens=2048,
+        )
+
+    assert text.strip()
+    [record] = records
+    assert record.error is None
+    assert record.temperature is None

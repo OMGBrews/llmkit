@@ -70,10 +70,12 @@ class LLMCallRecord:
     returned (``None`` on every record that is not a hit). The YAML body
     carries both; ``index.jsonl`` carries ``cache_hit`` only.
 
-    ``temperature`` is ``None`` exactly when no ``temperature`` kwarg was
-    sent and the provider's default sampling applied — an unset call
-    (llmkit's :data:`~llmkit.DEFAULT_TEMPERATURE` is ``None``) or an explicit
-    ``temperature=None``. Custom sinks that read ``record.temperature`` must
+    ``temperature`` is the temperature the request actually sent. It is
+    ``None`` exactly when none was sent and the model's default sampling
+    applied — an unset call (llmkit's :data:`~llmkit.DEFAULT_TEMPERATURE` is
+    ``None``), an explicit ``temperature=None``, or a value the model refused
+    as unsupported, which llmkit then omitted on a single re-issue. A cache
+    hit sent nothing and records the requested value. Custom sinks that read ``record.temperature`` must
     handle the ``None`` state (the YAML sink writes it as ``null``).
 
     ``run_id`` is the *outer* scope ``call_id`` does not provide: the run —

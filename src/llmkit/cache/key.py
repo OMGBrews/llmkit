@@ -62,7 +62,10 @@ def llm_cache_key(
     ``"text"``; temperature; max_tokens; the effective reasoning effort; and,
     for a structured call, the provider's structured-output mode and strict
     JSON-schema flag. ``feature`` and ``label`` are telemetry and are not part
-    of it.
+    of it. The temperature is the *requested* value, which may be omitted on
+    the wire when the model refuses it; the omission is a deterministic
+    function of the same request, so keying on the request never conflates two
+    different answers.
 
     The JSON is serialised **without** sorting keys: a schema's property order
     is sent to the provider and steers the order the model generates fields
