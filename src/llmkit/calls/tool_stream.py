@@ -218,6 +218,14 @@ async def _stream_tools_once(
     # stopped". Set *before* the terminal yield, because that is where an
     # idiomatic consumer's ``break`` throws ``GeneratorExit`` into this frame.
     completed = False
+    # What the transport actually sent, copied once, before the first yield:
+    # until then every line here runs inside the consumer's first ``__anext__``,
+    # the same context the funnel stamped. After a yield the consumer's own
+    # llmkit calls may restamp that context, so it is never read again (see
+    # :func:`llmkit._litellm.sent_temperature`).
+    sent_temperature = temperature
+    captured = False
+    _litellm.begin_sent_temperature()
     try:
         async with aclosing(
             _litellm.astream_tools(
@@ -232,6 +240,9 @@ async def _stream_tools_once(
             )
         ) as transport:
             async for item in transport:
+                if not captured:
+                    sent_temperature = _litellm.sent_temperature(temperature)
+                    captured = True
                 if isinstance(item, str):
                     accumulated.append(item)
                     yield TextDeltaEvent(item)
@@ -269,6 +280,9 @@ async def _stream_tools_once(
         error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if not captured:
+            # Nothing was yielded, so this is still the funnel's context.
+            sent_temperature = _litellm.sent_temperature(temperature)
         resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
         record = LLMCallRecord(
             started_at=started_at,
@@ -276,7 +290,7 @@ async def _stream_tools_once(
             label=label,
             model=resolved_model,
             provider=resolved_provider,
-            temperature=temperature,
+            temperature=sent_temperature,
             duration_ms=(time.monotonic() - start_t) * 1000,
             schema=TOOL_STREAM_LOG_SCHEMA,
             prompt=prompt,

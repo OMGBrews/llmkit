@@ -64,8 +64,11 @@ async def text_llm_call(
             neither this keyword nor ``options`` supplies a value it resolves
             to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``): no
             ``temperature`` kwarg is forwarded and the provider's default
-            sampling applies. An explicit ``None`` does the same; an
-            explicit number is forwarded unchanged.
+            sampling applies. An explicit ``None`` does the same. An
+            explicit number is forwarded; where LiteLLM or the provider
+            refuses it as unsupported for the model (GPT-5 models with
+            reasoning active, Claude 5.5-era models), the request is
+            re-issued once without it and the call record shows ``None``.
         model: Optional model override (provider default when it resolves
             to ``None``). *Dual-homed* with
             :class:`~llmkit.LLMClientConfig`: per-call overrides
@@ -138,6 +141,10 @@ async def text_llm_call(
         cost: float | None = None
         usage: TokenUsage | None = None
         error: str | None = None
+        # What the transport actually sent, copied right after its await (see
+        # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
+        sent_temperature = args.temperature
+        _litellm.begin_sent_temperature()
         try:
             text, cost, counts = await _litellm.acompletion_text(
                 prompt,
@@ -147,6 +154,7 @@ async def text_llm_call(
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
             )
+            sent_temperature = _litellm.sent_temperature(args.temperature)
             usage = TokenUsage(*counts)
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this text and re-rolls
@@ -165,7 +173,7 @@ async def text_llm_call(
                     prompt=prompt,
                     text=text,
                     start_t=start_t,
-                    temperature=args.temperature,
+                    temperature=sent_temperature,
                     model=args.model,
                     provider=provider,
                     error=error,

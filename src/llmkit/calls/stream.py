@@ -323,6 +323,14 @@ async def _stream_once(
     begin_queue_wait()
     accumulated: list[str] = []
     error: str | None = None
+    # What the transport actually sent, copied once, before the first yield:
+    # until then every line here runs inside the consumer's first ``__anext__``,
+    # the same context the funnel stamped. After a yield the consumer's own
+    # llmkit calls may restamp that context, so it is never read again (see
+    # :func:`llmkit._litellm.sent_temperature`).
+    sent_temperature = temperature
+    captured = False
+    _litellm.begin_sent_temperature()
     try:
         async for chunk in _litellm.astream_text(
             prompt,
@@ -332,6 +340,9 @@ async def _stream_once(
             reasoning_effort=reasoning_effort,
             provider=provider,
         ):
+            if not captured:
+                sent_temperature = _litellm.sent_temperature(temperature)
+                captured = True
             if chunk:
                 accumulated.append(chunk)
                 yield chunk
@@ -350,6 +361,9 @@ async def _stream_once(
         error = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if not captured:
+            # Nothing was yielded, so this is still the funnel's context.
+            sent_temperature = _litellm.sent_temperature(temperature)
         record = build_text_record(
             started_at=started_at,
             feature=feature,
@@ -357,7 +371,7 @@ async def _stream_once(
             prompt=prompt,
             text="".join(accumulated),
             start_t=start_t,
-            temperature=temperature,
+            temperature=sent_temperature,
             model=model,
             provider=provider,
             error=error,

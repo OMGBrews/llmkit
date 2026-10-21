@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **A temperature the model refuses is omitted on one re-issue instead of
+  failing the call.** LiteLLM refuses any `temperature` but `1` on GPT-5
+  models whose effective reasoning effort is not `none` (including
+  `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models
+  on the Anthropic and Bedrock routes, and a provider may refuse it with an
+  HTTP 400 of its own. When either refusal names `temperature`, every call
+  lane now re-issues the request exactly once with LiteLLM's per-call
+  `additional_drop_params=["temperature"]`, so `temperature=0.0` runs at the
+  model's own sampling without a host setting the process-global
+  `litellm.drop_params`. If the re-issue fails too, the original refusal is
+  raised. `LLMCallRecord.temperature` records what was sent, so a dropped call
+  logs `temperature: null`; a cache hit records the requested value, and the
+  cache key keeps keying on it. This supersedes the 0.11.0 entry's promise
+  that an explicit temperature is "forwarded unchanged on every provider" and
+  "a model that rejects it fails loudly". A host that sets the global
+  `litellm.drop_params` gets LiteLLM's silent drop instead, and its records
+  show the requested value.
+
 ## [0.12.0] — 2026-10-10
 
 ### Added

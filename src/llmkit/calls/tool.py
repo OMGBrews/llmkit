@@ -142,6 +142,10 @@ async def tool_llm_call[T: BaseModel](
         result: ToolCallResult | ToolComposeResult[T] | None = None
         cost: float | None = None
         error: str | None = None
+        # What the transport actually sent, copied right after its await (see
+        # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
+        sent_temperature = args.temperature
+        _litellm.begin_sent_temperature()
         try:
             text, raw_calls, stop_reason, counts, cost = await _litellm.acompletion_tools(
                 prompt,
@@ -164,6 +168,7 @@ async def tool_llm_call[T: BaseModel](
                     else None
                 ),
             )
+            sent_temperature = _litellm.sent_temperature(args.temperature)
             parsed_calls, invalid_calls = parse_tool_calls(raw_calls, definitions)
             base = (
                 text,
@@ -217,7 +222,7 @@ async def tool_llm_call[T: BaseModel](
                     label=label,
                     model=resolved_model,
                     provider=resolved_provider,
-                    temperature=args.temperature,
+                    temperature=sent_temperature,
                     duration_ms=(time.monotonic() - start_t) * 1000,
                     schema=(
                         "tools" if output_schema is None else f"tools+{output_schema.__name__}"

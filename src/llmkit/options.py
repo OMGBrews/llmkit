@@ -100,7 +100,9 @@ class LLMCallOptions:
             ``temperature`` keyword, then to :data:`DEFAULT_TEMPERATURE`
             (``None``): no ``temperature`` kwarg is forwarded and the
             provider's default sampling stands. An explicit ``None`` means
-            the same; a number is forwarded unchanged.
+            the same. A number is forwarded; where the model refuses it as
+            unsupported, the request is re-issued once without it and the
+            call record shows ``None``.
         model: Model override. Unset defers to the per-call ``model``
             keyword, then to the provider default.
         max_tokens: Completion-length cap. Unset defers to the per-call
@@ -191,7 +193,9 @@ def resolve_call_args(
     For ``temperature`` specifically, the default is ``None``: llmkit
     chooses no temperature, the transport forwards **no** ``temperature``
     kwarg, and the provider's default sampling applies. An explicit ``None``
-    resolves the same way; an explicit number is forwarded unchanged.
+    resolves the same way. An explicit number is forwarded, except that a
+    model refusing it as unsupported gets the request re-issued once without
+    it (see :func:`llmkit._litellm._acompletion`).
 
     ``options=None`` is simply an all-unset options, so the flat-kwarg path
     resolves to the same values as before options existed. The true defaults

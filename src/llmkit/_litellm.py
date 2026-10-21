@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -47,6 +48,7 @@ import instructor
 import litellm
 from instructor.core.exceptions import IncompleteOutputException
 from litellm import CustomStreamWrapper
+from litellm.exceptions import BadRequestError
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
@@ -64,6 +66,79 @@ from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.tools import ToolChoice, ToolDefinition, ToolName
 
 logger = logging.getLogger(__name__)
+
+
+class _NotSent:
+    """Sentinel type: no transport call in this context has returned yet."""
+
+
+_NOT_SENT = _NotSent()
+
+# The temperature the funnel actually sent on its last *successful* call in
+# this context: the caller's value, or ``None`` when the model refused it and
+# the request was re-issued without it. The same three-party protocol as the
+# queue-wait stamp (:mod:`llmkit.rate_limiting._observability`): the call
+# layer calls :func:`begin_sent_temperature` before each transport await,
+# :func:`_acompletion` stamps on return, and the call layer copies
+# :func:`sent_temperature` into a plain local *immediately* after the await —
+# never at record-build time, because a streaming record may be written from
+# another task's context (see ``llmkit.calls.stream``).
+_sent_temperature: ContextVar[float | None | _NotSent] = ContextVar(
+    "_llmkit_sent_temperature", default=_NOT_SENT
+)
+
+_TEMPERATURE = "temperature"
+_DROP_PARAMS = "additional_drop_params"
+
+
+def begin_sent_temperature() -> None:
+    """Clear the sent-temperature stamp before an attempt reaches the transport.
+
+    Without the reset an attempt that raised, or a test double that never
+    reached :func:`_acompletion`, would inherit an earlier call's stamp.
+    """
+    _ = _sent_temperature.set(_NOT_SENT)
+
+
+def sent_temperature(requested: float | None) -> float | None:
+    """The temperature the last transport call in this context sent.
+
+    Falls back to *requested* when nothing stamped since
+    :func:`begin_sent_temperature`: the attempt raised, or a patched transport
+    bypassed the funnel.
+    """
+    sent = _sent_temperature.get()
+    return requested if isinstance(sent, _NotSent) else sent
+
+
+def _refuses_temperature(exc: Exception, kwargs: dict[str, object]) -> bool:
+    """Whether *exc* is a 400 refusing the ``temperature`` this request carried.
+
+    Covers LiteLLM's client-side ``UnsupportedParamsError`` (a
+    ``BadRequestError`` subclass) and a provider's own 400 alike, so the
+    behaviour does not depend on which LiteLLM model map loaded. A request that
+    already asks LiteLLM to drop ``temperature`` is never re-issued.
+    """
+    if _TEMPERATURE not in kwargs or not isinstance(exc, BadRequestError):
+        return False
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    already_dropped = kwargs.get(_DROP_PARAMS)
+    if isinstance(already_dropped, list) and _TEMPERATURE in cast("list[object]", already_dropped):
+        return False
+    return _TEMPERATURE in str(exc).lower()
+
+
+def _without_temperature(kwargs: dict[str, object]) -> dict[str, object]:
+    """*kwargs* plus LiteLLM's per-call ``additional_drop_params=["temperature"]``.
+
+    The ``temperature`` key itself stays, so the re-issued request differs from
+    the refused one only in the parameter it named; a host-supplied drop list
+    is extended, not replaced.
+    """
+    existing = kwargs.get(_DROP_PARAMS)
+    drop: list[object] = list(cast("list[object]", existing)) if isinstance(existing, list) else []
+    return {**kwargs, _DROP_PARAMS: [*drop, _TEMPERATURE]}
 
 
 async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
@@ -90,13 +165,39 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     ``__cause__``); every other exception propagates untouched. This cannot be an
     ``except <type>`` clause — that is the very matching the litellm class fails —
     hence the catch-all plus ``isinstance`` inside the normalizer.
+
+    It is also where a refused ``temperature`` is omitted. When LiteLLM
+    (client-side) or the provider (an HTTP 400) refuses the request's
+    ``temperature`` as unsupported for the model, the same request is re-issued
+    exactly once with LiteLLM's per-call ``additional_drop_params`` naming it —
+    never the process-global ``litellm.drop_params``. If the re-issue fails too,
+    the *original* refusal is raised, the second error chained as its context.
+    The temperature actually sent is stamped for the call record (see
+    :func:`sent_temperature`). A host that sets the global
+    ``litellm.drop_params`` makes LiteLLM drop silently instead, so no refusal
+    reaches here and the record shows the caller's value.
     """
     acompletion = cast(
         "Callable[..., Coroutine[object, object, ModelResponse | CustomStreamWrapper]]",
         litellm.acompletion,
     )
     try:
-        return await acompletion(**kwargs)
+        try:
+            result = await acompletion(**kwargs)
+        except Exception as refused:
+            if not _refuses_temperature(refused, kwargs):
+                raise
+            try:
+                result = await acompletion(**_without_temperature(kwargs))
+            except Exception:
+                # Raised inside this handler, so the second error rides on
+                # ``__context__`` while the caller sees the refusal it caused.
+                raise refused  # noqa: B904 — the original is the error to surface
+            _ = _sent_temperature.set(None)
+            return result
+        sent = kwargs.get(_TEMPERATURE)
+        _ = _sent_temperature.set(sent if isinstance(sent, (int, float)) else None)
+        return result
     except Exception as e:
         normalized = normalize_service_unavailable(e)
         if normalized is not e:
@@ -472,7 +573,8 @@ async def acompletion_structured[T: BaseModel](
     resolved ``None`` — llmkit's :data:`~llmkit.DEFAULT_TEMPERATURE` — sends
     no ``temperature`` key at all, so the provider's default sampling applies
     (Google is retiring sampling parameters on Gemini). An explicit number is
-    forwarded unchanged.
+    forwarded; a refusal of it as unsupported for the model is absorbed by
+    :func:`_acompletion`, which re-issues the request once without it.
 
     ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
     ``"disable"`` turns Gemini thinking off). When ``None``, the provider's
