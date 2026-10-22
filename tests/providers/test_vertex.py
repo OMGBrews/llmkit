@@ -1,18 +1,16 @@
-"""Unit tests for the Google Vertex AI provider.
+"""Unit tests for the Gemini Enterprise Agent Platform (formerly Vertex AI) provider.
 
-Parity with the other curated providers, plus the two things Vertex does
-differently: it reaches Gemini through Google Cloud (``vertex_ai/<model>``,
-not AI Studio's ``gemini/<model>``), and it authenticates through **Application
-Default Credentials**, not a bearer ``api_key``. The provider must expose the
-right LiteLLM model-prefix string (``vertex_ai/<model>``), pin Gemini's native
-JSON-schema mode (``Mode.JSON_SCHEMA`` — the same mode the direct
-``GoogleProvider`` uses, since the model is Gemini; instructor's ``VERTEXAI_*``
-modes target its ``from_vertexai`` client and don't apply over ``from_litellm``),
-and carry only ``vertex_project`` / ``vertex_location`` — and only when set, so
-an unset project/location (and the credentials, always) resolve from the ambient
-ADC chain / environment. ``vertex_location`` is the data-residency control.
-``build_provider`` must map ``Provider.VERTEX`` explicitly and thread model /
-project / location / reasoning_effort.
+Parity with the other curated providers, plus the two things Google's Agent Platform does
+differently: it reaches Gemini through Google Cloud (``vertex_ai/<model>``, not AI Studio's
+``gemini/<model>``), and it authenticates through **Application Default Credentials**, not a bearer
+``api_key``. The provider must expose the right LiteLLM model-prefix string
+(``vertex_ai/<model>``), pin Gemini's native JSON-schema mode (``Mode.JSON_SCHEMA`` — the same mode
+the direct ``GoogleProvider`` uses, since the model is Gemini; instructor's ``VERTEXAI_*`` modes
+target its ``from_vertexai`` client and don't apply over ``from_litellm``), and carry only
+``vertex_project`` / ``vertex_location`` — and only when set, so an unset project/location (and the
+credentials, always) resolve from the ambient ADC chain / environment. ``vertex_location`` is the
+data-residency control. ``build_provider`` must map ``Provider.VERTEX`` explicitly and thread model
+/ project / location / reasoning_effort.
 
 These are mocked-shape assertions; a real round-trip lives in
 ``tests/integration/test_live_providers.py::test_vertex_live`` (gated on the
@@ -34,14 +32,14 @@ from llmkit.providers import VertexProvider
 def test_model_prefix_and_mode() -> None:
     """LiteLLM ``vertex_ai/`` prefix and Gemini's native JSON-schema mode."""
     provider = VertexProvider(model="gemini-2.5-pro")
-    assert provider.name == "Google Vertex AI"
+    assert provider.name == "Google Agent Platform"
     assert provider.litellm_model() == "vertex_ai/gemini-2.5-pro"
     assert provider.litellm_model("gemini-2.5-flash") == "vertex_ai/gemini-2.5-flash"
     assert provider.instructor_mode is instructor.Mode.JSON_SCHEMA
 
 
 def test_completion_kwargs_with_project_and_location() -> None:
-    """Explicit project + location are forwarded as the Vertex routing kwargs."""
+    """Explicit project + location are forwarded as Google's Agent Platform routing kwargs."""
     provider = VertexProvider(vertex_project="my-gcp-project", vertex_location="europe-west4")
     assert provider.completion_kwargs() == {
         "vertex_project": "my-gcp-project",
@@ -68,7 +66,7 @@ def test_default_model() -> None:
 
 
 def test_not_local() -> None:
-    """Vertex is a cloud provider — data leaves the host (unlike Ollama)."""
+    """Google's Agent Platform is a cloud provider — data leaves the host (unlike Ollama)."""
     assert VertexProvider().is_local is False
 
 

@@ -23,8 +23,9 @@ an ``ImportError`` or ``AttributeError`` from this module is not evidence that
 the guarantee broke. A test that runs and *fails* its assertions is.
 
 The complementary live proof is ``test_vertex_tool_schema_roundtrip_live`` in
-``tests/integration/test_live_providers.py``: this module pins the transform,
-that one pins that the transform's output is what Vertex actually accepts.
+``tests/integration/test_live_providers.py``: this module pins the transform, that one pins that
+the transform's output is what Gemini Enterprise Agent Platform (formerly Vertex AI) actually
+accepts.
 """
 
 from __future__ import annotations

@@ -15,10 +15,9 @@ Two kinds of test live here, and the difference is the model id:
   slipped through for several releases). Its model ids are deliberately *not*
   env-overridable.
 * The per-provider ``test_<name>_live`` tests drive an explicit, env-overridable
-  ``*_SMOKE_MODEL``. They pin wire-level behaviour (OpenRouter's strict
-  ``json_schema`` enforcement, Vertex's ``Mode.JSON_SCHEMA``) and give a
-  maintainer whose key lacks access to a default a way to still exercise the
-  provider.
+  ``*_SMOKE_MODEL``. They pin wire-level behaviour (OpenRouter's strict ``json_schema``
+  enforcement, ``Mode.JSON_SCHEMA`` on Gemini Enterprise Agent Platform (formerly Vertex AI)) and
+  give a maintainer whose key lacks access to a default a way to still exercise the provider.
 
 **These are the live half of an explicit split.** Every test in this module is
 marked ``@pytest.mark.live`` (via ``pytestmark`` below) and runs *only* when
@@ -57,7 +56,8 @@ Provider -> credential it reads:
     Cerebras    CEREBRAS_API_KEY            https://cloud.cerebras.ai
     Ollama      (local server on :11434)    https://ollama.com  (no key)
     Bedrock     AWS chain + AWS_REGION_NAME https://console.aws.amazon.com  (see below)
-    Vertex      Google ADC + VERTEXAI_*     https://console.cloud.google.com  (see below)
+    Google's Agent Platform
+                Google ADC + VERTEXAI_*     https://console.cloud.google.com (see below)
 
 Ollama reads no key — it needs a reachable server instead. Point ``OLLAMA_HOST``
 at it (default ``http://localhost:11434``); in the maintainer devcontainer
@@ -75,17 +75,15 @@ it; once boto3 is present, a missing region/credential is a hard failure like
 every other provider, not a skip. Secrets come from the AWS chain — they are
 never passed through ``LLMClientConfig``.
 
-Vertex AI is the same kind of structural exception. It needs both a GCP project
-*and* the optional ``google-auth`` dependency (``omg-llmkit[vertex]``), so its
-test is gated with ``pytest.importorskip("google.auth")``. Install the extra
-(``uv sync`` already pulls it) and export ``VERTEXAI_PROJECT`` /
-``VERTEXAI_LOCATION`` plus resolvable Application Default Credentials
-(``gcloud auth application-default login``) to run it; once google-auth is
-present, a missing project/location/credential is a hard failure like every
-other provider, not a skip. Credentials come from the ADC chain — they are
-never passed through ``LLMClientConfig``; ``vertex_location`` selects the
-data-residency region. This is also where the ``Mode.JSON_SCHEMA`` pin for
-Vertex Gemini is *measured*, not trusted.
+Google's Agent Platform is the same kind of structural exception. It needs both a GCP project *and*
+the optional ``google-auth`` dependency (``omg-llmkit[vertex]``), so its test is gated with
+``pytest.importorskip("google.auth")``. Install the extra (``uv sync`` already pulls it) and export
+``VERTEXAI_PROJECT`` / ``VERTEXAI_LOCATION`` plus resolvable Application Default Credentials
+(``gcloud auth application-default login``) to run it; once google-auth is present, a missing
+project/location/credential is a hard failure like every other provider, not a skip. Credentials
+come from the ADC chain — they are never passed through ``LLMClientConfig``; ``vertex_location``
+selects the data-residency region. This is also where the ``Mode.JSON_SCHEMA`` pin for Gemini on
+Google's Agent Platform is *measured*, not trusted.
 """
 
 from __future__ import annotations
@@ -235,8 +233,8 @@ _CEREBRAS_MODEL = os.getenv("CEREBRAS_SMOKE_MODEL", "qwen-3.8-27b")
 # profile. Override with another profile- or partition-prefixed id (e.g.
 # ``eu.anthropic.claude-...``) when the account routes elsewhere.
 _BEDROCK_MODEL = os.getenv("BEDROCK_SMOKE_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-# Gemini on Vertex: same model family as the AI Studio smoke model. Override
-# with another Vertex-available Gemini id if the project lacks access.
+# Gemini on Google's Agent Platform: same model family as the AI Studio smoke model. Override with
+# another Gemini id available on Google's Agent Platform if the project lacks access.
 _VERTEX_MODEL = os.getenv("VERTEX_SMOKE_MODEL", "gemini-3.1-flash-lite")
 _OLLAMA_MODEL = os.getenv("OLLAMA_SMOKE_MODEL", "llama3.2")
 # Where the Ollama server lives. Default is an in-process localhost server; in
@@ -393,13 +391,14 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
             # Secrets resolve from the ambient AWS chain; only the region is explicit.
             return {"aws_region_name": region}
         case Provider.VERTEX:
-            # Same structural gate as Bedrock: google-auth ships only with the
-            # optional `omg-llmkit[vertex]` extra, and Vertex also needs a GCP
-            # project that `--run-live` cannot assume.
+            # Same structural gate as Bedrock: google-auth ships only with the optional
+            # `omg-llmkit[vertex]` extra, and Google's Agent Platform also needs a GCP project that
+            # `--run-live` cannot assume.
             google_auth = cast(
                 "_GoogleAuthModule",
                 pytest.importorskip(
-                    "google.auth", reason="install omg-llmkit[vertex] for live Vertex"
+                    "google.auth",
+                    reason="install omg-llmkit[vertex] for live calls to Google's Agent Platform",
                 ),
             )
             project = _require_env("VERTEXAI_PROJECT", "GOOGLE_CLOUD_PROJECT")
@@ -417,9 +416,9 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
     assert_never(provider)
 
 
-# Gemini 2.5 (AI Studio *and* Vertex) thinks by default; disable it so the smoke
-# call doesn't burn reasoning tokens on a trivial extraction. Every other
-# provider sends nothing — some models reject the knob outright.
+# Gemini 2.5 (AI Studio *and* Google's Agent Platform) thinks by default; disable it so the smoke
+# call doesn't burn reasoning tokens on a trivial extraction. Every other provider sends nothing —
+# some models reject the knob outright.
 _REASONING_EFFORT: dict[Provider, str] = {
     Provider.GOOGLE: "disable",
     Provider.VERTEX: "disable",
@@ -815,7 +814,7 @@ async def test_bedrock_schema_repair_reask_is_accepted_live(model: str, effort: 
 
 @pytest.mark.asyncio
 async def test_vertex_live() -> None:
-    # This call is what *measures* the Mode.JSON_SCHEMA pin against live Vertex.
+    # This call is what *measures* the Mode.JSON_SCHEMA pin against Google's Agent Platform live.
     await _override_roundtrip(Provider.VERTEX, _VERTEX_MODEL)
 
 
@@ -855,11 +854,11 @@ async def test_cerebras_tool_roundtrip_live() -> None:
 async def test_vertex_tool_schema_roundtrip_live() -> None:
     """Gemini accepts a ``from_model`` schema and a no-arg tool, unprocessed.
 
-    The Vertex leg of the guarantee README states: a consumer hands llmkit a
-    Pydantic model with a nested model and an enum, or a no-argument tool, and
-    needs no schema pre-processing of their own. Measured on the provider family
-    that would reject the raw schema, rather than inferred from Anthropic/OpenAI,
-    which accept ``$ref``/``$defs`` natively and so prove nothing here.
+    Google's Agent Platform leg of the guarantee README states: a consumer hands llmkit a Pydantic
+    model with a nested model and an enum, or a no-argument tool, and needs no schema
+    pre-processing of their own. Measured on the provider family that would reject the raw schema,
+    rather than inferred from Anthropic/OpenAI, which accept ``$ref``/``$defs`` natively and so
+    prove nothing here.
     """
     provider = make_provider(
         Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)

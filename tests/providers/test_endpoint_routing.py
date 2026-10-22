@@ -67,17 +67,15 @@ Every test clears every endpoint environment variable before asserting:
 importing ``litellm`` runs ``load_dotenv()``, so an ambient value can be injected
 into the process, and a pass that depended on one would be worthless.
 
-One test here covers a provider on the *other* side of that decision. Bedrock
-sends no ``api_base`` at all — its endpoint is LiteLLM's to derive from
-``aws_region_name`` — but llmkit still documents that region as the control over
-where the request is processed, so
-``test_bedrock_region_selects_the_endpoint_it_promises`` holds that promise to
-the wire. It asserts the positive property (the URL a pinned region reaches),
-never LiteLLM's precedence between its own ambient sources, which stays
-deliberately untested. Vertex has no equivalent here: observing its URL requires
-patching a private LiteLLM seam to mint an OAuth token, so its routing is
-covered at the kwargs level in ``test_vertex_routing.py`` instead — an asymmetry
-worth naming rather than leaving to be discovered.
+One test here covers a provider on the *other* side of that decision. Bedrock sends no ``api_base``
+at all — its endpoint is LiteLLM's to derive from ``aws_region_name`` — but llmkit still documents
+that region as the control over where the request is processed, so
+``test_bedrock_region_selects_the_endpoint_it_promises`` holds that promise to the wire. It asserts
+the positive property (the URL a pinned region reaches), never LiteLLM's precedence between its own
+ambient sources, which stays deliberately untested. Gemini Enterprise Agent Platform (formerly
+Vertex AI) has no equivalent here: observing its URL requires patching a private LiteLLM seam to
+mint an OAuth token, so its routing is covered at the kwargs level in ``test_vertex_routing.py``
+instead — an asymmetry worth naming rather than leaving to be discovered.
 """
 
 from __future__ import annotations
@@ -430,14 +428,13 @@ def test_bedrock_region_selects_the_endpoint_it_promises(
 ) -> None:
     """A pinned ``aws_region_name`` reaches the endpoint the docs promise it does.
 
-    Bedrock is one of the three providers that deliberately send no ``api_base``
-    (with Vertex, and Google AI Studio when nothing is configured), so llmkit
-    does not *choose* this URL — LiteLLM derives it from the region. But llmkit
-    still makes a promise about it: ``aws_region_name`` is documented as the
-    control over where the request is processed, the counterpart of Vertex's
-    residency knob. Nothing offline held that promise to the wire, which left
-    the two providers whose region knob carries a compliance meaning as the only
-    two making a URL claim no test checked.
+    Bedrock is one of the three providers that deliberately send no ``api_base`` (with Google's
+    Agent Platform, and Google AI Studio when nothing is configured), so llmkit does not *choose*
+    this URL — LiteLLM derives it from the region. But llmkit still makes a promise about it:
+    ``aws_region_name`` is documented as the control over where the request is processed, the
+    counterpart of the residency knob on Google's Agent Platform. Nothing offline held that promise
+    to the wire, which left the two providers whose region knob carries a compliance meaning as the
+    only two making a URL claim no test checked.
 
     This asserts the positive property — the artifact llmkit means to produce —
     rather than LiteLLM's internal precedence, which is deliberately untested:

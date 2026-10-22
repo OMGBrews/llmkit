@@ -105,16 +105,15 @@ def require_boto3_sdk(provider_name: str) -> None:
 def require_google_auth_sdk(provider_name: str) -> None:
     """Raise a clear, actionable error if ``google-auth`` is not installed.
 
-    LiteLLM's ``vertex_ai/`` path signs Gemini-on-Vertex requests with a Google
-    OAuth access token that it mints and refreshes through ``google.auth`` (the
-    Application Default Credentials chain), so the Vertex provider needs it at
-    call time. It is the minimal credential dependency the gemini-on-Vertex chat
-    path actually imports — deliberately **not** the much heavier
-    ``google-cloud-aiplatform`` (which targets instructor's ``from_vertexai``
-    google-SDK client, a path this library does not use). It ships in the opt-in
-    ``omg-llmkit[vertex]`` extra rather than the core install. Call this at
-    provider construction so a missing ``google-auth`` fails *eagerly* with a
-    fix, instead of as a cryptic ``ModuleNotFound`` deep on the first completion.
+    LiteLLM's ``vertex_ai/`` path signs requests to Gemini Enterprise Agent Platform (formerly
+    Vertex AI) with a Google OAuth access token that it mints and refreshes through ``google.auth``
+    (the Application Default Credentials chain), so Google's Agent Platform provider needs it at
+    call time. It is the minimal credential dependency the Gemini on Google's Agent Platform chat
+    path actually imports — deliberately **not** the much heavier ``google-cloud-aiplatform``
+    (which targets instructor's ``from_vertexai`` google-SDK client, a path this library does not
+    use). It ships in the opt-in ``omg-llmkit[vertex]`` extra rather than the core install. Call
+    this at provider construction so a missing ``google-auth`` fails *eagerly* with a fix, instead
+    of as a cryptic ``ModuleNotFound`` deep on the first completion.
     """
     _require_sdk(
         "google.auth",
@@ -123,7 +122,7 @@ def require_google_auth_sdk(provider_name: str) -> None:
         label="the google-auth library (google.auth)",
         note=(
             "(google-auth mints and refreshes the OAuth access token LiteLLM "
-            "signs Vertex AI requests with, via Application Default Credentials.)"
+            "signs Google's Agent Platform requests with, via Application Default Credentials.)"
         ),
     )
 
@@ -303,32 +302,28 @@ class LLMClientConfig:
     via :func:`configure_llm_client`, so the library never imports the
     host's config module.
 
-    Only the *active* provider's fields need be populated — and populating a
-    provider-shaped field the selected provider does **not** read is rejected at
-    :func:`~llmkit.providers.build_provider`, not silently ignored (each provider
-    declares the knobs it honours; see ``_accepted_config_fields``). ``api_key``
-    is a bearer credential for the key-authenticated providers (OpenRouter,
-    OpenAI, Anthropic, Google, DeepSeek, Cerebras); it resolves from this value,
-    else the provider's environment variable (``ANTHROPIC_API_KEY`` and friends), else the
-    provider raises at construction. It is not accepted by Ollama (local) or
-    Bedrock/Vertex (ambient AWS/Google chains). The credential is masked in this
-    config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray
-    ``print`` or traceback never leaks it. ``base_url`` sets the endpoint for the
-    key-authenticated providers and Ollama: it resolves from this value,
-    else the provider's own documented endpoint variable(s) (``OPENAI_BASE_URL``
-    / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE`` and friends — still honoured,
-    now read explicitly by llmkit in a tested order), else that provider's own
-    measured default endpoint. The endpoint is therefore llmkit's decision,
-    readable from ``completion_kwargs()`` rather than inferred from LiteLLM's own
-    chain, and it is resolved per call so it reflects the environment the call
-    goes out in (see :func:`resolve_base_url`). Google AI Studio is the one
-    provider with no default — its base carries an API version LiteLLM picks from
-    the model — so with neither this field nor ``GEMINI_API_BASE`` set it sends no
-    ``api_base`` and lets LiteLLM choose. It is not accepted by
-    Bedrock or Vertex, whose endpoints derive from ``aws_region_name`` /
-    ``vertex_location`` instead. Per-call ``model`` overrides (e.g. the
-    strong/small roles the host resolves) are passed at call time and are not
-    part of this config — this carries only the provider's *default* model.
+    Only the *active* provider's fields need be populated — and populating a provider-shaped field
+    the selected provider does **not** read is rejected at
+    :func:`~llmkit.providers.build_provider`, not silently ignored (each provider declares the
+    knobs it honours; see ``_accepted_config_fields``). ``api_key`` is a bearer credential for the
+    key-authenticated providers (OpenRouter, OpenAI, Anthropic, Google, DeepSeek, Cerebras); it
+    resolves from this value, else the provider's environment variable (``ANTHROPIC_API_KEY`` and
+    friends), else the provider raises at construction. It is not accepted by Ollama (local) or
+    Bedrock or Google's Agent Platform (ambient AWS/Google chains). The credential is masked in
+    this config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray ``print`` or
+    traceback never leaks it. ``base_url`` sets the endpoint for the key-authenticated providers
+    and Ollama: it resolves from this value, else the provider's own documented endpoint
+    variable(s) (``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE`` and friends —
+    still honoured, now read explicitly by llmkit in a tested order), else that provider's own
+    measured default endpoint. The endpoint is therefore llmkit's decision, readable from
+    ``completion_kwargs()`` rather than inferred from LiteLLM's own chain, and it is resolved per
+    call so it reflects the environment the call goes out in (see :func:`resolve_base_url`). Google
+    AI Studio is the one provider with no default — its base carries an API version LiteLLM picks
+    from the model — so with neither this field nor ``GEMINI_API_BASE`` set it sends no
+    ``api_base`` and lets LiteLLM choose. It is not accepted by Bedrock or Google's Agent Platform,
+    whose endpoints derive from ``aws_region_name`` / ``vertex_location`` instead. Per-call
+    ``model`` overrides (e.g. the strong/small roles the host resolves) are passed at call time and
+    are not part of this config — this carries only the provider's *default* model.
 
     ``model`` is optional: leave it ``None`` (or empty) to inherit the
     selected provider's own default model rather than naming one here. A
@@ -353,40 +348,34 @@ class LLMClientConfig:
     pass through ``LLMClientConfig``. Leave it ``None`` to let the region
     resolve from the chain too (``AWS_REGION_NAME`` / ``AWS_REGION``).
 
-    ``vertex_project`` and ``vertex_location`` are the Vertex AI analog of
-    ``aws_region_name`` and are not accepted by any other provider. They are the
-    only Vertex-shaped fields on purpose: like Bedrock, the Vertex provider
-    carries **no secret** here — Google credentials resolve from **Application
-    Default Credentials** (``gcloud auth application-default login``,
-    ``GOOGLE_APPLICATION_CREDENTIALS``, or a workload-identity/metadata-server
-    token), never through ``LLMClientConfig``. ``vertex_location`` is the
-    **data-processing residency** control: it selects the endpoint where the
-    request runs (LiteLLM derives three shapes from it —
-    ``https://aiplatform.googleapis.com`` for ``"global"``,
-    ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region
-    geography, else ``https://<location>-aiplatform.googleapis.com``), so a
-    regional value (e.g. ``"europe-west4"``) pins in-region processing while
-    the ``"global"`` endpoint gives no residency guarantee. That pin is
-    overridable from outside the config — see
-    :class:`~llmkit.providers.vertex.VertexProvider`. Leave either
-    ``None`` to let it resolve from the environment (``VERTEXAI_PROJECT`` /
-    ``VERTEXAI_LOCATION``), with the location otherwise falling back to
-    Google's default region.
+    ``vertex_project`` and ``vertex_location`` are Google's Agent Platform analog of
+    ``aws_region_name`` and are not accepted by any other provider. They are the only fields
+    specific to Google's Agent Platform on purpose: like Bedrock, Google's Agent Platform provider
+    carries **no secret** here — Google credentials resolve from **Application Default
+    Credentials** (``gcloud auth application-default login``, ``GOOGLE_APPLICATION_CREDENTIALS``,
+    or a workload-identity/metadata-server token), never through ``LLMClientConfig``.
+    ``vertex_location`` is the **data-processing residency** control: it selects the endpoint where
+    the request runs (LiteLLM derives three shapes from it — ``https://aiplatform.googleapis.com``
+    for ``"global"``, ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region geography,
+    else ``https://<location>-aiplatform.googleapis.com``), so a regional value (e.g.
+    ``"europe-west4"``) pins in-region processing while the ``"global"`` endpoint gives no
+    residency guarantee. That pin is overridable from outside the config — see
+    :class:`~llmkit.providers.vertex.VertexProvider`. Leave either ``None`` to let it resolve from
+    the environment (``VERTEXAI_PROJECT`` / ``VERTEXAI_LOCATION``), with the location otherwise
+    falling back to Google's default region.
 
-    ``gemini_structured_output`` selects the structured-output *strategy* for
-    the two Gemini providers (Vertex, Google AI Studio); a non-default value is
-    not accepted by any other provider (the default ``"schema"`` is always
-    allowed). ``"schema"`` (the default) preserves the pre-existing wire
-    behavior exactly — Gemini's native JSON-schema constrained decoding
-    (``responseSchema`` / ``instructor.Mode.JSON_SCHEMA``), with server-side
-    schema enforcement. ``"json"`` switches to JSON-mime-type-only output
-    (``Mode.JSON``): the schema moves into the system prompt and is validated
-    client-side, trading server-side schema enforcement for an escape from
-    Gemini's constrained-decoding repetition-loop trap (measured 67-83%
-    first-attempt runaway under ``"schema"`` vs 0% under ``"json"`` on real
-    workloads — PIA Maker, 2026-07-15; see the Gemini provider docstrings). An
-    unrecognized value fails loudly at provider construction — the ``Literal``
-    type is not runtime-enforced, so a typo must not silently fall back.
+    ``gemini_structured_output`` selects the structured-output *strategy* for the two Gemini
+    providers (Google's Agent Platform, Google AI Studio); a non-default value is not accepted by
+    any other provider (the default ``"schema"`` is always allowed). ``"schema"`` (the default)
+    preserves the pre-existing wire behavior exactly — Gemini's native JSON-schema constrained
+    decoding (``responseSchema`` / ``instructor.Mode.JSON_SCHEMA``), with server-side schema
+    enforcement. ``"json"`` switches to JSON-mime-type-only output (``Mode.JSON``): the schema
+    moves into the system prompt and is validated client-side, trading server-side schema
+    enforcement for an escape from Gemini's constrained-decoding repetition-loop trap (measured
+    67-83% first-attempt runaway under ``"schema"`` vs 0% under ``"json"`` on real workloads — PIA
+    Maker, 2026-07-15; see the Gemini provider docstrings). An unrecognized value fails loudly at
+    provider construction — the ``Literal`` type is not runtime-enforced, so a typo must not
+    silently fall back.
     """
 
     provider: Provider
@@ -578,18 +567,15 @@ class BaseProvider(ABC):
     #: stays defined alongside the provider it describes (see
     #: :func:`~llmkit.providers.describe_llm`). Cloud providers leave this False.
     is_local: ClassVar[bool] = False
-    #: Whether structured requests upgrade instructor's ``json_schema``
-    #: ``response_format`` to *strict* server-side enforcement (``"strict":
-    #: true`` + top-level ``additionalProperties: false``) at the LiteLLM call
-    #: seam (see ``llmkit._litellm``). instructor's ``JSON_SCHEMA`` handler
-    #: sends neither, and some providers (OpenRouter) treat a non-strict
-    #: json_schema as advisory — weak models then drift (measured: the schema
-    #: echoed back with values nested inside ``properties``). A provider
-    #: trait, not a global: providers whose enforcement was measured fine
-    #: without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Vertex, Cerebras) keep
-    #: their measured wire shape untouched. Exposed via the
-    #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
-    #: pattern).
+    #: Whether structured requests upgrade instructor's ``json_schema`` ``response_format`` to
+    #: *strict* server-side enforcement (``"strict": true`` + top-level ``additionalProperties:
+    #: false``) at the LiteLLM call seam (see ``llmkit._litellm``). instructor's ``JSON_SCHEMA``
+    #: handler sends neither, and some providers (OpenRouter) treat a non-strict json_schema as
+    #: advisory — weak models then drift (measured: the schema echoed back with values nested
+    #: inside ``properties``). A provider trait, not a global: providers whose enforcement was
+    #: measured fine without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Google's Agent
+    #: Platform, Cerebras) keep their measured wire shape untouched. Exposed via the
+    #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode`` pattern).
     _strict_json_schema: ClassVar[bool] = False
     #: Whether structured requests send ``parallel_tool_calls=False`` so the
     #: answer to one schema arrives as exactly one tool call. Some routes carry a
@@ -778,15 +764,13 @@ class BaseProvider(ABC):
     def reject_unread_config_fields(cls, config: LLMClientConfig) -> None:
         """Reject a populated config knob this provider will not read.
 
-        Every provider reads ``provider`` / ``model`` / ``reasoning_effort``, but
-        the six provider-shaped knobs (:data:`_PROVIDER_SHAPED_FIELDS`) are
-        provider-specific. Passing one to a provider that never reads it — an
-        ``api_key`` to Bedrock or Vertex (which authenticate via their ambient
-        AWS/Google credential chains), a ``base_url`` to a fixed-endpoint
-        provider, a non-default ``gemini_structured_output`` to a non-Gemini
-        provider — used to be a silent no-op. That silence is a footgun: a host
-        that populates a config generically believes it pinned a credential or
-        endpoint that is in fact ignored.
+        Every provider reads ``provider`` / ``model`` / ``reasoning_effort``, but the six
+        provider-shaped knobs (:data:`_PROVIDER_SHAPED_FIELDS`) are provider-specific. Passing one
+        to a provider that never reads it — an ``api_key`` to Bedrock or Google's Agent Platform
+        (which authenticate via their ambient AWS/Google credential chains), a ``base_url`` to a
+        fixed-endpoint provider, a non-default ``gemini_structured_output`` to a non-Gemini
+        provider — used to be a silent no-op. That silence is a footgun: a host that populates a
+        config generically believes it pinned a credential or endpoint that is in fact ignored.
 
         A knob counts as *populated* when it differs from its dataclass default
         (so an untouched field never trips this). Anything populated beyond this

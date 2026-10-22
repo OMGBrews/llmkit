@@ -1,13 +1,12 @@
 """Gemini 3 and every later generation get ``thinkingLevel``, never ``thinkingBudget``.
 
-Google has announced that its upcoming Gemini models will reject a request
-carrying ``thinkingConfig.thinkingBudget`` with ``400 INVALID_ARGUMENT``; Gemini
-3 already remaps it to ``thinkingLevel``. llmkit's Google and Vertex providers
-send LiteLLM's portable ``reasoning_effort``, and LiteLLM picks the field by
-parsing the model name in ``VertexGeminiConfig._is_gemini_3_or_newer``. Before
-LiteLLM 1.104.0 that was the substring test ``"gemini-3" in model``, so a
-``gemini-4-*`` id fell through to ``thinkingBudget``. 1.104.0 instead excludes
-only the 1.x/2.x/exp/legacy names, which is why it is llmkit's floor: the
+Google has announced that its upcoming Gemini models will reject a request carrying
+``thinkingConfig.thinkingBudget`` with ``400 INVALID_ARGUMENT``; Gemini 3 already remaps it to
+``thinkingLevel``. llmkit's Google and Gemini Enterprise Agent Platform (formerly Vertex AI)
+providers send LiteLLM's portable ``reasoning_effort``, and LiteLLM picks the field by parsing the
+model name in ``VertexGeminiConfig._is_gemini_3_or_newer``. Before LiteLLM 1.104.0 that was the
+substring test ``"gemini-3" in model``, so a ``gemini-4-*`` id fell through to ``thinkingBudget``.
+1.104.0 instead excludes only the 1.x/2.x/exp/legacy names, which is why it is llmkit's floor: the
 ``gemini-4-flash`` cases below fail on 1.99.0.
 
 Each case drives the real provider's ``reasoning_kwargs`` output through the

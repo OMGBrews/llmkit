@@ -150,13 +150,12 @@ _PRE_GEMINI_3_RE = re.compile(
 def _is_gemini_3_or_newer(model: str) -> bool:
     """Whether an OpenRouter model id names Gemini 3 or any later generation.
 
-    Reproduces LiteLLM 1.104.0's ``VertexGeminiConfig._is_gemini_3_or_newer``
-    rule — exclude only the known pre-Gemini-3 names, so a future
-    ``google/gemini-4-*`` counts without a code change — rather than calling
-    that private method, keeping this route independent of LiteLLM's Gemini
-    config. The id after the last ``/`` must start with ``gemini-`` (so
-    ``google/gemma-*`` and non-Google models never match). LiteLLM's
-    fine-tuned-id clause is dropped: Vertex numeric ids cannot occur here.
+    Reproduces LiteLLM 1.104.0's ``VertexGeminiConfig._is_gemini_3_or_newer`` rule — exclude only
+    the known pre-Gemini-3 names, so a future ``google/gemini-4-*`` counts without a code change —
+    rather than calling that private method, keeping this route independent of LiteLLM's Gemini
+    config. The id after the last ``/`` must start with ``gemini-`` (so ``google/gemma-*`` and
+    non-Google models never match). LiteLLM's fine-tuned-id clause is dropped: Gemini Enterprise
+    Agent Platform (formerly Vertex AI) numeric ids cannot occur here.
     """
     name = model.rsplit("/", 1)[-1].lower()
     return name.startswith("gemini-") and _PRE_GEMINI_3_RE.match(name) is None

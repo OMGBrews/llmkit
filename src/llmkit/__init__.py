@@ -1,10 +1,9 @@
 """LLM client with multi-provider support.
 
-Provides a thin, opinionated layer over **LiteLLM** (with ``instructor``
-for structured output) that gives the application a unified, provider-
-agnostic call surface across cloud providers (OpenRouter, Google AI Studio,
-Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, Cerebras) and local
-Ollama.
+Provides a thin, opinionated layer over **LiteLLM** (with ``instructor`` for structured output)
+that gives the application a unified, provider- agnostic call surface across cloud providers
+(OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic,
+OpenAI, DeepSeek, AWS Bedrock, Cerebras) and local Ollama.
 
 This package provides:
 - The structured / plain-text / tool-calling call functions, buffered and

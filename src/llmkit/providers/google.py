@@ -28,27 +28,24 @@ from llmkit.providers.base import (
 #: Either way a static default silently changes the wire shape for some models,
 #: which is exactly what this change promises not to do.
 #:
-#: So when nothing is configured this provider sends no ``api_base`` and lets
-#: LiteLLM pick the version. Computing it here instead would be endpoint
-#: derivation — the gateway-shaped work llmkit does not do (``PRINCIPLES.md``),
-#: and the same reason Bedrock and Vertex are excluded from endpoint ownership.
-#: The cost is scoped and documented: with no ``base_url`` and no
-#: ``GEMINI_API_BASE``, this provider leaves the endpoint to LiteLLM's chain —
-#: the third of the three cases where llmkit declines to name an endpoint it
-#: would have to *compute*, alongside Bedrock and Vertex. Naming either closes
-#: it here, which is what makes this case the mildest of the three; the decision
-#: covering all three is settled (README, "``BEDROCK`` and ``VERTEX`` do not own
-#: their endpoints").
+#: So when nothing is configured this provider sends no ``api_base`` and lets LiteLLM pick the
+#: version. Computing it here instead would be endpoint derivation — the gateway-shaped work llmkit
+#: does not do (``PRINCIPLES.md``), and the same reason Bedrock and Gemini Enterprise Agent
+#: Platform (formerly Vertex AI) are excluded from endpoint ownership. The cost is scoped and
+#: documented: with no ``base_url`` and no ``GEMINI_API_BASE``, this provider leaves the endpoint
+#: to LiteLLM's chain — the third of the three cases where llmkit declines to name an endpoint it
+#: would have to *compute*, alongside Bedrock and Google's Agent Platform. Naming either closes it
+#: here, which is what makes this case the mildest of the three; the decision covering all three is
+#: settled (README, "``BEDROCK`` and ``VERTEX`` do not own their endpoints").
 _DEFAULT_BASE_URL: str | None = None
 
 
 class GoogleProvider(BaseProvider):
     """Google AI Studio LLM provider.
 
-    Uses Gemini directly (``gemini/<model>``) for high rate limits and low
-    latency. Structured output defaults to Gemini's native JSON-schema mode for
-    instructor (``Mode.JSON_SCHEMA``) — the same default the Vertex path uses,
-    since the underlying model is Gemini.
+    Uses Gemini directly (``gemini/<model>``) for high rate limits and low latency. Structured
+    output defaults to Gemini's native JSON-schema mode for instructor (``Mode.JSON_SCHEMA``) — the
+    same default Google's Agent Platform path uses, since the underlying model is Gemini.
 
     The strategy is host-selectable via the ``structured_output`` argument
     (``LLMClientConfig.gemini_structured_output``), because Gemini's native
@@ -93,9 +90,9 @@ class GoogleProvider(BaseProvider):
 
     _provider_name: ClassVar[str] = "Google AI Studio"
     _model_prefix: ClassVar[str] = "gemini/"
-    # Default strategy + the contract value ``__init_subclass__`` requires; the
-    # effective mode is resolved per instance and returned by ``instructor_mode``
-    # (see the Vertex provider for the same pattern and why the ClassVar stays).
+    # Default strategy + the contract value ``__init_subclass__`` requires; the effective mode is
+    # resolved per instance and returned by ``instructor_mode`` (see Google's Agent Platform
+    # provider for the same pattern and why the ClassVar stays).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-3.1-flash-lite"
     _api_key_env_var: ClassVar[str] = "GEMINI_API_KEY"

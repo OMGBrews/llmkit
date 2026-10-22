@@ -1,9 +1,9 @@
 """Host-selectable Gemini structured-output strategy (``schema`` vs ``json``).
 
-The two Gemini providers (Vertex, Google AI Studio) resolve their instructor
-``Mode`` from a host-configurable strategy instead of a fixed ClassVar, so a host
-can escape Gemini's constrained-decoding repetition-loop trap without subclassing
-a provider or overriding the private ``_mode`` ClassVar. These tests pin:
+The two Gemini providers (Gemini Enterprise Agent Platform (formerly Vertex AI), Google AI Studio)
+resolve their instructor ``Mode`` from a host-configurable strategy instead of a fixed ClassVar, so
+a host can escape Gemini's constrained-decoding repetition-loop trap without subclassing a provider
+or overriding the private ``_mode`` ClassVar. These tests pin:
 
 - the default preserves 0.7.0 behavior (``Mode.JSON_SCHEMA``) byte-for-byte;
 - ``"json"`` selects ``Mode.JSON`` and ``"schema"`` selects ``Mode.JSON_SCHEMA``;

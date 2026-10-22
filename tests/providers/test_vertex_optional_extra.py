@@ -1,12 +1,13 @@
-"""google-auth is an opt-in extra for the Vertex provider, not a core dependency.
+"""google-auth is an opt-in extra for the Gemini Enterprise Agent Platform (formerly Vertex AI)
+provider, not a core dependency.
 
-LiteLLM's ``vertex_ai/`` path mints and refreshes the Google OAuth access token
-it signs Gemini-on-Vertex requests with through ``google.auth`` (the Application
-Default Credentials chain), so the Vertex provider needs it at call time — but a
-host that never routes to Vertex should take on no Google dependency. It
-therefore ships in the ``omg-llmkit[vertex]`` extra and is checked *eagerly* at
-construction, so a missing ``google-auth`` fails with a fix instead of as a
-cryptic ``ModuleNotFound`` deep on the first completion.
+LiteLLM's ``vertex_ai/`` path mints and refreshes the Google OAuth access token it signs requests
+to Gemini on Google's Agent Platform with, using ``google.auth`` (the Application Default
+Credentials chain), so Google's Agent Platform provider needs it at call time — but a host that
+never routes to Google's Agent Platform should take on no Google dependency. It therefore ships in
+the ``omg-llmkit[vertex]`` extra and is checked *eagerly* at construction, so a missing
+``google-auth`` fails with a fix instead of as a cryptic ``ModuleNotFound`` deep on the first
+completion.
 
 ``VertexProvider.__init__`` runs one eager check: ``require_google_auth_sdk``.
 These tests cover that guard. They simulate ``google-auth``'s absence by stubbing
@@ -45,7 +46,7 @@ def google_auth_absent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.usefixtures("google_auth_absent")
 def test_vertex_provider_raises_clearly_without_google_auth() -> None:
-    """Constructing Vertex without google-auth names the install fix."""
+    """Constructing Google's Agent Platform without google-auth names the install fix."""
     with pytest.raises(ModuleNotFoundError, match=r"omg-llmkit\[vertex\]") as excinfo:
         _ = VertexProvider()
     message = str(excinfo.value)
@@ -64,5 +65,5 @@ def test_build_provider_vertex_raises_without_google_auth() -> None:
 def test_vertex_provider_builds_when_google_auth_present() -> None:
     """With google-auth installed (the dev extra), construction succeeds (sanity)."""
     provider = VertexProvider()
-    assert provider.name == "Google Vertex AI"
+    assert provider.name == "Google Agent Platform"
     assert provider.litellm_model() == "vertex_ai/gemini-3.1-flash-lite"

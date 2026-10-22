@@ -223,7 +223,8 @@ def test_make_provider_bedrock_region_only() -> None:
 
 
 def test_make_provider_vertex_project_and_location_only() -> None:
-    """Vertex takes project + location, never an ``api_key`` (ambient ADC signs)."""
+    """Gemini Enterprise Agent Platform (formerly Vertex AI) takes project + location, never an
+    ``api_key`` (ambient ADC signs)."""
     provider = make_provider(
         Provider.VERTEX,
         model="gemini-2.5-flash",

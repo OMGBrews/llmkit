@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -50,7 +50,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
-- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
+- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google's Agent Platform / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Google's Agent Platform (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see [Logging](#logging-agent-readable-by-default)) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -87,17 +87,17 @@ dependencies behind opt-in extras so hosts pay only for what they call:
 
 ```bash
 pip install "omg-llmkit[bedrock]"    # Claude-on-Bedrock (boto3 for SigV4 signing)
-pip install "omg-llmkit[vertex]"     # Gemini via Google Cloud Vertex AI
+pip install "omg-llmkit[vertex]"     # Gemini via Google's Agent Platform
 pip install "omg-llmkit[all]"        # both of the above
 ```
 
 Bedrock's `[bedrock]` extra pulls only `boto3` (LiteLLM signs Bedrock requests
 with AWS SigV4 through it), and constructing the `BedrockProvider` without it
 raises a clear `install omg-llmkit[bedrock]` error at construction, not a
-cryptic failure on the first call. Vertex is the same shape: its `[vertex]`
-extra pulls only `google-auth` (LiteLLM mints the Vertex OAuth token through
+cryptic failure on the first call. Google's Agent Platform is the same shape: its `[vertex]`
+extra pulls only `google-auth` (LiteLLM mints Google's Agent Platform OAuth token through
 it), and constructing the `VertexProvider` without it raises a clear `install
-omg-llmkit[vertex]` error — a non-Vertex host takes on no Google dependency.
+omg-llmkit[vertex]` error — a host using another provider takes on no Google dependency.
 Direct Anthropic routing needs no SDK at all: LiteLLM speaks the Anthropic
 HTTP API itself, so there is no `[anthropic]` extra.
 
@@ -259,7 +259,7 @@ Four differences from `tool_llm_call`, all deliberate:
 - **Usage is real, not null.** Unlike the plain text stream, this lane requests
   `stream_options={"include_usage": True}`, so `result.usage`, the log record's
   `usage`, and the token-rate limiter's debit are all populated. Measured on
-  Vertex, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek, and on
+  Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek, and on
   Cerebras, whose LiteLLM route drops `stream_options` but which reports usage
   on the stream regardless; Bedrock and Ollama are covered by the same code path
   but that measurement is still outstanding.
@@ -303,7 +303,7 @@ Without a standard flag every application invents its own convention — a JSON 
 
 ### Tool schemas: hand them over unprocessed
 
-**`ToolDefinition.from_model()` output works on every supported provider as-is. Do not pre-process it.** A Pydantic model with a nested model or an enum renders `$defs` and `$ref` in its JSON Schema, and llmkit forwards `parameters` verbatim — but the transport normalises per provider on the way to the wire. On the Gemini routes (Vertex AI and Google AI Studio) that means `additionalProperties` is stripped, `$defs` is popped, `$ref` targets are inlined, and keywords outside Gemini's `Schema` subset are filtered, so a schema Gemini's API rejects outright when posted raw is accepted through llmkit. Writing your own normalisation layer on top duplicates that work and will drift from it.
+**`ToolDefinition.from_model()` output works on every supported provider as-is. Do not pre-process it.** A Pydantic model with a nested model or an enum renders `$defs` and `$ref` in its JSON Schema, and llmkit forwards `parameters` verbatim — but the transport normalises per provider on the way to the wire. On the Gemini routes (Google's Agent Platform and Google AI Studio) that means `additionalProperties` is stripped, `$defs` is popped, `$ref` targets are inlined, and keywords outside Gemini's `Schema` subset are filtered, so a schema Gemini's API rejects outright when posted raw is accepted through llmkit. Writing your own normalisation layer on top duplicates that work and will drift from it.
 
 The same applies to a **tool that takes no arguments**: `{"type": "object", "properties": {}}` is the portable schema, sent to Gemini as a bare `OBJECT` declaration. You do not need a dummy parameter.
 
@@ -329,7 +329,7 @@ tools = [
 
 **Where the guarantee stops.** It is delivery in the provider's accepted subset, not lossless translation: a construct the subset cannot express is *dropped, not errored*. The one to know about is that Gemini accepts `enum` only on string-typed fields, so an enum on an integer or float field is silently discarded and the model sees an unconstrained number. Keep enums as string enums when a Gemini route is in play, or validate the range yourself — `from_model()` validates the model's arguments locally either way, so a value outside the enum still fails validation on our side.
 
-Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transport.py` asserts the transform's output offline (so a transport upgrade that stopped normalising fails the suite), and `test_vertex_tool_schema_roundtrip_live` asserts live Vertex accepts it.
+Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transport.py` asserts the transform's output offline (so a transport upgrade that stopped normalising fails the suite), and `test_vertex_tool_schema_roundtrip_live` asserts Google's Agent Platform accepts it live.
 
 ### Reusing call options
 
@@ -379,14 +379,14 @@ llmkit chooses no temperature of its own (`DEFAULT_TEMPERATURE` is `None`), so t
 | `temperature=0.5` (any number, incl. `0.0`) | your value, forwarded | `temperature: 0.5`, or **no key** after the model refused it (see below) |
 
 "Wire" is what llmkit hands LiteLLM. On every route but one that is also what
-reaches the provider; the exception is Gemini 3 on Google AI Studio and Vertex
-AI, where LiteLLM adds a temperature of its own — see the Gemini caveat below.
+reaches the provider; the exception is Gemini 3 on Google AI Studio and Google's Agent Platform,
+where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
 `None` is accepted on every call surface — structured, plain-text, streaming, tool calls, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
 
 **A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
 
-**Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded on every provider, Gemini included, and a Gemini model that rejects it with an error naming `temperature` gets the request re-issued once without it, as above. One wrinkle remains on the Google AI Studio and Vertex AI routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
+**Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded on every provider, Gemini included, and a Gemini model that rejects it with an error naming `temperature` gets the request re-issued once without it, as above. One wrinkle remains on the Google AI Studio and Google's Agent Platform routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
 
 ### Contracts as JSON-schema dicts
 
@@ -917,18 +917,18 @@ class LLMClientConfig:
     provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
-    base_url: str | None = None      # endpoint: config, then env var, then a default (sent as api_base; see below); not accepted by Bedrock/Vertex
+    base_url: str | None = None      # endpoint: config, then env var, then a default (sent as api_base; see below); not accepted by Bedrock or Google's Agent Platform
     reasoning_effort: ReasoningEffort | None = None  # "disable" | "low" | "medium" | "high", or any provider value
     aws_region_name: str | None = None   # AWS Bedrock region; not accepted by any other provider
-    vertex_project: str | None = None    # Vertex AI GCP project; not accepted by any other provider
-    vertex_location: str | None = None   # Vertex AI region (data residency); not accepted by any other provider
+    vertex_project: str | None = None    # Google's Agent Platform GCP project; not accepted by any other provider
+    vertex_location: str | None = None   # Google's Agent Platform region (data residency); not accepted by any other provider
     gemini_structured_output: Literal["schema", "json"] = "schema"  # Gemini strategy; a non-default value is not accepted by any other provider
 ```
 
 **Populating a knob the selected provider does not read is rejected, not
 ignored.** Each provider declares which provider-shaped fields it honours, and
 `build_provider` / `make_provider` raise a clear `ValueError` if the config
-carries any other populated one — an `api_key` for Bedrock/Vertex, a `base_url`
+carries any other populated one — an `api_key` for Bedrock or Google's Agent Platform, a `base_url`
 for a fixed-endpoint provider, a non-default `gemini_structured_output` for a
 non-Gemini provider. Populate only the fields the active provider uses. A config
 generically filled from a settings object therefore cannot *look* like it pinned
@@ -1038,14 +1038,14 @@ ambient surface for no gain.
 
 These two reject `base_url` outright, and llmkit sends them no `api_base`:
 their endpoints are *derived* rather than configured — Bedrock's from
-`aws_region_name`, Vertex's from `vertex_location`. llmkit names an endpoint
+`aws_region_name`, the endpoint for Google's Agent Platform from `vertex_location`. llmkit names an endpoint
 where the endpoint is a constant it can measure once; where it is computed from
 an input llmkit does not own, llmkit declines to compute it and LiteLLM's own
 resolution stays in charge. (Google AI Studio with neither `base_url` nor
 `GEMINI_API_BASE` set is the third case in that same family, for the API-version
 reason above.) The alternative would be llmkit constructing regional URLs — the
 gateway-shaped work this library [deliberately does not do](PRINCIPLES.md), and
-for Vertex it would mean running Google credential resolution just to build a
+for Google's Agent Platform it would mean running Google credential resolution just to build a
 path, since the project id comes from ADC.
 
 **The cost is scoped, and it is sharper here than elsewhere, because these are
@@ -1065,19 +1065,19 @@ VERTEX, vertex_location="us"
 
 Four things that matter if you pin residency:
 
-- **What travels.** Vertex sends the ADC-minted `Authorization: Bearer ya29.…`
+- **What travels.** Google's Agent Platform sends the ADC-minted `Authorization: Bearer ya29.…`
   to the overridden host; Bedrock hands it a live SigV4 signature over the real
   payload. This is credential exposure as much as region drift. Bedrock's SigV4
   scope keeps following the region you pinned, so redirecting to a *different
   AWS region* fails loudly on signature; redirecting anywhere else succeeds
   silently.
-- **Vertex's surface is two sources, Bedrock's is one.** For Vertex, LiteLLM
+- **Google's Agent Platform has two endpoint sources, Bedrock has one.** For Google's Agent Platform, LiteLLM
   resolves `api_base or litellm.api_base or VERTEXAI_API_BASE` on one line, and
   the in-process global **outranks** the variable — no environment hygiene
   reaches a global that any dependency or notebook cell can set. Bedrock's route
   never consults that global. (`VERTEX_API_BASE`, without the `AI`, is
   embeddings-only and does not affect completions.)
-- **Vertex replaces the whole URL rather than swapping the host**, composing
+- **Google's Agent Platform replaces the whole URL rather than swapping the host**, composing
   `"{value}:{action}"` — so a value carrying a path or trailing slash redirects
   silently, while a *bare host* fails loudly with `Invalid port:
   'generateContent'` and sends nothing. Do not read a crash as the only failure
@@ -1089,7 +1089,7 @@ Four things that matter if you pin residency:
   configured key-management backend. An empty string is safe; a stray value is
   not.
 
-**Vertex has a second residency override with no environment variable
+**Google's Agent Platform has a second residency override with no environment variable
 involved.** LiteLLM reroutes a pinned `vertex_location` to a model's first
 `supported_regions` entry when its shipped cost map lists regions that exclude
 yours, warning only on the verbose logger. llmkit's `gemini-3.1-flash-lite`
@@ -1106,7 +1106,7 @@ pip install "omg-llmkit[bedrock]"
 
 The default model is Claude Haiku 4.5 via its **cross-region inference profile** id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on Bedrock are typically reached through inference profiles rather than plain on-demand ids. Pass a different profile- or partition-prefixed id as `model` (e.g. `eu.anthropic.claude-...`) when your account routes elsewhere.
 
-`vertex_project` and `vertex_location` are the Vertex AI analog and are not accepted by any other provider. Vertex reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Vertex routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
+`vertex_project` and `vertex_location` are the equivalents for Google's Agent Platform and are not accepted by any other provider. Google's Agent Platform reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Google's Agent Platform routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
 
 ```bash
 pip install "omg-llmkit[vertex]"
@@ -1114,7 +1114,7 @@ pip install "omg-llmkit[vertex]"
 
 **`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 3.1 Flash-Lite (parity with the AI Studio provider) and requires `global`, `us`, or `eu`; the maintained configuration uses `us`. As with AI Studio, Gemini 3.1 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
 
-> **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host the `gemini-3.1-flash-lite` default; it requires the `global`, `us`, or `eu` multi-region endpoint. A model that isn't deployed in your region fails with a Vertex `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a model your region actually serves. Check the [Gemini-on-Vertex locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
+> **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host the `gemini-3.1-flash-lite` default; it requires the `global`, `us`, or `eu` multi-region endpoint. A model that isn't deployed in your region fails with an Agent Platform `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a model your region actually serves. Check the [Gemini on Google's Agent Platform locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
 
 **`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
 
@@ -1154,8 +1154,8 @@ result = structured_llm_call_sync(
 
 `make_provider` takes the same knobs as `LLMClientConfig`, and — like
 `build_provider` — **rejects** any that the selected provider does not read
-rather than silently dropping them: `base_url` for Bedrock/Vertex (whose
-endpoints derive from region/location), `api_key` for Ollama or Bedrock/Vertex
+rather than silently dropping them: `base_url` for Bedrock or Google's Agent Platform (whose
+endpoints derive from region/location), `api_key` for Ollama or Bedrock or Google's Agent Platform
 (which authenticate via their ambient AWS/Google chains), `aws_region_name` for
 anything but Bedrock, and so on. Pass only the fields the provider uses. Leave
 `model` unset to inherit the provider's own default; the assembled LiteLLM id is

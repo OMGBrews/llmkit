@@ -109,13 +109,13 @@ export AWS_REGION_NAME=us-east-1   # plus credentials via the standard AWS chain
 uv run pytest tests/integration --run-live -k bedrock
 ```
 
-**Google Vertex AI** is the same kind of structural exception. Like Bedrock it
+**Gemini Enterprise Agent Platform (formerly Vertex AI)** is the same kind of structural exception. Like Bedrock it
 has no API key — it authenticates through Google **Application Default
 Credentials** and needs the `google-auth`-bearing `[vertex]` extra — so its only
 allowed skip is `pytest.importorskip("google.auth")` when the extra isn't
 installed. Once present, a missing `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` or an
 unresolvable ADC chain **fails** the test under `--run-live`. `vertex_location`
-selects the data-residency region, and this test is where the Vertex
+selects the data-residency region, and this test is where Google's Agent Platform
 `Mode.JSON_SCHEMA` pin is *measured*:
 
 ```bash

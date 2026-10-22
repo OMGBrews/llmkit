@@ -102,9 +102,9 @@ def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
 
     Raises:
         ValueError: If the config populates a provider-shaped knob the selected
-            provider does not read (e.g. an ``api_key`` for Bedrock/Vertex, a
-            ``base_url`` for a fixed-endpoint provider), or if a bearer provider
-            has no key configured and no matching environment variable.
+            provider does not read (e.g. an ``api_key`` for Bedrock or Gemini Enterprise Agent
+            Platform (formerly Vertex AI), a ``base_url`` for a fixed-endpoint provider), or if a
+            bearer provider has no key configured and no matching environment variable.
         AssertionError: If ``config.provider`` is not wired to a provider
             here (an unwired enum member). See :func:`typing.assert_never`.
     """
@@ -143,55 +143,51 @@ def make_provider(
     provider *name*, so calls sharing a provider share its budget (llmkit is
     single-tenant by design — see :mod:`llmkit.rate_limiting`).
 
-    This function's keywords are the fields of :class:`LLMClientConfig`, but a
-    knob the selected provider does not read is **rejected**, not silently
-    ignored: passing ``api_key`` to Ollama/Bedrock/Vertex, ``base_url`` to
-    Bedrock/Vertex, ``aws_region_name`` to anything but Bedrock, ``vertex_*`` to
-    anything but Vertex, or a non-default ``gemini_structured_output`` to a
-    non-Gemini provider raises ``ValueError``. Populate only the fields the
-    selected provider uses. A falsy ``model`` resolves to the provider's own
-    default, so the assembled LiteLLM id is always well-formed.
+    This function's keywords are the fields of :class:`LLMClientConfig`, but a knob the selected
+    provider does not read is **rejected**, not silently ignored: passing ``api_key`` to Ollama,
+    Bedrock, or Google's Agent Platform, ``base_url`` to Bedrock or Google's Agent Platform,
+    ``aws_region_name`` to anything but Bedrock, ``vertex_*`` to anything but Google's Agent
+    Platform, or a non-default ``gemini_structured_output`` to a non-Gemini provider raises
+    ``ValueError``. Populate only the fields the selected provider uses. A falsy ``model`` resolves
+    to the provider's own default, so the assembled LiteLLM id is always well-formed.
 
     Args:
         provider: Which provider to construct.
         api_key: Bearer credential for the key-authenticated providers
-            (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras);
-            resolves from this value, else the provider's environment variable,
-            else raises. Not accepted by Ollama (local) or Bedrock/Vertex (which
-            sign via their ambient AWS/Google credential chains).
+            (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras); resolves from
+            this value, else the provider's environment variable, else raises. Not accepted by
+            Ollama (local) or Bedrock or Google's Agent Platform (which sign via their ambient
+            AWS/Google credential chains).
         model: Default model for this provider; ``None`` uses the provider's
             built-in default.
         base_url: Endpoint (gateway, proxy, compatible endpoint) for every
-            key-authenticated provider and Ollama, forwarded to LiteLLM as
-            ``api_base``: it resolves from this value, else the provider's own
-            documented endpoint variable(s) (``OPENAI_BASE_URL`` and friends,
-            still honoured), else that provider's measured default — resolved
-            per call, so it reflects the environment the call goes out in. That
-            keeps a source llmkit does not read from choosing the endpoint, with
-            two documented exceptions: Google AI Studio owns no default (its base
-            carries a model-derived API version) and so sends nothing when
-            neither is set, and Ollama's LiteLLM route ranks ``litellm.api_base``
-            above the value sent. Not accepted by Bedrock/Vertex, whose endpoints
-            LiteLLM derives from ``aws_region_name`` / ``vertex_location`` — for
-            those two an ambient endpoint value can override the pinned region,
-            which matters because that region is the residency control (see each
-            provider's class docstring).
+            key-authenticated provider and Ollama, forwarded to LiteLLM as ``api_base``: it
+            resolves from this value, else the provider's own documented endpoint variable(s)
+            (``OPENAI_BASE_URL`` and friends, still honoured), else that provider's measured
+            default — resolved per call, so it reflects the environment the call goes out in. That
+            keeps a source llmkit does not read from choosing the endpoint, with two documented
+            exceptions: Google AI Studio owns no default (its base carries a model-derived API
+            version) and so sends nothing when neither is set, and Ollama's LiteLLM route ranks
+            ``litellm.api_base`` above the value sent. Not accepted by Bedrock or Google's Agent
+            Platform, whose endpoints LiteLLM derives from ``aws_region_name`` /
+            ``vertex_location`` — for those two an ambient endpoint value can override the pinned
+            region, which matters because that region is the residency control (see each provider's
+            class docstring).
         reasoning_effort: Provider "thinking" effort translated to its
             request control; ``None`` leaves the provider default in place.
         aws_region_name: AWS region for Bedrock; not accepted by any other
             provider.
-        vertex_project: GCP project id for Vertex AI; not accepted by any other
+        vertex_project: GCP project id for Google's Agent Platform; not accepted by any other
             provider. ``None`` resolves from the environment / ADC.
-        vertex_location: Vertex AI region — the data-residency control; not
+        vertex_location: Google's Agent Platform region — the data-residency control; not
             accepted by any other provider. ``None`` resolves from the
             environment, else Google's default region.
         gemini_structured_output: Structured-output strategy for the Gemini
-            providers (Vertex, Google AI Studio); a non-default value is not
-            accepted by any other provider. ``"schema"`` (default) keeps Gemini's
-            native JSON-schema constrained decoding; ``"json"`` switches to
-            JSON-mime-type output
-            with client-side validation to escape the constrained-decoding
-            repetition-loop trap (see the Gemini provider docstrings).
+            providers (Google's Agent Platform, Google AI Studio); a non-default value is not
+            accepted by any other provider. ``"schema"`` (default) keeps Gemini's native
+            JSON-schema constrained decoding; ``"json"`` switches to JSON-mime-type output with
+            client-side validation to escape the constrained-decoding repetition-loop trap (see the
+            Gemini provider docstrings).
 
     Returns:
         A constructed provider, ready to pass as a per-call ``provider=``.
