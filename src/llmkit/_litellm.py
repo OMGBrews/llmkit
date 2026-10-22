@@ -89,6 +89,8 @@ _sent_temperature: ContextVar[float | None | _NotSent] = ContextVar(
 
 _TEMPERATURE = "temperature"
 _DROP_PARAMS = "additional_drop_params"
+# LiteLLM's per-call opt-out of its proxy MCP gateway check; see _acompletion.
+_SKIP_MCP_HANDLER = "_skip_mcp_handler"
 
 
 def begin_sent_temperature() -> None:
@@ -176,11 +178,29 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     :func:`sent_temperature`). A host that sets the global
     ``litellm.drop_params`` makes LiteLLM drop silently instead, so no refusal
     reaches here and the record shows the caller's value.
+
+    It is also where a request carrying ``tools`` opts out of LiteLLM's proxy
+    MCP gateway, with LiteLLM's per-call ``_skip_mcp_handler=True``. Unless that
+    switch is set, ``completion`` enters a check that asks whether any tool names
+    the gateway, and in LiteLLM 1.106.0 through 1.106.2 the check's module
+    imports the ``mcp`` package at module level. ``mcp`` ships only in LiteLLM's
+    ``mcp``/``proxy`` extras, so on a plain install every tool call failed
+    before anything was sent, as an ``APIConnectionError`` reading
+    ``No module named 'mcp'`` (BerriAI/litellm#46045, fixed on LiteLLM's
+    ``main`` by #45961). Skipping is safe because llmkit builds only
+    ``{"type": "function", ...}`` tools, which that check classifies as non-MCP
+    anyway. ``completion`` pops the key before parameter mapping, so it never
+    reaches a provider, and it is set on these *kwargs* so the temperature
+    re-issue carries it too. Why llmkit does this rather than cap LiteLLM or
+    require the ``mcp`` extra is recorded on the ``litellm`` requirement in
+    ``pyproject.toml``.
     """
     acompletion = cast(
         "Callable[..., Coroutine[object, object, ModelResponse | CustomStreamWrapper]]",
         litellm.acompletion,
     )
+    if kwargs.get("tools"):
+        _ = kwargs.setdefault(_SKIP_MCP_HANDLER, True)
     try:
         try:
             result = await acompletion(**kwargs)

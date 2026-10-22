@@ -26,6 +26,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `litellm.drop_params` gets LiteLLM's silent drop instead, and its records
   show the requested value.
 
+### Fixed
+
+- **Tool calls work on LiteLLM 1.106.0–1.106.2 without the `mcp` package.**
+  Those releases import `mcp`, which ships only in LiteLLM's `mcp` and `proxy`
+  extras, on every completion that carries `tools`, so on a plain install
+  `tool_llm_call` and `tool_llm_call_stream` failed before anything was sent
+  with `APIConnectionError: ... No module named 'mcp'`
+  ([BerriAI/litellm#46045](https://github.com/BerriAI/litellm/issues/46045)).
+  llmkit now passes LiteLLM's per-call `_skip_mcp_handler=True` on every
+  request carrying tools, so LiteLLM skips the proxy MCP gateway check that
+  imports it. That is safe because llmkit sends only function tools, which the
+  check classifies as non-MCP anyway. No `mcp` install or `litellm[mcp]` extra
+  is needed, and the supported LiteLLM range is unchanged. LiteLLM has fixed
+  the import on its `main` branch
+  ([BerriAI/litellm#45961](https://github.com/BerriAI/litellm/pull/45961)),
+  after which the switch is redundant but harmless.
+
 ## [0.12.0] — 2026-10-10
 
 ### Added
