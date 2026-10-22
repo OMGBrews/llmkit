@@ -569,3 +569,11 @@ class ComposeUnsupportedError(Exception):
     combined request.  Use the portable two-step pattern (tool loop followed by
     ``structured_llm_call``) instead.
     """
+
+
+class ReasoningEffortUnsupportedError(Exception):
+    """A model is known to require thinking but the caller requested disable.
+
+    A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS``:
+    retrying cannot turn thinking off on an always-on model.
+    """

@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers._claude import reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -77,8 +78,12 @@ class BedrockProvider(BaseProvider):
     should pass their region group's profile id (e.g. ``eu.anthropic....``)
     as the ``model``. Inference profiles are otherwise out of scope here.
 
-    ``reasoning_effort`` is forwarded to LiteLLM for Bedrock models that
-    support thinking (e.g. Claude) and is harmless on those that don't.
+    ``reasoning_effort="disable"`` translates to LiteLLM's ``"none"``.
+    Models LiteLLM flags as requiring thinking raise
+    :class:`~llmkit.ReasoningEffortUnsupportedError`; use ``"low"`` for their
+    lowest explicit effort. Unknown metadata permits the translation.
+    Other effort values are forwarded unchanged, with support decided by LiteLLM
+    and the selected Bedrock model.
 
     Bedrock pulls in ``boto3`` for request signing (AWS SigV4); it ships via
     the ``omg-llmkit[bedrock]`` extra rather than the core install, so
@@ -130,6 +135,11 @@ class BedrockProvider(BaseProvider):
         require_boto3_sdk(self._provider_name)
         super().__init__(model, reasoning_effort)
         self._aws_region_name: str | None = aws_region_name
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate disable to none, rejecting models known to require thinking."""
+        return reasoning_kwargs(effort, model, route="bedrock")
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
