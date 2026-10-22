@@ -417,9 +417,12 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
 
 
 # Gemini 2.5 (AI Studio *and* Google's Agent Platform) thinks by default; disable it so the smoke
-# call doesn't burn reasoning tokens on a trivial extraction. Every other provider sends nothing —
+# call doesn't burn reasoning tokens on a trivial extraction. Claude routes also
+# exercise the portable disable translation. Other providers send nothing because
 # some models reject the knob outright.
 _REASONING_EFFORT: dict[Provider, str] = {
+    Provider.ANTHROPIC: "disable",
+    Provider.BEDROCK: "disable",
     Provider.GOOGLE: "disable",
     Provider.VERTEX: "disable",
 }

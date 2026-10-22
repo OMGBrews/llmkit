@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers._claude import reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -104,6 +105,11 @@ class AnthropicProvider(BaseProvider):
         # environment and so must happen at the read point, never here (see
         # ``completion_kwargs``).
         self._base_url: str | None = base_url
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate disable to none, rejecting models known to require thinking."""
+        return reasoning_kwargs(effort, model, route="anthropic")
 
     @override
     def completion_kwargs(self) -> dict[str, object]:

@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Translate `reasoning_effort="disable"` to `"none"` on Anthropic and Bedrock,
+  turning thinking off where supported. Models LiteLLM identifies as always-on
+  raise the exported `ReasoningEffortUnsupportedError` before transport, with
+  a steer to `"low"`. Unknown metadata permits the translation. Other efforts
+  pass through unchanged; OpenAI's vocabulary remains untranslated.
+
 ### Added
 
 - **Cerebras as a provider.** `Provider.CEREBRAS` / `CerebrasProvider`
