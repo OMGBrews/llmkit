@@ -654,6 +654,12 @@ async def acompletion_structured[T: BaseModel](
                 # sampling applies — see options.resolve_call_args. The
                 # identity check keeps ``0.0`` a real, forwarded value.
                 **({"temperature": temperature} if temperature is not None else {}),
+                # One schema, one tool call: on the Claude routes a schema can
+                # travel as a synthetic tool the model may call twice, splitting
+                # the answer (see BaseProvider._single_tool_call_per_schema).
+                # Gated like the two above, so every other provider's request is
+                # unchanged; never sent by the tool-calling functions.
+                **({"parallel_tool_calls": False} if provider.single_tool_call_per_schema else {}),
             )
         except IncompleteOutputException as e:
             # The declined re-ask propagates instructor's exception bare (no

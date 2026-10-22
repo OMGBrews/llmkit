@@ -94,7 +94,7 @@ import socket
 from typing import NoReturn, Protocol, TypedDict, assert_never, cast
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from llmkit import (
     ChatMessage,
@@ -738,6 +738,67 @@ async def test_ollama_live() -> None:
 @pytest.mark.asyncio
 async def test_bedrock_live() -> None:
     await _override_roundtrip(Provider.BEDROCK, _BEDROCK_MODEL)
+
+
+#: Named only in the validator's error message, so a first attempt cannot
+#: produce it and a parsed result carrying it can only come from the re-ask.
+_REASK_TOKEN = "heliotrope-7193"
+
+
+class _ReaskProbe(BaseModel):
+    """A schema whose first attempt fails validation by construction."""
+
+    code: str
+
+    @field_validator("code")
+    @classmethod
+    def _must_be_the_token(cls, value: str) -> str:
+        if value.strip() != _REASK_TOKEN:
+            raise ValueError(f"code must be exactly {_REASK_TOKEN!r}")
+        return value.strip()
+
+
+# The provider's default model takes Bedrock's native ``outputConfig`` path;
+# Sonnet 5.5 with thinking on takes LiteLLM's synthetic ``json_tool_call`` path,
+# the one a 0.12.0 report saw split across two tool calls and then refused on
+# the re-ask. The Sonnet id is hard-coded rather than env-overridable: it is
+# the path that case exists to exercise.
+_BEDROCK_REASK_ROUTES = [
+    pytest.param(_BEDROCK_MODEL, None, id="bedrock-default-native"),
+    pytest.param(
+        "global.anthropic.claude-sonnet-5-5", "low", id="bedrock-sonnet-5-5-synthetic-tool"
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model", "effort"), _BEDROCK_REASK_ROUTES)
+async def test_bedrock_schema_repair_reask_is_accepted_live(model: str, effort: str | None) -> None:
+    """A first-attempt validation failure on Bedrock is re-asked, accepted and parsed.
+
+    The probe schema rejects every value but a token that appears only in the
+    validation error, so attempt 1 fails deterministically and the result can
+    carry the token only if instructor's re-ask reached Bedrock, was accepted,
+    and was answered. One log record with ``attempt == 1`` proves it was the
+    in-call re-ask, not a cross-call retry. A two-tool-call first response
+    cannot be forced, so this pins the re-ask's validity, not the split.
+    """
+    built = make_provider(Provider.BEDROCK, model=model, **_live_credentials(Provider.BEDROCK))
+    with capture_llm_records() as records:
+        result = await structured_llm_call(
+            "Return a JSON object whose `code` field is any single lowercase word.",
+            _ReaskProbe,
+            feature="integration-reask-smoke",
+            label=model,
+            provider=built,
+            reasoning_effort=effort,
+            max_tokens=4096,
+        )
+
+    assert result.code == _REASK_TOKEN
+    [record] = records
+    assert record.error is None
+    assert record.attempt == 1
 
 
 @pytest.mark.asyncio

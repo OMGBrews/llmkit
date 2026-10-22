@@ -114,6 +114,7 @@ def _provider(**completion_kwargs: object) -> MagicMock:
     provider.litellm_model = MagicMock(return_value="openai/gpt-5-mini")
     provider.reasoning_effort = None
     provider.strict_json_schema = False
+    provider.single_tool_call_per_schema = False
     provider.supports_tool_choice = True
     provider.reasoning_kwargs = MagicMock(return_value={})
     return provider

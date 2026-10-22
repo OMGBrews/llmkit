@@ -28,6 +28,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Structured output on the Anthropic and Bedrock routes asks for one tool
+  call per schema.** On Bedrock models that LiteLLM serves without native
+  structured output, such as `global.anthropic.claude-sonnet-5-5`, the schema
+  travels as a synthetic tool. With thinking on, the model occasionally called
+  it twice and split one answer across the two calls; LiteLLM kept only the
+  first, so validation failed and the re-ask started from half an answer. This
+  was measured at 2 of 300 calls with `reasoning_effort="low"`. `structured_llm_call`
+  and its variants now send `parallel_tool_calls=False` on these two providers,
+  which LiteLLM maps to Anthropic's `disable_parallel_tool_use`. Other
+  providers' requests and the text, stream and tool-calling functions are
+  unchanged. A reported Bedrock 400 on the re-ask after such a split was not
+  reproduced at the declared dependency floor or later, and the live suite now
+  pins that a Bedrock re-ask is accepted.
 - **Tool calls work on LiteLLM 1.106.0–1.106.2 without the `mcp` package.**
   Those releases import `mcp`, which ships only in LiteLLM's `mcp` and `proxy`
   extras, on every completion that carries `tools`, so on a plain install

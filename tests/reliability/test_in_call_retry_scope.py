@@ -61,6 +61,7 @@ def _fake_provider() -> MagicMock:
     provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = None
     provider.strict_json_schema = False
+    provider.single_tool_call_per_schema = False
     return provider
 
 

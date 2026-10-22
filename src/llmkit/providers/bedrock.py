@@ -89,12 +89,37 @@ class BedrockProvider(BaseProvider):
     ``ModuleNotFound`` deep on the first completion. (The Anthropic SDK is
     **not** needed — see :class:`AnthropicProvider`; instructor >=1.15.4
     never requires it on the LiteLLM path.)
+
+    **Structured requests send ``parallel_tool_calls=False``**
+    (``single_tool_call_per_schema``). LiteLLM serves ``response_format`` through
+    Bedrock's native ``outputConfig`` only for models its cost map marks
+    ``supports_native_structured_output`` (Haiku 4.5 is; Sonnet 5.5,
+    ``global.anthropic.claude-sonnet-5-5``, is not). Every other model gets a
+    synthetic ``json_tool_call`` tool, and with thinking on LiteLLM does not force
+    it, so the model may call it twice. Measured live on 2026-10-21: 2 of 300
+    first responses from Sonnet 5.5 with ``reasoning_effort="low"`` split one
+    answer across two calls, the first a partial object with a nested field
+    garbled into a string, the second the leftover fields. LiteLLM keeps only the
+    first call's arguments, so validation fails and the re-ask starts from half an
+    answer. LiteLLM maps the parameter to ``disable_parallel_tool_use`` only for
+    models whose cost-map entry has ``supports_parallel_tool_use_config`` (Sonnet
+    5.5 and Haiku 4.5 do); a model missing from the map silently loses the
+    protection rather than erroring.
+
+    A 0.12.0 report had Bedrock refuse that re-ask with a 400 (``tool_use`` ids
+    found without ``tool_result`` blocks). It was **not** reproduced at the
+    declared dependency floor (LiteLLM 1.104.0, instructor 1.15.4) or on later
+    versions: LiteLLM collapses every synthetic tool call into the message text,
+    so instructor's re-ask carries no ``tool_use`` block, and Bedrock accepted it
+    live. The live suite pins that re-ask on both the native and the
+    synthetic-tool path.
     """
 
     _provider_name: ClassVar[str] = "AWS Bedrock"
     _model_prefix: ClassVar[str] = "bedrock/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    _single_tool_call_per_schema: ClassVar[bool] = True
     _accepted_config_fields: ClassVar[frozenset[str]] = frozenset({"aws_region_name"})
 
     def __init__(

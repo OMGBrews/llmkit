@@ -478,6 +478,11 @@ class LLMProviderInterface(Protocol):
         ...
 
     @property
+    def single_tool_call_per_schema(self) -> bool:
+        """Whether structured requests forbid splitting the schema across tool calls."""
+        ...
+
+    @property
     def compose_tools_schema(self) -> bool:
         """Whether this provider has a measured stable tools+schema capability."""
         ...
@@ -584,6 +589,16 @@ class BaseProvider(ABC):
     #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
     #: pattern).
     _strict_json_schema: ClassVar[bool] = False
+    #: Whether structured requests send ``parallel_tool_calls=False`` so the
+    #: answer to one schema arrives as exactly one tool call. Some routes carry a
+    #: schema as a synthetic tool (LiteLLM's ``json_tool_call`` on Bedrock models
+    #: without native structured output); a model free to call it twice can split
+    #: one answer across two calls, of which LiteLLM keeps only the first. Sent on
+    #: the structured lane only, never on the tool-calling functions, where real
+    #: tools exist and parallel use is the caller's choice. The Claude providers
+    #: opt in; see :class:`~llmkit.providers.bedrock.BedrockProvider` for the
+    #: measurement. Exposed via the ``single_tool_call_per_schema`` property.
+    _single_tool_call_per_schema: ClassVar[bool] = False
     #: Whether tools plus a strict response schema are a measured, stable
     #: capability for this provider. Preview-only or unmeasured routes remain
     #: false so callers receive a loud steer to the portable two-step pattern.
@@ -677,6 +692,16 @@ class BaseProvider(ABC):
         upgrade itself happens at the LiteLLM call seam in ``llmkit._litellm``.
         """
         return self._strict_json_schema
+
+    @property
+    def single_tool_call_per_schema(self) -> bool:
+        """Whether structured requests forbid splitting the schema across tool calls.
+
+        See the ``_single_tool_call_per_schema`` trait above for the rationale;
+        ``parallel_tool_calls=False`` is added in ``llmkit._litellm``'s
+        structured call only.
+        """
+        return self._single_tool_call_per_schema
 
     @property
     def compose_tools_schema(self) -> bool:

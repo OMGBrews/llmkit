@@ -269,6 +269,7 @@ def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvi
         "_model_prefix",
         "is_local",
         "_strict_json_schema",
+        "_single_tool_call_per_schema",
         "_compose_tools_schema",
         "_supports_tool_choice",
     )
@@ -276,3 +277,17 @@ def test_routing_class_attrs_are_annotated_classvar(provider_cls: type[BaseProvi
         assert typing.get_origin(hints[attr]) is typing.ClassVar, (
             f"{provider_cls.__name__}.{attr} must be annotated ClassVar"
         )
+
+
+@pytest.mark.parametrize("provider_cls", [BaseProvider, *_SHIPPED_PROVIDERS])
+def test_single_tool_call_per_schema_is_opt_in_for_the_claude_providers(
+    provider_cls: type[BaseProvider],
+) -> None:
+    """The trait defaults off; only the Anthropic and Bedrock providers opt in.
+
+    It adds ``parallel_tool_calls=False`` to structured requests, a parameter
+    measured accepted only on the Claude routes, so a provider joins this set
+    on its own live evidence rather than by inheriting a default.
+    """
+    expected = provider_cls in (AnthropicProvider, BedrockProvider)
+    assert provider_cls._single_tool_call_per_schema is expected

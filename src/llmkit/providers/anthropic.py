@@ -61,6 +61,18 @@ class AnthropicProvider(BaseProvider):
     so a host already using them is unaffected (see :func:`resolve_base_url`). The
     wire shape with nothing configured is unchanged, because the default is the
     endpoint LiteLLM itself resolved.
+
+    Structured requests also send ``parallel_tool_calls=False``
+    (``single_tool_call_per_schema``), which LiteLLM maps to Anthropic's
+    ``disable_parallel_tool_use``. This route uses native ``output_format`` and
+    was not seen to split a schema; the parameter is sent for parity with
+    :class:`~llmkit.providers.bedrock.BedrockProvider`, whose synthetic-tool
+    path did, so a model that falls back to a tool-shaped schema stays one call.
+    Accepted live on Sonnet 5.5 and Haiku 4.5 (2026-10-21), including on native
+    structured-output requests that declare no tools. A Bedrock re-ask refusal
+    reported against 0.12.0 (a 400 naming ``tool_use`` ids without
+    ``tool_result`` blocks) was **not** reproduced at the declared dependency
+    floor; see the Bedrock provider.
     """
 
     _provider_name: ClassVar[str] = "Anthropic"
@@ -71,6 +83,7 @@ class AnthropicProvider(BaseProvider):
     #: rejected by ``guard_compose_tools_schema`` because LiteLLM's fallback
     #: replaces caller tools with a forced response-format tool.
     _compose_tools_schema: ClassVar[bool] = True
+    _single_tool_call_per_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "ANTHROPIC_API_KEY"
     #: The endpoint variables LiteLLM consulted for this route, in its own
     #: precedence order (measured, not read off the source). Read here so a host

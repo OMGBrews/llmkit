@@ -128,6 +128,9 @@ def _transport_provider(
     provider.instructor_mode = instructor_mode
     provider.litellm_model = MagicMock(return_value="fake/model")
     provider.reasoning_effort = reasoning_effort
+    # A real bool, not a truthy MagicMock attribute: the structured transport
+    # adds ``parallel_tool_calls`` only for providers that opt in.
+    provider.single_tool_call_per_schema = False
 
     # Keep the transport double explicit as the provider contract grows:
     # MagicMock would manufacture a new hook whose ``**`` expansion is an empty
