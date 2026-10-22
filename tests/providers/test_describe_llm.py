@@ -53,11 +53,12 @@ def test_describe_llm_marks_only_ollama_local() -> None:
 
 
 def test_describe_llm_snapshots_vertex() -> None:
-    """Vertex resolves its name + default model in the snapshot; residency
+    """Gemini Enterprise Agent Platform (formerly Vertex AI) resolves its name + default model in
+    the snapshot; residency
     fields don't affect the read accessor (they're routing, not display)."""
     info = describe_llm(LLMClientConfig(provider=Provider.VERTEX, vertex_location="europe-west4"))
     assert isinstance(info, LLMInfo)
     assert info.provider == Provider.VERTEX
-    assert info.provider_name == "Google Vertex AI"
+    assert info.provider_name == "Google Agent Platform"
     assert info.model == "gemini-3.1-flash-lite"
     assert info.is_local is False

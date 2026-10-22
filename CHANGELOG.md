@@ -23,6 +23,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Google's provider display name is now `"Google Agent Platform"` (previously
+  `"Google Vertex AI"`).** The new label appears in call-log `provider:` fields,
+  the JSONL index, `describe_llm().provider_name`, error messages that name the
+  provider, rate-limiter keys, and cache keys. Existing Vertex cache entries
+  miss once. Hosts passing the old name to `rate_limit_acquire_async` or
+  `rate_limit_acquire_sync` must pass `"Google Agent Platform"`; hosts comparing
+  `CircuitOpenError.provider` must use the casefolded `"google agent platform"`.
+  Prose and docstrings now use Gemini Enterprise Agent Platform (formerly
+  Vertex AI), then Google's Agent Platform. The `vertex` provider key,
+  `Provider.VERTEX`, `vertex_project` / `vertex_location` arguments,
+  `omg-llmkit[vertex]` extra, and `VertexProvider` symbol are unchanged:
+  LiteLLM's `vertex_ai/` prefix, Google's `aiplatform.googleapis.com` host, and
+  the `VERTEXAI_*` environment variables retain their wire-level names.
+
 - **A temperature the model refuses is omitted on one re-issue instead of
   failing the call.** LiteLLM refuses any `temperature` but `1` on GPT-5
   models whose effective reasoning effort is not `none` (including

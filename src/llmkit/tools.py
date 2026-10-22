@@ -47,13 +47,13 @@ class ToolDefinition:
     — the portable spelling, sent to Gemini as a bare ``OBJECT``. No dummy
     parameter is needed.
 
-    The guarantee is delivery in the provider's accepted subset, not lossless
-    translation: a construct the subset cannot express is *dropped, not errored*.
-    Notably Gemini accepts ``enum`` only on string-typed fields, so an enum on an
-    integer field is silently discarded and the model sees an unconstrained
-    number — :meth:`from_model` still validates the returned arguments locally.
-    ``tests/providers/test_gemini_tool_schema_transport.py`` pins the transform;
-    ``test_vertex_tool_schema_roundtrip_live`` pins that Vertex accepts its output.
+    The guarantee is delivery in the provider's accepted subset, not lossless translation: a
+    construct the subset cannot express is *dropped, not errored*. Notably Gemini accepts ``enum``
+    only on string-typed fields, so an enum on an integer field is silently discarded and the model
+    sees an unconstrained number — :meth:`from_model` still validates the returned arguments
+    locally. ``tests/providers/test_gemini_tool_schema_transport.py`` pins the transform;
+    ``test_vertex_tool_schema_roundtrip_live`` pins that Gemini Enterprise Agent Platform (formerly
+    Vertex AI) accepts its output.
     """
 
     name: str

@@ -1,15 +1,14 @@
 """End-to-end: a real VertexProvider threads its residency routing to the wire.
 
-The unit tests in ``test_vertex.py`` check ``completion_kwargs()`` in isolation.
-These prove the data-residency selection actually *reaches LiteLLM*: a **real**
-``VertexProvider`` drives the real ``_litellm`` call seam (only the
-LiteLLM/instructor boundary faked), and the captured request carries
-``vertex_project`` / ``vertex_location`` (the residency selection) alongside the
-``vertex_ai/`` model string. For structured output it additionally asserts
-instructor is pinned to ``Mode.JSON_SCHEMA`` — so a regression in how creds splat
-into the call, the model prefix, or the mode pin fails here rather than only
-against live Vertex. (Parallels ``test_openrouter_routing.py``, which pins that
-provider's routing preference reaches the wire.)
+The unit tests in ``test_vertex.py`` check ``completion_kwargs()`` in isolation. These prove the
+data-residency selection actually *reaches LiteLLM*: a **real** ``VertexProvider`` drives the real
+``_litellm`` call seam (only the LiteLLM/instructor boundary faked), and the captured request
+carries ``vertex_project`` / ``vertex_location`` (the residency selection) alongside the
+``vertex_ai/`` model string. For structured output it additionally asserts instructor is pinned to
+``Mode.JSON_SCHEMA`` — so a regression in how creds splat into the call, the model prefix, or the
+mode pin fails here rather than only when Gemini Enterprise Agent Platform (formerly Vertex AI)
+receives a live call. (Parallels ``test_openrouter_routing.py``, which pins that provider's routing
+preference reaches the wire.)
 """
 
 from __future__ import annotations

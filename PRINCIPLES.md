@@ -18,7 +18,7 @@ One call does it: pass a prompt — plus a Pydantic model when you want structur
 
 ## Providers switch by config; models switch per call
 
-OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one `LLMClientConfig`, registered once at startup — so switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is even lighter: every call takes an optional `model=` that overrides the default just for that call.
+OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one `LLMClientConfig`, registered once at startup — so switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is even lighter: every call takes an optional `model=` that overrides the default just for that call.
 
 ## Local-first, zero infrastructure
 

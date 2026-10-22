@@ -1,4 +1,4 @@
-"""Google Vertex AI LLM provider."""
+"""Gemini Enterprise Agent Platform (formerly Vertex AI) LLM provider."""
 
 from __future__ import annotations
 
@@ -16,43 +16,37 @@ from llmkit.providers.base import (
 
 
 class VertexProvider(BaseProvider):
-    """Google Vertex AI LLM provider.
+    """Google's Agent Platform LLM provider.
 
-    Routes Gemini through Google Cloud's Vertex AI (``vertex_ai/<model>``) — the
-    enterprise path to the same Gemini models the direct
-    :class:`~llmkit.providers.google.GoogleProvider` reaches through Google AI
-    Studio (``gemini/<model>``). The relationship mirrors Anthropic-direct vs
-    Bedrock: same underlying model, but a different routing namespace, a
-    different credential story, and a region knob that controls data residency.
+    Routes Gemini through Google's Agent Platform (``vertex_ai/<model>``) — the enterprise path to
+    the same Gemini models the direct :class:`~llmkit.providers.google.GoogleProvider` reaches
+    through Google AI Studio (``gemini/<model>``). The relationship mirrors Anthropic-direct vs
+    Bedrock: same underlying model, but a different routing namespace, a different credential
+    story, and a region knob that controls data residency.
 
-    Like Bedrock, Vertex does **not** authenticate with a bearer ``api_key``:
-    LiteLLM mints and refreshes a Google OAuth access token from the standard
-    **Application Default Credentials (ADC)** chain (``gcloud auth
-    application-default login``, ``GOOGLE_APPLICATION_CREDENTIALS``, or a
-    workload-identity/metadata-server token). This provider therefore carries no
-    secret — only the non-secret routing fields ``vertex_project`` and
-    ``vertex_location``, and each only when set; the credentials stay in the
-    ambient chain and never pass through :class:`~llmkit.LLMClientConfig`. When
-    both are left unset they resolve from the environment (``VERTEXAI_PROJECT`` /
-    ``VERTEXAI_LOCATION``), with the location otherwise falling back to Google's
-    default region.
+    Like Bedrock, Google's Agent Platform does **not** authenticate with a bearer ``api_key``:
+    LiteLLM mints and refreshes a Google OAuth access token from the standard **Application Default
+    Credentials (ADC)** chain (``gcloud auth application-default login``,
+    ``GOOGLE_APPLICATION_CREDENTIALS``, or a workload-identity/metadata-server token). This
+    provider therefore carries no secret — only the non-secret routing fields ``vertex_project``
+    and ``vertex_location``, and each only when set; the credentials stay in the ambient chain and
+    never pass through :class:`~llmkit.LLMClientConfig`. When both are left unset they resolve from
+    the environment (``VERTEXAI_PROJECT`` / ``VERTEXAI_LOCATION``), with the location otherwise
+    falling back to Google's default region.
 
-    ``vertex_location`` is the **data-processing residency** control: it selects
-    the endpoint where the request is processed. LiteLLM derives three shapes
-    from it — ``https://aiplatform.googleapis.com`` for ``"global"``,
-    ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region geography
-    (``"us"``, ``"eu"``), else ``https://<location>-aiplatform.googleapis.com``.
-    Pass a regional value (e.g. ``"europe-west4"``,
-    ``"asia-northeast1"``) to pin in-region processing; the ``"global"`` endpoint
-    gives no residency guarantee. Note Gemini availability is **region-specific**,
-    so a region chosen for residency may not host every model. The
-    ``gemini-3.1-flash-lite`` default is served through the ``"global"``,
-    ``"us"``, and ``"eu"`` multi-region endpoints; use ``"us"`` for the
-    maintained default configuration when a global endpoint is unsuitable. A
-    model not deployed in the region fails
-    with a Vertex ``400 FAILED_PRECONDITION`` ("Precondition check failed."), an
-    *availability* error distinct from auth/permission failures; pass a ``model``
-    the region actually serves.
+    ``vertex_location`` is the **data-processing residency** control: it selects the endpoint where
+    the request is processed. LiteLLM derives three shapes from it —
+    ``https://aiplatform.googleapis.com`` for ``"global"``,
+    ``https://aiplatform.<geo>.rep.googleapis.com`` for a multi-region geography (``"us"``,
+    ``"eu"``), else ``https://<location>-aiplatform.googleapis.com``. Pass a regional value (e.g.
+    ``"europe-west4"``, ``"asia-northeast1"``) to pin in-region processing; the ``"global"``
+    endpoint gives no residency guarantee. Note Gemini availability is **region-specific**, so a
+    region chosen for residency may not host every model. The ``gemini-3.1-flash-lite`` default is
+    served through the ``"global"``, ``"us"``, and ``"eu"`` multi-region endpoints; use ``"us"``
+    for the maintained default configuration when a global endpoint is unsuitable. A model not
+    deployed in the region fails with an Agent Platform ``400 FAILED_PRECONDITION`` ("Precondition
+    check failed."), an *availability* error distinct from auth/permission failures; pass a
+    ``model`` the region actually serves.
 
     **Two accepted edges, and both can override that residency pin.** This
     provider sends no ``api_base`` — the endpoint derives from
@@ -125,21 +119,20 @@ class VertexProvider(BaseProvider):
     An unrecognized ``structured_output`` raises ``ValueError`` at construction
     rather than silently falling back.
 
-    ``reasoning_effort`` is forwarded to LiteLLM for Vertex Gemini models that
-    support thinking and is harmless on those that don't. As with Google AI
-    Studio, Gemini 3.1 models think by default, spending reasoning tokens
-    against ``max_tokens``; pass ``reasoning_effort="disable"`` to turn it off
-    so a small ``max_tokens`` cap doesn't truncate structured output.
+    ``reasoning_effort`` is forwarded to LiteLLM for Gemini models on Google's Agent Platform that
+    support thinking and is harmless on those that don't. As with Google AI Studio, Gemini 3.1
+    models think by default, spending reasoning tokens against ``max_tokens``; pass
+    ``reasoning_effort="disable"`` to turn it off so a small ``max_tokens`` cap doesn't truncate
+    structured output.
 
-    Vertex needs the ``google-auth`` library to mint its OAuth token; it ships
-    via the ``omg-llmkit[vertex]`` extra rather than the core install, so
-    non-Vertex users take on no Google dependency. It is checked *eagerly* at
-    construction: constructing this provider without ``google-auth`` raises a
-    clear "install omg-llmkit[vertex]" error instead of a cryptic
+    Google's Agent Platform needs the ``google-auth`` library to mint its OAuth token; it ships via
+    the ``omg-llmkit[vertex]`` extra rather than the core install, so users of other providers take
+    on no Google dependency. It is checked *eagerly* at construction: constructing this provider
+    without ``google-auth`` raises a clear "install omg-llmkit[vertex]" error instead of a cryptic
     ``ModuleNotFound`` deep on the first completion.
     """
 
-    _provider_name: ClassVar[str] = "Google Vertex AI"
+    _provider_name: ClassVar[str] = "Google Agent Platform"
     _model_prefix: ClassVar[str] = "vertex_ai/"
     # The default strategy, and the value ``__init_subclass__`` requires every
     # concrete provider to name. The *effective* mode is resolved per instance
@@ -181,7 +174,7 @@ class VertexProvider(BaseProvider):
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        """Return Vertex routing kwargs forwarded to ``litellm``.
+        """Return Google's Agent Platform routing kwargs forwarded to ``litellm``.
 
         Only ``vertex_project`` / ``vertex_location`` are sent, and only when
         set; the OAuth credentials resolve from the ambient ADC chain. An empty

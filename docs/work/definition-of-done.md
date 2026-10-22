@@ -106,7 +106,7 @@ siblings), and `ci-ok` succeeds only when every CI job does.
   - Command: `uv run pytest tests/integration --run-live`
   - Pass condition: every live test passes with every provider's credentials loaded. A
     missing credential is a failure, not a skip; the only allowed skips are the structural
-    `importorskip`s for the optional Bedrock and Vertex extras.
+    `importorskip`s for the optional Bedrock and Gemini Enterprise Agent Platform (formerly Vertex AI) extras.
   - Applies to: a change to a structured-output mode pin, a default model id, or a
     provider adapter.
   - Evidence type: automated
