@@ -1,6 +1,7 @@
 """Bearer providers resolve their API key config-first, then env, else raise.
 
-The five key-authenticated providers used to coerce a missing ``api_key`` to
+The key-authenticated providers (Cerebras aside, which was added later on this
+pattern) used to coerce a missing ``api_key`` to
 ``""`` and let LiteLLM silently fall back to the ambient environment key — an
 invisible identity/billing swap. Resolution is now explicit library behavior:
 the configured value wins; otherwise the provider's own environment variable is
@@ -26,6 +27,7 @@ _BEARER_PROVIDERS = [
     (Provider.OPENAI, "OPENAI_API_KEY", "OpenAI"),
     (Provider.DEEPSEEK, "DEEPSEEK_API_KEY", "DeepSeek"),
     (Provider.GOOGLE, "GEMINI_API_KEY", "Google AI Studio"),
+    (Provider.CEREBRAS, "CEREBRAS_API_KEY", "Cerebras"),
 ]
 
 # The subset the resolution-value tests need — they assert on the resolved key,

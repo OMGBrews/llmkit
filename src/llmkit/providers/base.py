@@ -169,13 +169,13 @@ def resolve_gemini_structured_output(strategy: str) -> instructor.Mode:
 def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str) -> str:
     """Resolve a bearer provider's API key: explicit config, then env var, else raise.
 
-    The five key-authenticated providers (OpenRouter, Anthropic, OpenAI,
-    DeepSeek, Google AI Studio) previously coerced a missing ``api_key`` to
-    ``""`` and handed that to LiteLLM, which then *silently* fell back to the
-    provider's ambient environment key (``ANTHROPIC_API_KEY`` and friends). A
-    caller who believed they were pinning credentials explicitly could bill or
-    authenticate as a different identity than intended — an undocumented,
-    invisible swap (and, because importing LiteLLM runs ``load_dotenv()``, even
+    The key-authenticated providers that predate Cerebras (OpenRouter,
+    Anthropic, OpenAI, DeepSeek, Google AI Studio) previously coerced a missing
+    ``api_key`` to ``""`` and handed that to LiteLLM, which then *silently* fell
+    back to the provider's ambient environment key (``ANTHROPIC_API_KEY`` and
+    friends). A caller who believed they were pinning credentials explicitly
+    could bill or authenticate as a different identity than intended — an
+    undocumented, invisible swap (and, because importing LiteLLM runs ``load_dotenv()``, even
     a stray ``.env`` could inject that key).
 
     This makes the same env-var fallback an *explicit, documented, tested*
@@ -227,8 +227,9 @@ def resolve_base_url(
     whatever a future release adds. Enumerating those in order to *reject* them
     would be a blocklist against an unversioned dependency; returning a value the
     caller's provider then always sends is closed instead, because an explicit
-    ``api_base`` outranks every other entry in the chains of the four routes this
-    serves. (Ollama's chain is inverted and is *not* one of them — see
+    ``api_base`` outranks every other entry in the chains of the routes this
+    serves (Anthropic, Cerebras, DeepSeek, Google AI Studio, OpenAI). (Ollama's
+    chain is inverted and is *not* one of them — see
     :class:`~llmkit.providers.ollama.OllamaProvider`.)
 
     Unlike the key this never raises: an endpoint has a correct publishable
@@ -290,6 +291,7 @@ class Provider(StrEnum):
     DEEPSEEK = "deepseek"
     BEDROCK = "bedrock"
     VERTEX = "vertex"
+    CEREBRAS = "cerebras"
 
 
 @dataclass(frozen=True, repr=False)
@@ -305,14 +307,14 @@ class LLMClientConfig:
     provider-shaped field the selected provider does **not** read is rejected at
     :func:`~llmkit.providers.build_provider`, not silently ignored (each provider
     declares the knobs it honours; see ``_accepted_config_fields``). ``api_key``
-    is a bearer credential for the five key-authenticated providers (OpenRouter,
-    OpenAI, Anthropic, Google, DeepSeek); it resolves from this value, else the
-    provider's environment variable (``ANTHROPIC_API_KEY`` and friends), else the
+    is a bearer credential for the key-authenticated providers (OpenRouter,
+    OpenAI, Anthropic, Google, DeepSeek, Cerebras); it resolves from this value,
+    else the provider's environment variable (``ANTHROPIC_API_KEY`` and friends), else the
     provider raises at construction. It is not accepted by Ollama (local) or
     Bedrock/Vertex (ambient AWS/Google chains). The credential is masked in this
     config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray
     ``print`` or traceback never leaks it. ``base_url`` sets the endpoint for the
-    five key-authenticated providers and Ollama: it resolves from this value,
+    key-authenticated providers and Ollama: it resolves from this value,
     else the provider's own documented endpoint variable(s) (``OPENAI_BASE_URL``
     / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE`` and friends — still honoured,
     now read explicitly by llmkit in a tested order), else that provider's own
@@ -584,7 +586,7 @@ class BaseProvider(ABC):
     #: json_schema as advisory — weak models then drift (measured: the schema
     #: echoed back with values nested inside ``properties``). A provider
     #: trait, not a global: providers whose enforcement was measured fine
-    #: without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Vertex) keep
+    #: without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Vertex, Cerebras) keep
     #: their measured wire shape untouched. Exposed via the
     #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode``
     #: pattern).

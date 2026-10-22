@@ -29,6 +29,7 @@ _MINIMAL_KEY: dict[Provider, str | None] = {
     Provider.ANTHROPIC: "k",
     Provider.OPENAI: "k",
     Provider.DEEPSEEK: "k",
+    Provider.CEREBRAS: "k",
     Provider.BEDROCK: None,
     Provider.VERTEX: None,
 }

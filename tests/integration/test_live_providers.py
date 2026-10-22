@@ -40,6 +40,7 @@ start a local Ollama server first (this is the release gate; see
     ANTHROPIC_API_KEY=...         \
     OPENAI_API_KEY=sk-...         \
     DEEPSEEK_API_KEY=sk-...       \
+    CEREBRAS_API_KEY=csk-...      \
     uv run pytest tests/integration --run-live -v
 
 To exercise a single provider you have a key for, select it explicitly rather
@@ -53,6 +54,7 @@ Provider -> credential it reads:
     Anthropic   ANTHROPIC_API_KEY           https://console.anthropic.com/settings/keys
     OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
     DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
+    Cerebras    CEREBRAS_API_KEY            https://cloud.cerebras.ai
     Ollama      (local server on :11434)    https://ollama.com  (no key)
     Bedrock     AWS chain + AWS_REGION_NAME https://console.aws.amazon.com  (see below)
     Vertex      Google ADC + VERTEXAI_*     https://console.cloud.google.com  (see below)
@@ -226,6 +228,9 @@ _GOOGLE_MODEL = os.getenv("GOOGLE_SMOKE_MODEL", "gemini-3.1-flash-lite")
 _ANTHROPIC_MODEL = os.getenv("ANTHROPIC_SMOKE_MODEL", "claude-haiku-4-5-20251001")
 _OPENAI_MODEL = os.getenv("OPENAI_SMOKE_MODEL", "gpt-4.1-mini")
 _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
+# The second of Cerebras's two shared-inference models; the default
+# (gpt-oss-120b) is covered by ``test_live_default_model``.
+_CEREBRAS_MODEL = os.getenv("CEREBRAS_SMOKE_MODEL", "qwen-3.8-27b")
 # The provider's default: Claude Haiku 4.5 via its cross-region inference
 # profile. Override with another profile- or partition-prefixed id (e.g.
 # ``eu.anthropic.claude-...``) when the account routes elsewhere.
@@ -368,6 +373,8 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
             return {"api_key": _require_env("OPENAI_API_KEY")}
         case Provider.DEEPSEEK:
             return {"api_key": _require_env("DEEPSEEK_API_KEY")}
+        case Provider.CEREBRAS:
+            return {"api_key": _require_env("CEREBRAS_API_KEY")}
         case Provider.BEDROCK:
             # boto3 ships only with the optional `omg-llmkit[bedrock]` extra.
             # Skipping when it's absent is a *structural* gate (the dependency
@@ -731,6 +738,11 @@ async def test_deepseek_live() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cerebras_live() -> None:
+    await _override_roundtrip(Provider.CEREBRAS, _CEREBRAS_MODEL)
+
+
+@pytest.mark.asyncio
 async def test_ollama_live() -> None:
     await _override_roundtrip(Provider.OLLAMA, _OLLAMA_MODEL)
 
@@ -832,6 +844,14 @@ async def test_google_tool_roundtrip_live() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cerebras_tool_roundtrip_live() -> None:
+    # No ``model``: the default (gpt-oss-120b) is the one whose plain tool
+    # round-trip the provider docstring records.
+    provider = make_provider(Provider.CEREBRAS, **_live_credentials(Provider.CEREBRAS))
+    await _assert_tool_roundtrip(provider)
+
+
+@pytest.mark.asyncio
 async def test_vertex_tool_schema_roundtrip_live() -> None:
     """Gemini accepts a ``from_model`` schema and a no-arg tool, unprocessed.
 
@@ -916,6 +936,20 @@ async def test_anthropic_tool_stream_roundtrip_live() -> None:
 async def test_vertex_tool_stream_roundtrip_live() -> None:
     provider = make_provider(
         Provider.VERTEX, model=_VERTEX_MODEL, **_live_credentials(Provider.VERTEX)
+    )
+    await _assert_tool_stream_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_cerebras_tool_stream_roundtrip_live() -> None:
+    """Usage arrives although LiteLLM drops ``stream_options`` on this route.
+
+    Run on the override model: ``gpt-oss-120b`` streamed no text deltas before
+    its tool call when measured, which the shared helper's interleaving claim
+    would fail on for reasons unrelated to usage.
+    """
+    provider = make_provider(
+        Provider.CEREBRAS, model=_CEREBRAS_MODEL, **_live_credentials(Provider.CEREBRAS)
     )
     await _assert_tool_stream_roundtrip(provider)
 

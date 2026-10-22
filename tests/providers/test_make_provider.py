@@ -102,7 +102,7 @@ def test_make_provider_openai_no_base_url_uses_library_default(
     This test's premise is inverted from what it used to pin. It argued that
     OpenRouter/Ollama substitute a concrete endpoint literal when ``base_url`` is
     omitted but OpenAI must *not* — leaving the endpoint unset so LiteLLM's
-    internal chain picks it. That exception is gone: all six network providers
+    internal chain picks it. That exception is gone: the network providers
     now name their endpoint, so OpenRouter/Ollama stopped being special. The
     reason is *ownership and readability*, not blocking: the endpoint is llmkit's
     decision, resolved in a documented, tested order and readable straight off
@@ -137,17 +137,17 @@ def test_make_provider_openai_no_base_url_uses_library_default(
 
 @pytest.mark.parametrize(
     "provider_enum",
-    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK],
+    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK, Provider.CEREBRAS],
 )
 def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) -> None:
     """A ``base_url`` reaches LiteLLM as ``api_base`` — never silently dropped.
 
-    These three providers historically ignored ``base_url`` under a false
+    The first three historically ignored ``base_url`` under a false
     "endpoints are fixed" rationale, so a gateway-routed config silently sent
     every request to the public endpoint — a data-egress surprise for exactly
     the users who set an endpoint override. LiteLLM accepts ``api_base`` on
-    the ``anthropic/`` / ``gemini/`` / ``deepseek/`` routes, so the override
-    must land on the wire kwargs.
+    the ``anthropic/`` / ``gemini/`` / ``deepseek/`` / ``cerebras/`` routes, so
+    the override must land on the wire kwargs.
     """
     provider = make_provider(
         provider_enum, api_key="sk-test", base_url="https://gateway.example/v1"
@@ -167,6 +167,7 @@ def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) ->
             ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"),
         ),
         (Provider.DEEPSEEK, "https://api.deepseek.com/beta", ("DEEPSEEK_API_BASE",)),
+        (Provider.CEREBRAS, "https://api.cerebras.ai/v1", ("CEREBRAS_API_BASE",)),
     ],
 )
 def test_make_provider_no_base_url_uses_library_default_api_base(
@@ -260,6 +261,7 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
         (Provider.DEEPSEEK, "deepseek/", "deepseek-chat", "k"),
         (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0", None),
         (Provider.VERTEX, "vertex_ai/", "gemini-3.1-flash-lite", None),
+        (Provider.CEREBRAS, "cerebras/", "gpt-oss-120b", "k"),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(

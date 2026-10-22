@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Google Vertex AI, Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -50,7 +50,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
-- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
+- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google Vertex AI / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Vertex AI (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see [Logging](#logging-agent-readable-by-default)) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -82,7 +82,7 @@ from what you installed; a source tree with no installed metadata reports
 Requires Python ≥ 3.12.
 
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
-DeepSeek, and Ollama with no extra dependencies. Two providers gate their
+DeepSeek, Cerebras, and Ollama with no extra dependencies. Two providers gate their
 dependencies behind opt-in extras so hosts pay only for what they call:
 
 ```bash
@@ -259,9 +259,10 @@ Four differences from `tool_llm_call`, all deliberate:
 - **Usage is real, not null.** Unlike the plain text stream, this lane requests
   `stream_options={"include_usage": True}`, so `result.usage`, the log record's
   `usage`, and the token-rate limiter's debit are all populated. Measured on
-  Vertex, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek; Bedrock
-  and Ollama are covered by the same code path but that measurement is still
-  outstanding.
+  Vertex, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek, and on
+  Cerebras, whose LiteLLM route drops `stream_options` but which reports usage
+  on the stream regardless; Bedrock and Ollama are covered by the same code path
+  but that measurement is still outstanding.
 
 Log records use the `tools-stream` schema and carry the offered `tools`, the
 returned `tool_calls`, and `usage`, exactly as the buffered tool lane does.
@@ -913,7 +914,7 @@ configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX
+    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
     base_url: str | None = None      # endpoint: config, then env var, then a default (sent as api_base; see below); not accepted by Bedrock/Vertex
@@ -937,7 +938,7 @@ a credential or endpoint that was in fact dropped.
 `api_key=<redacted>`, so a stray `print(config)`, log line, or traceback never
 leaks the credential; its presence still shows for debugging.
 
-**Bearer-key resolution is explicit.** The five key-authenticated providers
+**Bearer-key resolution is explicit.** The key-authenticated providers below
 resolve their key from `api_key` if set, else the provider's own environment
 variable, else they raise at construction naming the variable — no silent
 fallback to an ambient key:
@@ -949,6 +950,7 @@ fallback to an ambient key:
 | `OPENAI` | `OPENAI_API_KEY` |
 | `DEEPSEEK` | `DEEPSEEK_API_KEY` |
 | `GOOGLE` (AI Studio) | `GEMINI_API_KEY` |
+| `CEREBRAS` | `CEREBRAS_API_KEY` |
 
 `OLLAMA` needs no key; `BEDROCK` and `VERTEX` authenticate through their ambient
 AWS / Google credential chains ([see below](#bedrock-and-vertex-do-not-own-their-endpoints)), so none of the three accepts an
@@ -975,12 +977,13 @@ the host's `.env` had not been read into yet.
 | `ANTHROPIC` | `ANTHROPIC_API_BASE`, then `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 | `OPENAI` | `OPENAI_BASE_URL`, then `OPENAI_API_BASE` | `https://api.openai.com/v1` |
 | `DEEPSEEK` | `DEEPSEEK_API_BASE` | `https://api.deepseek.com/beta` |
+| `CEREBRAS` | `CEREBRAS_API_BASE` | `https://api.cerebras.ai/v1` |
 | `GOOGLE` (AI Studio) | `GEMINI_API_BASE` | *(none — LiteLLM picks, see below)* |
 | `OLLAMA` | *(none)* | `http://localhost:11434` |
 | `BEDROCK` | `AWS_BEDROCK_RUNTIME_ENDPOINT` — read by **LiteLLM**, not llmkit | derived from `aws_region_name` by LiteLLM |
 | `VERTEX` | `VERTEXAI_API_BASE`, outranked by the `litellm.api_base` global — both read by **LiteLLM**, not llmkit | derived from `vertex_location` by LiteLLM |
 
-The last two rows are governed differently from the six above them, and the
+The last two rows (`BEDROCK`, `VERTEX`) are governed differently from the rows above them, and the
 [section below](#bedrock-and-vertex-do-not-own-their-endpoints) says why and what
 it costs.
 
@@ -1006,7 +1009,7 @@ endpoint can still come from a source llmkit does not read — notably the
 
 **llmkit reads the listed variables itself**, in the order shown (LiteLLM's own
 measured precedence), so a host can point its endpoint with one of them. The
-resolution is *closed* for `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, and a `GOOGLE`
+resolution is *closed* for `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, `CEREBRAS`, and a `GOOGLE`
 that has a `base_url` or `GEMINI_API_BASE`: for those, sources llmkit does not
 read cannot choose the endpoint — the `litellm.api_base` module global, a
 LiteLLM key-management backend serving one of these names, or an alias some
@@ -1124,7 +1127,7 @@ configure_llm_client(lambda: LLMClientConfig(
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
-`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning.
+`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models.
 
 Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
 

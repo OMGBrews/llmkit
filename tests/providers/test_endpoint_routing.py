@@ -16,8 +16,8 @@ necessarily name the providers' real hosts, since reproducing the real URL is th
 whole assertion. Those requests are built and then dropped, never sent, and the
 key is fake.
 
-The bug being pinned: for the four providers that only forward ``api_base`` when
-a ``base_url`` is configured (OpenAI, Anthropic, Google AI Studio, DeepSeek), the
+The bug being pinned: for the four providers that only forwarded ``api_base`` when
+a ``base_url`` was configured (OpenAI, Anthropic, Google AI Studio, DeepSeek), the
 endpoint was whatever LiteLLM's *own* resolution chain produced — an
 open-ended list llmkit neither owned nor documented: ``litellm.api_base``
 (a module global), a pluggable key-management backend behind ``get_secret``, the
@@ -38,11 +38,12 @@ because its base carries a model-derived API version — see
 An explicit ``api_base`` outranks every other entry in the chains of the routes
 this covers, so sending one makes the endpoint llmkit's decision. What that
 *removes* is every source llmkit does not read — the module global, the
-secret-manager backend, future aliases — for OpenAI, Anthropic and DeepSeek.
+secret-manager backend, future aliases — for OpenAI, Anthropic, DeepSeek and
+Cerebras (added later, on the same pattern from the start).
 Google keeps that exposure in the one case where it sends nothing (no
 ``base_url``, no ``GEMINI_API_BASE``), and Ollama keeps it always, its chain
 being inverted; both are documented carve-outs, not silent ones.
-What it deliberately *keeps* is the six documented environment aliases: llmkit
+What it deliberately *keeps* is the documented environment aliases: llmkit
 now reads them itself, in LiteLLM's own measured precedence, so a host steering
 its traffic with ``OPENAI_BASE_URL`` today is not silently redirected to the
 public endpoint tomorrow. That is the same bargain ``resolve_api_key`` struck for
@@ -52,7 +53,8 @@ steers — by llmkit's own decision, observable in ``completion_kwargs()`` — a
 the tests below assert exactly that, rather than pretending otherwise.
 
 The literals below were measured on the wire against litellm 1.92.0 on
-2026-07-21, not read out of LiteLLM's source: each provider's route derives its
+2026-07-21 (Cerebras's against litellm 1.106.2 on 2026-10-22), not read out of
+LiteLLM's source: each provider's route derives its
 URL differently. Anthropic appends its own ``/v1``, so a default pinned to
 ``https://api.anthropic.com/v1`` yields ``/v1/v1/messages``. Gemini's version
 segment lives *in* the base and LiteLLM chooses it per model, which is why that
@@ -61,7 +63,7 @@ plausible-looking constants and are invisible to any test that exercises a singl
 model — which is exactly why these assertions are byte-for-byte rather than
 reasoned about.
 
-Every test clears all six endpoint environment variables before asserting:
+Every test clears every endpoint environment variable before asserting:
 importing ``litellm`` runs ``load_dotenv()``, so an ambient value can be injected
 into the process, and a pass that depended on one would be worthless.
 
@@ -102,10 +104,11 @@ _ALL_ENDPOINT_ENV_VARS: Final[tuple[str, ...]] = (
     "ANTHROPIC_BASE_URL",
     "GEMINI_API_BASE",
     "DEEPSEEK_API_BASE",
+    "CEREBRAS_API_BASE",
 )
 
 #: The measured base each provider's route resolves when nothing else names one.
-#: For OpenAI, Anthropic and DeepSeek these are the values the providers'
+#: For OpenAI, Anthropic, DeepSeek and Cerebras these are the values the providers'
 #: ``_DEFAULT_BASE_URL`` constants must reproduce exactly. **Google's entry is
 #: not a library constant** — that provider owns no default; it is recorded here
 #: only as the base LiteLLM happens to derive for the *default* model, which is
@@ -115,6 +118,7 @@ _MEASURED_DEFAULT_BASE: Final[dict[Provider, str]] = {
     Provider.ANTHROPIC: "https://api.anthropic.com",
     Provider.GOOGLE: "https://generativelanguage.googleapis.com/v1alpha",
     Provider.DEEPSEEK: "https://api.deepseek.com/beta",
+    Provider.CEREBRAS: "https://api.cerebras.ai/v1",
 }
 
 #: The full request URL each provider's route builds from that default — path
@@ -129,6 +133,7 @@ _MEASURED_DEFAULT_URL: Final[dict[Provider, str]] = {
         + "/models/gemini-3.1-flash-lite:generateContent"
     ),
     Provider.DEEPSEEK: "https://api.deepseek.com/beta/chat/completions",
+    Provider.CEREBRAS: "https://api.cerebras.ai/v1/chat/completions",
 }
 
 #: (provider, endpoint env var) for every alias each provider's LiteLLM route
@@ -145,6 +150,7 @@ _ALIAS_PAIRS: Final[tuple[tuple[Provider, str], ...]] = (
     (Provider.ANTHROPIC, "ANTHROPIC_BASE_URL"),
     (Provider.GOOGLE, "GEMINI_API_BASE"),
     (Provider.DEEPSEEK, "DEEPSEEK_API_BASE"),
+    (Provider.CEREBRAS, "CEREBRAS_API_BASE"),
 )
 
 #: A host that cannot resolve (RFC 6761 reserves ``.invalid``), standing in for
@@ -179,7 +185,7 @@ async def _abort_at_transport(
     """Stand in for ``httpx.AsyncClient.send``, capturing the URL and aborting.
 
     ``send`` is the chokepoint every LiteLLM route funnels through — the OpenAI
-    SDK path (OpenAI/DeepSeek), LiteLLM's own async HTTP handler (Anthropic,
+    SDK path (OpenAI/DeepSeek/Cerebras), LiteLLM's own async HTTP handler (Anthropic,
     Gemini) — and it sits *below* URL construction and *above* DNS and connect.
     That is what makes one patch enough to see every provider's resolved
     endpoint while guaranteeing the suite stays offline.
@@ -265,7 +271,9 @@ def _clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(env_var, raising=False)
 
 
-@pytest.mark.parametrize("provider", [Provider.OPENAI, Provider.ANTHROPIC, Provider.DEEPSEEK])
+@pytest.mark.parametrize(
+    "provider", [Provider.OPENAI, Provider.ANTHROPIC, Provider.DEEPSEEK, Provider.CEREBRAS]
+)
 def test_litellm_global_api_base_no_longer_steers_the_request(
     provider: Provider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -281,7 +289,7 @@ def test_litellm_global_api_base_no_longer_steers_the_request(
     is inert.
 
     This is the honest wire-level discriminator, *not* an ambient environment
-    variable: the six documented aliases deliberately still steer (llmkit reads
+    variable: the documented aliases deliberately still steer (llmkit reads
     them itself now — see ``test_honoured_env_alias_steers_explicitly_through_the_library``).
     What the fix removes is every endpoint source llmkit does **not** read, of
     which this global is the one reachable offline. The others — a LiteLLM
@@ -290,11 +298,12 @@ def test_litellm_global_api_base_no_longer_steers_the_request(
     for exactly the same reason, which is why the fix is a closed one rather than
     a blocklist chasing an unversioned dependency.
 
-    DeepSeek is a pin rather than a discriminator: its route resolves through its
-    own transformation and was measured never to consult the global, so its case
-    passes before and after. It is parametrized anyway so that a future LiteLLM
-    that *does* route DeepSeek through the global finds this test already
-    standing.
+    DeepSeek and Cerebras are pins rather than discriminators: their routes
+    resolve through their own transformations and were measured never to consult
+    the global (Cerebras: litellm 1.106.2, 2026-10-22), so their cases pass
+    with or without an explicit ``api_base``. They are parametrized anyway so
+    that a future LiteLLM that *does* route either through the global finds this
+    test already standing.
 
     **Google is deliberately absent**, and its absence is a documented
     limitation rather than an oversight. With nothing configured it sends no
@@ -327,7 +336,7 @@ def test_honoured_env_alias_steers_explicitly_through_the_library(
     The migration promise, pinned where it can actually be checked. Taking
     ownership of ``api_base`` had one obvious failure mode: sending the library
     default unconditionally would silently redirect every host that steers its
-    traffic with ``OPENAI_BASE_URL`` (or one of its five siblings) to the public
+    traffic with ``OPENAI_BASE_URL`` (or one of its siblings) to the public
     endpoint — the sibling bug pointed at a different group of users. So the
     fallback is kept, and this test proves the request genuinely lands on the
     alias's host rather than merely appearing in a kwargs dict.
@@ -354,7 +363,7 @@ def test_default_endpoint_matches_the_measured_literal(
     """The unconfigured endpoint is byte-identical to the measured URL.
 
     This passes both before and after the fix, and that identity *is* the claim:
-    making the four providers always send an ``api_base`` must not move a single
+    making these providers always send an ``api_base`` must not move a single
     byte of the wire shape they had when they sent none. Anyone rewriting a
     default has two ways to break it invisibly — pinning Anthropic to
     ``https://api.anthropic.com/v1`` (LiteLLM appends its own ``/v1``, giving
@@ -445,7 +454,7 @@ def test_bedrock_region_selects_the_endpoint_it_promises(
     pytest.importorskip("boto3", reason="Bedrock's optional extra is not installed")
 
     _clear_endpoint_env(monkeypatch)
-    # LiteLLM's own resolution reaches further than the six bearer aliases:
+    # LiteLLM's own resolution reaches further than the bearer aliases:
     # the endpoint override, the ambient region chain, and any real credential
     # or profile ``load_dotenv()`` injected all have to go before this asserts.
     for name in (

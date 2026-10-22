@@ -3,7 +3,8 @@
 Provides a thin, opinionated layer over **LiteLLM** (with ``instructor``
 for structured output) that gives the application a unified, provider-
 agnostic call surface across cloud providers (OpenRouter, Google AI Studio,
-Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock) and local Ollama.
+Google Vertex AI, Anthropic, OpenAI, DeepSeek, AWS Bedrock, Cerebras) and local
+Ollama.
 
 This package provides:
 - The structured / plain-text / tool-calling call functions, buffered and
@@ -19,7 +20,7 @@ This package provides:
 The headline surface below is what a typical consumer needs. Lower-level
 symbols stay importable from their submodules (``llmkit.providers``,
 ``llmkit.retry``, ``llmkit.rate_limiting``) without crowding the top level:
-the eight concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
+the concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 ``with_retries``, and ``GlobalRateLimiter`` all live there.
 """
 

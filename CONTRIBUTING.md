@@ -79,6 +79,7 @@ GEMINI_API_KEY=...             # https://aistudio.google.com/apikey
 ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
 OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
 DEEPSEEK_API_KEY=...           # https://platform.deepseek.com/api_keys
+CEREBRAS_API_KEY=...           # https://cloud.cerebras.ai
 uv run pytest tests/integration --run-live -v
 ```
 

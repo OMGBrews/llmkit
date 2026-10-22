@@ -3,7 +3,7 @@
 Public facade for the provider layer. The provider-agnostic core lives in
 :mod:`llmkit.providers.base`; each concrete provider lives in its own
 sibling module (``openrouter``, ``ollama``, ``google``, ``anthropic``,
-``openai``, ``deepseek``, ``bedrock``, ``vertex``). This package is the
+``openai``, ``deepseek``, ``bedrock``, ``vertex``, ``cerebras``). This package is the
 **single place** that imports every provider module and maps a
 :class:`Provider` to its implementation.
 
@@ -32,6 +32,7 @@ from llmkit.providers.base import (
     configure_llm_client,
 )
 from llmkit.providers.bedrock import BedrockProvider
+from llmkit.providers.cerebras import CerebrasProvider
 from llmkit.providers.deepseek import DeepSeekProvider
 from llmkit.providers.google import GoogleProvider
 from llmkit.providers.ollama import OllamaProvider
@@ -67,6 +68,8 @@ def _provider_class(provider: Provider) -> type[BaseProvider]:
             return BedrockProvider
         case Provider.VERTEX:
             return VertexProvider
+        case Provider.CEREBRAS:
+            return CerebrasProvider
     # Every Provider member is handled above, so the subject narrows to Never
     # here. assert_never makes that a *static* guarantee: basedpyright reports
     # a type error if a newly-added Provider member is missing its case, and it
@@ -151,7 +154,8 @@ def make_provider(
 
     Args:
         provider: Which provider to construct.
-        api_key: Bearer credential for the five key-authenticated providers;
+        api_key: Bearer credential for the key-authenticated providers
+            (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras);
             resolves from this value, else the provider's environment variable,
             else raises. Not accepted by Ollama (local) or Bedrock/Vertex (which
             sign via their ambient AWS/Google credential chains).
@@ -252,6 +256,7 @@ __all__ = [
     "DeepSeekProvider",
     "BedrockProvider",
     "VertexProvider",
+    "CerebrasProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

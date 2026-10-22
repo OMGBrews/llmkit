@@ -146,7 +146,7 @@ class VertexProvider(BaseProvider):
     # from ``structured_output`` and returned by the ``instructor_mode``
     # property below — the ClassVar stays the declared contract value, never
     # shadowed through ``self`` (which would fail basedpyright and break the
-    # ``_mode`` → ``instructor_mode`` pattern for the other six providers).
+    # ``_mode`` → ``instructor_mode`` pattern for the other providers).
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gemini-3.1-flash-lite"
     _accepted_config_fields: ClassVar[frozenset[str]] = frozenset(

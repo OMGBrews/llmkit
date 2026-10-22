@@ -27,14 +27,16 @@ import pytest
 from llmkit.providers import (
     AnthropicProvider,
     BedrockProvider,
+    CerebrasProvider,
     DeepSeekProvider,
     GoogleProvider,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
     VertexProvider,
+    _provider_class,
 )
-from llmkit.providers.base import BaseProvider
+from llmkit.providers.base import BaseProvider, Provider
 
 # Every concrete provider the library ships. Listed by class (not via the
 # ``Provider`` enum) so a real subclass that silently lost a hook is caught
@@ -42,6 +44,7 @@ from llmkit.providers.base import BaseProvider
 _SHIPPED_PROVIDERS = [
     AnthropicProvider,
     BedrockProvider,
+    CerebrasProvider,
     DeepSeekProvider,
     GoogleProvider,
     OllamaProvider,
@@ -49,6 +52,15 @@ _SHIPPED_PROVIDERS = [
     OpenRouterProvider,
     VertexProvider,
 ]
+
+
+def test_shipped_provider_list_covers_every_provider() -> None:
+    """The hand-written list above matches the dispatch, so no provider escapes it.
+
+    Without this, a new provider missing from ``_SHIPPED_PROVIDERS`` would leave
+    every contract test below silently green for it.
+    """
+    assert set(_SHIPPED_PROVIDERS) == {_provider_class(p) for p in Provider}
 
 
 def _define_provider(name: str, bases: tuple[type, ...], **hooks: object) -> type[BaseProvider]:

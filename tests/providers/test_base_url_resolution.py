@@ -7,7 +7,8 @@ only when a ``base_url`` was configured, leaving the endpoint to LiteLLM — whi
 reads its own environment aliases (``OPENAI_BASE_URL``, ``ANTHROPIC_API_BASE``,
 ``GEMINI_API_BASE``, ``DEEPSEEK_API_BASE``). A stray variable could therefore
 redirect every request to another host with nothing in the library naming the
-endpoint: the same invisible swap the key work closed, one layer down.
+endpoint: the same invisible swap the key work closed, one layer down. Cerebras,
+added later, resolves the same way from the start (``CEREBRAS_API_BASE``).
 
 Endpoint resolution is now explicit library behavior: the configured
 ``base_url`` wins; otherwise the provider's own environment aliases are
@@ -21,10 +22,11 @@ is what runs ``load_dotenv()`` and ``import llmkit`` does not import LiteLLM —
 a provider built at startup must not freeze a default it read too early. And
 **Google AI Studio owns no default**: its base carries an API version LiteLLM
 derives from the model, so it sends no ``api_base`` at all when nothing is
-configured. The other three always send one.
+configured. The others always send one.
 
 The defaults below are not transcribed from LiteLLM's source: each was measured
-byte-for-byte on the wire against litellm 1.92.0 (2026-07-21), which is the only
+byte-for-byte on the wire against litellm 1.92.0 (2026-07-21; Cerebras's against
+1.106.2 on 2026-10-22), which is the only
 way to catch the shape traps they encode — Anthropic's default must *omit*
 ``/v1`` (LiteLLM appends its own, so a pinned ``/v1`` yields ``/v1/v1/messages``),
 and Gemini turned out not to admit a constant at all. The alias precedence was
@@ -46,7 +48,7 @@ from llmkit.providers import build_provider
 
 # (provider, endpoint env aliases in measured precedence order, library default).
 #
-# Google's default is ``None`` — alone among the four it owns no default endpoint,
+# Google's default is ``None`` — alone among these it owns no default endpoint,
 # because the AI Studio base carries an API *version* LiteLLM derives from the
 # model (``v1alpha`` for Gemini 3 and newer, ``v1beta`` otherwise). A static
 # default would silently move some models to the wrong version, so with nothing
@@ -61,10 +63,11 @@ _ENDPOINT_PROVIDERS: list[tuple[Provider, tuple[str, ...], str | None]] = [
     ),
     (Provider.GOOGLE, ("GEMINI_API_BASE",), None),
     (Provider.DEEPSEEK, ("DEEPSEEK_API_BASE",), "https://api.deepseek.com/beta"),
+    (Provider.CEREBRAS, ("CEREBRAS_API_BASE",), "https://api.cerebras.ai/v1"),
 ]
 
-# Flattened to one case per alias — six in all, since OpenAI and Anthropic each
-# answer to two. Every alias gets its own assertion because "we kept honouring
+# Flattened to one case per alias, since OpenAI and Anthropic each answer to
+# two. Every alias gets its own assertion because "we kept honouring
 # the variables LiteLLM already read" is a promise about each name, not about
 # the provider in aggregate.
 _PROVIDER_ALIAS_DEFAULTS: list[tuple[Provider, str, str | None]] = [
@@ -76,7 +79,7 @@ _PROVIDER_ALIAS_DEFAULTS: list[tuple[Provider, str, str | None]] = [
 # The subset that asserts on the resolved endpoint rather than the default.
 _PROVIDER_ALIASES = [(provider, alias) for provider, alias, _ in _PROVIDER_ALIAS_DEFAULTS]
 
-# The three providers that *do* own a default endpoint — the fallback tests below
+# The providers that *do* own a default endpoint — the fallback tests below
 # are about that default, so Google (which owns none, by design) is excluded and
 # gets its own dedicated test instead of a conditional inside these.
 _PROVIDER_DEFAULTS = [
@@ -97,7 +100,7 @@ _ALIAS_PAIRS = [
     if len(aliases) == 2
 ]
 
-# Every endpoint alias any of the four providers consults.
+# Every endpoint alias any of these providers consults.
 _ALL_ALIASES = tuple(alias for _, alias, _ in _PROVIDER_ALIAS_DEFAULTS)
 
 
@@ -256,7 +259,7 @@ def test_openrouter_and_ollama_ignore_litellm_endpoint_env_vars(
     deaf to the environment, and that non-expansion is deliberate: their
     endpoints are a fixed gateway and a local server, so an ambient
     ``OPENROUTER_API_BASE`` / ``OLLAMA_API_BASE`` redirecting them buys nothing
-    and widens the surface. Pinned here so a later "make all six providers
+    and widens the surface. Pinned here so a later "make every provider
     consistent" tidy-up has to argue with a test rather than quietly grant two
     more variables the power to reroute traffic."""
     _clear_endpoint_env(monkeypatch)

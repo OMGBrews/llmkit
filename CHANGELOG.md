@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Cerebras as a provider.** `Provider.CEREBRAS` / `CerebrasProvider`
+  (`cerebras/` LiteLLM prefix) calls Cerebras's OpenAI-compatible API on a
+  first-party key, with no extra dependency. The key resolves from `api_key`,
+  else `CEREBRAS_API_KEY`; the endpoint from `base_url`, else
+  `CEREBRAS_API_BASE`, else `https://api.cerebras.ai/v1`. The default model is
+  `gpt-oss-120b`; `qwen-3.8-27b` is the other shared-inference model. Structured
+  output is pinned to `instructor.Mode.JSON_SCHEMA` without the strict upgrade,
+  measured live. Combining tools with an output schema is not supported
+  (`gpt-oss-120b` rejects it), so `tool_llm_call(..., output_schema=...)` raises
+  `ComposeUnsupportedError` with the two-step steer. The portable
+  `reasoning_effort="disable"` becomes Cerebras's `none`, or `low` on gpt-oss
+  models, which cannot disable reasoning.
+
 ### Changed
 
 - **A temperature the model refuses is omitted on one re-issue instead of

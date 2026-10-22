@@ -70,7 +70,7 @@ def test_classvar_mode_is_unchanged_on_both_providers() -> None:
 
     The selection mechanism is the overridden ``instructor_mode`` property; the
     ClassVar is never dropped or instance-shadowed (``__init_subclass__`` still
-    requires it, and the other six providers keep the ClassVar → base-property
+    requires it, and the other providers keep the ClassVar → base-property
     path).
     """
     assert GoogleProvider._mode is instructor.Mode.JSON_SCHEMA
