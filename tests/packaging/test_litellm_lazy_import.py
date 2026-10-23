@@ -35,6 +35,25 @@ def test_import_llmkit_does_not_import_litellm() -> None:
     _run_python("import llmkit, sys; assert 'litellm' not in sys.modules")
 
 
+def test_import_llmkit_testing_does_not_import_litellm() -> None:
+    """``import llmkit.testing`` leaves litellm out of ``sys.modules`` too.
+
+    The public testing transport and its failure helpers build the exceptions
+    the transport tuple names without the litellm import a provider call pays.
+    """
+    _run_python(
+        textwrap.dedent(
+            """
+            import sys
+            import llmkit.testing
+            llmkit.testing.rate_limit_error(1)
+            llmkit.testing.service_unavailable_error()
+            assert 'litellm' not in sys.modules
+            """
+        )
+    )
+
+
 def test_transport_classification_works_without_litellm_loaded() -> None:
     """The lazy 503 entry is inert before litellm loads.
 

@@ -339,6 +339,10 @@ async def _stream_once(
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             provider=provider,
+            feature=feature,
+            label=label,
+            call_id=call_id,
+            attempt=attempt,
         ):
             if not captured:
                 sent_temperature = _litellm.sent_temperature(temperature)

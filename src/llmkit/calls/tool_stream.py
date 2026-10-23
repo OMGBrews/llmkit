@@ -237,6 +237,10 @@ async def _stream_tools_once(
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
                 provider=provider,
+                feature=feature,
+                label=label,
+                call_id=call_id,
+                attempt=attempt,
             )
         ) as transport:
             async for item in transport:

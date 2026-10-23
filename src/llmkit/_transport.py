@@ -9,12 +9,24 @@ shapes without loading it.
 
 They are private: :class:`WireRequest` carries the provider-routed request
 kwargs, credentials included. The public request a test fake receives is a
-separate, credential-free type that is mapped from these one way.
+separate, credential-free type, mapped one way from :class:`CallContext`.
+This module also holds the slot through which :mod:`llmkit.testing`
+installs a :class:`TransportDouble`.
 """
 
 from __future__ import annotations
 
+import threading
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
+from typing import Literal, Protocol
+
+from pydantic import BaseModel
+
+from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit.tools import ToolChoice, ToolDefinition
+
+CallKind = Literal["structured", "text", "tool", "text_stream", "tool_stream"]
 
 
 @dataclass(frozen=True)
@@ -121,11 +133,87 @@ class WireStreamEnd:
 
 
 @dataclass(frozen=True)
+class CallContext:
+    """Who is asking, and for what, on one provider round trip.
+
+    Built by each transport from what the call layer passed it, and never
+    sent to LiteLLM. It is the source of the public request a test fake
+    receives, so it holds no credentials or provider-native kwargs.
+    ``feature``, ``label``, ``call_id`` and ``attempt`` are ``None`` when a
+    transport is called directly, without the call layer's identity.
+    """
+
+    kind: CallKind
+    prompt: str | Sequence[ChatMessage]
+    messages: Sequence[ChatMessage]
+    model: str
+    provider: str
+    temperature: float | None
+    max_tokens: int | None
+    reasoning_effort: ReasoningEffort | None
+    feature: str | None = None
+    label: str | None = None
+    call_id: str | None = None
+    attempt: int | None = None
+    output_schema: type[BaseModel] | None = None
+    tools: Sequence[ToolDefinition] = ()
+    tool_choice: ToolChoice | None = None
+    repair: bool = False
+
+
+@dataclass(frozen=True)
 class WireRequest:
     """One provider round trip.
 
     ``kwargs`` is the complete request as LiteLLM receives it: model, messages,
     tools, sampling settings and the provider's credential and native kwargs.
+    ``call`` is the request's identity and inputs, for an installed double.
     """
 
     kwargs: dict[str, object]
+    call: CallContext | None = None
+
+
+class TransportDouble(Protocol):
+    """A stand-in for the provider round trip, installed by :mod:`llmkit.testing`.
+
+    The transports consult it inside the rate-limiter slot, so whatever it
+    returns or raises passes through the same limiter outcome, circuit breaker
+    and retry handling as a real provider's answer.
+    """
+
+    async def respond(self, call: CallContext) -> WireResponse:
+        """Answer one buffered round trip."""
+        ...
+
+    def stream(self, call: CallContext) -> AsyncIterator[WireChunk | WireStreamEnd]:
+        """Answer one streamed round trip, ending with a :class:`WireStreamEnd`."""
+        ...
+
+
+# The installed doubles, innermost last. One process-wide slot by design: a
+# ContextVar would miss threads the host starts itself, such as a web server
+# under test. The lock guards the list against installs from several threads.
+_doubles: list[TransportDouble] = []
+_doubles_lock = threading.Lock()
+
+
+def push_double(double: TransportDouble) -> None:
+    """Install *double* as the active one, above any already installed."""
+    with _doubles_lock:
+        _doubles.append(double)
+
+
+def remove_double(double: TransportDouble) -> None:
+    """Uninstall *double*, wherever it sits; a no-op when it is not installed."""
+    with _doubles_lock:
+        for position in range(len(_doubles) - 1, -1, -1):
+            if _doubles[position] is double:
+                del _doubles[position]
+                return
+
+
+def active_double() -> TransportDouble | None:
+    """The most recently installed double still in place, or ``None``."""
+    with _doubles_lock:
+        return _doubles[-1] if _doubles else None
