@@ -16,6 +16,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`llmkit.testing`: a supported fake transport for testing apps built on
+  llmkit.** `install(fake)` (a `with` / `async with` context manager) answers
+  every provider round trip with your function or coroutine function, which
+  receives a frozen `TransportRequest` carrying the call's `feature`, `label`,
+  kind, `call_id`, `attempt`, prompt, schema or tools, and effective model
+  settings, and returns a `Reply` (`Reply.text`, `Reply.json`, tool calls via
+  `FakeToolCall`, streamed chunks, usage, cost, and a `delay`). All five call
+  kinds are covered, sync and async. The fake plugs in inside the rate-limiter
+  slot, so `rate_limit_error()`, `service_unavailable_error()`,
+  `server_error()` and `timeout_error()` drive the real retry, `Retry-After`
+  back-off, adaptive concurrency and circuit breaker. Cache hits and shared
+  in-flight requests never reach the fake. Patching `llmkit._litellm` (its
+  transport coroutines, `_acompletion`, or `litellm.acompletion` through it)
+  is unsupported: those are internal test seams that change without notice,
+  and `llmkit.testing` is the supported replacement. Supersedes
+  [#43](https://github.com/OMGBrews/llmkit/issues/43).
 - **Cerebras as a provider.** `Provider.CEREBRAS` / `CerebrasProvider`
   (`cerebras/` LiteLLM prefix) calls Cerebras's OpenAI-compatible API on a
   first-party key, with no extra dependency. The key resolves from `api_key`,

@@ -199,6 +199,10 @@ async def structured_llm_call[T: BaseModel](
                 max_tokens=args.max_tokens,
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
+                feature=feature,
+                label=label,
+                call_id=call_id,
+                attempt=attempt,
             )
             sent_temperature = _litellm.sent_temperature(args.temperature)
             usage = TokenUsage(*counts)

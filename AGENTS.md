@@ -22,12 +22,14 @@ one's `__init__.py` docstring names its own modules: `calls/` (the public call
 surface, one module per family), `providers/` (one per vendor behind a single
 dispatch), `rate_limiting/`, `logging/`, `cache/` (the response-cache seam) and
 `json_schema/`. The rest are single modules: `retry`, `exceptions`, `options`,
-`capture`, `run_scope`, `sync`, `tools`, `_types`, `_latch` (the warn-once
-latch the log sinks and the cache share), `_messages` (the litellm-free request
-pieces the transport and the cache key both use), and `_litellm` (the only
-place that *calls* LiteLLM — two other modules touch it narrowly: `exceptions`
-resolves litellm's 503 class lazily, and the Anthropic provider reads one
-capability helper). Start from the subpackage `__init__` when you need the
+`capture`, `run_scope`, `sync`, `tools`, `testing` (the public fake transport
+downstream projects test with), `_types`, `_latch` (the warn-once latch the log
+sinks and the cache share), `_messages` (the litellm-free request pieces the
+transport and the cache key both use), `_transport` (llmkit's own request,
+response and stream-chunk types, and the slot `testing` installs a fake in),
+and `_litellm` (the only place that *calls* LiteLLM — two other modules touch it
+narrowly: `exceptions` resolves litellm's 503 class lazily, and the Anthropic
+provider reads one capability helper). Start from the subpackage `__init__` when you need the
 design rationale — that is where it is kept.
 
 ## Setup

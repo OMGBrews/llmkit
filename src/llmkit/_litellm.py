@@ -6,11 +6,26 @@ The single place that talks to LiteLLM (and, for structured output,
 around these helpers; this module owns provider routing, the rate-limit
 semaphore, structured-output mode pinning, and best-effort cost extraction.
 
-It is also the **test seam**: unit tests patch these entry points
+**The transport boundary.** Every provider round trip crosses :func:`_send`
+(buffered) or :func:`_stream` (streamed), inside the rate-limiter slot, as
+llmkit's own types from :mod:`llmkit._transport`. Behind the boundary,
+:func:`_acompletion` is the LiteLLM adapter, and the ``_wire_*`` readers are
+the only code that reads LiteLLM's response objects; everything after them
+reads wire types. A fake installed through :mod:`llmkit.testing` answers at
+the boundary instead, so the limiter, breaker, retry and parsing still run.
+That is the supported way for downstream code to fake a provider; patching
+this module is not.
+
+**Internal test seams.** The library's own tests patch three levels here,
+and they stay internal: the five transport coroutines
 (``acompletion_structured`` / ``acompletion_text`` / ``acompletion_tools`` /
-``astream_text`` / ``astream_tools``) so the real call-function bodies —
-logging, retry, content coercion — still run over a faked provider response
-(see ``tests/_support`` ``patch_llm``).
+``astream_text`` / ``astream_tools``), :func:`_acompletion`, and
+``litellm.acompletion`` itself. A test belongs on these seams when it tests
+the LiteLLM adapter itself, needs input the public fake cannot produce (a
+LiteLLM-shaped response, a mid-stream failure), or deliberately isolates the
+call layer from the limiter and breaker. A test of behavior observable
+through the public call functions, whose inputs the public fake can express,
+belongs on :mod:`llmkit.testing`.
 
 **Every reach into this module is a *function-local* ``import
 llmkit._litellm as _litellm``** (the call modules under :mod:`llmkit.calls`
@@ -43,7 +58,7 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast
 
 import instructor
@@ -57,6 +72,8 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from llmkit._messages import resolve_reasoning_effort, wire_messages
 from llmkit._transport import (
+    CallContext,
+    CallKind,
     WireChunk,
     WireFunction,
     WireRequest,
@@ -65,6 +82,7 @@ from llmkit._transport import (
     WireToolCall,
     WireToolFragment,
     WireUsage,
+    active_double,
 )
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
@@ -240,11 +258,16 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
 async def _send(request: WireRequest) -> WireResponse:
     """One buffered provider round trip, as llmkit's own response type.
 
-    The boundary the buffered transports await. The LiteLLM adapter behind it
-    is :func:`_acompletion`, whose duties (503 re-ownership, the temperature
-    re-issue and stamp, the MCP-handler opt-out) are unchanged; this only
-    converts the result.
+    The boundary the buffered transports await, always inside the
+    rate-limiter slot. A double installed through :mod:`llmkit.testing`
+    answers here in place of the provider; otherwise the LiteLLM adapter does:
+    :func:`_acompletion`, whose duties (503 re-ownership, the temperature
+    re-issue and stamp, the MCP-handler opt-out) this only wraps with a
+    conversion.
     """
+    double = active_double()
+    if double is not None and request.call is not None:
+        return await double.respond(request.call)
     return _wire_response(await _acompletion(**request.kwargs))
 
 
@@ -256,6 +279,11 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
     call-time boundary does, so the stream path keeps the
     ``except LLM_RECOVERABLE_ERRORS`` contract too.
     """
+    double = active_double()
+    if double is not None and request.call is not None:
+        async for item in double.stream(request.call):
+            yield item
+        return
     # stream=True makes acompletion return a CustomStreamWrapper, whose async
     # iteration yields typed ModelResponseStream chunks.
     stream = cast("CustomStreamWrapper", await _acompletion(**request.kwargs))
@@ -401,17 +429,40 @@ def _render_model_response(response: WireResponse) -> ModelResponse:
     return rendered
 
 
-async def _instructor_completion(*, strict: bool, **kwargs: object) -> ModelResponse:
+@dataclass
+class _Invocations:
+    """How many times instructor has called the completion callable this attempt."""
+
+    count: int = 0
+
+
+async def _instructor_completion(
+    *, strict: bool, call: CallContext, invocations: _Invocations, **kwargs: object
+) -> ModelResponse:
     """The completion callable handed to ``instructor.from_litellm``.
 
     Sends instructor's request through :func:`_send` and presents the answer
     with :func:`_render_model_response`, so the structured path crosses the
-    same boundary as every other transport. ``strict`` is bound per call by
-    :func:`acompletion_structured`; see :func:`_stricten_json_schema_response_format`.
+    same boundary as every other transport. :func:`acompletion_structured`
+    binds the keyword-only arguments per call: ``strict`` (see
+    :func:`_stricten_json_schema_response_format`), the call's identity, and
+    the invocation counter that marks instructor's in-attempt schema-repair
+    re-ask. The identity carries instructor's messages, which differ from the
+    caller's prompt in ``Mode.JSON``, where a schema system message is
+    prepended.
     """
     if strict:
         _stricten_json_schema_response_format(kwargs)
-    return _render_model_response(await _send(WireRequest(kwargs=kwargs)))
+    invocations.count += 1
+    messages = kwargs.get("messages")
+    call = replace(
+        call,
+        messages=(
+            cast("list[ChatMessage]", messages) if isinstance(messages, list) else call.messages
+        ),
+        repair=invocations.count > 1,
+    )
+    return _render_model_response(await _send(WireRequest(kwargs=kwargs, call=call)))
 
 
 def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
@@ -706,6 +757,44 @@ def _chunk_delta_text(chunk: ModelResponseStream) -> str | None:
     return delta.content
 
 
+def _call_context(
+    kind: CallKind,
+    prompt: str | Sequence[ChatMessage],
+    messages: Sequence[ChatMessage],
+    provider: LLMProviderInterface,
+    *,
+    model: str,
+    temperature: float | None,
+    max_tokens: int | None,
+    reasoning_effort: ReasoningEffort | None,
+    feature: str | None,
+    label: str | None,
+    call_id: str | None,
+    attempt: int | None,
+    output_schema: type[BaseModel] | None = None,
+    tools: Sequence[ToolDefinition] = (),
+    tool_choice: ToolChoice | None = None,
+) -> CallContext:
+    """The :class:`CallContext` a transport attaches to its wire request."""
+    return CallContext(
+        kind=kind,
+        prompt=prompt,
+        messages=messages,
+        model=model,
+        provider=provider.name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+        output_schema=output_schema,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+
+
 async def acompletion_structured[T: BaseModel](
     prompt: str | Sequence[ChatMessage],
     output_schema: type[T],
@@ -715,6 +804,10 @@ async def acompletion_structured[T: BaseModel](
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
+    feature: str | None = None,
+    label: str | None = None,
+    call_id: str | None = None,
+    attempt: int | None = None,
 ) -> tuple[T, float | None, tuple[int | None, int | None, int | None]]:
     """Structured completion via instructor pinned to the provider's mode.
 
@@ -773,7 +866,28 @@ async def acompletion_structured[T: BaseModel](
     # ``strict_json_schema`` (OpenRouter) get their ``response_format``
     # upgraded to strict enforcement on the way. ``inspect.iscoroutinefunction``
     # sees through the partial, so instructor still builds its async client.
-    completion = functools.partial(_instructor_completion, strict=provider.strict_json_schema)
+    messages = wire_messages(prompt)
+    call = _call_context(
+        "structured",
+        prompt,
+        messages,
+        provider,
+        model=litellm_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+        output_schema=output_schema,
+    )
+    completion = functools.partial(
+        _instructor_completion,
+        strict=provider.strict_json_schema,
+        call=call,
+        invocations=_Invocations(),
+    )
     # instructor's ``from_litellm`` is overloaded on whether the completion is
     # sync or async; basedpyright has been seen to resolve the *sync* overload
     # for our async completion callable on some platforms (CI x86_64 vs local
@@ -791,7 +905,7 @@ async def acompletion_structured[T: BaseModel](
         try:
             result = await client.chat.completions.create_with_completion(
                 model=litellm_model,
-                messages=wire_messages(prompt),  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
+                messages=messages,  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
                 response_model=output_schema,
                 # instructor's in-call schema-repair budget: two total attempts
                 # = exactly one schema-repair re-ask, and only for a genuine
@@ -847,6 +961,10 @@ async def acompletion_text(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
+    feature: str | None = None,
+    label: str | None = None,
+    call_id: str | None = None,
+    attempt: int | None = None,
 ) -> tuple[str, float | None, tuple[int | None, int | None, int | None]]:
     """Plain-text completion via LiteLLM.
 
@@ -867,10 +985,26 @@ async def acompletion_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    litellm_model = provider.litellm_model(model)
+    messages = wire_messages(prompt)
+    call = _call_context(
+        "text",
+        prompt,
+        messages,
+        provider,
+        model=litellm_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+    )
     request = WireRequest(
         kwargs={
-            "model": provider.litellm_model(model),
-            "messages": wire_messages(prompt),
+            "model": litellm_model,
+            "messages": messages,
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
@@ -882,7 +1016,8 @@ async def acompletion_text(
             # the request stays byte-identical to prior behaviour. Creds are
             # splatted first to match the structured/stream helpers exactly.
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        }
+        },
+        call=call,
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
@@ -903,6 +1038,11 @@ async def acompletion_tools(
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
     response_format: dict[str, object] | None = None,
+    output_schema: type[BaseModel] | None = None,
+    feature: str | None = None,
+    label: str | None = None,
+    call_id: str | None = None,
+    attempt: int | None = None,
 ) -> tuple[
     str | None, list[object], str | None, tuple[int | None, int | None, int | None], float | None
 ]:
@@ -917,17 +1057,37 @@ async def acompletion_tools(
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
+    litellm_model = provider.litellm_model(model)
+    messages = wire_messages(prompt)
+    call = _call_context(
+        "tool",
+        prompt,
+        messages,
+        provider,
+        model=litellm_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+        output_schema=output_schema,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
     request = WireRequest(
         kwargs={
-            "model": provider.litellm_model(model),
-            "messages": wire_messages(prompt),
+            "model": litellm_model,
+            "messages": messages,
             "tools": [definition.to_litellm() for definition in tools],
             **({"response_format": response_format} if response_format is not None else {}),
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        }
+        },
+        call=call,
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
@@ -1084,6 +1244,10 @@ async def astream_tools(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
+    feature: str | None = None,
+    label: str | None = None,
+    call_id: str | None = None,
+    attempt: int | None = None,
 ) -> AsyncGenerator[str | StreamedToolTurn]:
     """Stream a tool-enabled turn: text deltas, then one :class:`StreamedToolTurn`.
 
@@ -1111,10 +1275,28 @@ async def astream_tools(
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
+    litellm_model = provider.litellm_model(model)
+    messages = wire_messages(prompt)
+    call = _call_context(
+        "tool_stream",
+        prompt,
+        messages,
+        provider,
+        model=litellm_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
     request = WireRequest(
         kwargs={
-            "model": provider.litellm_model(model),
-            "messages": wire_messages(prompt),
+            "model": litellm_model,
+            "messages": messages,
             "tools": [definition.to_litellm() for definition in tools],
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
@@ -1122,7 +1304,8 @@ async def astream_tools(
             "stream_options": {"include_usage": True},
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        }
+        },
+        call=call,
     )
     fragments: dict[int, _ToolCallFragments] = {}
     stop_reason: str | None = None
@@ -1168,6 +1351,10 @@ async def astream_text(
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
+    feature: str | None = None,
+    label: str | None = None,
+    call_id: str | None = None,
+    attempt: int | None = None,
 ) -> AsyncIterator[str]:
     """Stream plain-text deltas via LiteLLM.
 
@@ -1186,10 +1373,26 @@ async def astream_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    litellm_model = provider.litellm_model(model)
+    messages = wire_messages(prompt)
+    call = _call_context(
+        "text_stream",
+        prompt,
+        messages,
+        provider,
+        model=litellm_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=effort,
+        feature=feature,
+        label=label,
+        call_id=call_id,
+        attempt=attempt,
+    )
     request = WireRequest(
         kwargs={
-            "model": provider.litellm_model(model),
-            "messages": wire_messages(prompt),
+            "model": litellm_model,
+            "messages": messages,
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
@@ -1198,7 +1401,8 @@ async def astream_text(
             "stream": True,
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        }
+        },
+        call=call,
     )
     async with (
         GlobalRateLimiter.acquire_async(provider.name) as slot,

@@ -43,6 +43,9 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
   - [Wrapping your own work: `with_retries()`](#wrapping-your-own-work-with_retries)
   - [instructor's in-call schema repair](#instructors-in-call-schema-repair)
   - [Re-rolling on a semantically-bad result](#re-rolling-on-a-semantically-bad-result)
+- [Testing your app with a fake transport](#testing-your-app-with-a-fake-transport)
+  - [Simulating failures](#simulating-failures)
+  - [What the fake does not see](#what-the-fake-does-not-see)
 - [Development](#development)
 - [Status & support](#status--support)
 - [License](#license)
@@ -1326,6 +1329,64 @@ result = await structured_llm_call(
 The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
+
+## Testing your app with a fake transport
+
+`llmkit.testing` lets your own tests answer llmkit's calls without a provider. Install a fake, and every call made while it is in place reaches the fake instead of the network. Everything around the provider round trip still runs: option merging, the response cache, the rate limiter and circuit breaker, retries, schema parsing and in-call repair, tool-argument parsing, and the call log.
+
+```python
+from llmkit import LLMClientConfig, Provider, configure_llm_client
+from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
+
+# A provider must still be configured; Ollama needs no key.
+configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="test"))
+
+def fake(request: TransportRequest) -> Reply:
+    if request.feature == "health":
+        return Reply.text("ok")
+    if request.kind == "structured":
+        return Reply.json(Summary(title="t", bullets=["b"]))
+    if request.kind in ("tool", "tool_stream"):
+        return Reply(tool_calls=[FakeToolCall("search", {"query": "llmkit"})])
+    return Reply.text("hello there")
+
+with install(fake) as transport:        # `async with` works too
+    run_the_app()
+print(transport.requests)               # every request the fake answered
+```
+
+The fake is a plain function or a coroutine function. It receives one frozen `TransportRequest` per provider round trip, carrying:
+
+- **identity:** `feature`, `label`, `kind` (`"structured"`, `"text"`, `"tool"`, `"text_stream"` or `"tool_stream"`), and the `call_id` and `attempt` the call log records, so a retried call reaches the fake once per attempt;
+- **inputs:** `prompt` as you passed it, `messages` as sent (they differ only for structured calls, whose output mode can add a schema instruction), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema-repair re-ask;
+- **effective settings:** the routed `model`, `provider`, `temperature`, `max_tokens` and `reasoning_effort`.
+
+It never carries credentials or provider-native request settings.
+
+A `Reply` answers every kind. `Reply.text(...)` gives text, and `Reply.json(model_instance)` gives the instance's JSON (`model_dump_json(by_alias=True)`); a model with computed fields and `extra="forbid"` does not round-trip, so send its JSON with `Reply.text`. Raw JSON and raw tool arguments (`FakeToolCall("add", '{"left": 1')`) run the real parsing, repair and malformed-call handling. A streaming call splits the text into word-sized deltas, or uses `chunks=[...]` when you give them, then delivers the tool calls; `usage` and `cost` are reported like a provider's. `finish_reason` defaults to `"tool_calls"` or `"stop"`. Set it to `"length"` to get each kind's real truncation behavior: a structured call raises `OutputLimitError`, a tool call reports it as `stop_reason`, and text calls and text streams do not surface it.
+
+The installed fake is **process-wide**: it reaches the sync wrappers and threads your application starts itself, such as a web server under test, and concurrent tests in one process share it. Nested installs stack, and leaving a block restores the one before. With no fake installed, the real transport runs.
+
+### Simulating failures
+
+The failure helpers build the exceptions providers really raise, so llmkit's retry, back-off, adaptive concurrency and circuit breaker treat them exactly like a real provider's, and so does your own `except LLM_RECOVERABLE_ERRORS`:
+
+| Helper | Raises | Retried | Throttle signal |
+|---|---|---|---|
+| `rate_limit_error(retry_after=None)` | `openai.RateLimitError` (429, optional `Retry-After`) | yes, after `Retry-After` when given | yes |
+| `service_unavailable_error(retry_after=None)` | `llmkit.exceptions.ServiceUnavailableError` (503) | yes | yes |
+| `server_error()` | `openai.InternalServerError` (500) | yes | no |
+| `timeout_error()` | `openai.APITimeoutError` | yes | no |
+
+Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait is spent inside the rate-limiter slot, as a slow provider's would be. Fault scripts compose from the request: refuse the first N attempts of one feature with `request.attempt`, or keep refusing one feature until its retry budget is spent. Tell a readiness probe from real work by its `feature` or `label`.
+
+### What the fake does not see
+
+- **Cache hits and shared in-flight requests.** The [response cache](#response-cache) sits above the fake. A hit never reaches it, and an identical buffered request that joins one already in flight shares that one round trip. Configure no cache, or pass `cache=False`, when a test counts requests.
+- **Calls with no configured provider.** The provider is resolved before the round trip, and a key-based provider raises without its key. Configure one that needs none, such as Ollama, or give the provider a placeholder key.
+- **Mid-stream failures.** A fake can fail a streaming call before its first chunk, not partway through.
+
+Patching llmkit's private modules (`llmkit._litellm` and its functions) is unsupported: those are internal test seams and change without notice. `llmkit.testing` is the supported way.
 
 ## Development
 

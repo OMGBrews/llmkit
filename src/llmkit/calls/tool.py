@@ -167,6 +167,11 @@ async def tool_llm_call[T: BaseModel](
                     if output_schema is not None
                     else None
                 ),
+                output_schema=output_schema,
+                feature=feature,
+                label=label,
+                call_id=call_id,
+                attempt=attempt_offset + attempt_count,
             )
             sent_temperature = _litellm.sent_temperature(args.temperature)
             parsed_calls, invalid_calls = parse_tool_calls(raw_calls, definitions)
