@@ -731,6 +731,20 @@ async def test_openai_live() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-4.1-mini", "gpt-5.1"])
+async def test_openai_reasoning_disable_live(model: str) -> None:
+    """Both supported disable paths return valid structured output.
+
+    Fixed model ids keep environment overrides from collapsing the omission
+    path (gpt-4.1-mini) and the explicit ``none`` path (gpt-5.1) into one case.
+    Offline capture tests establish request shape; a successful response here
+    does not independently prove the model's internal reasoning behavior.
+    """
+    provider = make_provider(Provider.OPENAI, model=model, **_live_credentials(Provider.OPENAI))
+    await _assert_structured_roundtrip(provider, reasoning_effort="disable")
+
+
+@pytest.mark.asyncio
 async def test_deepseek_live() -> None:
     # Mode.JSON (not JSON_SCHEMA, which DeepSeek's API rejects) validates on
     # both deepseek-chat and deepseek-reasoner; the default smoke model is

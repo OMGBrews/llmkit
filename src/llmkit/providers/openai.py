@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -77,6 +78,77 @@ class OpenAIProvider(BaseProvider):
         # environment and so must happen at the read point, never here (see
         # ``completion_kwargs``).
         self._base_url: str | None = base_url
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Disable thinking only when the effective model's capabilities establish how.
+
+        Missing metadata is not evidence of non-reasoning. Native effort values
+        remain an explicit escape hatch and pass through without lookup.
+        """
+        if effort != "disable":
+            return {"reasoning_effort": effort}
+
+        import litellm
+
+        unknown = ReasoningEffortUnsupportedError(
+            f"{model!r}: cannot establish how to turn thinking off; model capabilities "
+            + "are unknown or inconsistent. Choose a supported native reasoning_effort "
+            + 'explicitly, or remove the "disable" requirement.'
+        )
+        try:
+            info = litellm.get_model_info(model, custom_llm_provider="openai")
+            reasoning = info.get("supports_reasoning")
+            none = info.get("supports_none_reasoning_effort")
+            minimal = info.get("supports_minimal_reasoning_effort")
+            low = info.get("supports_low_reasoning_effort")
+            always_on = info.get("thinking_always_on")
+            params = info.get("supported_openai_params")
+
+            # Contradictory affirmative capabilities must not select a success path.
+            if (reasoning is False and (none is True or minimal is True or low is True)) or (
+                always_on is True and (none is True or reasoning is False)
+            ):
+                raise unknown
+            if none is True:
+                if params is not None and "reasoning_effort" not in params:
+                    raise unknown
+                return {"reasoning_effort": "none"}
+            if reasoning is False:
+                return {}
+            if reasoning is None and none is None and always_on is not True:
+                # Older non-reasoning catalogue entries omit the reasoning flag.
+                # Require both catalogue identity and a config excluding effort;
+                # generic/unknown OpenAI-compatible aliases prove neither.
+                catalog = cast(
+                    "set[str]", litellm.open_ai_chat_completion_models
+                )  # raw-llm: unparameterized catalogue set
+                if (
+                    model in catalog
+                    and info.get("key") in (model, f"openai/{model}")
+                    and params is not None
+                    and "reasoning_effort" not in params
+                    and minimal is not True
+                    and low is not True
+                ):
+                    return {}
+        except ReasoningEffortUnsupportedError:
+            raise
+        except Exception:
+            # Do not leak dependency errors or retry transport on missing metadata.
+            raise unknown from None
+
+        if none is False or always_on is True:
+            alternative = ' Choose a different model or remove the "disable" requirement.'
+            if minimal is True or low is True:
+                native = "minimal" if minimal is True else "low"
+                alternative = f' Send "{native}" explicitly for lower effort; it still reasons.'
+            raise ReasoningEffortUnsupportedError(
+                f'{model!r} cannot turn thinking off; reasoning_effort="disable" is not '
+                + "available on it."
+                + alternative
+            )
+        raise unknown
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
