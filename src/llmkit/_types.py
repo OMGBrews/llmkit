@@ -101,12 +101,15 @@ class Message(TypedDict):
 #: / ``"high"`` scale it. The trailing ``| str`` is a deliberate escape hatch —
 #: providers accept values outside this set (e.g. OpenAI's ``"minimal"``), and
 #: llmkit forwards the value without validating it, translating only where a
-#: provider needs a native request control (OpenRouter, Anthropic, Bedrock,
+#: provider needs a native request control (OpenRouter, OpenAI, Anthropic, Bedrock,
 #: Cerebras). Anthropic and Bedrock map disable to "none" and raise
 #: ReasoningEffortUnsupportedError on models LiteLLM flags as always-on;
 #: unknown metadata permits the translation. Use "low" for lowest explicit
-#: effort on always-on Claude. OpenAI forwards its own vocabulary unchanged:
-#: "disable" is not available on that route.
+#: effort on always-on Claude. OpenAI omits the parameter for known non-reasoning
+#: models and maps "disable" to "none" where model capabilities establish support.
+#: It raises ReasoningEffortUnsupportedError before transport if reasoning cannot
+#: be disabled or capabilities are unknown; it never substitutes a lower effort.
+#: Other OpenAI effort values pass through unchanged, without capability lookup.
 #:
 #: This alias is **advisory, not enforcing**: under the type checker
 #: ``Literal[...] | str`` widens to ``str``, so it names and documents the

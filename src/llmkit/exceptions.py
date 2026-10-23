@@ -572,8 +572,8 @@ class ComposeUnsupportedError(Exception):
 
 
 class ReasoningEffortUnsupportedError(Exception):
-    """A model is known to require thinking but the caller requested disable.
+    """Thinking cannot be disabled, or the model's off capability is unknown.
 
     A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS``:
-    retrying cannot turn thinking off on an always-on model.
+    retrying cannot establish a missing capability or disable an always-on model.
     """
