@@ -38,8 +38,10 @@ provider SDK's exhaustive parameter surface.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
+from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import cast
@@ -49,11 +51,21 @@ import litellm
 from instructor.core.exceptions import IncompleteOutputException
 from litellm import CustomStreamWrapper
 from litellm.exceptions import BadRequestError
-from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
+from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices, Usage
 from pydantic import BaseModel
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from llmkit._messages import resolve_reasoning_effort, wire_messages
+from llmkit._transport import (
+    WireChunk,
+    WireFunction,
+    WireRequest,
+    WireResponse,
+    WireStreamEnd,
+    WireToolCall,
+    WireToolFragment,
+    WireUsage,
+)
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
@@ -225,10 +237,185 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
         raise
 
 
-async def _acompletion_strict_json_schema(
-    **kwargs: object,
-) -> ModelResponse | CustomStreamWrapper:
-    """:func:`_acompletion`, upgrading a ``json_schema`` ``response_format`` to strict.
+async def _send(request: WireRequest) -> WireResponse:
+    """One buffered provider round trip, as llmkit's own response type.
+
+    The boundary the buffered transports await. The LiteLLM adapter behind it
+    is :func:`_acompletion`, whose duties (503 re-ownership, the temperature
+    re-issue and stamp, the MCP-handler opt-out) are unchanged; this only
+    converts the result.
+    """
+    return _wire_response(await _acompletion(**request.kwargs))
+
+
+async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStreamEnd]:
+    """One streamed provider round trip: wire chunks, then one :class:`WireStreamEnd`.
+
+    A 503 can surface mid-iteration, because the wrapper fetches chunks lazily
+    after :func:`_acompletion` has returned. It is re-owned exactly as the
+    call-time boundary does, so the stream path keeps the
+    ``except LLM_RECOVERABLE_ERRORS`` contract too.
+    """
+    # stream=True makes acompletion return a CustomStreamWrapper, whose async
+    # iteration yields typed ModelResponseStream chunks.
+    stream = cast("CustomStreamWrapper", await _acompletion(**request.kwargs))
+    try:
+        async for chunk in stream:
+            yield _wire_chunk(chunk)
+    except Exception as e:
+        normalized = normalize_service_unavailable(e)
+        if normalized is not e:
+            raise normalized from e
+        raise
+    yield WireStreamEnd(usage=_wire_usage(stream), cost=_response_cost(stream))
+
+
+def _wire_usage(raw: object) -> WireUsage:
+    """Read *raw*'s ``usage`` into :class:`WireUsage`, pure ``getattr``.
+
+    Any missing or non-``int`` count is ``None``; nothing here raises.
+    """
+    usage = getattr(raw, "usage", None)
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    total = getattr(usage, "total_tokens", None)
+    reasoning = getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None)
+    return WireUsage(
+        prompt_tokens=prompt if isinstance(prompt, int) else None,
+        completion_tokens=completion if isinstance(completion, int) else None,
+        total_tokens=total if isinstance(total, int) else None,
+        reasoning_tokens=reasoning if isinstance(reasoning, int) else None,
+    )
+
+
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _wire_tool_call(raw: object) -> WireToolCall:
+    """One LiteLLM tool call; a field that is not a ``str`` becomes ``None``.
+
+    The parser rejects a non-``str`` field as a malformed call either way, so
+    narrowing here changes no outcome.
+    """
+    function = getattr(raw, "function", None)
+    return WireToolCall(
+        id=_str_or_none(getattr(raw, "id", None)),
+        function=WireFunction(
+            name=_str_or_none(getattr(function, "name", None)),
+            arguments=_str_or_none(getattr(function, "arguments", None)),
+        ),
+    )
+
+
+def _wire_response(raw: object) -> WireResponse:
+    """Convert a LiteLLM completion to :class:`WireResponse`.
+
+    Total ``getattr`` rather than typed, so a test double shaped like a
+    completion (a ``SimpleNamespace``, a ``MagicMock``) converts as a real
+    ``ModelResponse`` does. Message content becomes ``None`` only when absent;
+    anything else is coerced by :func:`_coerce_text_content`.
+    """
+    usage = _wire_usage(raw)
+    cost = _response_cost(raw)
+    choices = cast("object", getattr(raw, "choices", None))
+    if not choices:
+        # A degenerate empty-``choices`` response (e.g. a malformed
+        # OpenAI-compatible proxy returning ``{"choices": []}``).
+        return WireResponse(has_choice=False, usage=usage, cost=cost)
+    choice = cast("Sequence[object]", choices)[0]
+    message = getattr(choice, "message", None)
+    content = cast("object", getattr(message, "content", None))
+    raw_calls = cast("object", getattr(message, "tool_calls", None))
+    return WireResponse(
+        text=_coerce_text_content(content) if content is not None else None,
+        tool_calls=(
+            tuple(_wire_tool_call(call) for call in cast("list[object]", raw_calls))
+            if isinstance(raw_calls, list)
+            else ()
+        ),
+        finish_reason=_str_or_none(getattr(choice, "finish_reason", None)),
+        usage=usage,
+        cost=cost,
+    )
+
+
+def _wire_chunk(chunk: ModelResponseStream) -> WireChunk:
+    """Convert one LiteLLM stream frame to :class:`WireChunk`."""
+    delta = _chunk_delta_text(chunk)
+    return WireChunk(
+        text=delta if isinstance(delta, str) else None,
+        tool_fragments=_chunk_tool_fragments(chunk),
+        finish_reason=_chunk_finish_reason(chunk),
+        # ``include_usage`` puts usage on a *final* frame that usually carries
+        # no choices; a frame without any usage reports ``None``.
+        usage=_wire_usage(chunk) if getattr(chunk, "usage", None) is not None else None,
+        cost=_response_cost(chunk),
+    )
+
+
+def _render_model_response(response: WireResponse) -> ModelResponse:
+    """Present a :class:`WireResponse` in the shape instructor parses.
+
+    instructor's handlers for the modes the providers pin (``JSON_SCHEMA``,
+    ``JSON``) read only the first choice's content and finish reason; a tool
+    mode reads its tool calls. Its usage tally reads ``usage``, and the
+    structured transport reads cost from ``_hidden_params["response_cost"]``,
+    which a hand-built ``ModelResponse`` starts without. ``usage`` is set only
+    when some count was reported: a ``ModelResponse`` built without one has no
+    ``usage`` attribute at all, which is what the original reported too.
+    """
+    message: dict[str, object] = {"role": "assistant", "content": response.text}
+    if response.tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.function.name, "arguments": call.function.arguments},
+            }
+            for call in response.tool_calls
+        ]
+    choices: list[dict[str, object]] = (
+        [{"index": 0, "finish_reason": response.finish_reason, "message": message}]
+        if response.has_choice
+        else []
+    )
+    usage = response.usage
+    reported = any(count is not None for count in (*usage.counts(), usage.reasoning_tokens))
+    rendered = (
+        ModelResponse(
+            choices=choices,
+            usage=Usage(
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+            ),
+        )
+        if reported
+        else ModelResponse(choices=choices)
+    )
+    rendered._hidden_params = (  # pyright: ignore[reportPrivateUsage]  # raw-llm — litellm's cost slot
+        {"response_cost": response.cost} if response.cost is not None else {}
+    )
+    return rendered
+
+
+async def _instructor_completion(*, strict: bool, **kwargs: object) -> ModelResponse:
+    """The completion callable handed to ``instructor.from_litellm``.
+
+    Sends instructor's request through :func:`_send` and presents the answer
+    with :func:`_render_model_response`, so the structured path crosses the
+    same boundary as every other transport. ``strict`` is bound per call by
+    :func:`acompletion_structured`; see :func:`_stricten_json_schema_response_format`.
+    """
+    if strict:
+        _stricten_json_schema_response_format(kwargs)
+    return _render_model_response(await _send(WireRequest(kwargs=kwargs)))
+
+
+def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
+    """Upgrade a ``json_schema`` ``response_format`` in *kwargs* to strict.
 
     instructor's ``JSON_SCHEMA`` handler emits ``response_format`` without
     ``"strict": true`` or ``additionalProperties: false``, and a provider that
@@ -236,18 +423,12 @@ async def _acompletion_strict_json_schema(
     models drift — measured 2026-07-14: ``mistralai/mistral-nemo``
     stochastically echoing the schema itself. The pre-1.15.3
     ``OPENROUTER_STRUCTURED_OUTPUTS`` handler sent exactly this strict shape,
-    so this wrapper restores the measured wire contract at the one seam the
-    library owns (the completion callable handed to ``from_litellm``). Used
-    only for providers that opt in via
+    so this restores the measured wire contract at the one seam the library
+    owns (the completion callable handed to ``from_litellm``). Used only for
+    providers that opt in via
     :pyattr:`~llmkit.providers.base.BaseProvider.strict_json_schema`; the
     mutation targets the request dict instructor builds fresh per call.
     """
-    _stricten_json_schema_response_format(kwargs)
-    return await _acompletion(**kwargs)
-
-
-def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
-    """Mutate a JSON-schema response format into the strict wire shape."""
     response_format = kwargs.get("response_format")
     if (
         isinstance(response_format, dict)
@@ -354,34 +535,10 @@ def _response_cost(
     return None
 
 
-def _total_tokens(raw: object) -> int | None:
-    """Best-effort total token count for a completion from its ``usage``.
-
-    LiteLLM stamps a ``usage`` object (``prompt_tokens`` / ``completion_tokens``
-    / ``total_tokens``) onto a non-streamed completion. This reads
-    ``usage.total_tokens`` for the tokens-per-minute limiter to debit, falling
-    back to summing ``prompt_tokens`` + ``completion_tokens`` (treating a
-    missing one as 0) when ``total_tokens`` is absent or non-int. Returns
-    ``None`` for any missing/odd shape (e.g. a streamed response that reports no
-    usage) — TPM accounting is best-effort and never breaks the call.
-    """
-    usage = getattr(raw, "usage", None)
-    total = getattr(usage, "total_tokens", None)
-    if isinstance(total, int):
-        return total
-    prompt = getattr(usage, "prompt_tokens", None)
-    completion = getattr(usage, "completion_tokens", None)
-    if isinstance(prompt, int) or isinstance(completion, int):
-        return (prompt if isinstance(prompt, int) else 0) + (
-            completion if isinstance(completion, int) else 0
-        )
-    return None
-
-
 def _completion_tokens(raw: object) -> int | None:
     """Best-effort completion-token count from a completion's ``usage``.
 
-    Sibling of :func:`_total_tokens`, for :class:`OutputLimitError`'s
+    For :class:`OutputLimitError`'s
     diagnostics: how many tokens the provider actually generated before the
     output-token limit cut the completion off. Returns ``None`` for any
     missing/odd shape — the diagnostics degrade, never break the raise.
@@ -397,7 +554,7 @@ def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics
     ``IncompleteOutputException``: normally the whole litellm
     ``ModelResponse`` (the OpenAI JSON / JSON-schema handlers every shipped
     provider reaches), but one handler passes a bare ``choices[0]`` and it can
-    be ``None``. Pure ``getattr`` like :func:`_usage_counts`, and it never
+    be ``None``. Pure ``getattr`` like :func:`_wire_usage`, and it never
     raises — the diagnostics degrade, never break or mask the
     :class:`OutputLimitError`. Shape rules: string content is kept as-is
     (``""`` stays ``""``); list-of-blocks content joins its text blocks as
@@ -422,19 +579,14 @@ def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics
             if isinstance(content, str | list)
             else None
         )
-        prompt, completion, total = _usage_counts(last_completion)
-        reasoning = getattr(
-            getattr(getattr(last_completion, "usage", None), "completion_tokens_details", None),
-            "reasoning_tokens",
-            None,
-        )
+        usage = _wire_usage(last_completion)
         return OutputLimitDiagnostics(
             partial_text=partial_text,
             finish_reason=finish_reason if isinstance(finish_reason, str) else None,
-            prompt_tokens=prompt,
-            completion_tokens=completion,
-            total_tokens=total,
-            reasoning_tokens=reasoning if isinstance(reasoning, int) else None,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
         )
     except Exception:
         logger.debug("Could not read output-limit diagnostics", exc_info=True)
@@ -610,19 +762,21 @@ async def acompletion_structured[T: BaseModel](
 
     Returns ``(parsed, approximate_cost, usage)``, where ``usage`` is the
     completion's ``(prompt_tokens, completion_tokens, total_tokens)`` from
-    :func:`_usage_counts` (each ``None`` when not reported) for the call log.
+    :class:`~llmkit._transport.WireUsage` (each ``None`` when not reported) for the call log.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     litellm_model = provider.litellm_model(model)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
-    # The completion callable is the library's seam under instructor: providers
-    # that opt in via ``strict_json_schema`` (OpenRouter) get their
-    # ``response_format`` upgraded to strict enforcement on the way to LiteLLM.
-    completion = _acompletion_strict_json_schema if provider.strict_json_schema else _acompletion
+    # The completion callable is the library's seam under instructor: it sends
+    # through the transport boundary, and providers that opt in via
+    # ``strict_json_schema`` (OpenRouter) get their ``response_format``
+    # upgraded to strict enforcement on the way. ``inspect.iscoroutinefunction``
+    # sees through the partial, so instructor still builds its async client.
+    completion = functools.partial(_instructor_completion, strict=provider.strict_json_schema)
     # instructor's ``from_litellm`` is overloaded on whether the completion is
     # sync or async; basedpyright has been seen to resolve the *sync* overload
-    # for our ``async def _acompletion`` on some platforms (CI x86_64 vs local
+    # for our async completion callable on some platforms (CI x86_64 vs local
     # arm64), which then types ``create_with_completion`` as a non-awaitable
     # ``tuple`` and breaks the ``await`` below. Pin the async client across
     # platforms by casting through ``object`` — the escape pyright itself
@@ -675,11 +829,14 @@ async def acompletion_structured[T: BaseModel](
                 completion_tokens=_completion_tokens(e.last_completion),
                 diagnostics=_output_limit_diagnostics(e.last_completion),
             ) from e
-        # instructor types the raw completion half of the tuple as Any; it is a
-        # litellm ModelResponse. Narrow once so cost/usage read a real type.
-        parsed, completion = cast("tuple[T, ModelResponse]", result)
-        slot.record_tokens(_total_tokens(completion))
-    return parsed, _response_cost(completion), _usage_counts(completion)
+        # instructor types the raw completion half of the tuple as Any. It is
+        # the last rendered response, whose usage instructor's tally has
+        # rewritten to the whole in-call total, so it is read back rather than
+        # the last wire response.
+        parsed, raw_completion = cast("tuple[T, object]", result)
+        response = _wire_response(raw_completion)
+        slot.record_tokens(response.usage.debit())
+    return parsed, response.cost, response.usage.counts()
 
 
 async def acompletion_text(
@@ -702,7 +859,7 @@ async def acompletion_text(
     provider for this call only (``None`` uses the globally-configured one).
 
     Returns ``(text, approximate_cost, usage)``, ``usage`` being the
-    :func:`_usage_counts` triple the call log records. The text is the first
+    :class:`~llmkit._transport.WireUsage` triple the call log records. The text is the first
     choice's message content coerced to a string via
     :func:`_coerce_text_content` (list content blocks joined; an empty string
     when the provider returns none).
@@ -710,10 +867,10 @@ async def acompletion_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
-    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        resp = await _acompletion(
-            model=provider.litellm_model(model),
-            messages=wire_messages(prompt),
+    request = WireRequest(
+        kwargs={
+            "model": provider.litellm_model(model),
+            "messages": wire_messages(prompt),
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
@@ -725,36 +882,14 @@ async def acompletion_text(
             # the request stays byte-identical to prior behaviour. Creds are
             # splatted first to match the structured/stream helpers exactly.
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        )
-        # Non-streaming acompletion returns a ModelResponse (the stub's union
-        # also admits CustomStreamWrapper, only reachable with stream=True);
-        # narrow it so the typed .choices[0].message.content chain (str | None)
-        # and .usage are precise.
-        response = cast("ModelResponse", resp)
-        slot.record_tokens(_total_tokens(response))
-    # Guard the index: a degenerate empty-``choices`` response (e.g. a malformed
-    # OpenAI-compatible proxy returning ``{"choices": []}``) would otherwise raise
-    # ``IndexError`` here, bypassing the ``None`` -> "" coercion below.
-    content = response.choices[0].message.content if response.choices else None
-    return _coerce_text_content(content), _response_cost(response), _usage_counts(response)
-
-
-def _usage_counts(response: object) -> tuple[int | None, int | None, int | None]:
-    """Extract portable usage fields without trusting a provider-specific model.
-
-    Typed ``object`` rather than ``ModelResponse`` because it is pure
-    ``getattr``: the streaming lane hands it a ``ModelResponseStream`` frame or
-    the stream wrapper itself, neither of which is a ``ModelResponse``.
-    """
-    usage = getattr(response, "usage", None)
-    prompt = getattr(usage, "prompt_tokens", None)
-    completion = getattr(usage, "completion_tokens", None)
-    total = getattr(usage, "total_tokens", None)
-    return (
-        prompt if isinstance(prompt, int) else None,
-        completion if isinstance(completion, int) else None,
-        total if isinstance(total, int) else None,
+        }
     )
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
+        response = await _send(request)
+        slot.record_tokens(response.usage.debit())
+    # A response with no choice, or no content, is an empty answer.
+    text = response.text if response.text is not None else ""
+    return text, response.cost, response.usage.counts()
 
 
 async def acompletion_tools(
@@ -782,30 +917,27 @@ async def acompletion_tools(
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
-    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        resp = await _acompletion(
-            model=provider.litellm_model(model),
-            messages=wire_messages(prompt),
-            tools=[definition.to_litellm() for definition in tools],
+    request = WireRequest(
+        kwargs={
+            "model": provider.litellm_model(model),
+            "messages": wire_messages(prompt),
+            "tools": [definition.to_litellm() for definition in tools],
             **({"response_format": response_format} if response_format is not None else {}),
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        )
-        response = cast("ModelResponse", resp)
-        slot.record_tokens(_total_tokens(response))
-    if not response.choices:
-        return None, [], None, _usage_counts(response), _response_cost(response)
-    message = response.choices[0].message
-    content = cast("object", getattr(message, "content", None))
-    raw_calls = cast("object", getattr(message, "tool_calls", None))
+        }
+    )
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
+        response = await _send(request)
+        slot.record_tokens(response.usage.debit())
     return (
-        _coerce_text_content(content) if content is not None else None,
-        cast("list[object]", raw_calls) if isinstance(raw_calls, list) else [],
-        getattr(response.choices[0], "finish_reason", None),
-        _usage_counts(response),
-        _response_cost(response),
+        response.text,
+        list[object](response.tool_calls),
+        response.finish_reason,
+        response.usage.counts(),
+        response.cost,
     )
 
 
@@ -862,41 +994,57 @@ class StreamedToolTurn:
     approximate_cost: float | None
 
 
-def _absorb_tool_fragments(
-    chunk: ModelResponseStream, fragments: dict[int, _ToolCallFragments]
-) -> None:
-    """Merge one chunk's tool-call deltas into the per-index accumulator.
+def _chunk_tool_fragments(chunk: ModelResponseStream) -> tuple[WireToolFragment, ...]:
+    """The first choice's tool-call deltas as :class:`WireToolFragment`\\ s.
 
     Deliberately total-getattr rather than typed: LiteLLM annotates
     ``Delta.tool_calls`` loosely and providers differ in which fields a given
     fragment carries (Gemini sends a complete argument JSON in one fragment;
-    Anthropic and the OpenAI-compatible routes split it). Anything missing is
-    skipped rather than defaulted, so a call that never received an id or a
-    name stays malformed for the parser to reject.
+    Anthropic and the OpenAI-compatible routes split it). Anything missing or
+    empty is ``None`` rather than defaulted, so a call that never received an
+    id or a name stays malformed for the parser to reject.
     """
     if not chunk.choices:
-        return
+        return ()
     delta: Delta = chunk.choices[0].delta
     raw_calls = cast("object", getattr(delta, "tool_calls", None))
     if not isinstance(raw_calls, list):
-        return
+        return ()
+    fragments: list[WireToolFragment] = []
     for position, raw in enumerate(cast("list[object]", raw_calls)):
         index = getattr(raw, "index", None)
-        # A provider that omits ``index`` on a single-call turn falls back to
-        # the fragment's position within this chunk, which is the same key for
-        # the common one-call case and never merges two distinct calls.
-        key = index if isinstance(index, int) else position
-        fragment = fragments.setdefault(key, _ToolCallFragments())
-        call_id = getattr(raw, "id", None)
-        if isinstance(call_id, str) and call_id and fragment.id is None:
-            fragment.id = call_id
         function = getattr(raw, "function", None)
-        name = getattr(function, "name", None)
-        if isinstance(name, str) and name and fragment.name is None:
-            fragment.name = name
-        arguments = getattr(function, "arguments", None)
-        if isinstance(arguments, str) and arguments:
-            fragment.arguments.append(arguments)
+        fragments.append(
+            WireToolFragment(
+                # A provider that omits ``index`` on a single-call turn falls
+                # back to the fragment's position within this chunk, which is
+                # the same key for the common one-call case and never merges
+                # two distinct calls.
+                index=index if isinstance(index, int) else position,
+                id=_str_or_none(getattr(raw, "id", None)) or None,
+                name=_str_or_none(getattr(function, "name", None)) or None,
+                arguments=_str_or_none(getattr(function, "arguments", None)) or None,
+            )
+        )
+    return tuple(fragments)
+
+
+def _absorb_tool_fragments(
+    fragments: tuple[WireToolFragment, ...], accumulated: dict[int, _ToolCallFragments]
+) -> None:
+    """Merge one chunk's tool-call fragments into the per-index accumulator.
+
+    The id and the name are kept from the first fragment that carries them;
+    argument pieces concatenate in arrival order.
+    """
+    for piece in fragments:
+        fragment = accumulated.setdefault(piece.index, _ToolCallFragments())
+        if piece.id is not None and fragment.id is None:
+            fragment.id = piece.id
+        if piece.name is not None and fragment.name is None:
+            fragment.name = piece.name
+        if piece.arguments is not None:
+            fragment.arguments.append(piece.arguments)
 
 
 def _assemble_tool_calls(fragments: dict[int, _ToolCallFragments]) -> list[object]:
@@ -963,56 +1111,51 @@ async def astream_tools(
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
-    fragments: dict[int, _ToolCallFragments] = {}
-    stop_reason: str | None = None
-    usage_source: object = None
-    cost: float | None = None
-    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        resp = await _acompletion(
-            model=provider.litellm_model(model),
-            messages=wire_messages(prompt),
-            tools=[definition.to_litellm() for definition in tools],
+    request = WireRequest(
+        kwargs={
+            "model": provider.litellm_model(model),
+            "messages": wire_messages(prompt),
+            "tools": [definition.to_litellm() for definition in tools],
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
-            stream=True,
-            stream_options={"include_usage": True},
+            "stream": True,
+            "stream_options": {"include_usage": True},
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        )
-        stream = cast("CustomStreamWrapper", resp)
-        try:
-            async for chunk in stream:
-                _absorb_tool_fragments(chunk, fragments)
-                reason = _chunk_finish_reason(chunk)
-                if reason is not None:
-                    stop_reason = reason
+        }
+    )
+    fragments: dict[int, _ToolCallFragments] = {}
+    stop_reason: str | None = None
+    usage: WireUsage | None = None
+    cost: float | None = None
+    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
+        async with aclosing(_stream(request)) as stream:
+            async for item in stream:
+                if isinstance(item, WireStreamEnd):
+                    # Usage on a frame wins; the stream's own accumulation is
+                    # the fallback.
+                    if usage is None:
+                        usage = item.usage
+                    if cost is None:
+                        cost = item.cost
+                    continue
+                _absorb_tool_fragments(item.tool_fragments, fragments)
+                if item.finish_reason is not None:
+                    stop_reason = item.finish_reason
                 # ``include_usage`` puts usage on a *final* frame that usually
-                # carries no choices; keep the last frame that has any, and
-                # fall back to the wrapper's own accumulation below.
-                if getattr(chunk, "usage", None) is not None:
-                    usage_source = chunk
-                chunk_cost = _response_cost(chunk)
-                if chunk_cost is not None:
-                    cost = chunk_cost
-                delta = _chunk_delta_text(chunk)
-                if delta:
-                    yield delta
-        except Exception as e:
-            # Same re-ownership as ``astream_text``: a 503 can surface
-            # mid-iteration, after ``_acompletion`` has already returned.
-            normalized = normalize_service_unavailable(e)
-            if normalized is not e:
-                raise normalized from e
-            raise
-        if usage_source is None:
-            usage_source = stream
-        slot.record_tokens(_total_tokens(usage_source))
-        if cost is None:
-            cost = _response_cost(stream)
+                # carries no choices; keep the last frame that has any.
+                if item.usage is not None:
+                    usage = item.usage
+                if item.cost is not None:
+                    cost = item.cost
+                if item.text:
+                    yield item.text
+        usage = usage if usage is not None else WireUsage()
+        slot.record_tokens(usage.debit())
     yield StreamedToolTurn(
         raw_calls=_assemble_tool_calls(fragments),
         stop_reason=stop_reason,
-        usage=_usage_counts(usage_source),
+        usage=usage.counts(),
         approximate_cost=cost,
     )
 
@@ -1043,38 +1186,31 @@ async def astream_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
-    async with GlobalRateLimiter.acquire_async(provider.name) as slot:
-        resp = await _acompletion(
-            model=provider.litellm_model(model),
-            messages=wire_messages(prompt),
+    request = WireRequest(
+        kwargs={
+            "model": provider.litellm_model(model),
+            "messages": wire_messages(prompt),
             # Gate temperature like max_tokens / reasoning_effort: a
             # ``None`` resolved value sends no ``temperature`` key at all,
             # so the provider's default sampling applies. Identity check
             # keeps ``0.0`` a real, forwarded value.
             **({"temperature": temperature} if temperature is not None else {}),
-            stream=True,
+            "stream": True,
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
-        )
-        # stream=True makes acompletion return a CustomStreamWrapper, whose
-        # async iteration yields typed ModelResponseStream chunks.
-        stream = cast("CustomStreamWrapper", resp)
-        try:
-            async for chunk in stream:
-                delta = _chunk_delta_text(chunk)
-                if delta:
-                    yield delta
-        except Exception as e:
-            # A 503 can also surface mid-iteration (the wrapper fetches chunks
-            # lazily, after ``_acompletion`` has returned) — re-own it exactly
-            # as the call-time boundary does, so the stream path keeps the
-            # ``except LLM_RECOVERABLE_ERRORS`` contract too.
-            normalized = normalize_service_unavailable(e)
-            if normalized is not e:
-                raise normalized from e
-            raise
-        # Best-effort TPM accounting: a stream usually reports no usage (we
-        # don't request stream_options=include_usage), so this is typically a
-        # no-op — consistent with cost being None for streamed calls. When the
-        # wrapper does expose a final usage, debit it before releasing the slot.
-        slot.record_tokens(_total_tokens(stream))
+        }
+    )
+    async with (
+        GlobalRateLimiter.acquire_async(provider.name) as slot,
+        aclosing(_stream(request)) as stream,
+    ):
+        async for item in stream:
+            if isinstance(item, WireStreamEnd):
+                # Best-effort TPM accounting: a stream usually reports no
+                # usage (we don't request stream_options=include_usage), so
+                # this is typically a no-op — consistent with cost being None
+                # for streamed calls. When the stream does expose a final
+                # usage, debit it before releasing the slot.
+                slot.record_tokens(item.usage.debit())
+            elif item.text:
+                yield item.text
