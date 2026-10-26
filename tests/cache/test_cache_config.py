@@ -1,4 +1,13 @@
-"""Configuring the cache, the shipped store, and failures that must not fail a call."""
+"""Configuring the cache, the shipped store, and failures that must not fail a call.
+
+The call tests answer the provider through an :mod:`llmkit.testing` fake. Three
+stay below it: the bare-``MagicMock`` provider test, because such a provider
+cannot survive the real request path (its ``reasoning_kwargs`` returns a mock,
+which the request builder rejects with ``TypeError``); the undecodable-entry
+test, because a paid structured answer through the real parser compares
+unequal to a freshly built schema instance (reported as a likely defect); and
+the byte-identical request test, which inspects the LiteLLM adapter's kwargs.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +28,7 @@ from llmkit import (
     structured_llm_call,
     text_llm_call,
 )
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import UsageCounts
 from tests.cache.conftest import cache_provider
 
@@ -45,10 +55,18 @@ def _cache_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]
 
 
 class _Counting:
+    """A fake answering ``answer-<n>`` to its n-th request; a text call's round
+    trip is one request, so ``calls`` counts the calls that reached the provider."""
+
     def __init__(self) -> None:
         self.calls: int = 0
 
+    def __call__(self, _request: TransportRequest) -> Reply:
+        self.calls += 1
+        return Reply.text(f"answer-{self.calls}")
+
     async def text(self, *_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
+        """The same answers through the private ``acompletion_text`` seam."""
         self.calls += 1
         return f"answer-{self.calls}", None, (None, None, None)
 
@@ -139,7 +157,7 @@ async def test_a_raising_store_degrades_to_a_miss_and_warns_once(
     configure_llm_cache(store())
     transport = _Counting()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(transport):
         results = [await text_llm_call("q", feature="f", provider=provider) for _ in range(3)]
 
     assert results == ["answer-1", "answer-2", "answer-3"]
@@ -151,7 +169,7 @@ async def test_a_raising_store_degrades_to_a_miss_and_warns_once(
 async def test_reconfiguring_rearms_the_warning(caplog: pytest.LogCaptureFixture) -> None:
     transport = _Counting()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(transport):
         configure_llm_cache(_GetRaises())
         _ = await text_llm_call("q", feature="f", provider=provider)
         _ = await text_llm_call("q", feature="f", provider=provider)
@@ -170,7 +188,7 @@ async def test_a_store_returning_junk_is_a_miss(caplog: pytest.LogCaptureFixture
 
     configure_llm_cache(_Junk())
     transport = _Counting()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(transport):
         assert await text_llm_call("q", feature="f", provider=cache_provider()) == "answer-1"
     assert len(_cache_warnings(caplog)) == 1
 
@@ -205,7 +223,7 @@ async def test_an_unkeyable_request_bypasses_the_cache(caplog: pytest.LogCapture
     # call from an untyped caller and cannot be JSON-serialised for the key.
     blob = cast("object", {"role": "user", "content": [{"type": "blob", "data": b"\x00"}]})
     prompt = [cast("ChatMessage", blob)]
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(transport):
         a = await text_llm_call(prompt, feature="f", provider=cache_provider())
         b = await text_llm_call(prompt, feature="f", provider=cache_provider())
 
@@ -218,7 +236,8 @@ async def test_a_provider_the_key_cannot_read_bypasses_the_cache(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A bare ``MagicMock`` provider — every attribute an unserialisable mock —
-    is the shape most third-party test doubles take."""
+    is the shape most third-party test doubles take. It stays on the private
+    seam: the real request path rejects such a provider before any fake."""
     configure_llm_cache(cache := InMemoryLLMCache())
     transport = _Counting()
     with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
