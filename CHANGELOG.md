@@ -47,6 +47,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: text calls raise `OutputLimitError` when the provider truncates
+  the answer.** `text_llm_call`, `text_llm_call_sync` and
+  `text_llm_call_stream` used to return text cut off at the output-token limit
+  as if it were complete. When the provider explicitly reports
+  `finish_reason="length"` they now raise `OutputLimitError`, as
+  `structured_llm_call` already did; a missing or any other finish reason is
+  still a normal answer, and successful calls return the same types as before.
+  The cut-off text is on `exc.diagnostics.partial_text`, with the finish reason
+  and whatever token counts the provider reported, and in the call log's
+  `partial_text` and `output_limit` fields. A stream yields every chunk it
+  received and then raises from the iteration, after its usage is recorded.
+  The error is never retried by default and never cached. Listing it in
+  `retry_on` retries a buffered call or a stream that yielded nothing; a stream
+  that has yielded text is never replayed. `OutputLimitError`'s message now
+  reads `completion for model ...` rather than `structured completion for
+  model ...`; its constructor is unchanged. Tool calls still report the reason
+  as `stop_reason`. **Migration:** to keep using a partial answer, catch the
+  error and read the partial text:
+
+  ```python
+  try:
+      text = await text_llm_call(prompt, feature="drafting", max_tokens=400)
+  except OutputLimitError as exc:
+      text = exc.diagnostics.partial_text if exc.diagnostics else ""
+  ```
+
+  For a stream, wrap the `async for` loop rather than the call: the chunks you
+  already received are the partial answer. Code that catches
+  `LLM_RECOVERABLE_ERRORS` already catches the new error. A test that drove a
+  fake with `Reply(..., finish_reason="length")` against a text call and
+  expected the partial text back must now expect the error.
+- **The response-cache key version is now 2 (`LLM_CACHE_KEY_VERSION`).** An
+  entry stored by an earlier version records no stop reason, so it could hold a
+  truncated text answer that would now be replayed as complete. Every existing
+  entry — structured ones included, because the version is shared — misses
+  once and is replaced by the next successful answer. llmkit does not delete
+  or rewrite your stored entries; a store you own may drop version-1 keys at
+  its convenience.
 - **Google's provider display name is now `"Google Agent Platform"` (previously
   `"Google Vertex AI"`).** The new label appears in call-log `provider:` fields,
   the JSONL index, `describe_llm().provider_name`, error messages that name the

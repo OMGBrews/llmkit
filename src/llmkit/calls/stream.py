@@ -5,9 +5,10 @@ Owns what one streaming *attempt* is; the retry loop around it lives in
 different problem from retrying an awaitable and both loops belong together.
 
 The record this family writes is honest about how the stream ended: a provider
-error logs that error, and a consumer that abandons the stream mid-flight logs
-:data:`STREAM_ABANDONED_ERROR` — never a clean ``ok`` over a truncated
-transcript.
+error logs that error, a length truncation logs
+:class:`~llmkit.OutputLimitError` over the partial transcript, and a consumer
+that abandons the stream mid-flight logs :data:`STREAM_ABANDONED_ERROR` —
+never a clean ``ok`` over a truncated transcript.
 
 It reads the response cache, with the same key as a buffered text call, but
 takes no part in the single flight: a stream's answer is complete only when its
@@ -35,6 +36,7 @@ from llmkit.calls._shared import (
     resolve_model_and_provider,
 )
 from llmkit.capture import record_call, record_call_async
+from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
@@ -96,6 +98,15 @@ async def text_llm_call_stream(
     once any chunk has reached the caller, a mid-stream error propagates
     unretried. Each attempt is its own logged call.
 
+    When the provider reports ``finish_reason="length"``, the stream yields
+    every chunk it received and then raises
+    :class:`~llmkit.OutputLimitError` from the iteration, so wrap the
+    ``async for`` — not the call — to catch it. The text already yielded is
+    the partial answer, also on ``exc.diagnostics.partial_text``; the log
+    record keeps it as ``response`` and ``partial_text`` with the error, and
+    nothing is cached. It is never retried by default, and a stream that has
+    yielded text is never replayed, even when ``retry_on`` lists the type.
+
     ``cache`` is response-cache participation (see
     :func:`structured_llm_call`): unset defers to ``options``, then to
     ``True``; ``False`` bypasses lookup and store. With a cache configured, a
@@ -103,9 +114,9 @@ async def text_llm_call_stream(
     share a key — is replayed from the store as a **single chunk**, with no
     provider call, no rate-limiter slot and no retry loop, and logged with
     ``cache_hit=True`` and ``approximate_cost=0.0``. A stream is stored only
-    when it runs to completion: one its consumer abandons, or one that raises,
-    stores nothing. A stream has no ``on_result`` hook, so outside an
-    enclosing :func:`~llmkit.retry.with_retries` loop ``cache=False`` is how
+    when it runs to completion: one its consumer abandons, or one that raises
+    (a length truncation included), stores nothing. A stream has no
+    ``on_result`` hook, so outside an enclosing :func:`~llmkit.retry.with_retries` loop ``cache=False`` is how
     to ask for a fresh sample. Identical streams in flight at once each pay
     for their own answer — the single flight is the buffered calls' alone.
 
@@ -323,6 +334,7 @@ async def _stream_once(
     begin_queue_wait()
     accumulated: list[str] = []
     error: str | None = None
+    diagnostics: OutputLimitDiagnostics | None = None
     # What the transport actually sent, copied once, before the first yield:
     # until then every line here runs inside the consumer's first ``__anext__``,
     # the same context the funnel stamped. After a yield the consumer's own
@@ -363,6 +375,10 @@ async def _stream_once(
         raise
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, OutputLimitError):
+            # Unlike the buffered lane, ``response`` keeps the transcript the
+            # consumer already received; ``partial_text`` repeats it.
+            diagnostics = exc.diagnostics
         raise
     finally:
         if not captured:
@@ -385,6 +401,7 @@ async def _stream_once(
             reasoning_effort=reasoning_effort,
             call_id=call_id,
             attempt=attempt,
+            output_limit=diagnostics,
         )
         if error == STREAM_ABANDONED_ERROR:
             # Abandonment unwinds via GeneratorExit / a re-deliverable

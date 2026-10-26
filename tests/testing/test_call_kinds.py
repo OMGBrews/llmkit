@@ -228,8 +228,11 @@ async def test_length_truncation_per_kind() -> None:
     with install(lambda _request: truncated):
         with pytest.raises(OutputLimitError):
             _ = await structured_llm_call("x", output_schema=Summary, feature="f", retry=NO_RETRY)
-        assert await text_llm_call("x", feature="f") == '{"title": "t'
+        with pytest.raises(OutputLimitError) as caught:
+            _ = await text_llm_call("x", feature="f")
         result = await tool_llm_call("x", [ADD], feature="f")
+    assert caught.value.diagnostics is not None
+    assert caught.value.diagnostics.partial_text == '{"title": "t'
     assert result.stop_reason == "length"
 
 

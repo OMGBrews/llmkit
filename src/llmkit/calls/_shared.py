@@ -46,7 +46,7 @@ from pydantic import BaseModel
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import cache_key_or_none, read_through
-from llmkit.exceptions import ResultValidationError, ToolArgumentError
+from llmkit.exceptions import OutputLimitDiagnostics, ResultValidationError, ToolArgumentError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
@@ -461,6 +461,7 @@ def build_text_record(
     usage: TokenUsage | None = None,
     cache_hit: bool = False,
     source_call_id: str | None = None,
+    output_limit: OutputLimitDiagnostics | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -479,11 +480,14 @@ def build_text_record(
     too (both default ``None`` — absent from the request and unset on the
     record). ``usage`` is the buffered call's token counts; the streaming
     surface leaves it ``None``, because a plain text stream does not ask the
-    provider for usage. ``cache_hit`` marks a response-cache hit — buffered or
-    streamed, whichever lane answered — whose ``queue_wait_ms`` is ``None``
-    because it never queued (the queue-wait stamp would still hold the
-    previous attempt's value), and ``source_call_id`` names the call that paid
-    for its answer.
+    provider for usage — except on a truncated stream, below. ``cache_hit``
+    marks a response-cache hit — buffered or streamed, whichever lane
+    answered — whose ``queue_wait_ms`` is ``None`` because it never queued
+    (the queue-wait stamp would still hold the previous attempt's value), and ``source_call_id`` names the call that paid
+    for its answer. ``output_limit`` is a truncated attempt's
+    :class:`~llmkit.OutputLimitDiagnostics`: it fills the record's
+    ``output_limit`` and ``partial_text`` fields, and its token counts become
+    ``usage`` when the caller passes none, as on the structured path.
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
@@ -492,6 +496,12 @@ def build_text_record(
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = resolve_model_and_provider(model, provider)
+    if output_limit is not None and usage is None:
+        usage = TokenUsage(
+            output_limit.prompt_tokens,
+            output_limit.completion_tokens,
+            output_limit.total_tokens,
+        )
     return LLMCallRecord(
         started_at=started_at,
         feature=feature,
@@ -514,4 +524,6 @@ def build_text_record(
         usage=usage_log_dict(usage),
         cache_hit=cache_hit,
         source_call_id=source_call_id,
+        output_limit=output_limit.to_log_dict() if output_limit is not None else None,
+        partial_text=output_limit.partial_text if output_limit is not None else None,
     )

@@ -39,8 +39,8 @@ The recoverable set is split into five subsets the retry layer budgets
   the union) ever re-asks a circuit the breaker already knows is open — unless
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
-  (:class:`OutputLimitError`, raised when a structured completion is cut off
-  by the output-token limit). Recoverable in the same catch-set sense as the
+  (:class:`OutputLimitError`, raised when a structured or text completion is
+  cut off by the output-token limit). Recoverable in the same catch-set sense as the
   breaker, but **never retried** on either budget by default:
   re-asking with an identical token budget can only truncate again — unless
   a caller explicitly lists the type in ``retry_on``.
@@ -360,7 +360,7 @@ LLM_BACKPRESSURE_ERRORS: tuple[type[Exception], ...] = (CircuitOpenError,)
 
 @dataclass(frozen=True)
 class OutputLimitDiagnostics:
-    """What a truncated structured completion reported, best-effort.
+    """What a truncated structured or text completion reported, best-effort.
 
     Carried by :attr:`OutputLimitError.diagnostics` and written to the call
     log: ``partial_text`` as the record's ``partial_text`` field, the rest as
@@ -370,7 +370,7 @@ class OutputLimitDiagnostics:
 
     Attributes:
         partial_text: The unfinished answer text, unparsed — not a validated
-            response.
+            response. For a text stream, the transcript already yielded.
         finish_reason: The provider's stop reason (``"length"`` for an
             OpenAI-shaped truncation).
         prompt_tokens: Input tokens, from the completion's usage.
@@ -401,18 +401,24 @@ class OutputLimitDiagnostics:
 
 
 class OutputLimitError(Exception):
-    """A structured completion was truncated by the output-token limit.
+    """A structured or text completion was truncated by the output-token limit.
 
     Raised by the structured path when the provider stopped generating at the
     token ceiling (``finish_reason='length'`` / Gemini ``MAX_TOKENS``) before a
-    complete response could be parsed. Deliberately **never retried**:
+    complete response could be parsed, and by the buffered and streamed text
+    paths when the provider explicitly reports ``finish_reason='length'`` — a
+    text stream raises it after its last chunk, so the text already yielded
+    is the partial answer. A missing finish reason is never read as a
+    truncation. Tool calls report the reason as ``stop_reason`` instead.
+    Deliberately **never retried**:
     re-asking with an identical token budget can only truncate again — the
     motivating production failure was a degenerate repetition loop that burned
     to the provider ceiling on the original ask *and* on every blind re-ask —
     so instructor's in-call repair loop refuses the re-ask (see
     :mod:`llmkit._litellm`) and :func:`~llmkit.retry.with_retries` propagates
     it immediately under every configuration, unless a caller explicitly lists
-    the type in ``retry_on`` (an explicit opt-in wins).
+    the type in ``retry_on`` (an explicit opt-in wins — though a text stream
+    that has already yielded text is never replayed, even then).
 
     Carries what the truncated completion reported, so the failure can be
     investigated without paying to reproduce it — but a truncation does not
@@ -457,7 +463,7 @@ class OutputLimitError(Exception):
     ) -> None:
         cap = "provider ceiling" if max_tokens is None else f"max_tokens={max_tokens}"
         super().__init__(
-            f"structured completion for model {model!r} truncated by the output-token limit "
+            f"completion for model {model!r} truncated by the output-token limit "
             + f"({cap}, generated {completion_tokens} tokens); not retried — an identical "
             + "budget can only truncate again"
         )
