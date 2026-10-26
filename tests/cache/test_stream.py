@@ -2,9 +2,15 @@
 
 A stream shares the buffered text key, replays a hit as one chunk outside the
 retry loop, stores only a stream that ran to completion, and takes no part in
-the single flight. As in ``test_read_through``, each test counts invocations
-of the patched transport seam, so "answered from the cache" is a positive
+the single flight. As in ``test_read_through``, each test answers the provider
+through an :mod:`llmkit.testing` fake and counts the requests it received; the
+cache sits above the fake, so "answered from the cache" is a positive
 observation rather than the absence of an error.
+
+Three tests stay below the fake: the mid-stream failure, because a fake can
+fail a stream only before its first chunk; and the slot-and-retry and
+byte-identical request tests, which patch ``litellm.acompletion`` below the
+LiteLLM adapter by design.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from llmkit import (
     InMemoryLLMCache,
     LLMCallOptions,
     ResultValidationError,
+    TokenUsage,
     capture_llm_records,
     configure_llm_cache,
     text_llm_call,
@@ -30,38 +37,30 @@ from llmkit import (
 )
 from llmkit.calls import STREAM_ABANDONED_ERROR
 from llmkit.rate_limiting import GlobalRateLimiter
-from llmkit.rate_limiting._observability import stamp_queue_wait
 from llmkit.retry import with_retries, with_retries_stream
-from tests._support import UsageCounts
+from llmkit.testing import Reply, TransportRequest, install
 from tests.cache.conftest import cache_provider
 
 
 @dataclass
-class _Transport:
-    """Fake streamed and buffered seams: answer *answers* in turn, count calls.
+class _InTurn:
+    """A fake answering *answers* in turn, streamed or buffered.
 
-    A streamed answer arrives as one chunk per word, so a replay's single
-    chunk is distinguishable from the live stream it stored.
+    A streamed answer arrives as one chunk per word, each later word with its
+    leading space, so a replay's single chunk is distinguishable from the live
+    stream it stored. ``len(installed.requests)`` counts the calls that paid.
     """
 
     answers: list[str] = field(default_factory=lambda: ["one two", "three four", "five"])
-    calls: int = 0
+    served: int = 0
 
-    def _next(self) -> str:
-        self.calls += 1
-        return self.answers[self.calls - 1]
-
-    def stream(self, *_a: object, **_k: object) -> AsyncIterator[str]:
-        answer = self._next()
-
-        async def _chunks() -> AsyncIterator[str]:
-            for index, word in enumerate(answer.split(" ")):
-                yield word if index == 0 else f" {word}"
-
-        return _chunks()
-
-    async def text(self, *_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
-        return self._next(), 0.002, (10, 5, 15)
+    def __call__(self, request: TransportRequest) -> Reply:
+        self.served += 1
+        answer = self.answers[self.served - 1]
+        if request.kind == "text_stream":
+            words = answer.split(" ")
+            return Reply(chunks=[words[0], *(f" {word}" for word in words[1:])])
+        return Reply.text(answer, cost=0.002, usage=TokenUsage(10, 5, 15))
 
 
 def _no_cache_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -77,32 +76,29 @@ async def _chunks(**kwargs: object) -> list[str]:
 @pytest.mark.asyncio
 async def test_hit_replays_the_stored_text_as_one_chunk(caplog: pytest.LogCaptureFixture) -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with patch("llmkit._litellm.astream_text", side_effect=transport.stream):
+    with install(transport) as installed:
         live = await _chunks(provider=provider)
         replayed = await _chunks(provider=provider)
 
     assert live == ["one", " two"]
     assert replayed == ["one two"]
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     _no_cache_warning(caplog)
 
 
 @pytest.mark.asyncio
 async def test_a_buffered_answer_serves_a_stream(caplog: pytest.LogCaptureFixture) -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport.text),
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-    ):
+    with install(transport) as installed:
         paid = await text_llm_call("q", feature="f", provider=provider)
         replayed = await _chunks(provider=provider)
 
     assert replayed == [paid] == ["one two"]
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     _no_cache_warning(caplog)
 
 
@@ -110,18 +106,14 @@ async def test_a_buffered_answer_serves_a_stream(caplog: pytest.LogCaptureFixtur
 async def test_a_streamed_answer_serves_a_buffered_call(caplog: pytest.LogCaptureFixture) -> None:
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport.text),
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-        capture_llm_records() as records,
-    ):
+    with install(transport) as installed, capture_llm_records() as records:
         _ = await _chunks(provider=provider)
         served = await text_llm_call("q", feature="f", provider=provider)
 
     assert served == "one two"
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     assert len(cache) == 1
     paid, hit = records
     # The hit names the lane that answered; the call that paid is the stream.
@@ -134,12 +126,9 @@ async def test_a_streamed_answer_serves_a_buffered_call(caplog: pytest.LogCaptur
 async def test_an_abandoned_stream_is_not_stored() -> None:
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-        capture_llm_records() as records,
-    ):
+    with install(transport) as installed, capture_llm_records() as records:
         stream = text_llm_call_stream("q", feature="f", provider=provider)
         async for _chunk in stream:
             break
@@ -149,21 +138,42 @@ async def test_an_abandoned_stream_is_not_stored() -> None:
 
     assert records[0].error == STREAM_ABANDONED_ERROR
     assert later == ["three", " four"]
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
     assert len(cache) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("before_first_chunk", [True, False])
-async def test_a_raising_stream_is_not_stored(before_first_chunk: bool) -> None:
+async def test_a_stream_failing_before_its_first_chunk_is_not_stored() -> None:
+    cache = InMemoryLLMCache()
+    configure_llm_cache(cache)
+    provider = cache_provider()
+
+    def _failing(_request: TransportRequest) -> Reply:
+        raise ValueError("provider broke")
+
+    seen: list[str] = []
+    with install(_failing) as installed, pytest.raises(ValueError, match="provider broke"):
+        async for chunk in text_llm_call_stream(
+            "q", feature="f", provider=provider, retry=NO_RETRY
+        ):
+            seen.append(chunk)
+
+    assert seen == []
+    assert len(installed.requests) == 1
+    assert len(cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stream_failing_mid_stream_is_not_stored() -> None:
+    """Stays on the private ``astream_text`` seam: a public fake can fail a
+    stream only before its first chunk."""
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
     provider = cache_provider()
 
     def _failing(*_a: object, **_k: object) -> AsyncIterator[str]:
         async def _chunks() -> AsyncIterator[str]:
-            if not before_first_chunk:
-                yield "partial"
+            yield "partial"
             raise ValueError("provider broke")
 
         return _chunks()
@@ -178,33 +188,25 @@ async def test_a_raising_stream_is_not_stored(before_first_chunk: bool) -> None:
         ):
             seen.append(chunk)
 
-    assert seen == ([] if before_first_chunk else ["partial"])
+    assert seen == ["partial"]
     assert len(cache) == 0
 
 
 @pytest.mark.asyncio
 async def test_stream_hit_record_fields() -> None:
     """The hit record names the stream lane, pays nothing, points at the call
-    that paid, and does not inherit the paid attempt's queue-wait stamp."""
+    that paid, and does not inherit the paid attempt's queue-wait stamp (the
+    real limiter's near-zero wait, stamped once the paid stream held its slot)."""
     configure_llm_cache(InMemoryLLMCache())
     provider = cache_provider()
 
-    def _stamped(*_a: object, **_k: object) -> AsyncIterator[str]:
-        async def _chunks() -> AsyncIterator[str]:
-            stamp_queue_wait(42.0)  # what the limiter does once a slot is held
-            yield "yes"
-
-        return _chunks()
-
-    with (
-        patch("llmkit._litellm.astream_text", side_effect=_stamped),
-        capture_llm_records() as records,
-    ):
+    with install(lambda _request: Reply.text("yes")), capture_llm_records() as records:
         _ = await _chunks(provider=provider)
         _ = await _chunks(provider=provider)
 
     paid, hit = records
-    assert (paid.cache_hit, paid.queue_wait_ms, paid.approximate_cost) == (False, 42.0, None)
+    assert (paid.cache_hit, paid.approximate_cost) == (False, None)
+    assert paid.queue_wait_ms is not None and paid.queue_wait_ms >= 0
     assert (hit.cache_hit, hit.schema, hit.approximate_cost) == (True, "stream", 0.0)
     assert (hit.queue_wait_ms, hit.error, hit.attempt) == (None, None, 1)
     assert cast("object", hit.response) == "yes"
@@ -215,12 +217,9 @@ async def test_stream_hit_record_fields() -> None:
 @pytest.mark.asyncio
 async def test_an_abandoned_replay_is_recorded_as_abandoned() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-        capture_llm_records() as records,
-    ):
+    with install(transport) as installed, capture_llm_records() as records:
         _ = await _chunks(provider=provider)
         stream = text_llm_call_stream("q", feature="f", provider=provider)
         async for _chunk in stream:
@@ -229,7 +228,7 @@ async def test_an_abandoned_replay_is_recorded_as_abandoned() -> None:
 
     hit = records[1]
     assert (hit.cache_hit, hit.error, hit.approximate_cost) == (True, STREAM_ABANDONED_ERROR, 0.0)
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -237,17 +236,13 @@ async def test_a_stored_empty_answer_replays_as_no_chunks() -> None:
     """An empty buffered answer is stored; replayed, it yields nothing — as a
     live empty stream does — and the hit is still recorded."""
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport(answers=[""])
+    transport = _InTurn(answers=[""])
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport.text),
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-        capture_llm_records() as records,
-    ):
+    with install(transport) as installed, capture_llm_records() as records:
         assert await text_llm_call("q", feature="f", provider=provider) == ""
         assert await _chunks(provider=provider) == []
 
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     assert (records[1].cache_hit, records[1].schema) == (True, "stream")
 
 
@@ -298,12 +293,12 @@ async def test_a_stream_hit_takes_no_slot_and_enters_no_retry_loop() -> None:
 async def test_cache_false_bypasses_lookup_and_store(via: str) -> None:
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
     opt_out: dict[str, object] = (
         {"cache": False} if via == "keyword" else {"options": LLMCallOptions(cache=False)}
     )
-    with patch("llmkit._litellm.astream_text", side_effect=transport.stream):
+    with install(transport) as installed:
         _ = await _chunks(provider=provider)  # stores "one two"
         bypassed = await _chunks(provider=provider, **opt_out)
         assert len(cache) == 1
@@ -312,7 +307,7 @@ async def test_cache_false_bypasses_lookup_and_store(via: str) -> None:
     # The opted-out stream neither read "one two" nor replaced it.
     assert bypassed == ["three", " four"]
     assert served == ["one two"]
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -321,15 +316,15 @@ async def test_identical_streams_in_flight_both_reach_the_transport() -> None:
     started while the first is mid-consumption does not wait on it."""
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
-    transport = _Transport(answers=["a b", "a b"])
+    transport = _InTurn(answers=["a b", "a b"])
     provider = cache_provider()
-    with patch("llmkit._litellm.astream_text", side_effect=transport.stream):
+    with install(transport) as installed:
         first = text_llm_call_stream("q", feature="f", provider=provider)
         second = text_llm_call_stream("q", feature="f", provider=provider)
         async with asyncio.timeout(2):
             assert await anext(first) == "a"
             assert await anext(second) == "a"
-            assert transport.calls == 2
+            assert len(installed.requests) == 2
             assert [c async for c in first] == [" b"]
             assert [c async for c in second] == [" b"]
 
@@ -341,12 +336,9 @@ async def test_a_stream_does_not_block_a_buffered_call_on_the_same_key() -> None
     """A buffered call made between a stream's chunks — the stream's own task —
     neither waits on the stream nor is served a half-finished answer."""
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport.text),
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
-    ):
+    with install(transport) as installed:
         async with asyncio.timeout(2):
             stream = text_llm_call_stream("q", feature="f", provider=provider)
             assert await anext(stream) == "one"
@@ -354,7 +346,7 @@ async def test_a_stream_does_not_block_a_buffered_call_on_the_same_key() -> None
             rest = [c async for c in stream]
 
     assert (buffered, rest) == ("three four", [" two"])
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -362,7 +354,7 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     """A stream re-run by an enclosing ``with_retries`` pass asks for a new
     sample: it skips the lookup and its answer replaces the stored one."""
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
     seen: list[str] = []
 
@@ -373,7 +365,7 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
             raise ResultValidationError("host rejects the first draft")
         return text
 
-    with patch("llmkit._litellm.astream_text", side_effect=transport.stream):
+    with install(transport) as installed:
         _ = await _chunks(provider=provider)  # stores "one two"
         accepted = await with_retries(
             _draft, max_attempts=3, validation_retry_on=(ResultValidationError,)
@@ -384,24 +376,24 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     assert seen == ["one two", "three four"]
     assert accepted == "three four"
     assert after == ["three four"]
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
 async def test_an_unkeyable_stream_bypasses_the_cache(caplog: pytest.LogCaptureFixture) -> None:
     cache = InMemoryLLMCache()
     configure_llm_cache(cache)
-    transport = _Transport()
+    transport = _InTurn()
     provider = cache_provider()
     provider.completion_kwargs = MagicMock(return_value={"api_base": object()})
     with (
         caplog.at_level(logging.WARNING, logger="llmkit.cache"),
-        patch("llmkit._litellm.astream_text", side_effect=transport.stream),
+        install(transport) as installed,
     ):
         _ = await _chunks(provider=provider)
         _ = await _chunks(provider=provider)
 
-    assert (transport.calls, len(cache)) == (2, 0)
+    assert (len(installed.requests), len(cache)) == (2, 0)
     assert [r for r in caplog.records if r.name == "llmkit.cache"]
 
 

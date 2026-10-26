@@ -1,8 +1,18 @@
-"""The cache seen through the buffered call functions, over the patched seam.
+"""The cache seen through the buffered call functions, over an installed fake.
 
-Each test patches the transport seam in :mod:`llmkit._litellm` and counts its
-invocations, so "answered from the cache" is a positive observation — the
-transport was not awaited — rather than the absence of an error.
+Each test answers the provider round trip with an :mod:`llmkit.testing` fake
+and counts the requests it received. The cache sits above the fake, so
+"answered from the cache" is a positive observation — the request never
+reached the provider — rather than the absence of an error.
+
+Four structured-call tests stay on the private ``acompletion_structured``
+seam: ``test_structured_hit_skips_the_transport``, ``test_sync_wrappers_hit``,
+``test_identical_requests_in_flight_share_one_transport_call`` and
+``test_a_truncated_answer_is_not_stored``. Through the real parser a paid
+structured answer is an instance of instructor's response-model subclass of
+the schema, not of the schema itself, so it compares unequal to the cached
+copy and to a freshly built instance, which these tests assert. That is
+reported as a likely defect, not rewritten around.
 """
 
 from __future__ import annotations
@@ -29,8 +39,9 @@ from llmkit import (
     text_llm_call_sync,
 )
 from llmkit.retry import with_retries
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import NO_USAGE, UsageCounts
-from tests.cache.conftest import cache_provider
+from tests.cache.conftest import CALL_MODE, cache_provider
 
 
 class _Answer(BaseModel):
@@ -38,8 +49,30 @@ class _Answer(BaseModel):
 
 
 @dataclass
+class _InTurn:
+    """A fake provider answering *answers* in turn, one per round trip.
+
+    A structured call gets the answer as ``_Answer(verdict=...)`` JSON, a text
+    call as plain text. The cache sits above the fake, so a hit or a joined
+    in-flight request never reaches it: ``len(installed.requests)`` counts the
+    calls that paid.
+    """
+
+    answers: list[str] = field(default_factory=lambda: ["first", "second", "third"])
+    served: int = 0
+
+    def __call__(self, request: TransportRequest) -> Reply:
+        self.served += 1
+        answer = self.answers[self.served - 1]
+        if request.kind == "structured":
+            return Reply.json(_Answer(verdict=answer))
+        return Reply.text(answer)
+
+
+@dataclass
 class _Transport:
-    """A fake transport seam: returns *answers* in turn and counts calls."""
+    """A fake transport seam for the tests still on it: returns *answers* in
+    turn and counts calls."""
 
     answers: list[str] = field(default_factory=lambda: ["first", "second", "third"])
     calls: int = 0
@@ -78,13 +111,12 @@ async def test_structured_hit_skips_the_transport(caplog: pytest.LogCaptureFixtu
 @pytest.mark.asyncio
 async def test_text_hit_skips_the_transport(caplog: pytest.LogCaptureFixture) -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         first = await text_llm_call("q", feature="f", provider=provider)
         second = await text_llm_call("q", feature="f", provider=provider)
 
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     assert first == second == "first"
     _no_cache_warning(caplog)
 
@@ -112,36 +144,33 @@ def test_sync_wrappers_hit(caplog: pytest.LogCaptureFixture) -> None:
 @pytest.mark.asyncio
 async def test_different_request_misses() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         a = await text_llm_call("q", feature="f", provider=provider)
         b = await text_llm_call("q", feature="f", provider=provider, temperature=0.2)
 
-    assert (a, b, transport.calls) == ("first", "second", 2)
+    assert (a, b, len(installed.requests)) == ("first", "second", 2)
 
 
 @pytest.mark.asyncio
 async def test_feature_and_label_do_not_split_hits() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         _ = await text_llm_call("q", feature="drafting", provider=provider)
         hit = await text_llm_call("q", feature="review", label="x", provider=provider)
 
-    assert (hit, transport.calls) == ("first", 1)
+    assert (hit, len(installed.requests)) == ("first", 1)
 
 
 @pytest.mark.asyncio
 async def test_no_cache_configured_always_reaches_the_transport() -> None:
-    transport = _Transport()
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         a = await text_llm_call("q", feature="f", provider=provider)
         b = await text_llm_call("q", feature="f", provider=provider)
 
-    assert (a, b, transport.calls) == ("first", "second", 2)
+    assert (a, b, len(installed.requests)) == ("first", "second", 2)
 
 
 # --- in flight at once -----------------------------------------------------
@@ -185,15 +214,15 @@ async def test_follower_runs_itself_when_the_leader_raises() -> None:
     release = asyncio.Event()
     calls = [0]
 
-    async def _first_fails(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
+    async def _first_fails(_request: TransportRequest) -> Reply:
         calls[0] += 1
         if calls[0] == 1:
             _ = await release.wait()
             raise ValueError("provider rejected the request")
-        return "recovered", None, NO_USAGE
+        return Reply.text("recovered")
 
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=_first_fails):
+    with install(_first_fails) as installed:
         leader = asyncio.create_task(
             text_llm_call("q", feature="f", provider=provider, retry=NO_RETRY)
         )
@@ -207,7 +236,7 @@ async def test_follower_runs_itself_when_the_leader_raises() -> None:
 
     assert isinstance(results[0], ValueError)
     assert results[1] == "recovered"
-    assert calls[0] == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -217,15 +246,15 @@ async def test_follower_runs_itself_when_the_leader_is_cancelled() -> None:
     release = asyncio.Event()
     calls = [0]
 
-    async def _gated(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
+    async def _gated(_request: TransportRequest) -> Reply:
         calls[0] += 1
         if calls[0] == 1:
             _ = await asyncio.Event().wait()  # never answers
         _ = await release.wait()
-        return "follower's own", None, NO_USAGE
+        return Reply.text("follower's own")
 
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=_gated):
+    with install(_gated) as installed:
         leader = asyncio.create_task(text_llm_call("q", feature="f", provider=provider))
         follower = asyncio.create_task(text_llm_call("q", feature="f", provider=provider))
         for _ in range(5):
@@ -236,7 +265,7 @@ async def test_follower_runs_itself_when_the_leader_is_cancelled() -> None:
 
     assert result == "follower's own"
     assert leader.cancelled()
-    assert calls[0] == 2
+    assert len(installed.requests) == 2
 
 
 # --- what is never stored --------------------------------------------------
@@ -245,27 +274,34 @@ async def test_follower_runs_itself_when_the_leader_is_cancelled() -> None:
 @pytest.mark.asyncio
 async def test_a_raised_attempt_is_not_stored() -> None:
     configure_llm_cache(cache := InMemoryLLMCache())
-    transport = AsyncMock(side_effect=[ValueError("boom"), ("ok", None, NO_USAGE)])
+
+    replies: list[Exception | Reply] = [ValueError("boom"), Reply.text("ok")]
+
+    def _fails_once(_request: TransportRequest) -> Reply:
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", transport):
+    with install(_fails_once) as installed:
         with pytest.raises(ValueError, match="boom"):
             _ = await text_llm_call("q", feature="f", provider=provider, retry=NO_RETRY)
         assert len(cache) == 0
         assert await text_llm_call("q", feature="f", provider=provider) == "ok"
 
-    assert transport.await_count == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
 async def test_an_on_result_rejection_is_not_stored() -> None:
     configure_llm_cache(cache := InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
 
     def _reject(_text: str) -> None:
         raise ResultValidationError("not this one")
 
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()):
         with pytest.raises(ResultValidationError):
             _ = await text_llm_call(
                 "q", feature="f", provider=provider, retry=NO_RETRY, on_result=_reject
@@ -297,12 +333,11 @@ async def test_a_truncated_answer_is_not_stored() -> None:
 @pytest.mark.parametrize("via", ["keyword", "options"])
 async def test_cache_false_bypasses_lookup_and_store(via: str) -> None:
     configure_llm_cache(cache := InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
     opt_out: dict[str, object] = (
         {"cache": False} if via == "keyword" else {"options": LLMCallOptions(cache=False)}
     )
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         # Not stored...
         a = await text_llm_call("q", feature="f", provider=provider, **opt_out)  # pyright: ignore[reportArgumentType]  # test-helper — kwargs splat
         assert len(cache) == 0
@@ -311,35 +346,32 @@ async def test_cache_false_bypasses_lookup_and_store(via: str) -> None:
         c = await text_llm_call("q", feature="f", provider=provider, **opt_out)  # pyright: ignore[reportArgumentType]  # test-helper — kwargs splat
 
     assert (a, b, c) == ("first", "second", "third")
-    assert transport.calls == 3
+    assert len(installed.requests) == 3
 
 
 @pytest.mark.asyncio
 async def test_keyword_overrides_options_cache() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
     off = LLMCallOptions(cache=False)
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         _ = await text_llm_call("q", feature="f", provider=provider, options=off, cache=True)
         hit = await text_llm_call("q", feature="f", provider=provider, options=off, cache=True)
 
-    assert (hit, transport.calls) == ("first", 1)
+    assert (hit, len(installed.requests)) == ("first", 1)
 
 
 @pytest.mark.asyncio
 async def test_cache_false_skips_single_flight() -> None:
     configure_llm_cache(InMemoryLLMCache())
     release = asyncio.Event()
-    calls = [0]
 
-    async def _gated(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
-        calls[0] += 1
+    async def _gated(_request: TransportRequest) -> Reply:
         _ = await release.wait()
-        return "x", None, NO_USAGE
+        return Reply.text("x")
 
     provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_text", side_effect=_gated):
+    with install(_gated) as installed:
         tasks = [
             asyncio.create_task(text_llm_call("q", feature="f", provider=provider, cache=False))
             for _ in range(2)
@@ -349,7 +381,7 @@ async def test_cache_false_skips_single_flight() -> None:
         release.set()
         _ = await asyncio.gather(*tasks)
 
-    assert calls[0] == 2
+    assert len(installed.requests) == 2
 
 
 # --- the caller rejecting a stored answer ----------------------------------
@@ -358,20 +390,19 @@ async def test_cache_false_skips_single_flight() -> None:
 @pytest.mark.asyncio
 async def test_on_result_rejecting_a_cached_answer_is_a_miss() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
 
     def _only_second(text: str) -> None:
         if text != "second":
             raise ResultValidationError(f"{text} rejected")
 
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         _ = await text_llm_call("q", feature="f", provider=provider)
         picky = await text_llm_call("q", feature="f", provider=provider, on_result=_only_second)
         # The accepted answer replaced the stored one.
         later = await text_llm_call("q", feature="f", provider=provider)
 
-    assert (picky, later, transport.calls) == ("second", "second", 2)
+    assert (picky, later, len(installed.requests)) == ("second", "second", 2)
 
 
 @pytest.mark.asyncio
@@ -380,7 +411,6 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     ``retry=NO_RETRY`` — asks for a new sample on each later pass. Those passes
     skip the lookup, so the stored answer cannot become a fixed point."""
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
     provider = cache_provider()
     seen: list[str] = []
 
@@ -391,7 +421,7 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
             raise ResultValidationError("host rejects the first draft")
         return text
 
-    with patch("llmkit._litellm.acompletion_text", side_effect=transport.text):
+    with install(_InTurn()) as installed:
         _ = await text_llm_call("q", feature="draft", provider=provider)  # stores "first"
         accepted = await with_retries(
             _draft, max_attempts=3, validation_retry_on=(ResultValidationError,)
@@ -402,7 +432,7 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     assert seen == ["first", "second"]
     assert accepted == "second"
     assert after == "second"
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -414,15 +444,14 @@ async def test_aliases_survive_the_round_trip(caplog: pytest.LogCaptureFixture) 
         score: int = Field(alias="Score")
 
     configure_llm_cache(InMemoryLLMCache())
-    transport = AsyncMock(return_value=(_Aliased(Score=3), None, NO_USAGE))
-    provider = cache_provider()
+    provider = cache_provider(instructor_mode=CALL_MODE)
     with (
         caplog.at_level(logging.DEBUG, logger="llmkit.cache"),
-        patch("llmkit._litellm.acompletion_structured", transport),
+        install(lambda _request: Reply.json(_Aliased(Score=3))) as installed,
     ):
         _ = await structured_llm_call("q", _Aliased, feature="f", provider=provider)
         hit = await structured_llm_call("q", _Aliased, feature="f", provider=provider)
 
     assert hit.score == 3
-    assert transport.await_count == 1
+    assert len(installed.requests) == 1
     _no_cache_warning(caplog)

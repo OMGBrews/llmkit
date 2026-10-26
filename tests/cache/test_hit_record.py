@@ -3,6 +3,10 @@
 A hit still writes one :class:`~llmkit.LLMCallRecord` — the log is how an
 operator sees that a call happened — but it takes no rate-limiter slot, runs no
 retry loop, and pays nothing.
+
+The provider is answered by an :mod:`llmkit.testing` fake, so the paid call
+runs the real limiter, parser and logging. The slot-and-retry test stays on
+``litellm.acompletion``, below the LiteLLM adapter, by design.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from pydantic import BaseModel
 from llmkit import (
     InMemoryLLMCache,
     LocalYamlLogSink,
+    TokenUsage,
     capture_llm_records,
     configure_llm_cache,
     configure_llm_logging,
@@ -26,31 +31,28 @@ from llmkit import (
     text_llm_call,
 )
 from llmkit.rate_limiting import GlobalRateLimiter
-from llmkit.rate_limiting._observability import stamp_queue_wait
 from llmkit.retry import with_retries
-from tests._support import UsageCounts
-from tests.cache.conftest import cache_provider
+from llmkit.testing import Reply, TransportRequest, install
+from tests.cache.conftest import CALL_MODE, cache_provider
 
 
 class _Answer(BaseModel):
     verdict: str
 
 
-async def _structured(*_a: object, **_k: object) -> tuple[_Answer, float | None, UsageCounts]:
-    return _Answer(verdict="yes"), 0.004, (100, 20, 120)
+def _structured(_request: TransportRequest) -> Reply:
+    return Reply.json(_Answer(verdict="yes"), cost=0.004, usage=TokenUsage(100, 20, 120))
 
 
 @pytest.mark.asyncio
 async def test_hit_record_fields() -> None:
     configure_llm_cache(InMemoryLLMCache())
-    provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_structured),
-        capture_llm_records() as records,
-    ):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_structured) as installed, capture_llm_records() as records:
         _ = await structured_llm_call("q", _Answer, feature="coach", label="a", provider=provider)
         _ = await structured_llm_call("q", _Answer, feature="coach", label="b", provider=provider)
 
+    assert len(installed.requests) == 1
     paid, hit = records
     assert paid.cache_hit is False
     assert paid.source_call_id is None
@@ -74,23 +76,20 @@ async def test_hit_record_fields() -> None:
 @pytest.mark.asyncio
 async def test_text_hit_record_never_reads_the_previous_queue_wait() -> None:
     """The queue-wait stamp still holds the paid attempt's value when the hit
-    is recorded; the hit must not inherit it."""
+    is recorded; the hit must not inherit it. The real limiter stamps the
+    paid attempt's (near-zero) wait once its slot is held."""
     configure_llm_cache(InMemoryLLMCache())
     provider = cache_provider()
 
-    async def _text(*_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
-        stamp_queue_wait(42.0)  # what the limiter does once a slot is held
-        return "yes", 0.001, (1, 1, 2)
+    def _text(_request: TransportRequest) -> Reply:
+        return Reply.text("yes", cost=0.001, usage=TokenUsage(1, 1, 2))
 
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=_text),
-        capture_llm_records() as records,
-    ):
+    with install(_text), capture_llm_records() as records:
         _ = await text_llm_call("q", feature="f", provider=provider)
         _ = await text_llm_call("q", feature="f", provider=provider)
 
     paid, hit = records
-    assert paid.queue_wait_ms == 42.0
+    assert paid.queue_wait_ms is not None and paid.queue_wait_ms >= 0
     assert (hit.cache_hit, hit.queue_wait_ms, hit.schema) == (True, None, "text")
     assert cast("object", hit.response) == "yes"
     assert (hit.approximate_cost, hit.usage, hit.source_call_id) == (0.0, None, paid.call_id)
@@ -98,11 +97,8 @@ async def test_text_hit_record_never_reads_the_previous_queue_wait() -> None:
 
 @pytest.mark.asyncio
 async def test_records_without_a_cache_say_so() -> None:
-    provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_structured),
-        capture_llm_records() as records,
-    ):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_structured), capture_llm_records() as records:
         _ = await structured_llm_call("q", _Answer, feature="f", provider=provider)
 
     (record,) = records
@@ -113,8 +109,8 @@ async def test_records_without_a_cache_say_so() -> None:
 async def test_header_line_two_and_index_carry_the_flag(tmp_path: Path) -> None:
     configure_llm_cache(InMemoryLLMCache())
     configure_llm_logging(LocalYamlLogSink(tmp_path))
-    provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_structured):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_structured):
         _ = await structured_llm_call("q", _Answer, feature="f", label="paid", provider=provider)
         _ = await structured_llm_call("q", _Answer, feature="f", label="hit", provider=provider)
 
