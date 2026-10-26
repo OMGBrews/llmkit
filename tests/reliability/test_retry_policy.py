@@ -20,8 +20,18 @@ behaviour in ``test_default_retries.py``:
 * the validation/transport budget split (a deterministic schema failure can't
   burn the full transport budget).
 
-A canonical transient error is :class:`TimeoutError`; a canonical
-non-recoverable one is an ``openai`` auth/4xx status error.
+The call-function tests fake the provider through :mod:`llmkit.testing`, so
+the real limiter, instructor parsing and in-call repair run around each
+attempt. A structured call's failure therefore escapes as instructor's
+``InstructorRetryException`` with the original on ``__cause__``, and malformed
+JSON costs one in-call repair re-ask (``repair=True``) per attempt, so attempt
+counts are taken over the first asks. The tests that hand-build instructor's
+wrap shapes (the pre-1.15 ``args[0]`` form, ``AsyncValidationError``,
+``ResponseParsingError``) keep the private ``acompletion_structured`` seam: the
+public fake cannot raise a pre-wrapped exception through the real parser.
+
+A canonical transient error is :func:`~llmkit.testing.timeout_error`; a
+canonical non-recoverable one is an ``openai`` auth/4xx status error.
 """
 
 from __future__ import annotations
@@ -72,12 +82,17 @@ from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
 )
 from llmkit.retry import with_retries
+from llmkit.testing import (
+    Fake,
+    Reply,
+    TransportRequest,
+    install,
+    rate_limit_error,
+    timeout_error,
+)
 from tests._support import (
-    NO_USAGE,
     OkSchema,
-    UsageCounts,
     capture_structured_provider_kwargs,
-    quiet_logging,
 )
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
@@ -107,6 +122,40 @@ def _wrap_v2(inner: BaseException) -> InstructorRetryException:
         return exc
 
 
+_OK = Reply.json(OkSchema(ok=True))
+# Parses as JSON but fails ``OkSchema``: a genuine ``ValidationError``.
+_INVALID = Reply.text('{"ok": "not-a-bool-or-coercible"}')
+
+
+def _always_raises(error: Exception) -> Fake:
+    """A fake raising *error* on every round trip."""
+
+    def fake(_request: TransportRequest) -> Reply:
+        raise error
+
+    return fake
+
+
+def _raises_then(error: Exception, reply: Reply) -> Fake:
+    """A fake raising *error* on the first attempt and answering *reply* after."""
+
+    def fake(request: TransportRequest) -> Reply:
+        if request.attempt == 1:
+            raise error
+        return reply
+
+    return fake
+
+
+def _first_asks(requests: list[TransportRequest]) -> list[TransportRequest]:
+    """The requests that were not instructor's in-call repair re-asks."""
+    return [request for request in requests if not request.repair]
+
+
+def _attempts(requests: list[TransportRequest]) -> list[int | None]:
+    return [request.attempt for request in requests]
+
+
 # --- RetryPolicy defaults & validation -----------------------------------
 
 
@@ -118,7 +167,6 @@ def test_default_retry_policy_values() -> None:
     assert DEFAULT_RETRY_POLICY.max_backoff_seconds == 30.0
 
 
-@pytest.mark.asyncio
 async def test_default_backoff_sleeps_with_jittered_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -137,26 +185,13 @@ async def test_default_backoff_sleeps_with_jittered_ceiling(
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(random, "uniform", _max_jitter)
 
-    calls = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return OkSchema(ok=True), None, NO_USAGE
-
-    configure_llm_logging(None)
-    try:
-        with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
-            result = await llm_calls.structured_llm_call(
-                "hi", OkSchema, feature="test", retry=DEFAULT_RETRY_POLICY
-            )
-    finally:
-        configure_llm_logging(LocalYamlLogSink())
+    with install(_raises_then(timeout_error(), _OK)) as installed:
+        result = await llm_calls.structured_llm_call(
+            "hi", OkSchema, feature="test", retry=DEFAULT_RETRY_POLICY
+        )
 
     assert result.ok is True
+    assert _attempts(installed.requests) == [1, 2]
     assert slept == [0.5]
 
 
@@ -266,47 +301,29 @@ def test_litellm_service_unavailable_503_is_in_transport_set() -> None:
     assert isinstance(err, LLM_RECOVERABLE_ERRORS)
 
 
-@pytest.mark.asyncio
 async def test_structured_auth_error_is_not_retried() -> None:
     """A 401 ``AuthenticationError`` fails fast: a single attempt, no retry."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise _status_error(openai.AuthenticationError, 401)
-
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(openai.AuthenticationError),
+        install(_always_raises(_status_error(openai.AuthenticationError, 401))) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
-    assert calls[0] == 1
+    assert isinstance(excinfo.value.__cause__, openai.AuthenticationError)
+    assert _attempts(installed.requests) == [1]
 
 
-@pytest.mark.asyncio
 async def test_structured_rate_limit_error_is_retried_then_succeeds() -> None:
     """A 429 ``RateLimitError`` is transient: retried once, then succeeds."""
-    calls = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise _status_error(openai.RateLimitError, 429)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+    with install(_raises_then(rate_limit_error(), _OK)) as installed:
         result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
-    assert calls[0] == 2
+    assert _attempts(installed.requests) == [1, 2]
 
 
-@pytest.mark.asyncio
 async def test_structured_litellm_503_is_retried_on_transport_budget() -> None:
     """A litellm-native 503 gets the full transport budget (3 attempts).
 
@@ -315,41 +332,25 @@ async def test_structured_litellm_503_is_retried_on_transport_budget() -> None:
     ``LLM_TRANSPORT_ERRORS`` a real 503 matched neither retry budget and
     propagated unretried after a single attempt.
     """
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise _litellm_503()
-
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(litellm.exceptions.ServiceUnavailableError),
+        install(_always_raises(_litellm_503())) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
-    assert calls[0] == 3
+    assert isinstance(excinfo.value.__cause__, litellm.exceptions.ServiceUnavailableError)
+    assert _attempts(installed.requests) == [1, 2, 3]
 
 
-@pytest.mark.asyncio
 async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
     """A transient litellm 503 is recovered: retried once, then succeeds."""
-    calls = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise _litellm_503()
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+    with install(_raises_then(_litellm_503(), _OK)) as installed:
         result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
-    assert calls[0] == 2
+    assert _attempts(installed.requests) == [1, 2]
 
 
 # --- instructor's in-call schema-repair budget -----------------------------
@@ -489,17 +490,11 @@ def test_retry_policy_and_with_retries_agree_on_max_attempts() -> None:
 # --- nested-retry guard: no budget multiplication -------------------------
 
 
-@pytest.mark.asyncio
 async def test_nested_with_retries_around_call_function_does_not_multiply() -> None:
     """Wrapping a call function (which already retries 3x) in
     ``with_retries(max_attempts=3)`` must NOT yield 3x3=9 attempts. The inner
     layer collapses to a single pass, so the outer loop owns the retries —
     a persistent transient error costs the *outer* budget, not the product."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("always")
 
     async def _wrapped() -> OkSchema:
         return await llm_calls.structured_llm_call(
@@ -507,29 +502,24 @@ async def test_nested_with_retries_around_call_function_does_not_multiply() -> N
         )
 
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+        install(_always_raises(timeout_error())) as installed,
         pytest.warns(RuntimeWarning, match="nested"),
-        pytest.raises(TimeoutError, match="always"),
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
-        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
 
+    assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
     # NOT 9 (3 x 3). The guard prevented the multiplication.
-    assert calls[0] == 3
+    assert len(installed.requests) == 3
 
 
-@pytest.mark.asyncio
 async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning() -> None:
     """The documented escape hatch: drive retries from an outer ``with_retries``
     by opting the inner call out with ``retry=NO_RETRY``. The inner collapses to
     a single pass (so the *outer* budget owns the retries — 3 transport calls,
     not 9) and, because the inner explicitly opted out, the nested guard stays
     silent: no ``RuntimeWarning`` fires on the user-intended path."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("always")
 
     async def _wrapped() -> OkSchema:
         return await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
@@ -538,30 +528,21 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
         # Any nested-guard RuntimeWarning on this intended path would fail the test.
         warnings.simplefilter("error", RuntimeWarning)
         with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            pytest.raises(TimeoutError, match="always"),
+            install(_always_raises(timeout_error())) as installed,
+            pytest.raises(InstructorRetryException) as excinfo,
         ):
-            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
 
-    assert calls[0] == 3
+    assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
+    assert len(installed.requests) == 3
 
 
-@pytest.mark.asyncio
 async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> None:
     """The nested guard preserves the one-log-per-attempt contract: an outer
     ``with_retries(max_attempts=2)`` around a transient-then-success call
     function writes one log per real attempt (here: 2). The accidental
     double-wrap still joins the loop's logical call: both records share one
     ``call_id`` and number their attempts 1, 2."""
-    calls = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-        return OkSchema(ok=True), None, NO_USAGE
 
     async def _wrapped() -> OkSchema:
         return await llm_calls.structured_llm_call(
@@ -571,17 +552,19 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
         with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+            install(_raises_then(timeout_error(), _OK)) as installed,
             capture_llm_log_paths() as paths,
             capture_llm_records() as records,
             pytest.warns(RuntimeWarning, match="nested"),
         ):
-            result = await with_retries(_wrapped, max_attempts=2, retry_on=(TimeoutError,))
+            result = await with_retries(
+                _wrapped, max_attempts=2, retry_on=(openai.APITimeoutError,)
+            )
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
     assert result.ok is True
-    assert calls[0] == 2
+    assert len(installed.requests) == 2
     assert len(paths) == 2
     assert all(p.exists() for p in paths)
     assert [r.attempt for r in records] == [1, 2]
@@ -645,7 +628,6 @@ async def test_task_spawned_inside_attempt_keeps_its_own_retries() -> None:
     assert outer_calls[0] == 1  # outer succeeded on its first pass
 
 
-@pytest.mark.asyncio
 async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() -> None:
     """A sync-bridge call from inside an ``on_result`` hook keeps its own retry
     budget. The hook runs synchronously inside the outer attempt, but
@@ -662,39 +644,29 @@ async def test_sync_bridge_call_inside_on_result_hook_keeps_its_own_retries() ->
     would abort the very first outer pass (masking the ``outer_calls == 3``
     discriminator). ``outer_calls`` is the discriminating assertion; the
     recorded-warning check is the direct read of "no nested-retry warning"."""
-    outer_calls = [0]
     inner_calls = [0]
 
-    async def _outer_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        outer_calls[0] += 1
-        return OkSchema(ok=True), None, NO_USAGE
-
-    async def _inner_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
+    def fake(request: TransportRequest) -> Reply:
+        if request.kind == "structured":
+            return _OK
         inner_calls[0] += 1
         if inner_calls[0] < 3:
-            raise TimeoutError("transient")
-        return "done", None, NO_USAGE
+            raise timeout_error()
+        return Reply.text("done")
 
     def hook(_result: OkSchema) -> None:
         _ = llm_calls.text_llm_call_sync("inner", feature="inner", retry=_NO_BACKOFF)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with (
-            quiet_logging(),
-            patch("llmkit._litellm.acompletion_structured", side_effect=_outer_transport),
-            patch("llmkit._litellm.acompletion_text", side_effect=_inner_transport),
-        ):
+        with install(fake) as installed:
             result = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="outer", retry=_NO_BACKOFF, on_result=hook
             )
 
+    outer_calls = [r for r in installed.requests if r.kind == "structured"]
     assert result.ok is True
-    assert outer_calls[0] == 1  # the discriminating assertion (pre-fix: 3, outer budget burned)
+    assert len(outer_calls) == 1  # the discriminating assertion (pre-fix: 3, outer budget burned)
     assert inner_calls[0] == 3  # inner kept its own transport budget
     nested = [
         w for w in caught if issubclass(w.category, RuntimeWarning) and "nested" in str(w.message)
@@ -736,44 +708,34 @@ async def test_directly_awaited_nested_with_retries_still_collapses_same_task() 
 # --- validation split: lower budget for schema-validation failures --------
 
 
-@pytest.mark.asyncio
 async def test_persistent_validation_error_uses_lower_validation_budget() -> None:
     """A persistent ``ValidationError`` is retried only on the lower
     validation budget (default 2 = one retry), NOT the transport budget (3).
     A deterministic schema failure can't burn the full transport budget."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise _make_validation_error()
-
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(ValidationError),
+        install(lambda _request: _INVALID) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
-    # validation_max_attempts default is 2 -> two attempts, not three.
-    assert calls[0] == 2
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+    # validation_max_attempts default is 2 -> two attempts, not three. Each
+    # attempt also sends instructor's one in-call repair re-ask.
+    assert _attempts(_first_asks(installed.requests)) == [1, 2]
+    assert len(installed.requests) == 4
 
 
-@pytest.mark.asyncio
 async def test_transport_error_still_uses_full_transport_budget() -> None:
     """A persistent transport error still gets the full transport budget (3)
     under the same default policy — the split lowered *only* validation."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("always")
-
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(TimeoutError, match="always"),
+        install(_always_raises(timeout_error())) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
-    assert calls[0] == 3
+    assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
+    assert _attempts(installed.requests) == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -1006,27 +968,20 @@ async def test_retry_on_none_wrapped_permanent_4xx_fails_fast() -> None:
     assert calls[0] == 1
 
 
-@pytest.mark.asyncio
 async def test_transiently_malformed_json_gets_one_cross_call_validation_retry() -> None:
     """A transiently-malformed response (one ``ValidationError`` then success)
     is still recovered: the one validation retry yields a clean parse."""
-    calls = [0]
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise _make_validation_error()
-        return OkSchema(ok=True), None, NO_USAGE
+    def fake(request: TransportRequest) -> Reply:
+        return _INVALID if request.attempt == 1 else _OK
 
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+    with install(fake) as installed:
         result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
-    assert calls[0] == 2
+    assert _attempts(_first_asks(installed.requests)) == [1, 2]
 
 
 def test_default_validation_budget_is_lower_than_transport() -> None:
@@ -1041,61 +996,44 @@ def test_no_retry_disables_both_budgets() -> None:
     assert NO_RETRY.validation_max_attempts == 1
 
 
-@pytest.mark.asyncio
 async def test_no_retry_single_attempt_for_validation_error() -> None:
     """``retry=NO_RETRY`` makes a ``ValidationError`` propagate after one
-    attempt (the validation budget is disabled too)."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise _make_validation_error()
-
+    attempt (the validation budget is disabled too). ``NO_RETRY`` governs the
+    cross-call budgets only: instructor's in-call repair re-ask still runs."""
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(ValidationError),
+        install(lambda _request: _INVALID) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
-    assert calls[0] == 1
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+    assert _attempts(_first_asks(installed.requests)) == [1]
+    assert [r.repair for r in installed.requests] == [False, True]
 
 
-@pytest.mark.asyncio
 async def test_no_retry_single_attempt_for_transport_error() -> None:
     """``retry=NO_RETRY`` makes a transport error propagate after one
     attempt (mirrors the validation case for the other budget)."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise TimeoutError("transient")
-
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        pytest.raises(TimeoutError, match="transient"),
+        install(_always_raises(timeout_error())) as installed,
+        pytest.raises(InstructorRetryException) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
-    assert calls[0] == 1
+    assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
+    assert _attempts(installed.requests) == [1]
 
 
-@pytest.mark.asyncio
 async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path) -> None:
     """Each validation attempt is its own logged call: a persistent
     ``ValidationError`` under the default validation budget (2) writes two
     log records (one per attempt), so per-attempt logging survives the split."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
-        calls[0] += 1
-        raise _make_validation_error()
-
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
         with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
+            install(lambda _request: _INVALID) as installed,
             capture_llm_log_paths() as paths,
-            pytest.raises(ValidationError),
+            pytest.raises(InstructorRetryException),
         ):
             _ = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF
@@ -1103,7 +1041,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
-    assert calls[0] == 2
+    assert _attempts(_first_asks(installed.requests)) == [1, 2]
     assert len(paths) == 2
     assert all(p.exists() for p in paths)
 

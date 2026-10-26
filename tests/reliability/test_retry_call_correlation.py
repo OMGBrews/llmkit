@@ -15,6 +15,11 @@ meet:
   and occurrence within the pass, so a call reached only on a later pass
   starts at attempt 1.
 
+The provider is faked through :mod:`llmkit.testing`, except in the two stream
+tests, which fail after the first yielded item and so stay on the private
+``astream_text`` / ``astream_tools`` seams (the public fake cannot fail a
+stream mid-way).
+
 The outside-a-loop baseline lives in ``tests/logging/test_record_enrichment.py``.
 """
 
@@ -25,6 +30,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import cast
 from unittest.mock import patch
 
+import openai
 import pytest
 from pydantic import BaseModel
 
@@ -33,7 +39,8 @@ from llmkit import calls as llm_calls
 from llmkit._litellm import StreamedToolTurn
 from llmkit.retry import with_retries
 from llmkit.sync import run_sync
-from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock, quiet_logging
+from llmkit.testing import Fake, Reply, TransportRequest, install, timeout_error
+from tests._support import OkSchema, provider_mock, quiet_logging
 
 
 def _assert_one_logical_call(records: list[LLMCallRecord], attempts: int) -> None:
@@ -51,17 +58,17 @@ class _Args(BaseModel):
 _TOOLS = [ToolDefinition.from_model("add", _Args, "Add.")]
 
 
-def _failing_twice[T](result: T) -> Callable[..., Awaitable[T]]:
-    """A transport fake that times out on its first two calls, then returns."""
+def _failing_twice(reply: Reply) -> Fake:
+    """A fake that times out on its first two round trips, then answers."""
     calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> T:
+    def fake(_request: TransportRequest) -> Reply:
         calls[0] += 1
         if calls[0] <= 2:
-            raise TimeoutError("transient")
-        return result
+            raise timeout_error()
+        return reply
 
-    return _transport
+    return fake
 
 
 async def _structured() -> object:
@@ -76,32 +83,22 @@ async def _tool() -> object:
     return await llm_calls.tool_llm_call("hi", _TOOLS, feature="test", retry=NO_RETRY)
 
 
-_BUFFERED_FAMILIES: list[tuple[str, object, Callable[[], Awaitable[object]]]] = [
-    ("acompletion_structured", (OkSchema(ok=True), None, NO_USAGE), _structured),
-    ("acompletion_text", ("hello", None, NO_USAGE), _text),
-    ("acompletion_tools", ("done", [], "stop", (None, None, None), None), _tool),
+_BUFFERED_FAMILIES: list[tuple[Reply, Callable[[], Awaitable[object]]]] = [
+    (Reply.json(OkSchema(ok=True)), _structured),
+    (Reply.text("hello"), _text),
+    (Reply.text("done"), _tool),
 ]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("transport", "result", "fn"),
-    _BUFFERED_FAMILIES,
-    ids=["structured", "text", "tool"],
-)
+@pytest.mark.parametrize(("reply", "fn"), _BUFFERED_FAMILIES, ids=["structured", "text", "tool"])
 async def test_outer_with_retries_joins_passes_under_one_call_id(
-    transport: str, result: object, fn: Callable[[], Awaitable[object]]
+    reply: Reply, fn: Callable[[], Awaitable[object]]
 ) -> None:
     """Two transport failures, then a success, under an outer
     ``with_retries(max_attempts=3)``: three records, one ``call_id``,
     attempts 1, 2, 3."""
-    with (
-        quiet_logging(),
-        patch(f"llmkit._litellm.{transport}", side_effect=_failing_twice(result)),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
-        _ = await with_retries(fn, max_attempts=3, retry_on=(TimeoutError,))
+    with install(_failing_twice(reply)), capture_llm_records() as records:
+        _ = await with_retries(fn, max_attempts=3, retry_on=(openai.APITimeoutError,))
 
     assert len(records) == 3
     _assert_one_logical_call(records, 3)
@@ -112,15 +109,10 @@ def test_outer_with_retries_joins_passes_through_the_sync_bridge() -> None:
     """``run_sync(with_retries(fn))`` runs the loop and ``fn`` in one bridge
     task, so the passes join exactly as they do on the async path."""
     with (
-        quiet_logging(),
-        patch(
-            "llmkit._litellm.acompletion_structured",
-            side_effect=_failing_twice((OkSchema(ok=True), None, NO_USAGE)),
-        ),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+        install(_failing_twice(Reply.json(OkSchema(ok=True)))),
         capture_llm_records() as records,
     ):
-        _ = run_sync(with_retries(_structured, max_attempts=3, retry_on=(TimeoutError,)))
+        _ = run_sync(with_retries(_structured, max_attempts=3, retry_on=(openai.APITimeoutError,)))
 
     _assert_one_logical_call(records, 3)
 
@@ -199,17 +191,11 @@ async def test_tool_stream_joins_passes_when_failing_after_the_first_event() -> 
     _assert_one_logical_call(records, 3)
 
 
-@pytest.mark.asyncio
 async def test_call_from_another_task_keeps_its_own_call_id() -> None:
     """A call spawned with ``create_task`` inside ``fn`` runs in its own task, so
     it never joins the loop's logical call — even with the same feature and
     label as the call that does."""
     passes = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
 
     async def _fn() -> OkSchema:
         passes[0] += 1
@@ -225,9 +211,7 @@ async def test_call_from_another_task_keeps_its_own_call_id() -> None:
         )
 
     with (
-        quiet_logging(),
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+        install(lambda _request: Reply.json(OkSchema(ok=True))),
         capture_llm_records() as records,
     ):
         _ = await with_retries(_fn, max_attempts=2, retry_on=(TimeoutError,))
@@ -241,31 +225,23 @@ async def test_call_from_another_task_keeps_its_own_call_id() -> None:
     assert not {r.call_id for r in children} & {r.call_id for r in owned}
 
 
-@pytest.mark.asyncio
 async def test_two_calls_per_pass_stay_two_logical_calls() -> None:
     """Two calls per pass — here with the *same* feature and label — form two
     logical calls, matched across passes by occurrence within the pass."""
     calls = [0]
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
+    def fake(_request: TransportRequest) -> Reply:
         calls[0] += 1
         if calls[0] == 2:
-            raise TimeoutError("second call of pass 1")
-        return "ok", None, NO_USAGE
+            raise timeout_error()
+        return Reply.text("ok")
 
     async def _fn() -> None:
         _ = await llm_calls.text_llm_call("first", feature="test", retry=NO_RETRY)
         _ = await llm_calls.text_llm_call("second", feature="test", retry=NO_RETRY)
 
-    with (
-        quiet_logging(),
-        patch("llmkit._litellm.acompletion_text", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
-        await with_retries(_fn, max_attempts=2, retry_on=(TimeoutError,))
+    with install(fake), capture_llm_records() as records:
+        await with_retries(_fn, max_attempts=2, retry_on=(openai.APITimeoutError,))
 
     # Pass 1: first, second (failed). Pass 2: first, second.
     assert len(records) == 4
@@ -276,17 +252,11 @@ async def test_two_calls_per_pass_stay_two_logical_calls() -> None:
     assert first[0].call_id != second[0].call_id
 
 
-@pytest.mark.asyncio
 async def test_call_first_reached_on_a_later_pass_starts_at_attempt_one() -> None:
     """``attempt`` counts tries of the logical call, not outer passes: a call
     that pass 1 never reached records attempt 1 on pass 2. A differently
     labelled call that runs on only some passes does not shift the others."""
     passes = [0]
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "ok", None, NO_USAGE
 
     async def _fn() -> None:
         passes[0] += 1
@@ -297,12 +267,7 @@ async def test_call_first_reached_on_a_later_pass_starts_at_attempt_one() -> Non
             "review", feature="report", label="review", retry=NO_RETRY
         )
 
-    with (
-        quiet_logging(),
-        patch("llmkit._litellm.acompletion_text", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(lambda _request: Reply.text("ok")), capture_llm_records() as records:
         await with_retries(_fn, max_attempts=2, retry_on=(TimeoutError,))
 
     drafts = [r for r in records if r.label == "draft"]
