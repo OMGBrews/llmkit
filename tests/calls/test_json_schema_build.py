@@ -4,15 +4,15 @@ Covers the conversion subset (nested objects, ``$defs``/``$ref``, arrays,
 enums, required/optional fields), the two CaCL footguns (omitted optionals
 serialising as ``null``; title-less schemas), clear failures on unsupported
 constructs (multi-branch unions, recursion, bad ``$ref``), and a full
-round-trip through ``structured_llm_call`` against a faked transport (patching
-``llmkit._litellm.acompletion_structured``, the same seam the other offline
-tests use). Per-field constraint handling lives in
+round-trip through ``structured_llm_call`` against an :mod:`llmkit.testing`
+fake, so the real parser reads the provider's JSON into the generated model. Per-field constraint handling lives in
 ``test_json_schema_constraints.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from enum import Enum
 from typing import Literal, get_args, get_origin
@@ -22,7 +22,7 @@ from pydantic import BaseModel, ValidationError
 
 from llmkit import calls as llm_calls
 from llmkit import model_from_json_schema
-from tests._support import NO_USAGE, UsageCounts
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import model_attr as _attr
 
 # A representative schema: nested objects (inline + via $defs/$ref), an array
@@ -851,29 +851,20 @@ def test_round_trip_through_structured_call() -> None:
     passed straight in as ``output_schema``."""
     model = model_from_json_schema(_INVOICE_SCHEMA)
 
-    async def _fake_transport(
-        _prompt: object, output_schema: type[BaseModel], **_kwargs: object
-    ) -> tuple[BaseModel, float | None, UsageCounts]:
-        # The seam receives exactly the generated model and parses into it,
-        # the way instructor would from the model-derived JSON schema.
-        assert output_schema is model
-        parsed = output_schema.model_validate(
-            {
-                "id": "INV-9",
-                "total": 99.5,
-                "status": "closed",
-                "customer": {"name": "Globex", "vip": True},
-                "lines": [{"sku": "Z", "qty": 3}],
-            }
-        )
-        return parsed, 0.001, NO_USAGE
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
+    answer = {
+        "id": "INV-9",
+        "total": 99.5,
+        "status": "closed",
+        "customer": {"name": "Globex", "vip": True},
+        "lines": [{"sku": "Z", "qty": 3}],
+    }
+    with install(lambda _request: Reply.text(json.dumps(answer))) as installed:
         result = asyncio.run(
             llm_calls.structured_llm_call("Extract the invoice.", model, feature="billing")
         )
 
+    # The request carries exactly the generated model as its output schema.
+    assert [r.output_schema for r in installed.requests] == [model]
     assert _attr(result, "id") == "INV-9"
     assert _attr(result, "status") == "closed"
     # Omitted optionals stay absent on the way back out.
@@ -886,27 +877,21 @@ def test_build_once_model_reused_across_calls() -> None:
     """The same generated model object can be reused across multiple calls
     (build-once-reuse pattern) — no per-call rebuild required."""
     model = model_from_json_schema(_INVOICE_SCHEMA)
-    seen: list[type[BaseModel]] = []
+    answer: dict[str, object] = {
+        "id": "X",
+        "total": 1.0,
+        "status": "open",
+        "customer": {"name": "N"},
+        "lines": [],
+    }
 
-    async def _fake_transport(
-        _prompt: object, output_schema: type[BaseModel], **_kwargs: object
-    ) -> tuple[BaseModel, float | None, UsageCounts]:
-        seen.append(output_schema)
-        parsed = output_schema.model_validate(
-            {
-                "id": "X",
-                "total": 1.0,
-                "status": "open",
-                "customer": {"name": "N"},
-                "lines": [],
-            }
-        )
-        return parsed, None, NO_USAGE
+    def fake(_request: TransportRequest) -> Reply:
+        return Reply.text(json.dumps(answer))
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("llmkit._litellm.acompletion_structured", _fake_transport)
+    with install(fake) as installed:
         for _ in range(3):
             _ = asyncio.run(llm_calls.structured_llm_call("go", model, feature="billing"))
 
+    seen = [r.output_schema for r in installed.requests]
     assert len(seen) == 3
     assert all(s is model for s in seen)  # the very same object each time

@@ -3,7 +3,8 @@
 ``structured_llm_call`` / ``structured_llm_call_sync`` gained a keyword-only
 ``max_tokens`` (parity with ``text_llm_call``). These tests pin two seams:
 
-* the public call functions thread ``max_tokens`` down to the transport, and
+* the public call functions thread ``max_tokens`` down to the transport
+  (observed through an :mod:`llmkit.testing` fake's request), and
 * the transport (``acompletion_structured``) only puts ``max_tokens`` on the
   provider request when it is not ``None`` — so the default produces a
   request byte-identical to the prior behaviour (no ``max_tokens`` key).
@@ -16,17 +17,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from unittest.mock import patch
 
 from llmkit import calls as llm_calls
+from llmkit.testing import Reply, install
 from tests._support import (
-    NO_USAGE,
     OkSchema,
-    UsageCounts,
     capture_structured_provider_kwargs,
     capture_text_provider_kwargs,
     capturing_sink,
 )
+
+_OK = Reply.json(OkSchema(ok=True))
 
 
 def test_signatures_expose_max_tokens() -> None:
@@ -37,18 +38,10 @@ def test_signatures_expose_max_tokens() -> None:
 
 def test_sync_call_threads_max_tokens_to_transport() -> None:
     """``structured_llm_call_sync(..., max_tokens=256)`` forwards the cap."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", max_tokens=256)
 
-    assert seen["max_tokens"] == 256
+    assert [r.max_tokens for r in installed.requests] == [256]
     # max_tokens does not disturb parsing — a validated instance comes back.
     assert isinstance(result, OkSchema)
     assert result.ok is True
@@ -56,20 +49,12 @@ def test_sync_call_threads_max_tokens_to_transport() -> None:
 
 def test_async_call_threads_max_tokens_to_transport() -> None:
     """The async ``structured_llm_call(..., max_tokens=N)`` does the same."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         result = asyncio.run(
             llm_calls.structured_llm_call("hi", OkSchema, feature="test", max_tokens=42)
         )
 
-    assert seen["max_tokens"] == 42
+    assert [r.max_tokens for r in installed.requests] == [42]
     assert result.ok is True
 
 
@@ -88,16 +73,7 @@ def test_transport_includes_max_tokens_when_set() -> None:
 
 def test_log_record_carries_max_tokens() -> None:
     """The ``LLMCallRecord`` built for a structured call records the cap."""
-
-    async def _fake_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        capturing_sink() as captured,
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
-    ):
+    with capturing_sink() as captured, install(lambda _request: _OK):
         _ = asyncio.run(
             llm_calls.structured_llm_call("hi", OkSchema, feature="test", max_tokens=256)
         )

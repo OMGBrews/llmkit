@@ -11,6 +11,12 @@ The invariants that separate this lane from the two it borrows from:
 * a consumer that takes the result and stops has **completed** the call, while
   one that leaves earlier has abandoned it, and the log record tells them apart.
 
+The call-level tests fake the provider through :mod:`llmkit.testing`. The
+transport-level tests drive the real ``astream_tools`` over a faked LiteLLM
+stream, and the cancellation test parks the private ``astream_tools`` seam
+mid-stream, which the public fake cannot do (it fails or waits only before the
+first chunk).
+
 Mutation check (recorded per the resolved-sibling convention): with the
 ``if not completed:`` guard removed from ``_stream_tools_once``'s abandonment
 arm, ``test_taking_the_result_and_stopping_is_a_completed_call_not_an_abandonment``
@@ -21,7 +27,7 @@ beside populated ``tool_calls``; restored, it passes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import cast, final
 from unittest.mock import MagicMock, patch
@@ -40,6 +46,8 @@ from llmkit import (
 )
 from llmkit._litellm import StreamedToolTurn
 from llmkit.calls import STREAM_ABANDONED_ERROR
+from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
+from llmkit.tools import TokenUsage
 from tests._support import capturing_sink, provider_mock, quiet_logging
 
 
@@ -52,60 +60,24 @@ def _add_tool() -> ToolDefinition:
     return ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
 
 
-@dataclass
-class _Function:
-    name: str | None
-    arguments: str
+def _add_call(arguments: str = '{"left": 1, "right": 1}', id: str = "call_1") -> FakeToolCall:
+    return FakeToolCall("add", arguments, id=id)
 
 
-@dataclass
-class _RawCall:
-    id: str | None
-    function: _Function
-
-
-def _turn(
-    *,
-    calls: list[object] | None = None,
-    stop_reason: str | None = "tool_calls",
-    usage: tuple[int | None, int | None, int | None] = (3, 4, 7),
-    cost: float | None = 0.01,
-) -> StreamedToolTurn:
-    return StreamedToolTurn(
-        raw_calls=calls
-        if calls is not None
-        else [_RawCall("call_1", _Function("add", '{"left": 1, "right": 1}'))],
-        stop_reason=stop_reason,
-        usage=usage,
-        approximate_cost=cost,
-    )
-
-
-def _fake_transport(items: list[object]) -> Callable[..., AsyncIterator[object]]:
-    """Patch ``astream_tools`` with a generator yielding *items* in order."""
-
-    def _factory(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        async def _gen() -> AsyncIterator[object]:
-            for item in items:
-                yield item
-
-        return _gen()
-
-    return _factory
+_USAGE = TokenUsage(prompt_tokens=3, completion_tokens=4, total_tokens=7)
 
 
 async def test_yields_text_events_then_the_completed_result() -> None:
     """The shape committed to the consumer: deltas, then one terminal result."""
-    raw = _RawCall("call_1", _Function("add", '{"left": 2, "right": 3}'))
-    with patch(
-        "llmkit._litellm.astream_tools",
-        side_effect=_fake_transport(["I will ", "add them.", _turn(calls=[raw])]),
-    ):
+    reply = Reply(
+        chunks=["I will ", "add them."],
+        tool_calls=[_add_call('{"left": 2, "right": 3}')],
+        usage=_USAGE,
+    )
+    with install(lambda _request: reply):
         events = [
             event
-            async for event in tool_llm_call_stream(
-                "add 2 and 3", [_add_tool()], feature="chat", provider=provider_mock()
-            )
+            async for event in tool_llm_call_stream("add 2 and 3", [_add_tool()], feature="chat")
         ]
 
     assert events[:-1] == [
@@ -123,13 +95,9 @@ async def test_yields_text_events_then_the_completed_result() -> None:
 
 async def test_a_tool_only_turn_yields_no_text_events_and_records_no_text() -> None:
     """A forced tool call produces no prose; ``text`` is ``None``, not ``""``."""
-    raw = _RawCall("call_1", _Function("add", '{"left": 1, "right": 1}'))
-    with patch("llmkit._litellm.astream_tools", side_effect=_fake_transport([_turn(calls=[raw])])):
+    with install(lambda _request: Reply(tool_calls=[_add_call()])):
         events = [
-            event
-            async for event in tool_llm_call_stream(
-                "add", [_add_tool()], feature="chat", provider=provider_mock()
-            )
+            event async for event in tool_llm_call_stream("add", [_add_tool()], feature="chat")
         ]
 
     assert len(events) == 1
@@ -139,21 +107,14 @@ async def test_a_tool_only_turn_yields_no_text_events_and_records_no_text() -> N
 
 
 async def test_log_record_carries_the_tool_lane_fields_under_its_own_schema() -> None:
-    raw = _RawCall("call_1", _Function("add", '{"left": 2, "right": 3}'))
-    with (
-        patch(
-            "llmkit._litellm.astream_tools", side_effect=_fake_transport(["hi", _turn(calls=[raw])])
-        ),
-        capturing_sink() as records,
-    ):
+    reply = Reply(
+        chunks=["hi"], tool_calls=[_add_call('{"left": 2, "right": 3}')], usage=_USAGE, cost=0.01
+    )
+    with install(lambda _request: reply), capturing_sink() as records:
         _ = [
             event
             async for event in tool_llm_call_stream(
-                "add 2 and 3",
-                [_add_tool()],
-                feature="chat",
-                label="panel",
-                provider=provider_mock(),
+                "add 2 and 3", [_add_tool()], feature="chat", label="panel"
             )
         ]
 
@@ -186,17 +147,10 @@ async def test_taking_the_result_and_stopping_is_a_completed_call_not_an_abandon
     the positive property (a clean record naming the calls), not merely the
     absence of the marker.
     """
-    raw = _RawCall("call_1", _Function("add", '{"left": 2, "right": 3}'))
-    with (
-        patch(
-            "llmkit._litellm.astream_tools", side_effect=_fake_transport(["hi", _turn(calls=[raw])])
-        ),
-        capturing_sink() as records,
-    ):
+    reply = Reply(chunks=["hi"], tool_calls=[_add_call('{"left": 2, "right": 3}')])
+    with install(lambda _request: reply), capturing_sink() as records:
         result: ToolCallResult | None = None
-        stream = tool_llm_call_stream(
-            "add 2 and 3", [_add_tool()], feature="chat", provider=provider_mock()
-        )
+        stream = tool_llm_call_stream("add 2 and 3", [_add_tool()], feature="chat")
         async for event in stream:
             if isinstance(event, ToolCallResult):
                 result = event
@@ -211,16 +165,9 @@ async def test_taking_the_result_and_stopping_is_a_completed_call_not_an_abandon
 
 async def test_abandoning_before_the_result_records_the_partial_transcript() -> None:
     """Leaving mid-prose is a real abandonment and still says so."""
-    raw = _RawCall("call_1", _Function("add", "{}"))
-    with (
-        quiet_logging(),
-        patch(
-            "llmkit._litellm.astream_tools",
-            side_effect=_fake_transport(["one ", "two ", "three", _turn(calls=[raw])]),
-        ),
-        capturing_sink() as records,
-    ):
-        stream = tool_llm_call_stream("go", [_add_tool()], feature="chat", provider=provider_mock())
+    reply = Reply(chunks=["one ", "two ", "three"], tool_calls=[_add_call("{}")])
+    with install(lambda _request: reply), capturing_sink() as records:
+        stream = tool_llm_call_stream("go", [_add_tool()], feature="chat")
         async for _event in stream:
             break
         await stream.aclose()
@@ -234,19 +181,15 @@ async def test_abandoning_before_the_result_records_the_partial_transcript() -> 
 
 async def test_partly_malformed_round_keeps_the_good_calls() -> None:
     """The salvage contract reaches the streamed lane through the shared parser."""
-    good = _RawCall("call_ok", _Function("add", '{"left": 1, "right": 2}'))
-    bad = _RawCall("call_bad", _Function("add", "{not json"))
-    with (
-        quiet_logging(),
-        patch(
-            "llmkit._litellm.astream_tools", side_effect=_fake_transport([_turn(calls=[good, bad])])
-        ),
-    ):
+    reply = Reply(
+        tool_calls=[
+            _add_call('{"left": 1, "right": 2}', id="call_ok"),
+            _add_call("{not json", id="call_bad"),
+        ]
+    )
+    with install(lambda _request: reply):
         events = [
-            event
-            async for event in tool_llm_call_stream(
-                "add", [_add_tool()], feature="chat", provider=provider_mock()
-            )
+            event async for event in tool_llm_call_stream("add", [_add_tool()], feature="chat")
         ]
 
     result = events[-1]
@@ -262,48 +205,22 @@ async def test_all_malformed_round_raises_and_is_not_retried() -> None:
     reaches the caller after exactly one transport call — the documented
     divergence from the buffered lane's ``tool_validation_budget`` re-ask.
     """
-    bad = _RawCall("call_bad", _Function("add", "{not json"))
-    factory = _fake_transport([_turn(calls=[bad])])
-    calls = 0
+    reply = Reply(tool_calls=[_add_call("{not json", id="call_bad")])
+    with install(lambda _request: reply) as installed, pytest.raises(ToolArgumentError):
+        _ = [event async for event in tool_llm_call_stream("add", [_add_tool()], feature="chat")]
 
-    def _counting(*args: object, **kwargs: object) -> AsyncIterator[object]:
-        nonlocal calls
-        calls += 1
-        return factory(*args, **kwargs)
-
-    with (
-        quiet_logging(),
-        patch("llmkit._litellm.astream_tools", side_effect=_counting),
-        pytest.raises(ToolArgumentError),
-    ):
-        _ = [
-            event
-            async for event in tool_llm_call_stream(
-                "add", [_add_tool()], feature="chat", provider=provider_mock()
-            )
-        ]
-
-    assert calls == 1
+    assert len(installed.requests) == 1
 
 
 async def test_a_failed_attempt_records_the_provider_error() -> None:
-    def _boom(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        async def _gen() -> AsyncIterator[object]:
-            raise RuntimeError("provider exploded")
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
+    def _boom(_request: TransportRequest) -> Reply:
+        raise RuntimeError("provider exploded")
 
-        return _gen()
-
-    with (
-        quiet_logging(),
-        patch("llmkit._litellm.astream_tools", side_effect=_boom),
-        capturing_sink() as records,
-        pytest.raises(RuntimeError),
-    ):
+    with install(_boom), capturing_sink() as records, pytest.raises(RuntimeError):
         _ = [
             event
             async for event in tool_llm_call_stream(
-                "add", [_add_tool()], feature="chat", provider=provider_mock(), retry=NO_RETRY
+                "add", [_add_tool()], feature="chat", retry=NO_RETRY
             )
         ]
 

@@ -5,7 +5,7 @@
 tests pin the now-symmetric seams:
 
 * the public ``text_llm_call_stream`` carries both parameters and threads
-  them to the transport (``astream_text``),
+  them to the transport (observed through an :mod:`llmkit.testing` fake),
 * the transport only puts each on the provider request when set
   (``reasoning_effort`` resolved against the provider's value) — so the
   default stream request is byte-identical to before, and
@@ -17,11 +17,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator
-from unittest.mock import patch
 
 import pytest
 
 from llmkit import calls as llm_calls
+from llmkit.testing import Reply, install
 from tests._support import capture_stream_provider_kwargs, capturing_sink
 
 
@@ -39,15 +39,8 @@ def test_signature_exposes_max_tokens_and_reasoning_effort() -> None:
 
 def test_stream_threads_kwargs_to_transport() -> None:
     """``text_llm_call_stream(..., max_tokens=N, reasoning_effort=...)`` forwards
-    both down to ``astream_text``."""
-    seen: dict[str, object] = {}
-
-    async def _fake_astream(*_args: object, **kwargs: object) -> AsyncIterator[str]:
-        seen.update(kwargs)
-        for delta in ("he", "llo"):
-            yield delta
-
-    with patch("llmkit._litellm.astream_text", _fake_astream):
+    both down to the transport."""
+    with install(lambda _request: Reply(chunks=["he", "llo"])) as installed:
         chunks = asyncio.run(
             _drain(
                 llm_calls.text_llm_call_stream(
@@ -57,8 +50,10 @@ def test_stream_threads_kwargs_to_transport() -> None:
         )
 
     assert chunks == ["he", "llo"]
-    assert seen["max_tokens"] == 5
-    assert seen["reasoning_effort"] == "low"
+    (request,) = installed.requests
+    assert request.kind == "text_stream"
+    assert request.max_tokens == 5
+    assert request.reasoning_effort == "low"
 
 
 def test_transport_omits_kwargs_when_unset() -> None:
@@ -90,14 +85,7 @@ def test_transport_falls_back_to_provider_reasoning_effort() -> None:
 
 def test_log_record_carries_kwargs() -> None:
     """The ``LLMCallRecord`` written for a stream records both settings."""
-
-    async def _fake_astream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        yield "hello"
-
-    with (
-        capturing_sink() as captured,
-        patch("llmkit._litellm.astream_text", _fake_astream),
-    ):
+    with capturing_sink() as captured, install(lambda _request: Reply.text("hello")):
         _ = asyncio.run(
             _drain(
                 llm_calls.text_llm_call_stream(
@@ -118,15 +106,7 @@ def test_deprecated_alias_warns_at_call_time_and_matches_new_name() -> None:
     the warning fires before the first ``__anext__``, not on first iteration) and
     yields chunks identical to the canonical name over the same faked transport.
     """
-
-    async def _fake_astream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        for delta in ("he", "llo"):
-            yield delta
-
-    with (
-        capturing_sink(),
-        patch("llmkit._litellm.astream_text", _fake_astream),
-    ):
+    with capturing_sink(), install(lambda _request: Reply(chunks=["he", "llo"])):
         canonical = asyncio.run(_drain(llm_calls.text_llm_call_stream("hi", feature="test")))
         # The warning fires when the alias is *called*, before any chunk is
         # pulled — so wrapping only the call (not the drain) captures it, which
