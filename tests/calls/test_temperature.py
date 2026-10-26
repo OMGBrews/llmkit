@@ -8,7 +8,8 @@ parameters outright.) An explicit ``None`` — passed as a call keyword or
 through ``LLMCallOptions`` — resolves the same way, and an explicit number is
 forwarded unchanged.
 
-These tests pin three seams:
+These tests pin three seams (the call-surface ones through an
+:mod:`llmkit.testing` fake, whose request carries the resolved temperature):
 
 * every public call surface (structured, plain-text, streaming, the sync
   wrappers, and the deprecated ``stream_text_with_log`` alias) accepts
@@ -29,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,15 +38,16 @@ import pytest
 from llmkit import DEFAULT_TEMPERATURE, LLMCallOptions, Provider, make_provider
 from llmkit import calls as llm_calls
 from llmkit.providers import LLMProviderInterface
+from llmkit.testing import Reply, install
 from tests._support import (
-    NO_USAGE,
     OkSchema,
-    UsageCounts,
     capture_stream_provider_kwargs,
     capture_structured_provider_kwargs,
     capture_text_provider_kwargs,
     capturing_sink,
 )
+
+_OK = Reply.json(OkSchema(ok=True))
 
 
 def test_signatures_expose_temperature() -> None:
@@ -122,36 +124,18 @@ def test_default_temperature_is_none() -> None:
 def test_unset_resolves_to_none_structured() -> None:
     """Neither keyword nor ``options`` value → the transport receives
     ``None``, which its gating turns into an absent key."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         _ = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="test"))
 
-    assert "temperature" in seen
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_unset_resolves_to_none_text() -> None:
     """The plain-text path resolves an unset temperature to ``None`` too."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return "ok", None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
+    with install(lambda _request: Reply.text("ok")) as installed:
         _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test"))
 
-    assert "temperature" in seen
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 #: A builder for every shipped provider — only the arguments each one's knob
@@ -240,56 +224,28 @@ def test_keyword_none_reaches_transport_structured() -> None:
     """``structured_llm_call(..., temperature=None)`` resolves to ``None`` —
     the value the transport's gating then drops (absence is asserted at the
     real wire seam by ``capture_structured_provider_kwargs``)."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         _ = asyncio.run(
             llm_calls.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
         )
 
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_keyword_none_reaches_transport_text() -> None:
     """``text_llm_call(..., temperature=None)`` resolves to ``None`` — the
     value the transport's gating then drops (absence asserted at the real
     seam by ``capture_text_provider_kwargs``)."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return "ok", None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
+    with install(lambda _request: Reply.text("ok")) as installed:
         _ = asyncio.run(llm_calls.text_llm_call("hi", feature="test", temperature=None))
 
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_keyword_none_omits_key_stream() -> None:
-    """``text_llm_call_stream(..., temperature=None)`` sends no key at all."""
-
-    class _FakeStream:
-        def __aiter__(self) -> AsyncIterator[str]:
-            async def _gen() -> AsyncIterator[str]:
-                yield "he"
-                yield "llo"
-
-            return _gen()
-
-    seen: dict[str, object] = {}
-
-    def _fake_transport(*_args: object, **kwargs: object) -> _FakeStream:
-        seen.update(kwargs)
-        return _FakeStream()
+    """``text_llm_call_stream(..., temperature=None)`` resolves to ``None``,
+    which the stream transport sends as no key at all (asserted at the real
+    seam by ``test_transport_omits_temperature_when_none_stream``)."""
 
     async def _drive() -> list[str]:
         chunks: list[str] = []
@@ -297,62 +253,33 @@ def test_keyword_none_omits_key_stream() -> None:
             chunks.append(chunk)
         return chunks
 
-    with patch("llmkit._litellm.astream_text", side_effect=_fake_transport):
+    with install(lambda _request: Reply(chunks=["he", "llo"])) as installed:
         chunks = asyncio.run(_drive())
 
     assert chunks == ["he", "llo"]
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_keyword_none_reaches_transport_sync_structured() -> None:
     """The sync wrapper propagates ``temperature=None`` to the transport."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test", temperature=None)
 
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_keyword_none_reaches_transport_sync_text() -> None:
     """``text_llm_call_sync(..., temperature=None)`` resolves to ``None`` at
     the transport."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return "ok", None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_text", side_effect=_fake_transport):
+    with install(lambda _request: Reply.text("ok")) as installed:
         _ = llm_calls.text_llm_call_sync("hi", feature="test", temperature=None)
 
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_deprecated_alias_omits_key() -> None:
     """The deprecated ``stream_text_with_log`` alias forwards
     ``temperature=None`` to the streaming path."""
-
-    class _FakeStream:
-        def __aiter__(self) -> AsyncIterator[str]:
-            async def _gen() -> AsyncIterator[str]:
-                yield "ok"
-
-            return _gen()
-
-    def _fake_stream(*_args: object, **kwargs: object) -> _FakeStream:
-        seen.update(kwargs)
-        return _FakeStream()
-
-    seen: dict[str, object] = {}
 
     async def _drive() -> list[str]:
         chunks: list[str] = []
@@ -360,33 +287,25 @@ def test_deprecated_alias_omits_key() -> None:
             chunks.append(chunk)
         return chunks
 
-    with patch("llmkit._litellm.astream_text", side_effect=_fake_stream):
+    with install(lambda _request: Reply.text("ok")) as installed:
         with pytest.warns(DeprecationWarning, match="text_llm_call_stream"):
             chunks = asyncio.run(_drive())
 
     assert chunks == ["ok"]
-    assert seen["temperature"] is None
+    assert [r.temperature for r in installed.requests] == [None]
 
 
 def test_options_numeric_still_forwards_when_keyword_unset() -> None:
     """A numeric ``LLMCallOptions`` value still reaches the transport when the
     keyword is unset."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         _ = asyncio.run(
             llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", options=LLMCallOptions(temperature=0.6)
             )
         )
 
-    assert seen["temperature"] == 0.6
+    assert [r.temperature for r in installed.requests] == [0.6]
 
 
 # --- Log records: the omitted state is observable and distinct -----------------
@@ -395,16 +314,7 @@ def test_options_numeric_still_forwards_when_keyword_unset() -> None:
 def test_log_record_carries_none_for_omitted_temperature() -> None:
     """An explicitly-omitted temperature is recorded as ``None`` on the
     ``LLMCallRecord``."""
-
-    async def _fake_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        capturing_sink() as captured,
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
-    ):
+    with capturing_sink() as captured, install(lambda _request: _OK):
         _ = asyncio.run(
             llm_calls.structured_llm_call("hi", OkSchema, feature="test", temperature=None)
         )
@@ -416,16 +326,7 @@ def test_log_record_carries_none_for_omitted_temperature() -> None:
 def test_log_record_carries_none_for_unset_temperature() -> None:
     """An unset temperature sends none, so it is recorded as ``None`` — the
     same state as an explicit ``temperature=None``."""
-
-    async def _fake_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        capturing_sink() as captured,
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
-    ):
+    with capturing_sink() as captured, install(lambda _request: _OK):
         _ = asyncio.run(llm_calls.structured_llm_call("hi", OkSchema, feature="test"))
 
     assert len(captured) == 1

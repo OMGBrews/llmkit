@@ -4,7 +4,8 @@
 gained a keyword-only ``reasoning_effort`` (and ``LLMClientConfig`` a
 matching field). These tests pin the seams:
 
-* the public call functions thread ``reasoning_effort`` to the transport,
+* the public call functions thread ``reasoning_effort`` to the transport
+  (observed through an :mod:`llmkit.testing` fake's request),
 * the transport only forwards ``reasoning_effort`` to the provider request
   when the resolved value is not ``None`` — so the default is byte-identical
   to the prior request (no ``reasoning_effort`` key),
@@ -17,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from unittest.mock import patch
 
 from llmkit import (
     LLMClientConfig,
@@ -28,14 +28,15 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.providers import GoogleProvider, OllamaProvider
+from llmkit.testing import Reply, install
 from tests._support import (
-    NO_USAGE,
     OkSchema,
-    UsageCounts,
     capture_structured_provider_kwargs,
     capture_text_provider_kwargs,
     capturing_sink,
 )
+
+_OK = Reply.json(OkSchema(ok=True))
 
 
 def test_signatures_expose_reasoning_effort() -> None:
@@ -77,40 +78,24 @@ def test_build_provider_wires_reasoning_effort() -> None:
 
 def test_sync_call_threads_reasoning_effort_to_transport() -> None:
     """``structured_llm_call_sync(..., reasoning_effort="disable")`` forwards it."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         result = llm_calls.structured_llm_call_sync(
             "hi", OkSchema, feature="test", reasoning_effort="disable"
         )
 
-    assert seen["reasoning_effort"] == "disable"
+    assert [r.reasoning_effort for r in installed.requests] == ["disable"]
     assert isinstance(result, OkSchema)
     assert result.ok is True
 
 
 def test_async_call_threads_reasoning_effort_to_transport() -> None:
     """The async ``structured_llm_call(..., reasoning_effort=...)`` does the same."""
-    seen: dict[str, object] = {}
-
-    async def _fake_transport(
-        *_args: object, **kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        seen.update(kwargs)
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
+    with install(lambda _request: _OK) as installed:
         result = asyncio.run(
             llm_calls.structured_llm_call("hi", OkSchema, feature="test", reasoning_effort="low")
         )
 
-    assert seen["reasoning_effort"] == "low"
+    assert [r.reasoning_effort for r in installed.requests] == ["low"]
     assert result.ok is True
 
 
@@ -147,16 +132,7 @@ def test_text_transport_forwards_reasoning_effort() -> None:
 
 def test_log_record_carries_reasoning_effort() -> None:
     """The ``LLMCallRecord`` built for a structured call records the setting."""
-
-    async def _fake_transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        capturing_sink() as captured,
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport),
-    ):
+    with capturing_sink() as captured, install(lambda _request: _OK):
         _ = asyncio.run(
             llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", reasoning_effort="disable"

@@ -11,9 +11,9 @@ the cost a host needs, and that it works even with logging disabled.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
 
 import pytest
+from instructor.core import InstructorRetryException
 
 from llmkit import (
     LLMCallRecord,
@@ -24,22 +24,18 @@ from llmkit import (
 from llmkit import (
     calls as llm_calls,
 )
-from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
+from llmkit.testing import Reply, TransportRequest, install
+from tests._support import OkSchema
 
 
-async def _fake_structured(
-    *_args: object, **_kwargs: object
-) -> tuple[OkSchema, float | None, UsageCounts]:
-    return OkSchema(ok=True), 0.0042, NO_USAGE
+def _fake_structured(_request: TransportRequest) -> Reply:
+    return Reply.json(OkSchema(ok=True), cost=0.0042)
 
 
 def test_capture_records_yields_record_with_cost_async() -> None:
     """A host gets the per-call record — including ``approximate_cost`` —
     from an async call with no custom sink."""
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_fake_structured):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
@@ -53,8 +49,8 @@ def test_capture_records_yields_record_with_cost_async() -> None:
     assert isinstance(record, LLMCallRecord)
     assert record.approximate_cost == 0.0042
     assert record.feature == "extraction"
-    assert record.model == "gemini-3.1-flash-lite"
-    assert record.provider == "Google AI Studio"
+    assert record.model == "fake-model"
+    assert record.provider == "Ollama"
     assert record.error is None
 
 
@@ -67,10 +63,7 @@ def test_capture_records_crosses_the_sync_bridge() -> None:
     *persistent loop's* thread, so the capture ``ContextVar`` only reaches it
     because the bridge runs the task inside a copy of the caller's context. A
     bare ``run_coroutine_threadsafe`` would lose it and capture nothing."""
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_fake_structured):
         with capture_llm_records() as records:
             result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="classification")
 
@@ -91,10 +84,7 @@ def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
     no-running-loop test above exercises the persistent-loop path, which also
     crosses a thread boundary and so needs the same context copy).
     """
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_fake_structured):
 
         async def _run() -> tuple[list[LLMCallRecord], OkSchema]:
             with capture_llm_records() as records:
@@ -116,15 +106,7 @@ def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
 def test_capture_records_captures_text_calls() -> None:
     """``text_llm_call`` records flow into the capture buffer too."""
 
-    async def _fake_text(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "hello", 0.001, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(lambda _request: Reply.text("hello", cost=0.001)):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
@@ -143,18 +125,18 @@ def test_capture_records_captures_text_calls() -> None:
 def test_capture_records_records_error_on_failure() -> None:
     """A failing call still produces a captured record with the error set."""
 
-    async def _boom(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
+    def _boom(_request: TransportRequest) -> Reply:
         raise RuntimeError("provider exploded")
 
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_boom),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_boom):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
-                with pytest.raises(RuntimeError, match="provider exploded"):
+                # A structured failure escapes instructor wrapped, the original
+                # on ``__cause__`` (see ``_schema_repair_retrying``).
+                with pytest.raises(InstructorRetryException) as excinfo:
                     _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="extraction")
+                assert isinstance(excinfo.value.__cause__, RuntimeError)
             return records
 
         captured = asyncio.run(_run())
@@ -168,10 +150,7 @@ def test_capture_records_independent_of_paths_capture() -> None:
     """Records-capture works with logging disabled — proving it does not
     depend on a file sink the way path-capture does."""
     configure_llm_logging(None)
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_fake_structured):
 
         async def _run() -> tuple[list[LLMCallRecord], list[object]]:
             with capture_llm_records() as records:
@@ -192,10 +171,7 @@ def test_capture_record_carries_cost_metadata_without_a_sink() -> None:
     """Pin the contract FiW relied on: the record exposes both
     ``approximate_cost`` and the per-call metadata a host needs for cost
     attribution, with no sink authored."""
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_fake_structured):
 
         async def _run() -> LLMCallRecord:
             with capture_llm_records() as records:
@@ -212,7 +188,7 @@ def test_capture_record_carries_cost_metadata_without_a_sink() -> None:
 
     assert record.approximate_cost == 0.0042
     assert record.model == "custom-model"
-    assert record.provider == "Google AI Studio"
+    assert record.provider == "Ollama"
     assert record.feature == "extraction"
     assert record.label == "risk_register"
     assert record.duration_ms >= 0.0
