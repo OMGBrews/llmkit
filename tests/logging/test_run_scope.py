@@ -17,17 +17,17 @@ the calls of one run. These pin the field that can:
   ``index.jsonl``, so index → YAML cross-referencing needs no new join key; and
   with no scope set both carry an explicit ``null``, leaving every pre-existing
   key and its order untouched.
+
+The call-driven tests fake the provider through :mod:`llmkit.testing`.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Awaitable, Callable, Generator, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -45,7 +45,8 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.run_scope import RUN_ID_ENV_VAR
-from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
+from llmkit.testing import Reply, TransportRequest, install
+from tests._support import OkSchema
 from tests._support import make_record as _record
 
 _NO_BACKOFF = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
@@ -91,34 +92,9 @@ def _no_ambient_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
 
 
-async def _ok_transport(
-    *_args: object, **_kwargs: object
-) -> tuple[OkSchema, float | None, UsageCounts]:
-    return OkSchema(ok=True), None, NO_USAGE
-
-
-_StructuredTransport = Callable[..., Awaitable[tuple[OkSchema, float | None, UsageCounts]]]
-_TextTransport = Callable[..., Awaitable[tuple[str, float | None, UsageCounts]]]
-
-
-@contextmanager
-def patch_transport(transport: _StructuredTransport = _ok_transport) -> Generator[None]:
-    """Run a structured call fully offline: fake transport, fake provider."""
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
-        yield
-
-
-@contextmanager
-def patch_text_transport(transport: _TextTransport) -> Generator[None]:
-    """The plain-text counterpart of :func:`patch_transport`."""
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
-        yield
+def _ok(_request: TransportRequest) -> Reply:
+    """Answer every structured call with a valid ``OkSchema``."""
+    return Reply.json(OkSchema(ok=True))
 
 
 def _index_lines(log_dir: Path) -> list[dict[str, object]]:
@@ -242,7 +218,7 @@ def test_context_scope_does_not_leak_into_a_worker_thread() -> None:
 async def test_structured_call_stamps_the_active_run_id() -> None:
     """The structured surface carries the scope onto its record."""
     with (
-        patch_transport(),
+        install(_ok),
         run_scope("eval-sweep"),
         capture_llm_records() as records,
     ):
@@ -255,14 +231,8 @@ async def test_structured_call_stamps_the_active_run_id() -> None:
 async def test_text_call_stamps_the_active_run_id() -> None:
     """So does the buffered plain-text surface, which builds its record through
     a different helper (``_build_text_record``)."""
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "hello", None, NO_USAGE
-
     with (
-        patch_text_transport(_transport),
+        install(lambda _request: Reply.text("hello")),
         run_scope("eval-sweep"),
         capture_llm_records() as records,
     ):
@@ -273,7 +243,7 @@ async def test_text_call_stamps_the_active_run_id() -> None:
 
 def test_sequential_process_scopes_never_cross_tag() -> None:
     """Two runs in one process, tagged with their own ids and nothing else's."""
-    with patch_transport(), capture_llm_records() as records:
+    with install(_ok), capture_llm_records() as records:
         set_run_id("run-a")
         _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
         set_run_id("run-b")
@@ -287,7 +257,7 @@ def test_sequential_process_scopes_never_cross_tag() -> None:
 def test_scope_crosses_the_sync_bridge() -> None:
     """``run_sync`` copies the calling thread's context onto the persistent
     loop, so a ContextVar-held scope reaches records built there."""
-    with patch_transport(), run_scope("scoped"), capture_llm_records() as records:
+    with install(_ok), run_scope("scoped"), capture_llm_records() as records:
         _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     assert [r.run_id for r in records] == ["scoped"]
@@ -304,17 +274,13 @@ def test_env_scoped_sync_call_tags_every_index_line_including_retries(
     attempt 1, 2 and 3 alike — carries the run id."""
     monkeypatch.setenv(RUN_ID_ENV_VAR, "abc")
     configure_llm_logging(LocalYamlLogSink(tmp_path))
-    calls = [0]
 
-    async def _flaky(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] < 3:
+    def _flaky(request: TransportRequest) -> Reply:
+        if request.attempt is not None and request.attempt < 3:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None, NO_USAGE
+        return Reply.json(OkSchema(ok=True))
 
-    with patch_transport(_flaky):
+    with install(_flaky):
         result = llm_calls.structured_llm_call_sync(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
@@ -382,7 +348,7 @@ def test_run_id_composes_with_the_log_dir_env_var(
     monkeypatch.setenv(RUN_ID_ENV_VAR, "both-set")
     configure_llm_logging(LocalYamlLogSink())
 
-    with patch_transport():
+    with install(_ok):
         _ = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     (line,) = _index_lines(tmp_path)

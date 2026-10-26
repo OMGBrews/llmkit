@@ -10,6 +10,12 @@ Also pins two response-fidelity contracts: a failed buffered text attempt
 logs ``response: None`` (not ``""``, which would be indistinguishable from
 a successful empty completion), and a schema whose custom serializer raises
 degrades the *logged* response to ``None`` without breaking the call.
+
+The call-driven tests fake the provider through :mod:`llmkit.testing`, except
+two that stay on the private seams (each docstring says why). The
+``"Google AI Studio"`` / ``gemini-3.1-flash-lite`` values asserted here come
+from directly built records (``make_record``) and ``MagicMock`` providers
+handed to ``resolve_model_and_provider``, not from a faked call.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.calls._shared import resolve_model_and_provider
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import NO_USAGE, UsageCounts, provider_mock
 from tests._support import make_record as _record
 
@@ -73,7 +80,11 @@ def test_resolve_uses_explicit_provider_without_global_lookup() -> None:
 
 def test_structured_call_forwards_provider_override_to_transport() -> None:
     """``structured_llm_call`` threads a per-call provider down to the
-    transport so the call routes through the override, not the global."""
+    transport so the call routes through the override, not the global.
+
+    Stays on the private ``acompletion_structured`` seam: it asserts the
+    provider *object* the transport received, which a
+    :class:`~llmkit.testing.TransportRequest` does not carry."""
     import asyncio
 
     from pydantic import BaseModel
@@ -253,13 +264,10 @@ def test_failed_text_call_logs_response_none() -> None:
     (per the ``LLMCallRecord`` contract), not ``""`` — an empty string would
     be indistinguishable from a successful empty completion."""
 
-    async def _boom(*_args: object, **_kwargs: object) -> tuple[str, float | None]:
+    def _boom(_request: TransportRequest) -> Reply:
         raise RuntimeError("transport exploded")
 
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=_boom),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(_boom):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
@@ -278,16 +286,7 @@ def test_failed_text_call_logs_response_none() -> None:
 def test_successful_text_call_still_logs_the_text() -> None:
     """Regression for the ``None``-sentinel fix: a successful text call
     records the actual completion text, exactly as before."""
-
-    async def _fake_text(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "hello world", 0.001, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=_fake_text),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(lambda _request: Reply.text("hello world", cost=0.001)):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
@@ -305,7 +304,11 @@ def test_successful_text_call_still_logs_the_text() -> None:
 def test_mid_stream_failure_still_logs_partial_transcript() -> None:
     """The streaming surface is deliberately different from the buffered
     one: a mid-stream error logs the partial transcript accumulated so far
-    (alongside the error), not ``None``."""
+    (alongside the error), not ``None``.
+
+    Stays on the private ``astream_text`` seam: the stream fails after its
+    second chunk, and a :mod:`llmkit.testing` fake can fail a stream only
+    before its first."""
     from collections.abc import AsyncIterator
 
     def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
@@ -349,19 +352,7 @@ def test_abandoned_stream_logs_abandonment_marker_not_ok(tmp_path: Path) -> None
     partial transcript), so the written YAML's ``head -1`` verdict reads
     ``ERROR``, never ``ok``.
     """
-    from collections.abc import AsyncIterator
-
-    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            for delta in ("a", "b", "c", "d"):
-                yield delta
-
-        return _gen()
-
-    with (
-        patch("llmkit._litellm.astream_text", side_effect=_fake_stream),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-    ):
+    with install(lambda _request: Reply(chunks=["a", "b", "c", "d"])):
 
         async def _run() -> list[LLMCallRecord]:
             with capture_llm_records() as records:
@@ -404,15 +395,9 @@ def test_raising_model_serializer_degrades_logged_response_not_the_call(
     successful return value (or mask a real provider error) — the dump
     exists only for the log, so the logged response degrades to ``None``
     with a warning, and the call still returns the parsed model."""
-
-    async def _fake_structured(
-        *_args: object, **_kwargs: object
-    ) -> tuple[_ExplodingDumpSchema, float | None, UsageCounts]:
-        return _ExplodingDumpSchema(ok=True), 0.001, NO_USAGE
-
+    # Raw JSON, not ``Reply.json``: serializing this schema is what explodes.
     with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_fake_structured),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
+        install(lambda _request: Reply.text('{"ok": true}', cost=0.001)),
         caplog.at_level("WARNING", logger="llmkit.calls"),
     ):
 
