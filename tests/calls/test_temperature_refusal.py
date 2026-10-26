@@ -28,6 +28,7 @@ from llmkit import (
     NO_RETRY,
     UNSET,
     InMemoryLLMCache,
+    OutputLimitError,
     RetryPolicy,
     ServiceUnavailableError,
     Unset,
@@ -398,3 +399,31 @@ async def test_a_concurrent_call_does_not_see_another_calls_drop() -> None:
         )
 
     assert sorted((r.temperature for r in records), key=lambda t: t is not None) == [None, 0.7]
+
+
+@pytest.mark.parametrize("lane", [_text, _text_stream], ids=["text", "text_stream"])
+async def test_a_truncated_text_attempt_records_the_temperature_sent(lane: _Lane) -> None:
+    """A length truncation raises after the refused temperature was dropped,
+    and the record still shows what was sent."""
+    requests: list[dict[str, object]] = []
+
+    async def _acompletion(**request: object) -> object:
+        requests.append(request)
+        if len(requests) == 1:
+            raise _client_refusal()
+        if lane is _text_stream:
+            return _Stream([_Chunk("cut"), _Chunk(None, finish_reason="length")])
+        response = _response("cut")
+        response.choices[0].finish_reason = "length"
+        return response
+
+    with (
+        patch("llmkit._litellm.litellm.acompletion", side_effect=_acompletion),
+        capture_llm_records() as records,
+        pytest.raises(OutputLimitError),
+    ):
+        await lane(_provider(), temperature=0.0, retry=NO_RETRY)
+    assert len(requests) == 2
+    [record] = records
+    assert record.temperature is None
+    assert record.partial_text == "cut"

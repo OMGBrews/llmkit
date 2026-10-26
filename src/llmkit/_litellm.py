@@ -644,6 +644,40 @@ def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics
         return OutputLimitDiagnostics()
 
 
+#: The finish reason a provider reports when the output-token limit cut a
+#: completion off (LiteLLM maps Gemini's ``MAX_TOKENS`` onto it).
+_LENGTH = "length"
+
+
+def _text_output_limit_error(
+    *,
+    model: str,
+    max_tokens: int | None,
+    partial_text: str | None,
+    usage: WireUsage,
+) -> OutputLimitError:
+    """The :class:`OutputLimitError` for a text completion the provider truncated.
+
+    Built from llmkit's own wire types rather than through
+    :func:`_output_limit_diagnostics`, which reads instructor's raw completion.
+    Only an explicit ``"length"`` finish reason reaches here, so the reason is
+    known; every count is whatever the provider reported, ``None`` otherwise.
+    """
+    return OutputLimitError(
+        model=model,
+        max_tokens=max_tokens,
+        completion_tokens=usage.completion_tokens,
+        diagnostics=OutputLimitDiagnostics(
+            partial_text=partial_text,
+            finish_reason=_LENGTH,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+        ),
+    )
+
+
 def _schema_repair_retrying() -> AsyncRetrying:
     """instructor's in-call repair budget: one schema-repair re-ask, for a
     genuine parse failure only.
@@ -981,6 +1015,12 @@ async def acompletion_text(
     choice's message content coerced to a string via
     :func:`_coerce_text_content` (list content blocks joined; an empty string
     when the provider returns none).
+
+    Raises :class:`~llmkit.exceptions.OutputLimitError` when the provider
+    reports ``finish_reason="length"``, after the slot has debited the
+    response's usage: the cut-off text travels in its diagnostics rather than
+    being returned as a complete answer. A missing or any other finish reason
+    returns normally.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1022,6 +1062,13 @@ async def acompletion_text(
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
         slot.record_tokens(response.usage.debit())
+    if response.finish_reason == _LENGTH:
+        raise _text_output_limit_error(
+            model=litellm_model,
+            max_tokens=max_tokens,
+            partial_text=response.text,
+            usage=response.usage,
+        )
     # A response with no choice, or no content, is an empty answer.
     text = response.text if response.text is not None else ""
     return text, response.cost, response.usage.counts()
@@ -1369,6 +1416,13 @@ async def astream_text(
     default request is byte-identical to the prior stream call. ``temperature``
     is forwarded only when not ``None`` — a resolved ``None`` sends no
     ``temperature`` key at all (the provider's default sampling applies).
+
+    When the provider reports ``finish_reason="length"`` — on a frame with
+    text or a frame of its own — the stream still runs out normally, so its
+    usage is debited and the slot released, and then raises
+    :class:`~llmkit.exceptions.OutputLimitError` carrying the yielded
+    transcript as its partial text. A missing or any other finish reason ends
+    the stream normally.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1404,6 +1458,9 @@ async def astream_text(
         },
         call=call,
     )
+    transcript: list[str] = []
+    stop_reason: str | None = None
+    usage: WireUsage | None = None
     async with (
         GlobalRateLimiter.acquire_async(provider.name) as slot,
         aclosing(_stream(request)) as stream,
@@ -1416,5 +1473,24 @@ async def astream_text(
                 # for streamed calls. When the stream does expose a final
                 # usage, debit it before releasing the slot.
                 slot.record_tokens(item.usage.debit())
-            elif item.text:
+                # Usage on a frame wins; the stream's own is the fallback.
+                if usage is None:
+                    usage = item.usage
+                continue
+            # The stop reason can ride a frame with text, or a frame of its own.
+            if item.finish_reason is not None:
+                stop_reason = item.finish_reason
+            if item.usage is not None:
+                usage = item.usage
+            if item.text:
+                transcript.append(item.text)
                 yield item.text
+    # Raised only once the stream ran out on its own, so its usage is already
+    # debited; the text it carries has already reached the consumer.
+    if stop_reason == _LENGTH:
+        raise _text_output_limit_error(
+            model=litellm_model,
+            max_tokens=max_tokens,
+            partial_text="".join(transcript),
+            usage=usage if usage is not None else WireUsage(),
+        )

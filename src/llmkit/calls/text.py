@@ -22,6 +22,7 @@ from llmkit.calls._shared import (
     run_with_policy,
 )
 from llmkit.capture import record_call_async
+from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
@@ -74,8 +75,9 @@ async def text_llm_call(
             :class:`~llmkit.LLMClientConfig`: per-call overrides
             ``options`` overrides config.
         max_tokens: Optional cap on the completion length, forwarded to
-            the provider when set (e.g. the readiness healthcheck uses
-            ``max_tokens=1`` to keep its ping cheap).
+            the provider when set. A completion the provider cuts off at the
+            cap (or at its own ceiling) raises :class:`~llmkit.OutputLimitError`
+            rather than returning the partial text.
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort; unset defers to ``options``, then to
             the configured :class:`~llmkit.LLMClientConfig` value.
@@ -103,6 +105,10 @@ async def text_llm_call(
         cache answered an identical earlier request.
 
     Raises:
+        OutputLimitError: The provider reported ``finish_reason="length"``.
+            The cut-off text is in ``exc.diagnostics.partial_text``, never
+            returned as the answer, never cached, and not retried by
+            default. A missing or any other finish reason returns normally.
         Any exception from the LLM provider — transient ones
         (``LLM_RECOVERABLE_ERRORS``) are retried per *retry*, others
         propagate immediately. The log is still written on every attempt
@@ -141,6 +147,7 @@ async def text_llm_call(
         cost: float | None = None
         usage: TokenUsage | None = None
         error: str | None = None
+        diagnostics: OutputLimitDiagnostics | None = None
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
@@ -166,7 +173,14 @@ async def text_llm_call(
                 _ = on_result(text)
             return text
         except Exception as exc:
+            # A truncation raises after the completion returned, so the
+            # funnel already stamped what it sent.
+            sent_temperature = _litellm.sent_temperature(sent_temperature)
             error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, OutputLimitError):
+                # ``response`` stays None: the cut-off text is not an answer,
+                # and is logged as ``partial_text`` instead.
+                diagnostics = exc.diagnostics
             raise
         finally:
             _ = await record_call_async(
@@ -188,6 +202,7 @@ async def text_llm_call(
                     call_id=call_id,
                     attempt=attempt,
                     usage=usage,
+                    output_limit=diagnostics,
                 )
             )
 

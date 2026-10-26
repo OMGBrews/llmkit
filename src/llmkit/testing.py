@@ -167,9 +167,9 @@ class Reply:
         finish_reason: The provider's finish reason. ``None`` means
             ``"tool_calls"`` when tool calls are present, otherwise ``"stop"``.
             ``"length"`` gets each kind's real truncation behavior: a
-            structured call raises :class:`~llmkit.OutputLimitError`, a tool
-            call reports it as ``stop_reason``, and text calls and text
-            streams do not surface it.
+            structured call, a text call and a text stream raise
+            :class:`~llmkit.OutputLimitError` (the stream after delivering
+            its chunks), and a tool call reports it as ``stop_reason``.
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
         cost: Approximate cost to report, or ``None``.

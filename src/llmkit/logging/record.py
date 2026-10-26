@@ -114,23 +114,24 @@ class LLMCallRecord:
     ``None``), on a structured or text attempt whose result an
     ``on_result`` hook then rejected (the tokens were spent, as its
     ``approximate_cost`` already shows), and on a truncated structured
-    attempt, whose counts it shares with ``output_limit``; any other failed
-    attempt logs ``None``. The plain text stream does not ask the provider for
-    usage and always logs ``None``; the tool stream asks, and logs it. The
-    YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
+    or text attempt, whose counts it shares with ``output_limit``; any other
+    failed attempt logs ``None``. The plain text stream does not ask the
+    provider for usage and logs ``None`` except when truncated; the tool stream
+    asks, and logs it. The YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
     deliberately does not, so the compact scan line keeps its fixed shape.
 
-    Two fields carry a **structured call cut off by its output limit** and are
-    ``None`` on every other attempt: ``output_limit`` is the truncated
+    Two fields carry a **structured or text call cut off by its output limit**
+    and are ``None`` on every other attempt: ``output_limit`` is the truncated
     completion's ``finish_reason`` / ``prompt_tokens`` /
     ``completion_tokens`` / ``total_tokens`` / ``reasoning_tokens``
     (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`; any value may be
     ``None`` when the completion did not report it, so a truncation that
     reported nothing is a mapping of nulls, never a ``None`` mapping), and
     ``partial_text`` is the unfinished answer text. ``response`` stays
-    ``None`` on such an attempt — unfinished text is not a validated
-    structured response — and ``completion_tokens`` may include reasoning
-    tokens that never appear in ``partial_text``. The YAML body carries both;
+    ``None`` on such a buffered attempt — unfinished text is not a finished
+    answer — while a text stream keeps the transcript it already yielded
+    there; and ``completion_tokens`` may include reasoning tokens that never
+    appear in ``partial_text``. The YAML body carries both;
     ``index.jsonl`` carries neither.
     """
 
