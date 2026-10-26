@@ -25,7 +25,6 @@ import random
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from unittest.mock import patch
 
 import httpx
 import openai
@@ -35,7 +34,8 @@ from instructor.core import InstructorRetryException
 from llmkit import calls as llm_calls
 from llmkit import retry
 from llmkit.retry import _retry_after_seconds, with_retries
-from tests._support import NO_USAGE, OkSchema, UsageCounts, quiet_logging
+from llmkit.testing import Reply, TransportRequest, install, rate_limit_error
+from tests._support import OkSchema
 
 
 def _request() -> httpx.Request:
@@ -301,10 +301,10 @@ async def test_wrapped_header_honored_through_with_retries(
 # --- end-to-end thread-through on the call surfaces ----------------------
 
 
-@pytest.mark.asyncio
 async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``structured_llm_call`` honours a ``Retry-After`` from its transport: the
-    default-policy backoff sleeps the server value before the successful retry."""
+    """``structured_llm_call`` honours a provider ``Retry-After``: the
+    default-policy backoff sleeps the server value before the successful
+    retry, even though instructor wraps the 429 in-call."""
     slept: list[float] = []
 
     async def _sleep(delay: float) -> None:
@@ -312,25 +312,20 @@ async def test_retry_after_honored_in_structured_call(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(asyncio, "sleep", _sleep)
     monkeypatch.setattr(random, "uniform", _no_jitter)
-    calls = [0]
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise _rate_limit({"retry-after": "4"})
-        return OkSchema(ok=True), None, NO_USAGE
+    def fake(request: TransportRequest) -> Reply:
+        if request.attempt == 1:
+            raise rate_limit_error(retry_after=4)
+        return Reply.json(OkSchema(ok=True))
 
-    with quiet_logging(), patch("llmkit._litellm.acompletion_structured", side_effect=_transport):
+    with install(fake) as installed:
         result = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert result.ok is True
-    assert calls[0] == 2
+    assert [r.attempt for r in installed.requests] == [1, 2]
     assert slept == [4.0]
 
 
-@pytest.mark.asyncio
 async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """``text_llm_call_stream`` honours a ``Retry-After`` on a pre-first-chunk
     failure: the retry waits the server value before delivering the stream.
@@ -351,20 +346,15 @@ async def test_retry_after_honored_in_streaming_call(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(asyncio, "sleep", _sleep)
     monkeypatch.setattr(random, "uniform", _no_jitter)
-    calls = [0]
 
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise _rate_limit({"retry-after": "4"})
-            # Unreachable: the bare yield makes this an async generator.
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-        for delta in ("he", "llo"):
-            yield delta
+    def fake(request: TransportRequest) -> Reply:
+        if request.attempt == 1:
+            raise rate_limit_error(retry_after=4)
+        return Reply(chunks=["he", "llo"])
 
-    with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+    with install(fake) as installed:
         chunks = await _drain(llm_calls.text_llm_call_stream("hi", feature="test"))
 
     assert chunks == ["he", "llo"]
-    assert calls[0] == 2
+    assert [r.attempt for r in installed.requests] == [1, 2]
     assert slept == [4.0]

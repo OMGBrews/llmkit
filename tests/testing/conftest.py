@@ -13,23 +13,11 @@ from collections.abc import Iterator
 
 import pytest
 
-from llmkit import LLMClientConfig, Provider, configure_llm_cache, configure_llm_client
-from llmkit.providers import base as providers_base
-from llmkit.rate_limiting import GlobalRateLimiter
-from tests._support import quiet_logging
+from tests._support import ollama_call_defaults
 
 
 @pytest.fixture(autouse=True)
 def _ollama_and_defaults() -> Iterator[None]:
     """An Ollama provider config, no cache, muted logging, default limits."""
-    previous = providers_base._config_source
-    configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model"))
-    configure_llm_cache(None)
-    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
-    try:
-        with quiet_logging():
-            yield
-    finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
-        configure_llm_cache(None)
-        providers_base._config_source = previous
+    with ollama_call_defaults():
+        yield

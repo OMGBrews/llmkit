@@ -16,8 +16,13 @@ unretried) does not multiply the two budgets. These pin:
 
 ``tool_llm_call_stream`` re-yields from the same loop and so participates in
 the same guard. What is *not* shared is its ``warn_stacklevel``: that is a
-per-call-site constant chosen by each wrapper, so the last two tests pin it
+per-call-site constant chosen by each wrapper, so the tool-lane tests pin it
 independently rather than inheriting the text lane's evidence.
+
+The provider is faked through :mod:`llmkit.testing`, so the real limiter runs
+around every attempt. The two mid-stream failure tests stay on the private
+``astream_text`` / ``astream_tools`` seams: the public fake cannot fail a
+stream after its first chunk.
 """
 
 from __future__ import annotations
@@ -27,14 +32,25 @@ import warnings
 from collections.abc import AsyncIterator
 from unittest.mock import patch
 
+import openai
 import pytest
+from pydantic import BaseModel
 
-from llmkit import NO_RETRY, RetryPolicy
+from llmkit import NO_RETRY, RetryPolicy, ToolDefinition
 from llmkit import calls as llm_calls
 from llmkit.retry import _retry_scope, _RetryScope, with_retries
+from llmkit.testing import Fake, Reply, TransportRequest, install, timeout_error
 from tests._support import quiet_logging
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
+_HELLO = Reply(chunks=["he", "llo"])
+
+
+class _Args(BaseModel):
+    left: int
+
+
+_TOOLS = [ToolDefinition.from_model("add", _Args, "Add.")]
 
 
 async def _drain(stream: AsyncIterator[str]) -> list[str]:
@@ -42,41 +58,45 @@ async def _drain(stream: AsyncIterator[str]) -> list[str]:
     return [chunk async for chunk in stream]
 
 
+def _always_times_out(_request: TransportRequest) -> Reply:
+    raise timeout_error()
+
+
+def _times_out_then(reply: Reply) -> Fake:
+    """A fake raising ``timeout_error()`` on the first attempt only."""
+
+    def fake(request: TransportRequest) -> Reply:
+        if request.attempt == 1:
+            raise timeout_error()
+        return reply
+
+    return fake
+
+
 # --- under an outer with_retries: collapse to a single pass ---------------
 
 
-@pytest.mark.asyncio
 async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
     """Wrapping stream consumption (which already retries 3x pre-first-chunk)
     in ``with_retries(max_attempts=3)`` must NOT yield 3x3=9 provider calls.
     The stream loop collapses to a single pass per outer attempt, and the
     accidental double-wrap warns."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        raise TimeoutError("always")
-        # Unreachable by design: the bare ``yield`` makes this an async
-        # generator; the ``raise`` above precedes it on every attempt.
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     async def _wrapped() -> list[str]:
         return await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF))
 
     with (
-        quiet_logging(),
-        patch("llmkit._litellm.astream_text", _transport),
+        install(_always_times_out) as installed,
         pytest.warns(RuntimeWarning, match="nested inside an already-retrying"),
-        pytest.raises(TimeoutError, match="always"),
+        pytest.raises(openai.APITimeoutError),
     ):
-        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
 
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
     # NOT 9 (3 x 3). The guard prevented the multiplication.
-    assert calls[0] == 3
+    assert len(installed.requests) == 3
 
 
-@pytest.mark.asyncio
 async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
     """The warning must name the *consumer's* ``async for``, once per call site.
 
@@ -92,11 +112,6 @@ async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
     ``warn_stacklevel`` that compensates for it.
     """
 
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        raise TimeoutError("always")
-        # Unreachable by design (see above).
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-
     # Two callers with their OWN ``async for`` lines: the default filter keys on
     # the warn site, so sharing ``_drain`` would legitimately collapse them to
     # one and the count below would prove nothing.
@@ -111,14 +126,14 @@ async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
         ]
 
     caught: list[warnings.WarningMessage] = []
-    with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+    with install(_always_times_out):
         with warnings.catch_warnings(record=True) as recorded:
             # The real default filter, not pytest.warns' ``always`` — the
             # per-warn-site de-duplication is half of what is being pinned.
             warnings.simplefilter("default")
             for site in (_site_one, _site_two):
-                with contextlib.suppress(TimeoutError):
-                    _ = await with_retries(site, max_attempts=2, retry_on=(TimeoutError,))
+                with contextlib.suppress(openai.APITimeoutError):
+                    _ = await with_retries(site, max_attempts=2, retry_on=(openai.APITimeoutError,))
             caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
 
     # Two distinct caller sites -> two warnings. One would mean the origin
@@ -129,18 +144,10 @@ async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
     assert len({w.lineno for w in caught}) == 2
 
 
-@pytest.mark.asyncio
 async def test_no_retry_inner_under_outer_wrapper_stays_silent() -> None:
     """The documented escape hatch: drive retries from an outer ``with_retries``
     by opting the stream out with ``retry=NO_RETRY``. The inner is already a
     single pass, so there is nothing to multiply and no ``RuntimeWarning``."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        raise TimeoutError("always")
-        # Unreachable by design (see above).
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     async def _wrapped() -> list[str]:
         return await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=NO_RETRY))
@@ -149,13 +156,12 @@ async def test_no_retry_inner_under_outer_wrapper_stays_silent() -> None:
         # Any nested-guard RuntimeWarning on this intended path fails the test.
         warnings.simplefilter("error", RuntimeWarning)
         with (
-            quiet_logging(),
-            patch("llmkit._litellm.astream_text", _transport),
-            pytest.raises(TimeoutError, match="always"),
+            install(_always_times_out) as installed,
+            pytest.raises(openai.APITimeoutError),
         ):
-            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(TimeoutError,))
+            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
 
-    assert calls[0] == 3
+    assert len(installed.requests) == 3
 
 
 @pytest.mark.asyncio
@@ -189,72 +195,44 @@ async def test_mid_stream_failure_under_outer_wrapper_does_not_warn() -> None:
 # --- without an outer loop: behaviour unchanged ----------------------------
 
 
-@pytest.mark.asyncio
 async def test_stream_retries_normally_without_outer_loop() -> None:
     """Standalone, a pre-first-chunk transient failure is still retried and
     the second attempt delivers the full output (the guard changed nothing)."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        if calls[0] == 1:
-            raise TimeoutError("transient")
-            # Unreachable by design (see above).
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-        for delta in ("he", "llo"):
-            yield delta
-
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+        with install(_times_out_then(_HELLO)) as installed:
             chunks = await _drain(
                 llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
 
     assert chunks == ["he", "llo"]
-    assert calls[0] == 2
+    assert len(installed.requests) == 2
     # The loop's own guard flag was reset on completion.
     assert _retry_scope.get() is None
 
 
-@pytest.mark.asyncio
 async def test_stream_exhausts_full_budget_without_outer_loop() -> None:
     """Standalone, a persistent pre-first-chunk failure still spends the full
     transport budget (3 attempts) before propagating."""
-    calls = [0]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        raise TimeoutError("always")
-        # Unreachable by design (see above).
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-
     with (
-        quiet_logging(),
-        patch("llmkit._litellm.astream_text", _transport),
-        pytest.raises(TimeoutError, match="always"),
+        install(_always_times_out) as installed,
+        pytest.raises(openai.APITimeoutError),
     ):
         _ = await _drain(llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF))
 
-    assert calls[0] == 3
+    assert len(installed.requests) == 3
     assert _retry_scope.get() is None
 
 
 # --- the guard flag never leaks into the consumer's context ----------------
 
 
-@pytest.mark.asyncio
 async def test_guard_flag_not_visible_to_consumer_between_chunks() -> None:
     """An async generator body runs in its consumer's context, so the loop
     releases the flag around each ``yield``: code the host runs between chunks
     (e.g. its own llmkit calls) must not see an active retry loop."""
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        for delta in ("he", "llo"):
-            yield delta
-
     seen_between_chunks: list[_RetryScope | None] = []
-    with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+    with install(lambda _request: _HELLO):
         async for _chunk in llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF):
             seen_between_chunks.append(_retry_scope.get())
 
@@ -262,16 +240,10 @@ async def test_guard_flag_not_visible_to_consumer_between_chunks() -> None:
     assert _retry_scope.get() is None
 
 
-@pytest.mark.asyncio
 async def test_guard_flag_clear_after_early_break() -> None:
     """A consumer that stops reading mid-stream must not be left with the
     guard flag set in its context — its later llmkit calls retry normally."""
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        for delta in ("he", "llo"):
-            yield delta
-
-    with quiet_logging(), patch("llmkit._litellm.astream_text", _transport):
+    with install(lambda _request: _HELLO):
         # The public annotation is AsyncGenerator, so aclose() — the
         # early-abandonment path under test — is on the surface directly.
         stream = llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
@@ -286,7 +258,6 @@ async def test_guard_flag_clear_after_early_break() -> None:
 # --- the streaming tool lane: same guard, its own wrapper frame -----------
 
 
-@pytest.mark.asyncio
 async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
     """``tool_llm_call_stream`` picks its own ``warn_stacklevel``, so pin it too.
 
@@ -296,25 +267,12 @@ async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() ->
     double-wrap and collapses every host's warning onto that one line — which
     is exactly why it is asserted rather than assumed.
     """
-    from pydantic import BaseModel
-
-    from llmkit import ToolDefinition
-
-    class _Args(BaseModel):
-        left: int
-
-    tools = [ToolDefinition.from_model("add", _Args, "Add.")]
-
-    async def _transport(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        raise TimeoutError("always")
-        # Unreachable by design; makes this an async generator.
-        yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
 
     async def _site_one() -> list[object]:
         return [
             e
             async for e in llm_calls.tool_llm_call_stream(
-                "a", tools, feature="t", retry=_NO_BACKOFF
+                "a", _TOOLS, feature="t", retry=_NO_BACKOFF
             )
         ]
 
@@ -322,17 +280,17 @@ async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() ->
         return [
             e
             async for e in llm_calls.tool_llm_call_stream(
-                "b", tools, feature="t", retry=_NO_BACKOFF
+                "b", _TOOLS, feature="t", retry=_NO_BACKOFF
             )
         ]
 
     caught: list[warnings.WarningMessage] = []
-    with quiet_logging(), patch("llmkit._litellm.astream_tools", _transport):
+    with install(_always_times_out):
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("default")
             for site in (_site_one, _site_two):
-                with contextlib.suppress(TimeoutError):
-                    _ = await with_retries(site, max_attempts=2, retry_on=(TimeoutError,))
+                with contextlib.suppress(openai.APITimeoutError):
+                    _ = await with_retries(site, max_attempts=2, retry_on=(openai.APITimeoutError,))
             caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
 
     assert len(caught) == 2, [f"{w.filename}:{w.lineno}" for w in caught]
@@ -342,43 +300,25 @@ async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() ->
     assert all("tool_llm_call_stream" in str(w.message) for w in caught)
 
 
+async def test_tool_stream_retries_before_the_first_event() -> None:
+    """The transport-only budget, on the lane whose terminal item is a result:
+    pre-first-event failures exhaust the budget."""
+    with install(_always_times_out) as installed, pytest.raises(openai.APITimeoutError):
+        _ = [
+            e
+            async for e in llm_calls.tool_llm_call_stream(
+                "a", _TOOLS, feature="t", retry=_NO_BACKOFF
+            )
+        ]
+    assert len(installed.requests) == _NO_BACKOFF.max_attempts
+
+
 @pytest.mark.asyncio
-async def test_tool_stream_retries_before_the_first_event_and_not_after() -> None:
-    """The transport-only budget, on the lane whose terminal item is a result.
-
-    Pre-first-event failures exhaust the budget; a failure after any event has
-    reached the consumer propagates unretried, because a partly consumed stream
-    cannot be restarted — the same contract the text stream documents.
-    """
-    from pydantic import BaseModel
-
-    from llmkit import ToolDefinition
-
-    class _Args(BaseModel):
-        left: int
-
-    tools = [ToolDefinition.from_model("add", _Args, "Add.")]
-    attempts = 0
-
-    def _failing_before(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        async def _gen() -> AsyncIterator[object]:
-            nonlocal attempts
-            attempts += 1
-            raise TimeoutError("pre-first")
-            yield  # pyright: ignore[reportUnreachable]  # pragma: no cover
-
-        return _gen()
-
-    with quiet_logging(), patch("llmkit._litellm.astream_tools", side_effect=_failing_before):
-        with pytest.raises(TimeoutError):
-            _ = [
-                e
-                async for e in llm_calls.tool_llm_call_stream(
-                    "a", tools, feature="t", retry=_NO_BACKOFF
-                )
-            ]
-    assert attempts == _NO_BACKOFF.max_attempts
-
+async def test_tool_stream_does_not_retry_after_the_first_event() -> None:
+    """A failure after any event has reached the consumer propagates
+    unretried, because a partly consumed stream cannot be restarted — the same
+    contract the text stream documents. Stays on the private seam: the public
+    fake cannot fail mid-stream."""
     attempts = 0
 
     def _failing_after(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
@@ -395,7 +335,7 @@ async def test_tool_stream_retries_before_the_first_event_and_not_after() -> Non
             _ = [
                 e
                 async for e in llm_calls.tool_llm_call_stream(
-                    "a", tools, feature="t", retry=_NO_BACKOFF
+                    "a", _TOOLS, feature="t", retry=_NO_BACKOFF
                 )
             ]
     assert attempts == 1

@@ -21,9 +21,15 @@ from pydantic import BaseModel
 
 from llmkit import (
     LLMCallRecord,
+    LLMClientConfig,
     LocalYamlLogSink,
+    Provider,
+    configure_llm_cache,
+    configure_llm_client,
     configure_llm_logging,
 )
+from llmkit.providers import base as providers_base
+from llmkit.rate_limiting import GlobalRateLimiter
 
 # The usage triple a faked ``acompletion_structured`` / ``acompletion_text``
 # returns beside its cost when the test does not care about token counts:
@@ -97,6 +103,30 @@ def quiet_logging() -> Generator[None]:
         yield
     finally:
         configure_llm_logging(LocalYamlLogSink())
+
+
+@contextmanager
+def ollama_call_defaults() -> Generator[None]:
+    """A keyless Ollama provider config, no cache, muted logging, default limits.
+
+    The setup a test needs to drive the public call functions through an
+    :mod:`llmkit.testing` fake: the fake answers only the round trip, so a real
+    configured provider must still resolve, and Ollama needs no key. The rate
+    limiter keeps the shipped defaults (breaker off). Restores the previous
+    provider config and resets the cache and limiter on exit. A ``conftest.py``
+    wraps this in an autouse fixture.
+    """
+    previous = providers_base._config_source
+    configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model"))
+    configure_llm_cache(None)
+    GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
+    try:
+        with quiet_logging():
+            yield
+    finally:
+        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
+        configure_llm_cache(None)
+        providers_base._config_source = previous
 
 
 @contextmanager
