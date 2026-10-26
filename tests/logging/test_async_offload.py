@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
@@ -29,7 +27,8 @@ import pytest
 from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
 from llmkit import calls as llm_calls
 from llmkit.capture import capture_llm_log_paths, record_call_async
-from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
+from llmkit.testing import FakeToolCall, Reply, install
+from tests._support import OkSchema
 from tests._support import make_record as _record
 
 
@@ -50,18 +49,10 @@ async def test_structured_call_writes_log_off_the_event_loop() -> None:
     """The structured path's sink write runs on a worker thread, not the
     thread driving the event loop."""
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
     try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.json(OkSchema(ok=True))):
             _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -73,18 +64,10 @@ async def test_structured_call_writes_log_off_the_event_loop() -> None:
 async def test_text_call_writes_log_off_the_event_loop() -> None:
     """Same off-loop guarantee for the buffered text path."""
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "hello", None, NO_USAGE
-
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
     try:
-        with (
-            patch("llmkit._litellm.acompletion_text", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.text("hello")):
             _ = await llm_calls.text_llm_call("hi", feature="test")
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -99,20 +82,10 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
     writes synchronously on the consumer's thread — suspending while
     ``GeneratorExit`` unwinds could lose the truncation-witness record."""
 
-    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            yield "a"
-            yield "b"
-
-        return _gen()
-
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
     try:
-        with (
-            patch("llmkit._litellm.astream_text", side_effect=_fake_stream),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply(chunks=["a", "b"])):
             # Clean finish → off-loop write.
             _ = [c async for c in llm_calls.text_llm_call_stream("hi", feature="test")]
             # Abandonment → synchronous write on this (the consumer's) thread.
@@ -144,43 +117,17 @@ async def test_tool_stream_offloads_a_completed_turn_and_syncs_an_abandoned_one(
     from pydantic import BaseModel
 
     from llmkit import ToolCallResult, ToolDefinition
-    from llmkit._litellm import StreamedToolTurn
 
     class _Args(BaseModel):
         left: int
 
     tools = [ToolDefinition.from_model("add", _Args, "Add.")]
-
-    @dataclass
-    class _Function:
-        name: str
-        arguments: str
-
-    @dataclass
-    class _RawCall:
-        id: str
-        function: _Function
-
-    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        async def _gen() -> AsyncIterator[object]:
-            yield "a"
-            yield "b"
-            yield StreamedToolTurn(
-                raw_calls=[_RawCall("call_1", _Function("add", '{"left": 1}'))],
-                stop_reason="tool_calls",
-                usage=(1, 2, 3),
-                approximate_cost=None,
-            )
-
-        return _gen()
+    reply = Reply(chunks=["a", "b"], tool_calls=[FakeToolCall("add", {"left": 1})])
 
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
     try:
-        with (
-            patch("llmkit._litellm.astream_tools", side_effect=_fake_stream),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: reply):
             # Took the result and stopped → a completed call, off-loop write.
             stream = llm_calls.tool_llm_call_stream("hi", tools, feature="test")
             async for event in stream:
@@ -214,11 +161,6 @@ async def test_loop_stays_responsive_during_a_slow_write() -> None:
 
             time.sleep(0.15)
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
     ticks = [0]
     stop = asyncio.Event()
 
@@ -229,10 +171,7 @@ async def test_loop_stays_responsive_during_a_slow_write() -> None:
 
     configure_llm_logging(_SlowSink())
     try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.json(OkSchema(ok=True))):
             beat = asyncio.create_task(_heartbeat())
             _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
             stop.set()
@@ -249,17 +188,9 @@ async def test_log_path_is_captured_before_the_call_returns(tmp_path: Path) -> N
     """The documented capture contract survives the offload: the written
     path is in the capture list at the moment the call returns."""
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.json(OkSchema(ok=True))):
             with capture_llm_log_paths() as paths:
                 _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
                 assert len(paths) == 1
@@ -282,17 +213,9 @@ async def test_cancellation_mid_write_still_lands_the_record(tmp_path: Path) -> 
             _ = release_write.wait(timeout=5)
             return super().write_returning_path(record)
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
     configure_llm_logging(_BlockingSink(tmp_path))
     try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.json(OkSchema(ok=True))):
             call = asyncio.create_task(
                 llm_calls.structured_llm_call("hi", OkSchema, feature="test")
             )
@@ -335,17 +258,9 @@ def test_sync_bridge_call_writes_and_captures_through_the_offload(tmp_path: Path
     YAML and captures its path before returning — the offload composes with
     the bridge's context propagation."""
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
-        with (
-            patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-            patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        ):
+        with install(lambda _request: Reply.json(OkSchema(ok=True))):
             with capture_llm_log_paths() as paths:
                 result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
         assert result.ok is True

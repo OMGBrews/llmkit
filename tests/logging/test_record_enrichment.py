@@ -15,6 +15,10 @@ Pins the July-2026 audit fixes for log-record fidelity:
 * **Rendering** — the three fields land in the per-call YAML and
   ``index.jsonl``, and header line 2 gains a ``call=<id[:8]> attempt=<n>``
   suffix while line 1 (the pinned ``head -1`` triage shape) is untouched.
+
+The call-driven tests fake the provider through :mod:`llmkit.testing`, so the
+queue wait they see is the real limiter slot's. One test stays on the private
+``acompletion_structured`` seam; its docstring says why.
 """
 
 from __future__ import annotations
@@ -39,10 +43,15 @@ from llmkit import (
 )
 from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.rate_limiting._observability import _queue_wait_ms
-from tests._support import NO_USAGE, OkSchema, UsageCounts, provider_mock
+from llmkit.testing import Reply, TransportRequest, install
+from tests._support import OkSchema, provider_mock
 from tests._support import make_record as _record
 
 _NO_BACKOFF = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
+
+
+def _ok(_request: TransportRequest) -> Reply:
+    return Reply.json(OkSchema(ok=True))
 
 
 # 1. Correlation across retries.
@@ -52,26 +61,19 @@ _NO_BACKOFF = RetryPolicy(max_attempts=3, backoff_base_seconds=0.0)
 async def test_retried_structured_call_shares_call_id_and_numbers_attempts() -> None:
     """Three attempts of one logical call → three records joined by one
     ``call_id``, with attempts numbered 1..3."""
-    calls = [0]
 
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        calls[0] += 1
-        if calls[0] < 3:
+    def _fake(request: TransportRequest) -> Reply:
+        if request.attempt is not None and request.attempt < 3:
             raise TimeoutError("transient")
-        return OkSchema(ok=True), None, NO_USAGE
+        return Reply.json(OkSchema(ok=True))
 
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(_fake) as installed, capture_llm_records() as records:
         result = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=_NO_BACKOFF
         )
 
     assert result.ok is True
+    assert [r.attempt for r in installed.requests] == [1, 2, 3]
     assert [r.attempt for r in records] == [1, 2, 3]
     call_ids = {r.call_id for r in records}
     assert len(call_ids) == 1
@@ -82,39 +84,20 @@ async def test_retried_structured_call_shares_call_id_and_numbers_attempts() -> 
 @pytest.mark.asyncio
 async def test_separate_logical_calls_get_distinct_call_ids() -> None:
     """Two calls — even identical ones — never share a ``call_id``."""
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(_ok) as installed, capture_llm_records() as records:
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert len(records) == 2
     assert records[0].call_id != records[1].call_id
     assert [r.attempt for r in records] == [1, 1]
+    assert [r.call_id for r in installed.requests] == [r.call_id for r in records]
 
 
 @pytest.mark.asyncio
 async def test_text_call_records_correlation() -> None:
     """The buffered text surface carries the same correlation fields."""
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[str, float | None, UsageCounts]:
-        return "hello", None, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(lambda _request: Reply.text("hello")), capture_llm_records() as records:
         _ = await llm_calls.text_llm_call("hi", feature="test")
 
     assert len(records) == 1
@@ -126,26 +109,13 @@ async def test_text_call_records_correlation() -> None:
 async def test_stream_retry_shares_call_id_across_attempts() -> None:
     """A pre-first-chunk transient failure retries under the same ``call_id``;
     each attempt is its own record (one-attempt-one-log), numbered in order."""
-    from collections.abc import AsyncIterator
 
-    calls = [0]
+    def _fake(request: TransportRequest) -> Reply:
+        if request.attempt == 1:
+            raise TimeoutError("pre-first-chunk blip")
+        return Reply.text("ok")
 
-    def _fake_stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
-        calls[0] += 1
-        first = calls[0] == 1
-
-        async def _gen() -> AsyncIterator[str]:
-            if first:
-                raise TimeoutError("pre-first-chunk blip")
-            yield "ok"
-
-        return _gen()
-
-    with (
-        patch("llmkit._litellm.astream_text", side_effect=_fake_stream),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(_fake), capture_llm_records() as records:
         chunks = [
             chunk
             async for chunk in llm_calls.text_llm_call_stream(
@@ -163,17 +133,7 @@ async def test_stream_retry_shares_call_id_across_attempts() -> None:
 def test_sync_bridge_carries_correlation() -> None:
     """``structured_llm_call_sync`` records ``call_id``/``attempt`` exactly
     like the async path — the fields cross the ``run_sync`` bridge."""
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    with install(_ok), capture_llm_records() as records:
         result = llm_calls.structured_llm_call_sync("hi", OkSchema, feature="test")
 
     assert result.ok is True
@@ -188,19 +148,9 @@ def test_sync_bridge_carries_correlation() -> None:
 @pytest.mark.asyncio
 async def test_queue_wait_recorded_when_transport_acquires() -> None:
     """An attempt whose transport passed through the limiter records a
-    non-``None`` ``queue_wait_ms`` (≈0 when uncontended)."""
-
-    async def _transport(
-        *_args: object, **_kwargs: object
-    ) -> tuple[OkSchema, float | None, UsageCounts]:
-        async with GlobalRateLimiter.acquire_async("Google AI Studio"):
-            return OkSchema(ok=True), None, NO_USAGE
-
-    with (
-        patch("llmkit._litellm.acompletion_structured", side_effect=_transport),
-        patch("llmkit.providers.build_provider", return_value=provider_mock()),
-        capture_llm_records() as records,
-    ):
+    non-``None`` ``queue_wait_ms`` (≈0 when uncontended): the real limiter slot,
+    acquired around the faked round trip."""
+    with install(_ok), capture_llm_records() as records:
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
 
     assert len(records) == 1
@@ -211,7 +161,11 @@ async def test_queue_wait_recorded_when_transport_acquires() -> None:
 @pytest.mark.asyncio
 async def test_queue_wait_is_reset_between_attempts_never_stale() -> None:
     """An attempt that fails *before* completing an acquire records ``None`` —
-    never the previous attempt's stale stamp."""
+    never the previous attempt's stale stamp.
+
+    Stays on the private ``acompletion_structured`` seam: it raises at the
+    limiter position, before any acquire, which a :mod:`llmkit.testing` fake
+    (answering inside the slot) cannot do."""
     calls = [0]
 
     async def _transport(*_args: object, **_kwargs: object) -> tuple[OkSchema, float | None]:
