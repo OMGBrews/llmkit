@@ -1,19 +1,17 @@
 """Configuring the cache, the shipped store, and failures that must not fail a call.
 
-The call tests answer the provider through an :mod:`llmkit.testing` fake. Three
+The call tests answer the provider through an :mod:`llmkit.testing` fake. Two
 stay below it: the bare-``MagicMock`` provider test, because such a provider
 cannot survive the real request path (its ``reasoning_kwargs`` returns a mock,
-which the request builder rejects with ``TypeError``); the undecodable-entry
-test, because a paid structured answer through the real parser compares
-unequal to a freshly built schema instance (reported as a likely defect); and
-the byte-identical request test, which inspects the LiteLLM adapter's kwargs.
+which the request builder rejects with ``TypeError``); and the byte-identical
+request test, which inspects the LiteLLM adapter's kwargs.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import cast, override
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
@@ -30,7 +28,7 @@ from llmkit import (
 )
 from llmkit.testing import Reply, TransportRequest, install
 from tests._support import UsageCounts
-from tests.cache.conftest import cache_provider
+from tests.cache.conftest import CALL_MODE, cache_provider
 
 
 def _entry(response: str = "x") -> LLMCacheEntry:
@@ -204,12 +202,12 @@ async def test_an_undecodable_entry_is_a_miss(caplog: pytest.LogCaptureFixture) 
             return LLMCacheEntry("{not json", "_Answer", None, None, call_id=key)
 
     configure_llm_cache(_Corrupt())
-    transport = AsyncMock(return_value=(_Answer(n=1), None, (None, None, None)))
-    with patch("llmkit._litellm.acompletion_structured", transport):
-        got = await structured_llm_call("q", _Answer, feature="f", provider=cache_provider())
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(lambda _request: Reply.json(_Answer(n=1))) as installed:
+        got = await structured_llm_call("q", _Answer, feature="f", provider=provider)
 
     assert got == _Answer(n=1)
-    assert transport.await_count == 1
+    assert len(installed.requests) == 1
     assert len(_cache_warnings(caplog)) == 1
 
 

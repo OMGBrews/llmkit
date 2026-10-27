@@ -13,6 +13,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   raise the exported `ReasoningEffortUnsupportedError` before transport, with
   a steer to `"low"`. Unknown metadata permits the translation. Other efforts
   pass through unchanged; OpenAI's vocabulary remains untranslated.
+- `structured_llm_call` and `structured_llm_call_sync` return an instance of
+  the `output_schema` class itself. A paid answer used to be an instance of a
+  subclass that instructor generates from the schema, which compared unequal
+  to an equal-valued instance of the schema and to the same answer served from
+  the response cache. Paid answers, cache hits and the `on_result` hook now
+  all see the schema class, so `==` between them holds. A schema that cannot
+  survive its own JSON round trip (a raising `@model_serializer`, a required
+  field with `exclude=True`) keeps the parser's instance and logs a warning;
+  such a schema is never cached, so it has no hit to compare against.
 
 ### Added
 
