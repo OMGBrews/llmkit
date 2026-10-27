@@ -3,16 +3,9 @@
 Each test answers the provider round trip with an :mod:`llmkit.testing` fake
 and counts the requests it received. The cache sits above the fake, so
 "answered from the cache" is a positive observation — the request never
-reached the provider — rather than the absence of an error.
-
-Four structured-call tests stay on the private ``acompletion_structured``
-seam: ``test_structured_hit_skips_the_transport``, ``test_sync_wrappers_hit``,
-``test_identical_requests_in_flight_share_one_transport_call`` and
-``test_a_truncated_answer_is_not_stored``. Through the real parser a paid
-structured answer is an instance of instructor's response-model subclass of
-the schema, not of the schema itself, so it compares unequal to the cached
-copy and to a freshly built instance, which these tests assert. That is
-reported as a likely defect, not rewritten around.
+reached the provider — rather than the absence of an error. A structured call
+runs the real parser, so a paid answer and its cached copy compare equal as
+instances of the schema itself.
 """
 
 from __future__ import annotations
@@ -21,7 +14,6 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import ClassVar
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel
@@ -40,7 +32,6 @@ from llmkit import (
 )
 from llmkit.retry import with_retries
 from llmkit.testing import Reply, TransportRequest, install
-from tests._support import NO_USAGE, UsageCounts
 from tests.cache.conftest import CALL_MODE, cache_provider
 
 
@@ -69,25 +60,6 @@ class _InTurn:
         return Reply.text(answer)
 
 
-@dataclass
-class _Transport:
-    """A fake transport seam for the tests still on it: returns *answers* in
-    turn and counts calls."""
-
-    answers: list[str] = field(default_factory=lambda: ["first", "second", "third"])
-    calls: int = 0
-
-    async def text(self, *_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
-        self.calls += 1
-        return self.answers[self.calls - 1], 0.002, (10, 5, 15)
-
-    async def structured(
-        self, *_a: object, **_k: object
-    ) -> tuple[_Answer, float | None, UsageCounts]:
-        text, cost, usage = await self.text()
-        return _Answer(verdict=text), cost, usage
-
-
 def _no_cache_warning(caplog: pytest.LogCaptureFixture) -> None:
     """The key computed and the store answered — no silent bypass."""
     assert not [r for r in caplog.records if r.name == "llmkit.cache"]
@@ -96,13 +68,12 @@ def _no_cache_warning(caplog: pytest.LogCaptureFixture) -> None:
 @pytest.mark.asyncio
 async def test_structured_hit_skips_the_transport(caplog: pytest.LogCaptureFixture) -> None:
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
-    provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_structured", side_effect=transport.structured):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_InTurn()) as installed:
         first = await structured_llm_call("q", _Answer, feature="f", provider=provider)
         second = await structured_llm_call("q", _Answer, feature="f", provider=provider)
 
-    assert transport.calls == 1
+    assert len(installed.requests) == 1
     assert first == second == _Answer(verdict="first")
     assert first is not second
     _no_cache_warning(caplog)
@@ -124,18 +95,14 @@ async def test_text_hit_skips_the_transport(caplog: pytest.LogCaptureFixture) ->
 def test_sync_wrappers_hit(caplog: pytest.LogCaptureFixture) -> None:
     """The sync bridge runs on its own loop; a hit works there too."""
     configure_llm_cache(InMemoryLLMCache())
-    transport = _Transport()
-    provider = cache_provider()
-    with (
-        patch("llmkit._litellm.acompletion_text", side_effect=transport.text),
-        patch("llmkit._litellm.acompletion_structured", side_effect=transport.structured),
-    ):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_InTurn()) as installed:
         texts = [text_llm_call_sync("q", feature="f", provider=provider) for _ in range(2)]
         parsed = [
             structured_llm_call_sync("q", _Answer, feature="f", provider=provider) for _ in range(2)
         ]
 
-    assert transport.calls == 2
+    assert len(installed.requests) == 2
     assert texts == ["first", "first"]
     assert parsed == [_Answer(verdict="second"), _Answer(verdict="second")]
     _no_cache_warning(caplog)
@@ -184,13 +151,13 @@ async def test_identical_requests_in_flight_share_one_transport_call(
     release = asyncio.Event()
     calls = [0]
 
-    async def _gated(*_a: object, **_k: object) -> tuple[_Answer, float | None, UsageCounts]:
+    async def _gated(_request: TransportRequest) -> Reply:
         calls[0] += 1
         _ = await release.wait()
-        return _Answer(verdict=f"answer-{calls[0]}"), 0.01, NO_USAGE
+        return Reply.json(_Answer(verdict=f"answer-{calls[0]}"))
 
-    provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_structured", side_effect=_gated):
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(_gated):
         leader = asyncio.create_task(
             structured_llm_call("q", _Answer, feature="coach", provider=provider)
         )
@@ -313,17 +280,19 @@ async def test_an_on_result_rejection_is_not_stored() -> None:
 @pytest.mark.asyncio
 async def test_a_truncated_answer_is_not_stored() -> None:
     configure_llm_cache(cache := InMemoryLLMCache())
-    truncated = OutputLimitError(model="gemini/x", max_tokens=8, completion_tokens=8)
-    transport = AsyncMock(side_effect=[truncated, (_Answer(verdict="whole"), None, NO_USAGE)])
-    provider = cache_provider()
-    with patch("llmkit._litellm.acompletion_structured", transport):
+    replies = [
+        Reply.text('{"verdict": "who', finish_reason="length"),
+        Reply.json(_Answer(verdict="whole")),
+    ]
+    provider = cache_provider(instructor_mode=CALL_MODE)
+    with install(lambda _request: replies.pop(0)) as installed:
         with pytest.raises(OutputLimitError):
             _ = await structured_llm_call("q", _Answer, feature="f", provider=provider)
         assert len(cache) == 0
         whole = await structured_llm_call("q", _Answer, feature="f", provider=provider)
 
     assert whole == _Answer(verdict="whole")
-    assert transport.await_count == 2
+    assert len(installed.requests) == 2
 
 
 # --- opting out ------------------------------------------------------------

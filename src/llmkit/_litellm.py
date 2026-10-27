@@ -982,9 +982,37 @@ async def acompletion_structured[T: BaseModel](
         # rewritten to the whole in-call total, so it is read back rather than
         # the last wire response.
         parsed, raw_completion = cast("tuple[T, object]", result)
+        parsed = _as_output_schema(parsed, output_schema)
         response = _wire_response(raw_completion)
         slot.record_tokens(response.usage.debit())
     return parsed, response.cost, response.usage.counts()
+
+
+def _as_output_schema[T: BaseModel](parsed: T, output_schema: type[T]) -> T:
+    """Rebuild instructor's *parsed* answer as an instance of *output_schema*.
+
+    instructor parses into a subclass it generates from the schema, which
+    compares unequal to an instance of the schema itself. The rebuild uses the
+    response cache's own encode and decode pair, so a paid answer equals its
+    cache hit by construction.
+
+    A schema that cannot survive its own JSON round trip (a raising
+    ``@model_serializer``, a required field with ``exclude=True``) keeps
+    instructor's instance with a warning: the answer already parsed and
+    validated, and failing the call here would re-roll a paid request on the
+    validation budget for a fault no re-ask can fix. Such a schema is never
+    stored in the cache either, so it has no cache hit to compare against.
+    """
+    try:
+        return output_schema.model_validate_json(parsed.model_dump_json(by_alias=True))
+    except Exception as exc:
+        logger.warning(
+            "Structured answer for %s failed its JSON round trip (%s: %s); returning the parser's subclass instance",
+            output_schema.__name__,
+            type(exc).__name__,
+            exc,
+        )
+        return parsed
 
 
 async def acompletion_text(
