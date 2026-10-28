@@ -762,16 +762,16 @@ Which of the two programmatic setters you want depends on your concurrency, beca
 The default directory is resolved **lazily at the first write** and then frozen for the sink's lifetime (a mid-run `chdir` can't split logs):
 
 1. `LLMKIT_LOG_DIR`, when set;
-2. `data/llm-logs/` under the nearest ancestor directory carrying a `pyproject.toml` or `.git` (nearest wins) — and when the sink creates that directory it also seeds a `.gitignore`, so prompt logs never land in your repository's history;
+2. `data/llm-logs/` under the nearest ancestor directory carrying a `pyproject.toml` or `.git` (nearest wins) — when the sink creates that directory it attempts to seed a `.gitignore` to reduce accidental commits (best effort; forced staging is still possible);
 3. otherwise a per-user state directory (`$XDG_STATE_HOME/llmkit/llm-logs` on Linux, `~/Library/Logs/llmkit` on macOS, `%LOCALAPPDATA%\llmkit\logs` on Windows) — never a CWD-relative path.
 
 The first successful write logs one INFO naming the absolute directory and the retention policy. `default_log_dir()` returns the currently-resolved answer; an explicit `LocalYamlLogSink(log_dir=Path(...))` — a `pathlib.Path`; a plain string raises `TypeError` — is used as given, made absolute at construction so that a *relative* path (or a relative `LLMKIT_LOG_DIR`) names one directory for the sink's lifetime instead of following the process around. Pass `configure_llm_logging(None)` to disable logging entirely.
 
-On POSIX, a sink-created directory is `0o700` and log files are `0o600` — prompt data is owner-only by default. A pre-existing directory is never re-chmodded: pre-create the directory yourself to share logs with other readers.
+On POSIX, the sink creates the leaf log directory with mode `0o700` and new log files with mode `0o600`. Intermediate directories and pre-existing files are outside that creation-mode guarantee. Existing directory permissions are preserved, but sharing a directory alone does not give other users read access to new log files; shared access requires separate file-permission management.
 
 ### Retention: bounded by default
 
-Long-running services do not accumulate unbounded prompt data: by default the sink prunes per-call YAML files older than **30 days** and rotates `index.jsonl` past **50 MiB** to a date-stamped sibling (which ages out under the same policy). Housekeeping runs on the write path, throttled to once per hour, off the event loop.
+By default the sink attempts to prune per-call YAML files older than **30 days** and rotates `index.jsonl` past **50 MiB** to a date-stamped sibling (which ages out under the same policy). Housekeeping is best effort and runs after successful writes, throttled to once per hour, off the event loop. Inactive applications and failed deletions can leave old files indefinitely; applications needing a fixed deletion deadline must arrange their own cleanup.
 
 ```python
 LocalYamlLogSink(retention_days=None)                  # keep everything forever

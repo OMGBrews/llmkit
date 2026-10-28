@@ -78,17 +78,20 @@ class LocalYamlLogSink:
     so a *relative* one names one directory forever rather than following
     the process around. The first successful write emits one INFO naming the
     absolute directory and the retention policy — before anything is ever
-    pruned. When the sink itself creates the directory it is ``0o700`` and
-    files are ``0o600`` (a pre-existing directory is never re-chmodded —
-    pre-create it to share logs with other readers), and the project-root
-    default location is seeded with a ``.gitignore`` so prompt logs cannot
-    land in the enclosing repository's history.
+    pruned. On POSIX the sink creates the leaf directory with mode ``0o700``
+    and new log files with mode ``0o600``; this does not cover intermediate
+    directories or pre-existing files. Existing directory permissions are
+    preserved, but sharing the directory alone does not grant read access to
+    new log files. At the project-root default location, a best-effort
+    ``.gitignore`` seed reduces accidental commits; forced staging is possible.
 
-    Growth is bounded by default: per-call YAML files older than
-    ``retention_days`` (default 30; ``None`` keeps forever) are pruned, and
+    By default, the sink attempts to prune per-call YAML files older than
+    ``retention_days`` (default 30; ``None`` keeps forever), and
     an ``index.jsonl`` past ``max_index_bytes`` (default 50 MiB; ``None``
     never rotates) is rotated to a date-stamped sibling that ages out under
-    the same policy. Housekeeping runs at most hourly, on the write path.
+    the same policy. Housekeeping is best effort, at most hourly, after successful
+    writes. Inactive applications or failed deletions can leave old files
+    indefinitely; a fixed deletion deadline requires external cleanup.
     **Pruning is a glob over the directory, not a list of files the sink
     remembers writing**: the sink owns ``log_dir``'s ``*.yaml`` and
     ``index-*.jsonl`` namespace, so a co-located file of either shape ages
