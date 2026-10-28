@@ -10,9 +10,8 @@ it serves.
 ## Repository profile
 
 - Declared unit: `OMGBrews/llmkit`, published to PyPI as `omg-llmkit` (import name
-  `llmkit`). The maintainers' work environment also pins it as a submodule
-  ([`consumed-by.md`](consumed-by.md)); that environment declares its own evidence and
-  nothing here is inherited from it.
+  `llmkit`). This contract applies to a standalone clone; no maintainer workspace
+  is needed to contribute or run the public checks.
 - Profile: [shared or released software](https://github.com/OMGBrewmaster/workshop/blob/main/docs/verification-profiles.md#profiles).
 - Production evidence: Not applicable — shared or released software.
 - Default landing route: pull request, squash-merged.
@@ -142,9 +141,7 @@ bash <workshop>/Tools/docs-only-diff.sh <base-sha>   # 0 = docs-only; 1 = full r
 ```
 
 Exit 2 means "cannot decide" and selects the full requirements, never a pass. The
-predicate exits 2 when this block is missing or malformed, and `/ship` stops on a
-malformed `CONSUMED-BY` list in [`consumed-by.md`](consumed-by.md), so a damaged
-machine-read block in this directory fails closed rather than silently.
+predicate exits 2 when this block is missing or malformed.
 
 ## Release requirements
 
@@ -209,4 +206,3 @@ deployments.
 - [`docs/README.md`](../README.md) — what each document under `docs/` is for
 - [`CONTRIBUTING.md`](../../CONTRIBUTING.md) — setup and the contribution workflow
 - [`AGENTS.md`](../../AGENTS.md) — guidance for coding agents
-- [`consumed-by.md`](consumed-by.md) — the maintainers' parent repository
