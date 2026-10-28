@@ -9,6 +9,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 - [Why llmkit](#why-llmkit)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Call reference](#call-reference)
   - [When a text answer is cut off](#when-a-text-answer-is-cut-off)
   - [Tool calls with a structured final answer](#tool-calls-with-a-structured-final-answer)
   - [Choosing which tool the model calls](#choosing-which-tool-the-model-calls)
@@ -61,6 +62,11 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 These four are the headline; [`PRINCIPLES.md`](PRINCIPLES.md) states the full set of design principles behind the library.
 
 ## Install
+
+This README describes `main`, which may include unreleased changes. After
+installing, check `llmkit.__version__` and read the README at the matching
+`v<version>` tag in this repository. The [changelog](CHANGELOG.md) distinguishes
+released changes from `[Unreleased]`.
 
 ```bash
 uv add omg-llmkit          # or: pip install omg-llmkit
@@ -145,6 +151,24 @@ see [Where the logs go](#where-the-logs-go).
 > - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
 > - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
+For local calls, first start an Ollama server and pull the model as described
+in [Contributing: live provider tests](CONTRIBUTING.md#live-provider-tests).
+Then replace the provider registration above with:
+
+```python
+configure_llm_client(lambda: LLMClientConfig(
+    provider=Provider.OLLAMA,
+    model="llama3.2",
+    base_url="http://localhost:11434",
+))
+```
+
+For the next step, see [call reference](#call-reference) for tools, streaming,
+and shared options; [configuration](#configuration) for provider defaults;
+and [logging](#logging-agent-readable-by-default) for stored data and retention.
+
+## Call reference
+
 The public call surface:
 
 | Function | Use |
@@ -210,7 +234,10 @@ For a measured compose-capable route, pass `output_schema=` to the tool call ins
 
 ```python
 from pydantic import BaseModel
-from llmkit import ToolDefinition, tool_llm_call
+from llmkit import (
+    ChatMessage, Provider, ToolDefinition, make_provider,
+    tool_llm_call, tool_result_message,
+)
 
 class AddArgs(BaseModel):
     a: int
@@ -219,18 +246,29 @@ class AddArgs(BaseModel):
 class Answer(BaseModel):
     total: int
 
-result = await tool_llm_call(
-    "Calculate 2 + 3; use the tool if needed.",
-    [ToolDefinition.from_model("add", AddArgs, "Add two integers")],
-    output_schema=Answer,
-    feature="calculator",
-)
-if result.tool_calls:
-    # Execute calls and make the next tool turn with the updated history.
-    ...
+# Requires OPENAI_API_KEY; this overrides the quick start's OpenRouter route.
+provider = make_provider(Provider.OPENAI, model="gpt-4.1-mini")
+tools = [ToolDefinition.from_model("add", AddArgs, "Add two integers")]
+history: list[ChatMessage] = [
+    {"role": "user", "content": "Calculate 2 + 3; use the add tool."},
+]
+
+for _ in range(5):  # bound the number of tool turns
+    result = await tool_llm_call(
+        history, tools, output_schema=Answer,
+        feature="calculator", provider=provider,
+    )
+    if not result.tool_calls:
+        assert result.parsed is not None
+        print(result.parsed.total)
+        break
+    history.append(result.to_message())
+    for call in result.tool_calls:
+        args = call.validated
+        assert isinstance(args, AddArgs)
+        history.append(tool_result_message(call.id, str(args.a + args.b)))
 else:
-    assert result.parsed is not None
-    assert result.parsed.total == 5
+    raise RuntimeError("Tool loop did not finish within five turns")
 ```
 
 Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
@@ -455,9 +493,9 @@ result = await structured_llm_call(
 )
 ```
 
-**Supported subset** (anything outside it raises a clear `ValueError` naming the construct): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An `"type": "object"` with **no properties** — `properties` absent *or* an explicit empty `{}` — raises rather than silently building a zero-field model that rejects every real response; set `"additionalProperties": true` for an intentionally free-form object.
+**Supported structural subset** (unsupported structural constructs raise `ValueError`; unsupported leaf constraints can be silently dropped, as detailed under [Schema constraints](#schema-constraints)): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An `"type": "object"` with **no properties** — `properties` absent *or* an explicit empty `{}` — raises rather than silently building a zero-field model that rejects every real response; set `"additionalProperties": true` for an intentionally free-form object.
 
-**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the optional-`None` drop above, so the dict matches the schema:
+**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the optional-`None` drop above, so omitted optional fields stay absent:
 
 ```python
 Person = model_from_json_schema(person_schema)   # build once, at import
@@ -560,8 +598,9 @@ document, rewrite exclusive bounds in the numeric form.
 
 **Leaf constraints outside the table above are silently dropped** — `pattern`,
 `format`, `multipleOf`, `uniqueItems`, `const`, and the rest are *not*
-enforced. This is deliberate: partial enforcement that looks complete is worse
-than none. If a schema relies on one of those, validate it elsewhere. The drop
+enforced. The generated model therefore does not establish conformance to those parts
+of the original schema. If a schema relies on one of them, validate it separately
+or express the rule in a Pydantic model you provide directly. The drop
 is scoped to per-value keywords like these; a *structural* construct outside
 the supported subset — a subschema applicator, a multi-variant union, a typed
 `additionalProperties` map — raises instead of vanishing, because losing one
@@ -585,7 +624,7 @@ from llmkit import configure_rate_limit
 configure_rate_limit(rpm=3_500, tpm=2_000_000)
 ```
 
-RPM and TPM are **opt-in** because — unlike concurrency, which has a universally sane default of 8 — the right per-minute number is the metered limit of *your* account, with no safe default to assume. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A plain *text* streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for those calls. `tool_llm_call_stream` is the exception: it asks the provider for usage on the stream, so it debits TPM like a buffered call.)
+RPM and TPM are **opt-in** because the right per-minute number is the metered limit of *your* account, with no safe default to assume. Concurrency defaults to 8; tune that cap for your account and workload too. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. (A plain *text* streamed call usually reports no token usage, so it does not debit TPM — consistent with cost being `None` for those calls. `tool_llm_call_stream` is the exception: it asks the provider for usage on the stream, so it debits TPM like a buffered call.)
 
 ### Adaptive concurrency
 
@@ -683,6 +722,11 @@ part of the public surface.
 
 ## Logging: agent-readable by default
 
+The default sink stores prompts and responses without automatic payload
+redaction. Treat the files as sensitive: disable persistence with
+`configure_llm_logging(None)` or supply a filtering sink before sending data
+you do not want stored. See [Security: scope](SECURITY.md#scope).
+
 `LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
 1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call — including passes of your own `with_retries` loop — are joinable from the file heads alone, and ends `cache=hit` when the [response cache](#response-cache) answered the call). Small metadata is next; the large `partial_text`, `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
@@ -732,7 +776,7 @@ prompt: ...
 jq 'select(.run_id == "nightly-eval-2026-06-05")' index.jsonl
 ```
 
-Three ways to set it, most specific first:
+Precedence is **`run_scope` → `set_run_id` → `LLMKIT_RUN_ID`**. A scope overrides the process default while it is active:
 
 ```python
 import llmkit
@@ -822,16 +866,14 @@ class LogSink(Protocol):
 A custom sink (a database, a metrics pipe, an in-memory buffer) is a one-method object that returns nothing; records (`LLMCallRecord`, a frozen dataclass) are handed to it for every call, and failures are swallowed so logging can never break a call. To send records somewhere other than local YAML — a database, an HTTP collector, structured stdout — implement `write` and register it:
 
 ```python
-import logging
+import json
+import sys
 from llmkit import LLMCallRecord, configure_llm_logging
-
-logger = logging.getLogger("llm-calls")
 
 class StructuredStdoutSink:
     def write(self, record: LLMCallRecord) -> None:
-        logger.info(
-            "llm_call",
-            extra={
+        print(
+            json.dumps({
                 "feature": record.feature,
                 "label": record.label,
                 "model": record.model,
@@ -840,11 +882,23 @@ class StructuredStdoutSink:
                 "duration_ms": record.duration_ms,
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
-            },
+            }),
+            file=sys.stdout,
+            flush=True,
         )
 
 configure_llm_logging(StructuredStdoutSink())   # pass None to disable logging entirely
 ```
+
+This example writes one JSON line directly to stdout and needs no Python
+logging handlers or formatter. The host owns collecting that output.
+
+Sink failures do not fail the LLM call. Built-in write failures and exceptions
+from custom sinks produce diagnostic warnings, with repeated identical failures
+reduced to DEBUG; host logging configuration can hide those diagnostics.
+A custom sink that returns normally without writing cannot be detected through
+`write(record) -> None`. Record capture proves a record was built, not that a
+sink persisted it.
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
@@ -955,6 +1009,25 @@ class LLMClientConfig:
     vertex_location: str | None = None   # Google's Agent Platform region (data residency); not accepted by any other provider
     gemini_structured_output: Literal["schema", "json"] = "schema"  # Gemini strategy; a non-default value is not accepted by any other provider
 ```
+
+When `model` is omitted or empty, these are the built-in defaults (before
+LiteLLM route prefixes). Pin `model` explicitly when you need stable selection:
+
+| Provider | Default model |
+|---|---|
+| `OPENROUTER` | `google/gemini-3.1-flash-lite` |
+| `GOOGLE` | `gemini-3.1-flash-lite` |
+| `VERTEX` | `gemini-3.1-flash-lite` |
+| `ANTHROPIC` | `claude-sonnet-4-6` |
+| `OPENAI` | `gpt-4.1-mini` |
+| `DEEPSEEK` | `deepseek-chat` |
+| `CEREBRAS` | `gpt-oss-120b` |
+| `BEDROCK` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `OLLAMA` | `llama3.2` |
+
+The defaults are declared by `_default_model` in each module under
+[`src/llmkit/providers/`](src/llmkit/providers/). Bedrock and Vertex also require
+region/project configuration; see [their setup and endpoint caveats](#bedrock-and-vertex-do-not-own-their-endpoints).
 
 **Populating a knob the selected provider does not read is rejected, not
 ignored.** Each provider declares which provider-shaped fields it honours, and
@@ -1143,22 +1216,22 @@ The default model is Claude Haiku 4.5 via its **cross-region inference profile**
 pip install "omg-llmkit[vertex]"
 ```
 
-**`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 3.1 Flash-Lite (parity with the AI Studio provider) and requires `global`, `us`, or `eu`; the maintained configuration uses `us`. As with AI Studio, Gemini 3.1 thinks by default — set `reasoning_effort="disable"` so a small `max_tokens` cap doesn't truncate structured output.
+**`vertex_location` is the data-processing residency control.** It selects the endpoint where the request is processed, so a regional value (e.g. `vertex_location="europe-west4"`) pins in-region processing; the `"global"` endpoint gives no residency guarantee. LiteLLM builds three endpoint shapes from it, not one: `"global"` yields `https://aiplatform.googleapis.com`, a multi-region geography (`"us"`, `"eu"`) yields `https://aiplatform.<geo>.rep.googleapis.com`, and any other value yields `https://<location>-aiplatform.googleapis.com`. llmkit does not construct that URL and does not send an `api_base` — see [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints), which also covers the two ways a pinned location can be overridden. The default model is Gemini 3.1 Flash-Lite (parity with the AI Studio provider) and requires `global`, `us`, or `eu`; the maintained configuration uses `us`. As with AI Studio, reasoning can consume output tokens; choose the model's supported `reasoning_effort` and a sufficient `max_tokens` budget. The route-specific handling of `"disable"` is described below.
 
 > **A residency region can constrain which model you may use.** Gemini model availability is region-specific, so a region you pick for residency may not host the `gemini-3.1-flash-lite` default; it requires the `global`, `us`, or `eu` multi-region endpoint. A model that isn't deployed in your region fails with an Agent Platform `400 FAILED_PRECONDITION` ("Precondition check failed."), which is an *availability* error, not an auth one. Pin a model your region actually serves. Check the [Gemini on Google's Agent Platform locations table](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) for your region.
 
-**`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). Reach for `"json"` when a non-trivial schema drives **runaway output loops**: Gemini's constrained-decoding grammar mask is a repetition-loop trap — once the model starts looping, the mask blocks exactly the tokens that would break the pattern, so the call spins until `max_tokens` kills it (measured 67-83% first-attempt runaway under `"schema"` vs 0% under `"json"` on real prompts). The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
+**`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). If you observe repeated output running into `max_tokens` with `"schema"`, compare `"json"` on your own model, prompts, and schemas. This is a workload-dependent workaround, not a guarantee that repetition or truncation will stop. The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
 
 ```python
 configure_llm_client(lambda: LLMClientConfig(
     provider=Provider.VERTEX,
-    gemini_structured_output="json",   # escape the constrained-decoding loop trap
+    gemini_structured_output="json",   # compare this mode on your workload
 ))
 ```
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
-`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. This matters most for Gemini, whose thinking is **on by default** and spends reasoning tokens against `max_tokens` — `reasoning_effort="disable"` turns it off so a small `max_tokens` cap doesn't truncate structured output. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
+`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. Reasoning can consume the output-token budget. The meaning of `"disable"` depends on the route and model: some disable reasoning, some reduce it to the lowest supported effort, and others reject the request. Do not assume it eliminates reasoning tokens or prevents truncation. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
 
 Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
 
@@ -1425,7 +1498,7 @@ uv run basedpyright          # recommended tier; clean with no baseline
 uv run pytest
 ```
 
-These four are the offline checks CI runs on every push and pull request; plain
+These four are offline checks CI runs on pushes to `main` and on pull requests; plain
 `uv run pytest` needs no network and no credentials. A change to provider
 behaviour (a structured-output mode pin, a default model, an adapter) also needs
 the live provider suite, `uv run pytest tests/integration --run-live`, which
