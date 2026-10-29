@@ -448,8 +448,10 @@ async def _instructor_completion(
     :func:`_stricten_json_schema_response_format`), the call's identity, and
     the invocation counter that marks instructor's in-attempt schema-repair
     re-ask. The identity carries instructor's messages, which differ from the
-    caller's prompt in ``Mode.JSON``, where a schema system message is
-    prepended.
+    caller's prompt in ``Mode.JSON``: instructor prepends a schema system
+    message when the prompt starts with none, and otherwise appends the schema
+    to the existing system message's content, on its own copy of the messages
+    (instructor 1.16.0 and later, which llmkit requires).
     """
     if strict:
         _stricten_json_schema_response_format(kwargs)

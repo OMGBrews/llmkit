@@ -53,12 +53,16 @@ dependencies = [
     # instructor's `from_litellm` validates the provider mode pins against its
     # LiteLLM mode registry at client construction (1.15.3 removed the
     # non-core modes from that registry, which broke three providers with
-    # RegistryError; 1.15.4 is the version the current pins are verified on).
+    # RegistryError; 1.15.4 is the version the current pins were verified on).
+    # 1.16.0 is the floor: it is the first release whose Mode.JSON handler
+    # edits a copy of the messages, where earlier releases appended the schema
+    # instruction to the caller's own system message, so every retry re-sent
+    # one more copy (tests/testing/test_caller_messages.py guards it).
     # The registry is an unstable coupling surface, so 2.x is excluded until
     # measured. tests/providers/test_provider_contract.py constructs every
     # shipped pin against the real registry, so a drift inside this range
     # fails CI, not production.
-    "instructor>=1.15.4,<2",
+    "instructor>=1.16.0,<2",
     "openai>=2.20.0",
     # 2.11.0 is the lowest pydantic that litellm>=1.104.0 allows below Python
     # 3.14, so it is the lowest version the CI floors job (Python 3.12) can

@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
+  1.16.0, instructor's `Mode.JSON` handler appended its schema instruction to
+  the caller's own system message. A retried structured call on a `Mode.JSON`
+  provider (DeepSeek, or Gemini with `gemini_structured_output="json"`)
+  therefore re-sent the schema once more per attempt, through llmkit's own
+  retry and through an outer `with_retries` alike, and left the caller's
+  messages edited afterwards. 1.16.0 edits a copy. A test on `llmkit.testing`
+  now retries such a call both ways and fails if any attempt carries the
+  schema more than once or the caller's messages change. A project that pinned
+  `instructor>=1.16.0` itself to avoid this can drop that constraint once it
+  requires this release.
+
 ## [0.13.0] — 2026-10-28
 
 ### Fixed
