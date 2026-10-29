@@ -27,6 +27,7 @@ import pytest
 from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
 from llmkit import calls as llm_calls
 from llmkit.capture import capture_llm_log_paths, record_call_async
+from llmkit.logging._health import WriteOutcome
 from llmkit.testing import FakeToolCall, Reply, install
 from tests._support import OkSchema
 from tests._support import make_record as _record
@@ -208,10 +209,10 @@ async def test_cancellation_mid_write_still_lands_the_record(tmp_path: Path) -> 
 
     class _BlockingSink(LocalYamlLogSink):
         @override
-        def write_returning_path(self, record: LLMCallRecord) -> Path | None:
+        def write_with_outcome(self, record: LLMCallRecord) -> WriteOutcome:
             write_started.set()
             _ = release_write.wait(timeout=5)
-            return super().write_returning_path(record)
+            return super().write_with_outcome(record)
 
     configure_llm_logging(_BlockingSink(tmp_path))
     try:

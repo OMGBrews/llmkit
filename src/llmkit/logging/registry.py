@@ -1,21 +1,27 @@
 """The configured sink, and the one function that writes through it.
 
 The process-global sink and the two functions that mutate and read it are one
-indivisible unit: a ``from ... import _sink`` in a second module would bind a
-snapshot, and every :func:`configure_llm_logging` call would silently no-op
+indivisible unit: a ``from ... import _installed`` in a second module would bind
+a snapshot, and every :func:`configure_llm_logging` call would silently no-op
 while records kept going to the old sink — a failure with no error anywhere.
 
 The default is constructed eagerly at import, so logging is on with zero setup;
 its log directory is still resolved lazily at the first write.
+
+The sink and its health counters are installed together as one object, so a
+write reads both with a single attribute load and a reconfigure during an
+in-flight write cannot land that write's outcome in the new counters.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from llmkit._latch import OnceLatch
+from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
 from llmkit.logging.local_yaml import LocalYamlLogSink
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
@@ -40,15 +46,53 @@ class _PathReturningLogSink(Protocol):
     much, treating anything else as a failed write rather than letting it
     reach the path-capture buffer). A sink that implements only
     :meth:`LogSink.write` does not match and is path-capture-invisible.
+
+    A third-party sink matching only this protocol is still a *custom* sink to
+    :func:`get_logging_health`: a returned path or ``None`` counts as a
+    handoff, because llmkit verifies only its own writes.
     """
 
     def write_returning_path(self, record: LLMCallRecord) -> Path | None: ...
 
 
-# Module-level configured sink, defaulting to the local-YAML sink at the
-# default directory (resolved lazily at first write). The host overrides it
-# once at startup; tests typically point it at a tmp directory.
-_sink: LogSink | None = LocalYamlLogSink()
+@runtime_checkable
+class _OutcomeReportingLogSink(Protocol):
+    """A sink whose writes llmkit verifies, because it returns what happened.
+
+    Internal capability protocol, matched structurally like
+    :class:`_PathReturningLogSink`. :class:`LocalYamlLogSink` exposes it, so
+    the failures it handles internally still reach the health counters even
+    when its latched warnings are filtered out.
+    """
+
+    def write_with_outcome(self, record: LLMCallRecord) -> WriteOutcome: ...
+
+
+def _classify(sink: LogSink | None) -> SinkKind:
+    if sink is None:
+        return "disabled"
+    if isinstance(sink, _OutcomeReportingLogSink):
+        return "builtin"
+    return "custom"
+
+
+@dataclass(frozen=True)
+class _Installed:
+    """The configured sink and the health state counting its outcomes."""
+
+    sink: LogSink | None
+    health: HealthState
+
+
+def _install(sink: LogSink | None) -> _Installed:
+    return _Installed(sink=sink, health=HealthState(sink=_classify(sink)))
+
+
+# Module-level installation, defaulting to the local-YAML sink at the default
+# directory (resolved lazily at first write). The host overrides it once at
+# startup; tests typically point it at a tmp directory. Replaced whole, never
+# mutated, so every reader sees a consistent sink/health pair.
+_installed: _Installed = _install(LocalYamlLogSink())
 
 # Warn-once latch for a *configured* sink that raises out of ``write`` — the
 # custom-sink counterpart of LocalYamlLogSink's internal latches, so a
@@ -72,7 +116,9 @@ def configure_llm_logging(sink: LogSink | None) -> None:
 
     Pass ``None`` to disable logging entirely (writes become no-ops).
     Re-arms the warn-once latch on sink failures, so a newly configured sink
-    gets a fresh loud first warning if it too turns out to be broken.
+    gets a fresh loud first warning if it too turns out to be broken, and
+    starts fresh :func:`get_logging_health` counts — including when the call
+    restores a previously installed sink.
 
     Raises:
         TypeError: if *sink* is neither ``None`` nor a :class:`LogSink`
@@ -90,7 +136,7 @@ def configure_llm_logging(sink: LogSink | None) -> None:
             ``__getattr__``), so stub with ``Mock(spec=LogSink)``, a small
             fake class, or ``None``.
     """
-    global _sink
+    global _installed
     # Deliberate runtime guards at the library's public boundary: the annotation
     # says ``LogSink | None``, but an untyped caller passing something else
     # would otherwise install it silently and lose every subsequent log.
@@ -106,7 +152,7 @@ def configure_llm_logging(sink: LogSink | None) -> None:
             "sink must implement LogSink (a write(record) method) or be None, "
             + f"got {type(sink).__name__}"
         )
-    _sink = sink
+    _installed = _install(sink)
     _sink_latch.succeeded()
 
 
@@ -134,16 +180,48 @@ def get_log_sink() -> LogSink | None:
     (``None``), and the eagerly-constructed default sink, which is a *specific
     instance* holding its own resolved log directory and housekeeping clock —
     ``configure_llm_logging(LocalYamlLogSink())`` puts back an equivalent sink,
-    not the same one.
+    not the same one. The restore does start fresh :func:`get_logging_health`
+    counts.
 
-    Reading the module attribute instead (``llmkit.logging.registry._sink``, or
-    the pre-split ``llmkit.logging._sink``) is what this replaces, and is the
-    reason it is worth a public name: a private attribute that moves — as it
-    did when this package was split out of one module — turns a save/restore
-    helper into a permanent ``configure_llm_logging(None)`` with no error
-    anywhere, caught only by a test that reads the private name too.
+    Reading a module attribute instead (``llmkit.logging.registry._sink`` before
+    the sink and its health were installed together, or the pre-split
+    ``llmkit.logging._sink``) is what this replaces, and is the reason it is
+    worth a public name: a private attribute that moves — as it did when this
+    package was split out of one module — turns a save/restore helper into a
+    permanent ``configure_llm_logging(None)`` with no error anywhere, caught
+    only by a test that reads the private name too.
     """
-    return _sink
+    return _installed.sink
+
+
+def get_logging_health() -> LoggingHealth:
+    """Return a snapshot of what happened to the records handed to the sink.
+
+    Diagnostic warnings about logging failures go through the standard
+    ``llmkit.logging`` logger, which the host's logging configuration may
+    hide. This snapshot does not depend on it: an application can read it
+    after a batch, in a health endpoint, or before exiting, and decide for
+    itself whether a lost record matters.
+
+    * ``sink`` is ``"disabled"``, ``"builtin"`` (the shipped
+      :class:`LocalYamlLogSink`, whose writes llmkit verifies) or
+      ``"custom"``.
+    * ``written`` counts built-in writes that reached disk; ``degraded``
+      counts those whose index line or retention housekeeping then failed.
+    * ``handed_off`` counts records a custom sink accepted by returning
+      normally. llmkit cannot see past that return, so it is not evidence
+      the record was stored.
+    * ``failed`` counts records lost to a detected failure.
+    * ``last_failure`` names the most recent failure's stage, error text,
+      feature, label and time, never the prompt or response.
+
+    Counts belong to the current installation and reset on every
+    :func:`configure_llm_logging` call, so a temporary sink swap — even one
+    restored with :func:`get_log_sink` — clears them. Writes run on worker
+    threads; counts are lock-guarded and exact. A write still running when
+    this is read is not yet counted.
+    """
+    return _installed.health.snapshot()
 
 
 def write_llm_log(record: LLMCallRecord) -> Path | None:
@@ -167,12 +245,29 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
     contract is treated as a sink failure — latched warning, ``None``
     returned — rather than passed through, so nothing but a real path ever
     reaches :func:`~llmkit.capture.capture_llm_log_paths`'s ``list[Path]``.
+
+    Every outcome is also counted in :func:`get_logging_health`, against the
+    installation read here at entry.
     """
-    if _sink is None:
+    installed = _installed
+    sink = installed.sink
+    health = installed.health
+    if sink is None:
         return None
     try:
-        if isinstance(_sink, _PathReturningLogSink):
-            path = _sink.write_returning_path(record)
+        if isinstance(sink, _OutcomeReportingLogSink):
+            # The built-in sink warns through its own latches and returns
+            # what happened instead of raising; only the counting happens here.
+            outcome = sink.write_with_outcome(record)
+            if outcome.path is None:
+                error = outcome.write_error or OSError("built-in sink wrote no file")
+                health.record_failed("write", error, record.feature, record.label)
+            else:
+                health.record_written(record.feature, record.label, outcome.post_write_failures)
+            _sink_latch.succeeded()
+            return outcome.path
+        if isinstance(sink, _PathReturningLogSink):
+            path = sink.write_returning_path(record)
             # Same deliberate guard as the configure-time one: a structural
             # protocol match promises the method exists, never that it honors
             # its return annotation. Raising here routes the contract breach
@@ -184,9 +279,15 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
                     f"write_returning_path must return Path | None, got {type(path).__name__}"
                 )
         else:
-            _sink.write(record)
+            sink.write(record)
             path = None
     except Exception as exc:
+        health.record_failed(
+            "contract" if isinstance(exc, _SinkContractError) else "sink_raised",
+            exc,
+            record.feature,
+            record.label,
+        )
         if _sink_latch.should_warn(exc):
             logger.warning(
                 "LLM log sink raised for %s/%s (further identical failures logged at DEBUG)",
@@ -199,5 +300,6 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
                 "LLM log sink raised for %s/%s", record.feature, record.label, exc_info=True
             )
         return None
+    health.record_handed_off()
     _sink_latch.succeeded()
     return path

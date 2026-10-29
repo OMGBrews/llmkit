@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`get_logging_health()` — see whether log records were lost.** Logging
+  failures surfaced only as diagnostic warnings, which a host's logging
+  configuration can hide, and the built-in sink swallowed its own failures
+  before anything could count them. `get_logging_health()` returns a frozen
+  `LoggingHealth` snapshot of the installed sink: `written`, `degraded` (YAML
+  written but its index line or housekeeping failed), `handed_off` (a custom
+  sink returned normally, which llmkit cannot verify), `failed`, the most
+  recent `LoggingFailure` (stage, error text, feature, label, time; never the
+  prompt or response) and `last_success_at`. Counts are lock-guarded, bound to
+  the installed sink, and reset by every `configure_llm_logging` call.
+  Documented in README's "Write your own `LogSink`".
+
 ### Changed
 
 - **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
@@ -19,6 +33,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   schema more than once or the caller's messages change. A project that pinned
   `instructor>=1.16.0` itself to avoid this can drop that constraint once it
   requires this release.
+
+- The registry now writes through `LocalYamlLogSink` with an internal
+  outcome-reporting method instead of `write_returning_path`, so a subclass
+  that overrides `write_returning_path` is no longer called by the configured
+  write path. Direct calls to `write` and `write_returning_path` behave as
+  before.
 
 ## [0.13.0] — 2026-10-28
 

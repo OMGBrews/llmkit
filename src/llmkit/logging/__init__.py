@@ -22,13 +22,17 @@ they own:
 * :mod:`~llmkit.logging.sink` — the :class:`LogSink` protocol;
 * :mod:`~llmkit.logging.local_yaml` — the shipped file sink;
 * :mod:`~llmkit.logging.registry` — the configured sink, its
-  :func:`get_log_sink` reader, and :func:`write_llm_log`;
+  :func:`get_log_sink` reader, :func:`get_logging_health`, and
+  :func:`write_llm_log`;
+* ``_health`` — the :class:`LoggingHealth` snapshot, :class:`LoggingFailure`,
+  and the lock-guarded counters behind them;
 * ``_paths`` — log-directory resolution and filename safety;
 * ``_yaml`` — the safe-load-able dumper;
 * the warn-once latch both the sink and the registry use lives one level up,
   in ``llmkit._latch``, because the response cache shares it.
 """
 
+from llmkit.logging._health import LoggingFailure, LoggingHealth
 from llmkit.logging._paths import LOG_DIR_ENV_VAR, default_log_dir
 from llmkit.logging.local_yaml import (
     DEFAULT_MAX_INDEX_BYTES,
@@ -36,7 +40,12 @@ from llmkit.logging.local_yaml import (
     LocalYamlLogSink,
 )
 from llmkit.logging.record import INDEX_FILENAME, LLMCallRecord
-from llmkit.logging.registry import configure_llm_logging, get_log_sink, write_llm_log
+from llmkit.logging.registry import (
+    configure_llm_logging,
+    get_log_sink,
+    get_logging_health,
+    write_llm_log,
+)
 from llmkit.logging.sink import LogSink
 
 __all__ = [
@@ -47,8 +56,11 @@ __all__ = [
     "LLMCallRecord",
     "LocalYamlLogSink",
     "LogSink",
+    "LoggingFailure",
+    "LoggingHealth",
     "configure_llm_logging",
     "default_log_dir",
     "get_log_sink",
+    "get_logging_health",
     "write_llm_log",
 ]
