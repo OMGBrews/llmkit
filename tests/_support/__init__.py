@@ -295,6 +295,8 @@ def capture_stream_provider_kwargs(
     provider = _transport_provider(reasoning_effort=provider_effort)
 
     async def _drive() -> list[str]:
+        # The terminal :class:`~llmkit._litellm.StreamedTextEnd` is record
+        # data, not a delta.
         return [
             chunk
             async for chunk in _litellm.astream_text(
@@ -305,6 +307,7 @@ def capture_stream_provider_kwargs(
                 reasoning_effort=reasoning_effort,
                 provider=provider,
             )
+            if isinstance(chunk, str)
         ]
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):

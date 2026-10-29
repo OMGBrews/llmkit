@@ -342,7 +342,7 @@ async def _drive_transport(
 
 
 async def test_transport_requests_usage_on_the_stream() -> None:
-    """The decided divergence from ``astream_text``, asserted positively.
+    """The usage request, asserted positively; ``astream_text`` sends the same.
 
     Measured 2026-08-29 on live Vertex, Anthropic, OpenAI, OpenRouter, Google
     AI Studio and DeepSeek: every one accepts the parameter and reports real

@@ -478,9 +478,9 @@ def build_text_record(
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the
-    record). ``usage`` is the buffered call's token counts; the streaming
-    surface leaves it ``None``, because a plain text stream does not ask the
-    provider for usage — except on a truncated stream, below. ``cache_hit``
+    record). ``usage`` is the call's token counts as the provider reported
+    them, buffered or streamed (``None`` where an attempt never received
+    them, such as an abandoned stream). ``cache_hit``
     marks a response-cache hit — buffered or streamed, whichever lane
     answered — whose ``queue_wait_ms`` is ``None`` because it never queued
     (the queue-wait stamp would still hold the previous attempt's value), and ``source_call_id`` names the call that paid

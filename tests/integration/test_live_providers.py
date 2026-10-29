@@ -108,6 +108,7 @@ from llmkit import (
     model_from_json_schema,
     structured_llm_call,
     text_llm_call,
+    text_llm_call_stream,
     tool_llm_call,
     tool_llm_call_stream,
     tool_result_message,
@@ -1003,6 +1004,68 @@ async def test_vertex_forced_tool_stream_reports_usage_live() -> None:
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].validated == _AdditionArgs(left=2, right=3)
     assert result.usage.total_tokens is not None and result.usage.total_tokens > 0
+
+
+# Bedrock is left out, as it is from the tool-stream tests: the live test
+# credentials may invoke a model but not stream one (measured 2026-10-29: AWS
+# denies ``bedrock:InvokeModelWithResponseStream`` to the test IAM user), so
+# its text-stream usage is listed as outstanding in the README until they can.
+_TEXT_STREAM_USAGE_PROVIDERS = [
+    provider for provider in Provider if provider is not Provider.BEDROCK
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", _TEXT_STREAM_USAGE_PROVIDERS)
+async def test_live_text_stream_reports_usage(provider: Provider) -> None:
+    """The plain text stream's record carries the provider's real token counts.
+
+    ``astream_text`` sends ``stream_options={"include_usage": True}`` on every
+    route; this measures that each provider accepts the flag (or, as on
+    Cerebras, has LiteLLM drop it and reports usage anyway) and that the counts
+    reach the call record rather than the nulls a stream reports without it.
+    Parametrized over :class:`Provider` on each provider's default model, so a
+    provider added later is measured here as soon as its enum member exists;
+    only Bedrock is excluded, for the credential reason above.
+
+    ``approximate_cost`` is whatever cost LiteLLM stamps on a stream frame,
+    which on LiteLLM 1.106.6 is none, so it is printed rather than required.
+    What is asserted is that a paid stream never records ``0.0``: LiteLLM's
+    stream wrapper carries that placeholder, and logging it would claim the
+    call was free. Ollama runs locally and may honestly cost nothing.
+    """
+    built = make_provider(provider, model=None, **_live_credentials(provider))
+    with capture_llm_records() as records:
+        chunks = [
+            chunk
+            async for chunk in text_llm_call_stream(
+                "Reply with one short sentence about the sea.",
+                feature="integration-text-stream-usage",
+                label=provider.value,
+                provider=built,
+                max_tokens=512,
+                reasoning_effort=_REASONING_EFFORT.get(provider),
+                cache=False,
+            )
+        ]
+
+    assert chunks, "the stream yielded no text"
+    assert len(records) == 1, records
+    record = records[0]
+    assert record.error is None, record.error
+    assert cast("object", record.response) == "".join(chunks)
+    usage = record.usage
+    assert usage is not None, "the text stream recorded no usage"
+    prompt_tokens = usage["prompt_tokens"]
+    completion_tokens = usage["completion_tokens"]
+    assert prompt_tokens is not None and prompt_tokens > 0, usage
+    assert completion_tokens is not None and completion_tokens > 0, usage
+    cost = record.approximate_cost
+    assert provider is Provider.OLLAMA or cost is None or cost > 0, cost
+    print(
+        f"text-stream usage {provider.value} {built.litellm_model()}: {usage}"
+        + f" approximate_cost={record.approximate_cost!r}"
+    )
 
 
 # The routes on which LiteLLM 1.104 refuses ``temperature=0.0``: a GPT-5 model

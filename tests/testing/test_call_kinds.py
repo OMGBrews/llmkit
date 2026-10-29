@@ -129,6 +129,17 @@ async def test_text_stream_async() -> None:
     assert [request.kind for request in fake.requests] == ["text_stream"]
 
 
+async def test_text_stream_records_usage_and_cost() -> None:
+    """A streamed text call's record carries the reply's usage and cost."""
+    reply = Reply(chunks=["hel", "lo"], usage=TokenUsage(2, 5, 7), cost=0.125)
+    with install(lambda _request: reply), capture_llm_records() as records:
+        chunks = await _collect_text_stream()
+    assert chunks == ["hel", "lo"]
+    assert records[0].schema == "stream"
+    assert records[0].usage == {"prompt_tokens": 2, "completion_tokens": 5, "total_tokens": 7}
+    assert records[0].approximate_cost == 0.125
+
+
 def test_text_stream_sync() -> None:
     with install(_answer) as fake:
         chunks = run_sync(_collect_text_stream())

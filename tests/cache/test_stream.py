@@ -429,6 +429,7 @@ def test_stream_requests_are_byte_identical_with_and_without_a_cache() -> None:
         "messages",
         "temperature",
         "stream",
+        "stream_options",
         "api_key",
         "api_base",
         "max_tokens",
