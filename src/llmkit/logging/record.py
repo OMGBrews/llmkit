@@ -42,7 +42,8 @@ class LLMCallRecord:
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
     per-response cost (no local price table) and is ``None`` when the
-    provider does not report it (e.g. streamed calls). A cache hit records
+    provider does not report it (LiteLLM does not price a stream,
+    so a streamed call records ``None``). A cache hit records
     ``0.0``: nothing was paid for it.
 
     ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
@@ -115,9 +116,9 @@ class LLMCallRecord:
     ``on_result`` hook then rejected (the tokens were spent, as its
     ``approximate_cost`` already shows), and on a truncated structured
     or text attempt, whose counts it shares with ``output_limit``; any other
-    failed attempt logs ``None``. The plain text stream does not ask the
-    provider for usage and logs ``None`` except when truncated; the tool stream
-    asks, and logs it. The YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
+    failed attempt logs ``None``. Both streams, plain text and tool, ask
+    the provider for usage and log it on every attempt that runs out, completed
+    or truncated. The YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
     deliberately does not, so the compact scan line keeps its fixed shape.
 
     Two fields carry a **structured or text call cut off by its output limit**

@@ -55,7 +55,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
+from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -295,7 +295,12 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
         if normalized is not e:
             raise normalized from e
         raise
-    yield WireStreamEnd(usage=_wire_usage(stream), cost=_response_cost(stream))
+    # No cost from the wrapper: LiteLLM seeds its ``response_cost`` with a
+    # ``0.0`` placeholder before any frame arrives and never prices the
+    # stream (measured on LiteLLM 1.106.6, OpenAI and Anthropic), so reading
+    # it would log a paid stream as free, the value a cache hit records. A
+    # cost a frame carries still reaches the record through ``_wire_chunk``.
+    yield WireStreamEnd(usage=_wire_usage(stream))
 
 
 def _wire_usage(raw: object) -> WireUsage:
@@ -1231,6 +1236,20 @@ class StreamedToolTurn:
     approximate_cost: float | None
 
 
+@dataclass(frozen=True)
+class StreamedTextEnd:
+    """What a plain text stream reported once its deltas ran out.
+
+    The final item :func:`astream_text` yields: an async generator cannot
+    ``return`` a value, so the stream's usage and cost are a terminal *yield*
+    of a distinct type, as :class:`StreamedToolTurn` is for the tool lane.
+    The caller records them and never passes this item on.
+    """
+
+    usage: tuple[int | None, int | None, int | None]
+    approximate_cost: float | None
+
+
 def _chunk_tool_fragments(chunk: ModelResponseStream) -> tuple[WireToolFragment, ...]:
     """The first choice's tool-call deltas as :class:`WireToolFragment`\\ s.
 
@@ -1333,11 +1352,10 @@ async def astream_tools(
     support raises before any request, so the streaming surface cannot
     silently accept what the buffered one rejects.
 
-    Unlike :func:`astream_text` this **does** request
+    Like :func:`astream_text` this requests
     ``stream_options={"include_usage": True}``, so the turn's token usage
     reaches the terminal :class:`~llmkit.ToolCallResult`, the log record's
-    ``usage`` field, and the TPM limiter's debit — the tool lane records usage
-    and a streamed tool turn should not be the one that does not.
+    ``usage`` field, and the TPM limiter's debit.
 
     The rate-limit slot is released **before** the terminal yield: a consumer
     parked on the assembled result (the idiomatic stopping point) is running
@@ -1432,11 +1450,15 @@ async def astream_text(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
-) -> AsyncIterator[str]:
-    """Stream plain-text deltas via LiteLLM.
+) -> AsyncGenerator[str | StreamedTextEnd]:
+    """Stream plain-text deltas via LiteLLM, then one :class:`StreamedTextEnd`.
 
     Yields each chunk's textual delta as it arrives. The rate-limit slot
-    is held for the lifetime of the stream. ``provider`` overrides the
+    is held while the deltas stream and released before the terminal item.
+    Like :func:`astream_tools` this requests
+    ``stream_options={"include_usage": True}``, so the provider's token usage
+    and any cost LiteLLM stamps on a frame reach the terminal item, and the
+    TPM limiter is debited with the reported total. ``provider`` overrides the
     configured provider for this call only (``None`` uses the global one).
 
     ``max_tokens`` caps the streamed completion length and ``reasoning_effort``
@@ -1449,7 +1471,8 @@ async def astream_text(
 
     When the provider reports ``finish_reason="length"`` — on a frame with
     text or a frame of its own — the stream still runs out normally, so its
-    usage is debited and the slot released, and then raises
+    usage is debited, the slot released and the terminal item yielded, and
+    then raises
     :class:`~llmkit.exceptions.OutputLimitError` carrying the yielded
     transcript as its partial text. A missing or any other finish reason ends
     the stream normally.
@@ -1483,6 +1506,11 @@ async def astream_text(
             # keeps ``0.0`` a real, forwarded value.
             **({"temperature": temperature} if temperature is not None else {}),
             "stream": True,
+            # Asked on every route, as the tool lane does: LiteLLM drops the
+            # key where a route does not accept it (see
+            # :mod:`llmkit.providers.cerebras`), and the usage frame carries
+            # no text, so the yielded deltas are unchanged.
+            "stream_options": {"include_usage": True},
             **request_kwargs,
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
@@ -1491,30 +1519,39 @@ async def astream_text(
     transcript: list[str] = []
     stop_reason: str | None = None
     usage: WireUsage | None = None
+    cost: float | None = None
     async with (
         GlobalRateLimiter.acquire_async(provider.name) as slot,
         aclosing(_stream(request)) as stream,
     ):
         async for item in stream:
             if isinstance(item, WireStreamEnd):
-                # Best-effort TPM accounting: a stream usually reports no
-                # usage (we don't request stream_options=include_usage), so
-                # this is typically a no-op — consistent with cost being None
-                # for streamed calls. When the stream does expose a final
-                # usage, debit it before releasing the slot.
-                slot.record_tokens(item.usage.debit())
-                # Usage on a frame wins; the stream's own is the fallback.
+                # Usage on a frame wins; the stream's own accumulation is the
+                # fallback.
                 if usage is None:
                     usage = item.usage
+                if cost is None:
+                    cost = item.cost
                 continue
             # The stop reason can ride a frame with text, or a frame of its own.
             if item.finish_reason is not None:
                 stop_reason = item.finish_reason
+            # ``include_usage`` puts usage on a *final* frame that usually
+            # carries no choices, and so no text; keep the last frame that has
+            # any.
             if item.usage is not None:
                 usage = item.usage
+            if item.cost is not None:
+                cost = item.cost
             if item.text:
                 transcript.append(item.text)
                 yield item.text
+        usage = usage if usage is not None else WireUsage()
+        # Debited before the slot is released, as the tool lane does.
+        slot.record_tokens(usage.debit())
+    # The terminal item precedes a truncation's raise, so a truncated attempt
+    # records the same counts its error reports.
+    yield StreamedTextEnd(usage=usage.counts(), approximate_cost=cost)
     # Raised only once the stream ran out on its own, so its usage is already
     # debited; the text it carries has already reached the consumer.
     if stop_reason == _LENGTH:
@@ -1522,5 +1559,5 @@ async def astream_text(
             model=litellm_model,
             max_tokens=max_tokens,
             partial_text="".join(transcript),
-            usage=usage if usage is not None else WireUsage(),
+            usage=usage,
         )

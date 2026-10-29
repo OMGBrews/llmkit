@@ -20,6 +20,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the installed sink, and reset by every `configure_llm_logging` call.
   Documented in README's "Write your own `LogSink`".
 
+- **`text_llm_call_stream` logs its token usage.** The plain text stream now
+  requests `stream_options={"include_usage": True}` on every route, as
+  `tool_llm_call_stream` already did, so a stream that runs out, completed or
+  truncated, fills the call log's `usage` with the provider's counts and
+  debits the tokens-per-minute limiter with the reported total. The yielded
+  text deltas are unchanged; the usage frame carries no text. An abandoned
+  stream or a mid-stream error still writes `null` usage.
+
 ### Changed
 
 - **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
@@ -39,6 +47,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that overrides `write_returning_path` is no longer called by the configured
   write path. Direct calls to `write` and `write_returning_path` behave as
   before.
+
+### Fixed
+
+- A streamed call no longer logs `approximate_cost: 0.0`. LiteLLM seeds a
+  stream's cost with a `0.0` placeholder and never prices the stream, so
+  `tool_llm_call_stream` recorded every paid turn as free, the value a cache
+  hit records. Both streams now record `null`, as for any call whose cost the
+  provider does not report.
 
 ## [0.13.0] — 2026-10-28
 

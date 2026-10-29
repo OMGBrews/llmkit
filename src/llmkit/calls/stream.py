@@ -41,6 +41,7 @@ from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
 from llmkit.retry import RetryPolicy, with_retries_stream
+from llmkit.tools import TokenUsage
 
 #: The ``error`` recorded when a stream's consumer abandons it mid-flight
 #: (breaks out / closes the generator / cancels the task). The verdict header
@@ -87,9 +88,11 @@ async def text_llm_call_stream(
     provider's default sampling applies).
 
     The ``schema`` field in the log is the literal string ``"stream"``
-    since there is no Pydantic schema applied here. Streamed responses
-    carry no per-call cost (LiteLLM does not stamp ``response_cost`` on
-    stream chunks), so ``approximate_cost`` is left ``None``.
+    since there is no Pydantic schema applied here. The stream asks the
+    provider for usage, so a stream that runs out — completed or truncated —
+    records the provider's token counts as ``usage``. ``approximate_cost`` is
+    a cost LiteLLM stamps on a stream frame, which it does not do today, so it
+    is ``None``. An abandoned stream or a mid-stream error records no usage.
 
     ``retry`` is the transient-error budget (default-on; pass
     :data:`~llmkit.NO_RETRY` to opt out). A partially-consumed stream
@@ -335,6 +338,8 @@ async def _stream_once(
     accumulated: list[str] = []
     error: str | None = None
     diagnostics: OutputLimitDiagnostics | None = None
+    usage: TokenUsage | None = None
+    approximate_cost: float | None = None
     # What the transport actually sent, copied once, before the first yield:
     # until then every line here runs inside the consumer's first ``__anext__``,
     # the same context the funnel stamped. After a yield the consumer's own
@@ -359,6 +364,11 @@ async def _stream_once(
             if not captured:
                 sent_temperature = _litellm.sent_temperature(temperature)
                 captured = True
+            if isinstance(chunk, _litellm.StreamedTextEnd):
+                # Record data, never a delta: it stays out of the transcript.
+                usage = TokenUsage(*chunk.usage)
+                approximate_cost = chunk.approximate_cost
+                continue
             if chunk:
                 accumulated.append(chunk)
                 yield chunk
@@ -395,12 +405,13 @@ async def _stream_once(
             model=model,
             provider=provider,
             error=error,
-            approximate_cost=None,
+            approximate_cost=approximate_cost,
             schema="stream",
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             call_id=call_id,
             attempt=attempt,
+            usage=usage,
             output_limit=diagnostics,
         )
         if error == STREAM_ABANDONED_ERROR:
