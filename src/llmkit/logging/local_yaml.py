@@ -20,6 +20,7 @@ from typing import Any, cast
 import yaml
 
 from llmkit._latch import OnceLatch
+from llmkit.logging._health import FailureStage, WriteOutcome
 from llmkit.logging._paths import (
     MAX_FILENAME_ATTEMPTS,
     oneline,
@@ -244,6 +245,18 @@ class LocalYamlLogSink:
         cross-reference it, without that file detail leaking into the shared
         :class:`LogSink` contract. ``None`` is returned when the write
         failed (best-effort: logging must never break the LLM call).
+        Behavior is otherwise that of :meth:`write_with_outcome`.
+        """
+        return self.write_with_outcome(record).path
+
+    def write_with_outcome(self, record: LLMCallRecord) -> WriteOutcome:
+        """Persist *record* and report what happened instead of hiding it.
+
+        Internal capability the registry detects structurally: every failure
+        this sink swallows (with its usual latched warning) is also returned,
+        so :func:`~llmkit.logging.get_logging_health` can count it even when
+        the warning is filtered out. The returned outcome's ``path`` is the
+        written file, or ``None`` when the write itself failed.
 
         The filename is ``{timestamp}_{feature}_{label}_{uniquifier}.yaml``:
         the microsecond ``started_at`` stamp keeps the directory naturally
@@ -373,15 +386,20 @@ class LocalYamlLogSink:
                     record.label,
                     exc_info=True,
                 )
-            return None
+            return WriteOutcome(path=None, write_error=exc)
 
         self._yaml_latch.succeeded()
         self._announce_once()
         # Best-effort index append, kept separate so an index failure can
         # never lose the per-call record that was just written successfully.
-        self._append_index(record, filepath)
-        self._maybe_prune()
-        return filepath
+        post_write_failures: list[tuple[FailureStage, Exception]] = []
+        index_error = self._append_index(record, filepath)
+        if index_error is not None:
+            post_write_failures.append(("index", index_error))
+        prune_error = self._maybe_prune()
+        if prune_error is not None:
+            post_write_failures.append(("housekeeping", prune_error))
+        return WriteOutcome(path=filepath, post_write_failures=tuple(post_write_failures))
 
     @staticmethod
     def _summary_header(record: LLMCallRecord) -> str:
@@ -421,11 +439,12 @@ class LocalYamlLogSink:
             f"# {record.started_at.isoformat()}{correlation}\n\n"
         )
 
-    def _append_index(self, record: LLMCallRecord, filepath: Path) -> None:
+    def _append_index(self, record: LLMCallRecord, filepath: Path) -> Exception | None:
         """Append one compact JSON line for *record* to ``index.jsonl``.
 
         Best-effort: *any* :class:`Exception` is swallowed with a warning
-        (logging must never break the call). The dataclass doesn't enforce
+        (logging must never break the call) and returned so the caller can
+        report it; ``None`` means the line was appended. The dataclass doesn't enforce
         its field types, so a directly-constructed record can make
         ``json.dumps`` raise ``TypeError``/``ValueError`` (or ``round`` raise
         on a non-numeric ``duration_ms``) — those must not escape here, where
@@ -480,22 +499,24 @@ class LocalYamlLogSink:
                     record.label,
                     exc_info=True,
                 )
-        else:
-            self._index_latch.succeeded()
+            return exc
+        self._index_latch.succeeded()
+        return None
 
-    def _maybe_prune(self) -> None:
+    def _maybe_prune(self) -> Exception | None:
         """Run retention housekeeping, throttled to once per hour per sink.
 
         Called from the write path (so a long-running service is bounded, not
         just a restarting one) but rate-limited to a monotonic-clock check so
         the steady-state per-write cost is nil. Best-effort like everything
-        else here: a prune failure warns (latched) and never breaks the call.
+        else here: a prune failure warns (latched), never breaks the call, and
+        is returned so the caller can report it; ``None`` means no failure.
         """
         if self.retention_days is None and self.max_index_bytes is None:
-            return
+            return None
         now = time.monotonic()
         if self._last_prune is not None and now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
-            return
+            return None
         self._last_prune = now
         try:
             self._prune()
@@ -508,8 +529,9 @@ class LocalYamlLogSink:
                 )
             else:
                 logger.debug("Failed to prune LLM log dir %s", self.log_dir, exc_info=True)
-        else:
-            self._prune_latch.succeeded()
+            return exc
+        self._prune_latch.succeeded()
+        return None
 
     def _prune(self) -> None:
         """Apply the retention policy: age out YAMLs, rotate an oversized index.

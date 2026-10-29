@@ -893,12 +893,14 @@ configure_llm_logging(StructuredStdoutSink())   # pass None to disable logging e
 This example writes one JSON line directly to stdout and needs no Python
 logging handlers or formatter. The host owns collecting that output.
 
-Sink failures do not fail the LLM call. Built-in write failures and exceptions
-from custom sinks produce diagnostic warnings, with repeated identical failures
-reduced to DEBUG; host logging configuration can hide those diagnostics.
-A custom sink that returns normally without writing cannot be detected through
-`write(record) -> None`. Record capture proves a record was built, not that a
-sink persisted it.
+Sink failures do not fail the LLM call, and llmkit never retries the provider
+because logging failed. Built-in write failures and exceptions from custom sinks
+produce diagnostic warnings, with repeated identical failures reduced to DEBUG;
+host logging configuration can hide those diagnostics, so read
+`get_logging_health()` (below) when you need to know whether records were lost.
+A custom sink that returns normally counts as a handoff: llmkit cannot see
+whether it actually wrote anything through `write(record) -> None`. Record
+capture proves a record was built, not that a sink persisted it.
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
@@ -916,6 +918,24 @@ finally:
 ```
 
 Restoring the returned value is what makes this correct in the two starting states a guess gets wrong: logging deliberately disabled (`None`), and the default sink, which is a *specific instance* carrying its own resolved log directory and housekeeping clock — `configure_llm_logging(LocalYamlLogSink())` puts back an equivalent sink, not the one that was there. Reach for `capture_llm_records()` above when you only want the records; this pair is for genuinely swapping the installed sink.
+
+**Checking for lost records: `get_logging_health()`.** Logging is best-effort, so no record is guaranteed to be stored. What llmkit can detect, it counts, independently of whether any warning was displayed. `get_logging_health()` returns a frozen `LoggingHealth` snapshot:
+
+```python
+from llmkit import get_logging_health
+
+health = get_logging_health()
+if health.failed:
+    print(f"{health.failed} records lost; last: {health.last_failure}")
+```
+
+- `sink` is `"disabled"` (logging set to `None`), `"builtin"` (`LocalYamlLogSink`), or `"custom"`.
+- `written` counts records the built-in sink wrote to disk. `degraded` counts those whose index line or retention housekeeping failed afterwards: the YAML file exists, but `index.jsonl` may lack its line.
+- `handed_off` counts records a custom sink accepted by returning normally. llmkit cannot see past that return, so a handoff is not evidence the record was stored.
+- `failed` counts records lost to a detected failure: the built-in write failed, a sink raised, or a sink broke its return contract.
+- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. `last_success_at` is the time of the last write or handoff.
+
+Counts belong to the installed sink and reset on every `configure_llm_logging` call, so the temporary swap above clears them even when it restores the same sink. Writes run on worker threads; the counts are lock-guarded and exact, and a write still in progress is not yet counted. If you read the snapshot from an `atexit` handler registered after `import llmkit`, that handler runs before llmkit drains its background event loop, so call `llmkit.sync.shutdown()` first to let any in-flight write finish.
 
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 

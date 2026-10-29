@@ -78,10 +78,13 @@ from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
     LLMCallRecord,
     LocalYamlLogSink,
+    LoggingFailure,
+    LoggingHealth,
     LogSink,
     configure_llm_logging,
     default_log_dir,
     get_log_sink,
+    get_logging_health,
 )
 from llmkit.options import (
     DEFAULT_TEMPERATURE,
@@ -156,6 +159,9 @@ __all__ = [
     "LocalYamlLogSink",
     "configure_llm_logging",
     "get_log_sink",
+    "get_logging_health",
+    "LoggingHealth",
+    "LoggingFailure",
     "default_log_dir",
     # Response cache (host-pluggable; off until configured)
     "LLMCache",
