@@ -20,6 +20,12 @@ In practice the line sorts every setting into one of three groups:
 
 The remaining principles are this one line applied to each part of the library.
 
+## One function call
+
+Pass a prompt, plus a Pydantic model when you want structured output, and get a result. `structured_llm_call` returns a validated instance, `text_llm_call` plain text, and `tool_llm_call` the model's requested tool calls. The only bookkeeping you add is a `feature`/`label` pair, which identifies the call in the logs.
+
+The surface is async-first, because LLM calls are I/O-bound and usually fanned out. Every call has a `_sync` twin that drives the same async path and inherits the same retries, rate limiting, and logging.
+
 ## Structured output always validates
 
 You pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and validators; your application owns domain correctness. A schema-valid answer can still be empty or wrong for your purpose, so reject it with constraints or an [`on_result` hook](README.md#re-rolling-on-a-semantically-bad-result).
@@ -33,12 +39,6 @@ OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex 
 What makes the switch safe rather than merely short is the other side of the line. Each provider's structured-output mode, retry classification, rate limiter, and log record are llmkit's decisions, measured per provider, and they move with the switch. Without that, a one-line change of vendor could silently turn validated answers into empty ones.
 
 Some things do change with a route, and each changes loudly. Model identifiers are provider-specific. Bedrock and the Agent Platform read region and project settings that no other provider accepts, and a config field the selected provider does not read is rejected at construction. A tool turn that asks for a validated final answer is enabled only on routes measured to support it, and refuses elsewhere rather than guess.
-
-## One function call
-
-Pass a prompt, plus a Pydantic model when you want structured output, and get a result. `structured_llm_call` returns a validated instance, `text_llm_call` plain text, and `tool_llm_call` the model's requested tool calls. The only bookkeeping you add is a `feature`/`label` pair, which identifies the call in the logs.
-
-The surface is async-first, because LLM calls are I/O-bound and usually fanned out. Every call has a `_sync` twin that drives the same async path and inherits the same retries, rate limiting, and logging.
 
 ## Reliable by default
 
