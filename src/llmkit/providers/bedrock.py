@@ -112,8 +112,8 @@ class BedrockProvider(BaseProvider):
 
     A 0.12.0 report had Bedrock refuse that re-ask with a 400 (``tool_use`` ids
     found without ``tool_result`` blocks). It was **not** reproduced at the
-    declared dependency floor (LiteLLM 1.104.0, instructor 1.15.4) or on later
-    versions: LiteLLM collapses every synthetic tool call into the message text,
+    dependency floor declared then (LiteLLM 1.104.0, instructor 1.15.4) or on
+    later versions: LiteLLM collapses every synthetic tool call into the message text,
     so instructor's re-ask carries no ``tool_use`` block, and Bedrock accepted it
     live. The live suite pins that re-ask on both the native and the
     synthetic-tool path.
