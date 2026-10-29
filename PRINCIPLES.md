@@ -8,7 +8,7 @@ The design principles behind `llmkit`: the durable promises the library makes to
 
 Every decision in llmkit falls on one side of a line.
 
-On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune.
+On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune. Because those decisions are made per provider and travel with it, switching providers or models is cheap for you: the correctness work has already been done on the other side of the switch.
 
 On your side is everything that depends on your application: which models play which roles, how prompts are built, how much to retry, how hard to drive a metered account, where logs and cached answers live, and what counts as a good answer. These have no right answer outside your application, so llmkit takes no position on them. Where it must ship a default, the default is safe and the setting is yours.
 
@@ -26,15 +26,19 @@ You pass a Pydantic model and get back a validated instance of it, or an excepti
 
 Making that contract hold is llmkit's side of the line. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs; instructor's automatic mode silently regresses some providers to empty results, and llmkit refuses it. The same contract covers a [tool turn's final answer](README.md#tool-calls-with-a-structured-final-answer) on routes measured to support it; an unmeasured or preview-only route fails loudly rather than guess.
 
+## Providers switch by config; models switch per call
+
+OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one flat [`LLMClientConfig`](README.md#configuration), registered once at startup. Switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is lighter still: every call takes an optional `model=` that overrides the default for that call alone, and llmkit imposes no role system on top. A single call can also take a [`provider=` override](README.md#constructing-a-provider-for-a-per-call-override) built on the fly, so routing one call through another vendor or credential needs no change to global state. The same model is often reachable by more than one route: Gemini through AI Studio or Google's Agent Platform, Claude direct or through Bedrock, so a route can change for residency or billing reasons while the model stays put.
+
+What makes the switch safe rather than merely short is the other side of the line. Each provider's structured-output mode, retry classification, rate limiter, and log record are llmkit's decisions, measured per provider, and they move with the switch. Without that, a one-line change of vendor could silently turn validated answers into empty ones.
+
+Some things do change with a route, and each changes loudly. Model identifiers are provider-specific. Bedrock and the Agent Platform read region and project settings that no other provider accepts, and a config field the selected provider does not read is rejected at construction. A tool turn that asks for a validated final answer is enabled only on routes measured to support it, and refuses elsewhere rather than guess.
+
 ## One call, no ceremony
 
 Pass a prompt, plus a Pydantic model when you want structured output, and get a result. `structured_llm_call` returns a validated instance, `text_llm_call` plain text, and `tool_llm_call` the model's requested tool calls. The only bookkeeping you add is a `feature`/`label` pair, which identifies the call in the logs.
 
 The surface is async-first, because LLM calls are I/O-bound and usually fanned out. Every call has a `_sync` twin that drives the same async path and inherits the same retries, rate limiting, and logging.
-
-## Providers switch by config; models switch per call
-
-OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one `LLMClientConfig`, registered once at startup. Switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is lighter still: every call takes an optional `model=` that overrides the default for that call alone. Where a model runs is configuration and which model answers is a per-call decision; neither is written into the code that asks the question.
 
 ## Reliability is built in; budgets are yours
 
