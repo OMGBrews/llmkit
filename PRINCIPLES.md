@@ -1,52 +1,65 @@
 # Principles
 
-The design principles behind `llmkit` — the durable promises the library makes to the people who call it. Read this to understand *why* llmkit behaves the way it does; for the API itself, see the [README](README.md). This describes the library as it ships today.
+The design principles behind `llmkit`: the durable promises the library makes to the people who call it. Read this to understand *why* llmkit behaves the way it does. The [README](README.md) is authoritative for the API and its details; where this page names a mechanism, it is the one that ships today.
 
-`llmkit` is opinionated on purpose: it decides the boring-but-easy-to-get-wrong things — which structured-output mode each provider needs, where logs go, how retries and rate limits behave — so you don't have to. These principles are what that buys you.
+`llmkit` is a thin, opinionated layer over LiteLLM that turns "call an LLM" into one function returning a validated result, with logging, retries, and rate limiting around it.
+
+## The one principle: llmkit owns correctness, you own policy
+
+Every decision in llmkit falls on one side of a line.
+
+On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune.
+
+On your side is everything that depends on your application: which models play which roles, how prompts are built, how much to retry, how hard to drive a metered account, where logs and cached answers live, and what counts as a good answer. These have no right answer outside your application, so llmkit takes no position on them. Where it must ship a default, the default is safe and the setting is yours.
+
+In practice the line sorts every setting into one of three groups:
+
+- **Fixed, because it is correctness:** the structured-output mode each provider runs in, instructor's in-call repair budget, the separation of transport retries from schema retries, and the content of a call record.
+- **Configurable with a safe default, because it is policy:** retry budgets and backoff, concurrency and per-minute ceilings, the circuit breaker, log destination and retention, and the response-cache store.
+- **Absent, because it is yours alone:** model roles, prompt construction, domain validation of a schema-valid answer, and infrastructure.
+
+The remaining principles are this one line applied to each part of the library.
 
 ## Validated structured output is the contract
 
-The core promise: you pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and validators; your application owns domain correctness. A schema-valid answer can still be empty or wrong for your purpose, so use constraints or an [on_result hook](README.md#re-rolling-on-a-semantically-bad-result) to reject it. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs (instructor's automatic mode silently regresses some providers to empty results — llmkit refuses it). So `structured_llm_call` gives you the same reliable, typed result whether you're on OpenAI, Gemini, Claude, DeepSeek, Cerebras, Bedrock, or a local model.
+You pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and validators; your application owns domain correctness. A schema-valid answer can still be empty or wrong for your purpose, so reject it with constraints or an [`on_result` hook](README.md#re-rolling-on-a-semantically-bad-result).
 
-On [measured compose-capable routes](README.md#tool-calls-with-a-structured-final-answer), `tool_llm_call(..., output_schema=...)` makes a tool turn return either requested calls or that same validated final instance; unavailable or preview-only routes fail loudly and keep the portable two-step tool-loop-plus-finalization pattern.
+Making that contract hold is llmkit's side of the line. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs; instructor's automatic mode silently regresses some providers to empty results, and llmkit refuses it. The same contract covers a [tool turn's final answer](README.md#tool-calls-with-a-structured-final-answer) on routes measured to support it; an unmeasured or preview-only route fails loudly rather than guess.
 
-## Opinionated where it counts, out of your way everywhere else
+## One call, no ceremony
 
-llmkit holds firm opinions about reliability, correctness, and observability — and deliberately none about *your* domain. It takes no position on model "roles" (strong/small/current are yours to define), on how you build prompts, on where your logs ultimately live, or on your retry budgets. The opinions exist to remove footguns, not to box you in; application policies such as retry budgets, rate limits, and log destinations are configurable. Correctness policies such as structured-output mode pinning and instructor's in-call repair budget stay fixed.
+Pass a prompt, plus a Pydantic model when you want structured output, and get a result. `structured_llm_call` returns a validated instance, `text_llm_call` plain text, and `tool_llm_call` the model's requested tool calls. The only bookkeeping you add is a `feature`/`label` pair, which identifies the call in the logs.
 
-## Calling an LLM is one function
-
-One call does it: pass a prompt — plus a Pydantic model when you want structured output — and get a result back. `structured_llm_call` returns a validated instance; `text_llm_call` returns plain text. The only bookkeeping you add is a `feature`/`label` pair, and it shows up in the logs.
+The surface is async-first, because LLM calls are I/O-bound and usually fanned out. Every call has a `_sync` twin that drives the same async path and inherits the same retries, rate limiting, and logging.
 
 ## Providers switch by config; models switch per call
 
-OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one `LLMClientConfig`, registered once at startup — so switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is even lighter: every call takes an optional `model=` that overrides the default just for that call.
+OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one `LLMClientConfig`, registered once at startup. Switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is lighter still: every call takes an optional `model=` that overrides the default for that call alone. Where a model runs is configuration and which model answers is a per-call decision; neither is written into the code that asks the question.
+
+## Reliability is built in; budgets are yours
+
+[Retries](README.md#retries) and [rate limiting](README.md#rate-limiting) are on by default, and the policy that makes them safe is fixed:
+
+- Transient transport failures get a larger retry budget than schema-validation failures, so a deterministically malformed answer cannot spend the transport budget on doomed re-asks. Backoff is bounded and jittered, and a provider's `Retry-After` takes precedence.
+- A streaming call is not retried once output has reached you, because replaying consumed output would change the meaning of the call.
+- A completion cut off by its output-token limit fails fast, as does a call refused by an open circuit breaker. Programming errors propagate immediately.
+- Rate limiting is adaptive and scoped per provider: overload lowers concurrency, and recovery raises it back toward your cap.
+
+The budgets and the failure policy are yours. Tune or opt out of retries per call, set the concurrency and per-minute ceilings for your account, and arm the [circuit breaker](README.md#circuit-breaker) only if failing fast suits you; it is opt-in because it changes "eventually succeeds" into "fails fast", which is an application decision. instructor's [in-call schema repair](README.md#instructors-in-call-schema-repair) stays on the fixed side, separate from your outer retries, because it is a correctness setting rather than a budget.
+
+## Logging is on by default, and written for an AI agent
+
+Every call is [logged with zero setup](README.md#logging-agent-readable-by-default); opt out with `configure_llm_logging(None)`. The assumed reader is a coding agent debugging a run, not a dashboard. So each record leads with the verdict (ok or error, feature and label, model, duration, approximate cost), carries the full prompt and response beneath it, and an append-only index answers cross-call questions in one scan. What a record contains is llmkit's decision; where it goes is yours.
 
 ## Local-first, zero infrastructure
 
-llmkit requires no collector, llmkit account, or hosted service of its own. Configure access to your chosen provider; logs are plain local files, and a local Ollama server keeps inference on your host. The underlying LiteLLM dependency can also fetch model-cost metadata from GitHub.
+llmkit needs no collector, llmkit account, or hosted service. Configure access to your provider and go: logs are plain local files, and a local Ollama server keeps inference on your host. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
 
-You can plug in external systems later (a [custom LogSink](README.md#write-your-own-logsink) ships records anywhere; a [custom LLMCache](README.md#write-your-own-store) stores responses wherever you keep them), but you never have to. The [response cache](README.md#response-cache) follows the same rule: off until a host configures one, the shipped store is in-process memory, and llmkit owns the request fingerprint, cache hooks, coalescing of identical buffered requests in flight, and hit records — while the host owns the store.
-
-## Logging is on by default — and written for an AI agent
-
-Every call is [logged with zero setup](README.md#logging-agent-readable-by-default); opt out with `configure_llm_logging(None)`. Each per-call log is laid out verdict-first: a two-line `#` header — a verdict line (`ok`/`ERROR`, feature/label, model, schema, duration, approximate cost) plus a second line carrying the timestamp, a `call=<id> attempt=<n>` correlation suffix, and `cache=hit` when the response cache answered the call — on top, the prompt and response below, plus an append-only `index.jsonl` for cross-call scans. The assumed reader is a coding agent like Claude Code debugging a run — so it can see at a glance what was sent, what came back, and what failed, and use that to diagnose problems and improve prompts.
-
-## Async-first; sync is one call away
-
-The call surface is async-first, because LLM calls are I/O-bound and usually fanned out. Callers that can't `await` use `structured_llm_call_sync`, which drives the same async path — and inherits the same rate limiting and logging.
-
-## Built for reliable calls
-
-Reliability is built into the call surface. [Automatic retries](README.md#automatic-retries-on-by-default) give transient transport failures a larger budget than schema-validation failures, so malformed answers cannot spend the entire transport budget on repeated attempts. Backoff is bounded and jittered; provider `Retry-After` delays take precedence, subject to a configurable cap (60 seconds by default) plus jitter. See [backoff and timing](README.md#backoff-and-retry-after). Streaming retries stop once an item reaches the caller: replaying already-consumed output would change the meaning of the call.
-
-Recoverable failures are not all retryable by default. `LLM_RECOVERABLE_ERRORS` groups transport, schema-validation, tool-argument, output-limit, and backpressure errors for callers that need a common catch-set. Structured and text completions cut off by the output-token limit fail fast by default, as does an open circuit breaker. Programming errors propagate immediately. Callers can [tune retry policy](README.md#tuning-or-opting-out-per-call); instructor's [fixed in-call schema-repair budget](README.md#instructors-in-call-schema-repair) stays separate from those outer retries.
-
-[Adaptive rate limiting](README.md#rate-limiting) is on by default and scoped per provider: overload reduces concurrency, and recovery raises it toward the configured cap. Optional per-minute ceilings support metered accounts. The [circuit breaker](README.md#circuit-breaker) is opt-in because failing fast during sustained overload is a different application policy from waiting and retrying. These controls keep reliability policy in one place while leaving budgets and failure handling with the caller.
+External systems can be plugged in later, never required. A [custom `LogSink`](README.md#write-your-own-logsink) ships records anywhere; a [custom `LLMCache`](README.md#write-your-own-store) stores answers wherever you keep them. The [response cache](README.md#response-cache) shows the line exactly: it is off until you configure a store, llmkit owns the request fingerprint, the hit records, and the coalescing of identical in-flight requests, and you own where the answers live.
 
 ## A thin layer, not a gateway
 
-llmkit owns the call ergonomics, the structured-output mode pinning, the rate-limit policy, and the logging convention — and stops there. It does **not** reimplement HTTP transport or run a proxy: that is LiteLLM's job, and reimplementing it is the one thing this library deliberately won't do. Staying thin is what keeps it small, predictable, and easy to reason about.
+llmkit owns the call ergonomics, the structured-output mode pinning, the retry and rate-limit policy, and the logging convention, and stops there. It does not reimplement HTTP transport, construct provider endpoints, or run a proxy: that is LiteLLM's job, and taking it on is the one thing this library deliberately will not do. Staying thin keeps the library small and predictable, and keeps the set of correctness decisions narrow enough to measure and hold.
 
 ## See also
 
