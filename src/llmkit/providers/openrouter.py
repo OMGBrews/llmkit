@@ -60,14 +60,16 @@ class OpenRouterProvider(BaseProvider):
     _provider_name: ClassVar[str] = "OpenRouter"
     _model_prefix: ClassVar[str] = "openrouter/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
-    #: Gemini 2.5 Flash-Lite — cheap, fast, and honors the strict json_schema
-    #: ``response_format`` this provider sends (measured 2026-07-14: 10/10
-    #: valid structured round-trips through the public surface). Succeeds
-    #: ``google/gemini-2.0-flash-001``, which OpenRouter retired — it left the
-    #: catalog entirely, so through 0.7.0 *every* default-model call 404'd with
-    #: "No endpoints found". The live smoke suite now drives this default with no
-    #: ``model=`` override (``test_openrouter_live_default_model``), so the next
-    #: retirement fails the release gate instead of shipping.
+    #: Gemini 3.1 Flash-Lite — cheap, fast, and served through the strict
+    #: json_schema ``response_format`` this provider sends. It replaced Gemini
+    #: 2.5 Flash-Lite on 2026-08-31 (commit ``6a0a03a``), whose strict
+    #: round-trips were measured on 2026-07-14 (10/10 valid through the public
+    #: surface). That model in turn succeeded ``google/gemini-2.0-flash-001``,
+    #: which OpenRouter retired — it left the catalog entirely, so through 0.7.0
+    #: *every* default-model call 404'd with "No endpoints found". The live
+    #: suite's parametrized ``test_live_default_model`` drives every provider's
+    #: default with no ``model=`` override, so the next retirement fails the
+    #: release gate instead of shipping.
     _default_model: ClassVar[str] = "google/gemini-3.1-flash-lite"
     _strict_json_schema: ClassVar[bool] = True
     _api_key_env_var: ClassVar[str] = "OPENROUTER_API_KEY"
