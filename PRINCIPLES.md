@@ -62,11 +62,11 @@ llmkit is complete on your machine the moment you configure access to a provider
 
 llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data, which should leave your machine only when you send it. Infrastructure is policy, so anything beyond the local default is yours to add, and only when you want it.
 
-## A thin layer, not a gateway
+## A thin layer
 
-llmkit owns the call ergonomics, the structured-output mode pinning, the retry and rate-limit policy, and the logging convention, and stops there. It does not reimplement HTTP transport, construct provider endpoints, or run a proxy: that is LiteLLM's job, and taking it on is the one thing this library deliberately will not do.
+llmkit is a thin layer over LiteLLM, owning what happens around a call and leaving the call itself to LiteLLM.
 
-llmkit holds this principle because the set of correctness decisions it promises to hold must stay narrow enough to measure against live providers and keep measured. Every layer added beneath the call would widen that set, and a gateway would widen it past what one small library can honestly promise.
+llmkit holds this principle because every correctness decision it takes on must be measured against live providers and kept measured, and that is only possible while the set of decisions stays small. Everything added beneath the call widens that set, and widens it fastest toward what one small library cannot honestly promise.
 
 ## See also
 
