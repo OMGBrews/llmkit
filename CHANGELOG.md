@@ -78,6 +78,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `model_json_schema` on llmkit's generated models now accepts
+  `by_alias=None`, matching pydantic 2.14's signature, so the override type
+  checks again. The default stays `True`, so the emitted schema is unchanged.
+
 - A streamed call no longer logs `approximate_cost: 0.0`. LiteLLM seeds a
   stream's cost with a `0.0` placeholder and never prices the stream, so
   `tool_llm_call_stream` recorded every paid turn as free, the value a cache
