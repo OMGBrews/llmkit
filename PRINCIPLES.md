@@ -52,9 +52,9 @@ llmkit holds this principle because the run you most need a record of is the one
 
 ## Logs are written for agents
 
-Every record is written for a coding agent, or a person, opening the log directory cold to find out what happened in a run. The verdict comes first, the full prompt and response follow, and a compact index answers questions about a whole run without opening every record.
+Every record llmkit writes is laid out so that an AI agent can read it cold and understand what happened.
 
-llmkit holds this principle because a record nobody can read cold is not evidence. The reader is increasingly an agent working from files, with no dashboard and no memory of the run, so the first lines must answer the first questions: whether the call succeeded, what it was for, which model it went to, how long it took, and roughly what it cost. What a record contains is llmkit's decision, so the shape is the same in every project; where the records go is yours. That shape lets anyone find a failing call, read exactly what was sent and what came back, and improve prompts, model choices, and spend from the record.
+llmkit holds this principle because its logs are expected to be read by AI agents more often than by people. An agent opening the logs should find a failing call, see exactly what was sent and what came back, and understand the run well enough to fix the problem, improve the prompt, or change the model. The easier that is, the more of that work anyone using llmkit can hand to their agents.
 
 ## Local-first, no infrastructure
 
