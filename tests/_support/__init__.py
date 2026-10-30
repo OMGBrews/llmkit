@@ -24,6 +24,7 @@ from llmkit import (
     LLMClientConfig,
     LocalYamlLogSink,
     Provider,
+    _litellm,
     configure_llm_cache,
     configure_llm_client,
     configure_llm_logging,
@@ -120,11 +121,13 @@ def ollama_call_defaults() -> Generator[None]:
     configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model"))
     configure_llm_cache(None)
     GlobalRateLimiter._reset()
+    _litellm.reset_temperature_warnings()
     try:
         with quiet_logging():
             yield
     finally:
         GlobalRateLimiter._reset()
+        _litellm.reset_temperature_warnings()
         configure_llm_cache(None)
         providers_base._config_source = previous
 

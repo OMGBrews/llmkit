@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A dropped `temperature` is now logged.** When a model refuses the
+  `temperature` you passed and llmkit re-issues the request without it, the
+  `llmkit._litellm` logger now warns the first time each model refuses, naming
+  the model and the dropped value; later drops for the same model log at
+  DEBUG. The re-issue and the `temperature: null` in the call record are
+  unchanged.
+
 - **`get_logging_health()` — see whether log records were lost.** Logging
   failures surfaced only as diagnostic warnings, which a host's logging
   configuration can hide, and the built-in sink swallowed its own failures
