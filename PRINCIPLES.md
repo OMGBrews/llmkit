@@ -6,19 +6,11 @@ The design principles behind `llmkit`: the durable promises the library makes to
 
 ## The main principle
 
-llmkit owns correctness; you own policy. Every decision in the library falls on one side of that line.
+llmkit owns correctness; you own policy. Every decision in the library falls on one side of that line, and the remaining principles are the line applied to each part of the library.
 
-On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune.
+llmkit holds this principle because the two kinds of decision fail differently. A correctness decision, such as which output mode a provider actually honours, has one right answer, and a wrong one fails silently and far from its cause. It must be made once by whoever can measure it, so llmkit decides it, measures it against live providers, and does not hand it to you to tune. A policy decision, such as how much to retry, has no right answer outside your application, and a wrong one is visible and cheap to change. So llmkit takes no position, and where it must ship a default, the default is safe and the setting is yours.
 
-On your side is everything that depends on your application: which models play which roles, how prompts are built, how much to retry, how hard to drive a metered account, where logs and cached answers live, and what counts as a good answer. These have no right answer outside your application, so llmkit takes no position on them. Where it must ship a default, the default is safe and the setting is yours.
-
-The line sorts every setting into one of three groups:
-
-- **Fixed, because it is correctness:** the output mode each provider runs in, how a malformed answer is repaired, the separation of transport retries from answer retries, and the content of a call record.
-- **Configurable with a safe default, because it is policy:** retry budgets and backoff, concurrency and per-minute ceilings, the circuit breaker, log destination and retention, and the response-cache store.
-- **Absent, because it is yours alone:** model roles, prompt construction, domain validation of a schema-valid answer, and infrastructure.
-
-The remaining principles are this one line applied to each part of the library.
+The line gives every decision one of three shapes: fixed, because it is correctness; configurable with a safe default, because it is policy the library still needs a value for; or absent, because only your application can make it.
 
 ## One function call
 
