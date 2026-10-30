@@ -48,13 +48,10 @@ class OpenRouterProvider(BaseProvider):
     preference (via ``extra_body``) **by default**, so a request only lands on
     an endpoint that honors every parameter sent — including the structured
     ``response_format``. It restricts routing to capable endpoints, which can in
-    principle reduce availability or shift cost; pass ``require_parameters=False``
-    to opt out (you then accept the silent-free-form-JSON risk above). That opt-out
-    is a **direct-construction-only escape hatch**: it is deliberately not exposed
-    through the :func:`~llmkit.providers.build_provider` /
-    :func:`~llmkit.providers.make_provider` factories, since
-    :class:`~llmkit.LLMClientConfig` is provider-agnostic and does not carry an
-    OpenRouter-specific flag.
+    principle reduce availability or shift cost. There is no opt-out: whether
+    the schema is enforced is a correctness decision, and a wrong answer fails
+    silently and far from its cause. A host that needs wider routing for its own
+    calls can subclass and override :meth:`completion_kwargs`, knowingly.
     """
 
     _provider_name: ClassVar[str] = "OpenRouter"
@@ -81,23 +78,22 @@ class OpenRouterProvider(BaseProvider):
         model: str | None = None,
         base_url: str = _DEFAULT_BASE_URL,
         reasoning_effort: ReasoningEffort | None = None,
-        require_parameters: bool = True,
     ):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key
         self._base_url: str = base_url
-        self._require_parameters: bool = require_parameters
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        kwargs: dict[str, object] = {"api_key": self._api_key, "api_base": self._base_url}
-        if self._require_parameters:
-            # OpenRouter routing preference: only route to serving endpoints that
-            # support every parameter in the request — so a strict
-            # ``response_format`` is never silently dropped by an endpoint that
-            # ignores it. LiteLLM forwards ``extra_body`` to OpenRouter verbatim.
-            kwargs["extra_body"] = {"provider": {"require_parameters": True}}
-        return kwargs
+        # OpenRouter routing preference: only route to serving endpoints that
+        # support every parameter in the request — so a strict
+        # ``response_format`` is never silently dropped by an endpoint that
+        # ignores it. LiteLLM forwards ``extra_body`` to OpenRouter verbatim.
+        return {
+            "api_key": self._api_key,
+            "api_base": self._base_url,
+            "extra_body": {"provider": {"require_parameters": True}},
+        }
 
     @override
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
@@ -126,8 +122,7 @@ class OpenRouterProvider(BaseProvider):
 
         ``api_key`` resolves from the config, else the ``OPENROUTER_API_KEY``
         environment variable, else raises (see :func:`resolve_api_key`).
-        ``require_parameters`` stays on (schema-honoring routing); construct the
-        provider directly to opt out.
+        Schema-honoring routing is always on.
         """
         return cls(
             api_key=resolve_api_key(

@@ -65,6 +65,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write path. Direct calls to `write` and `write_returning_path` behave as
   before.
 
+### Removed
+
+- **Breaking: `OpenRouterProvider` no longer accepts `require_parameters`.**
+  The keyword was a direct-construction-only way to turn off OpenRouter's
+  `provider.require_parameters` routing preference, which keeps a structured
+  request off serving endpoints that ignore its schema and return free-form
+  JSON. Whether the schema is enforced is a correctness decision, so the
+  preference is now always sent. **Migration:** drop the keyword; a host that
+  needs wider routing subclasses `OpenRouterProvider` and overrides
+  `completion_kwargs`.
+
 ### Fixed
 
 - A streamed call no longer logs `approximate_cost: 0.0`. LiteLLM seeds a

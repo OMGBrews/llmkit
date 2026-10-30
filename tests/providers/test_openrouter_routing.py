@@ -18,7 +18,7 @@ stochastically echoing the schema itself. The provider therefore opts into
 ``strict_json_schema``, and ``llmkit._litellm`` upgrades the
 ``response_format`` at the completion seam.
 
-These tests pin: the preference is on by default, can be opted out, survives
+These tests pin: the preference is always on, has no opt-out, survives
 the config-build path, and actually threads through to the LiteLLM call — and
 that the strict upgrade reaches the wire for OpenRouter (through the *real*
 instructor client) while leaving non-opted-in providers' requests untouched.
@@ -58,12 +58,10 @@ def test_require_parameters_on_by_default() -> None:
     assert kwargs["api_key"] == "k"
 
 
-def test_require_parameters_can_be_opted_out() -> None:
-    """``require_parameters=False`` drops the routing pref entirely."""
-    provider = OpenRouterProvider(api_key="k", model="x/y", require_parameters=False)
-    kwargs = provider.completion_kwargs()
-    assert "extra_body" not in kwargs
-    assert kwargs == {"api_key": "k", "api_base": "https://openrouter.ai/api/v1"}
+def test_require_parameters_has_no_opt_out() -> None:
+    """Schema-honoring routing is a correctness decision, so no keyword turns it off."""
+    with pytest.raises(TypeError, match="require_parameters"):
+        _ = OpenRouterProvider(api_key="k", model="x/y", require_parameters=False)  # pyright: ignore[reportCallIssue]
 
 
 def test_config_build_keeps_require_parameters_on() -> None:

@@ -1333,19 +1333,10 @@ routing preference, so a request only lands on a serving endpoint that honors
 *every* parameter sent — including the structured `response_format` and native
 `reasoning` control when configured. The trade-off
 is that restricting routing to capable endpoints can in principle reduce
-availability or shift cost. To opt out (and accept the silent-free-form-JSON
-risk), construct the provider directly:
-
-```python
-from llmkit import structured_llm_call
-from llmkit.providers import OpenRouterProvider
-
-provider = OpenRouterProvider(api_key="sk-or-...", require_parameters=False)
-result = await structured_llm_call(prompt, MySchema, feature="x", provider=provider)
-```
-
-Routing stays on for the config-driven path (`configure_llm_client` /
-`build_provider`); the direct constructor above is the way to turn it off.
+availability or shift cost. There is no switch to turn it off: whether your
+schema is enforced is a correctness decision, and an endpoint that ignores it
+fails silently and far from the cause. A host that knowingly wants wider routing
+can subclass `OpenRouterProvider` and override `completion_kwargs`.
 
 ## Retries
 
