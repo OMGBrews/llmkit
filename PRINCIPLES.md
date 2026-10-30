@@ -56,11 +56,11 @@ Every record llmkit writes is laid out so that an AI agent can read it cold and 
 
 llmkit holds this principle because its logs are expected to be read by AI agents more often than by people. An agent opening the logs should find a failing call, see exactly what was sent and what came back, and understand the run well enough to fix the problem, improve the prompt, or change the model. The easier that is, the more of that work anyone using llmkit can hand to their agents.
 
-## Local-first, no infrastructure
+## Local-first
 
-llmkit needs no collector, account, or hosted service: configure access to your provider and go. External systems can be plugged in later, never required.
+llmkit is complete on your machine the moment you configure access to a provider.
 
-llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data: it should leave your machine only when you send it. So logs are plain local files, a local Ollama server can keep even inference on your host, and shipping records elsewhere or keeping cached answers in a store of your own is a choice you make later. Infrastructure is policy, so every optional system sits on your side of the line. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
+llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data, which should leave your machine only when you send it. Infrastructure is policy, so anything beyond the local default is yours to add, and only when you want it.
 
 ## A thin layer, not a gateway
 
