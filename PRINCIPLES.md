@@ -1,6 +1,6 @@
 # Principles
 
-The design principles behind `llmkit`: the durable promises the library makes to the people who call it. Read this to understand *why* llmkit behaves the way it does. The [README](README.md) is authoritative for the API and its details; where this page names a mechanism, it is the one that ships today.
+The design principles behind `llmkit`: the durable promises the library makes to the people who call it. Each section says what a principle promises and why llmkit holds it. How each promise is kept belongs to the [README](README.md), which is authoritative for the API and its details.
 
 `llmkit` is a thin, opinionated layer over LiteLLM that turns "call an LLM" into one function returning a validated result, with logging, retries, and rate limiting around it.
 
@@ -8,13 +8,13 @@ The design principles behind `llmkit`: the durable promises the library makes to
 
 llmkit owns correctness; you own policy. Every decision in the library falls on one side of that line.
 
-On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune. Because those decisions are made per provider and travel with it, switching providers or models is cheap for you: the correctness work has already been done on the other side of the switch.
+On llmkit's side is everything that is easy to get wrong and expensive to discover: which structured-output mode a provider actually honours, how a malformed answer is repaired, how retries and backoff are budgeted, what a call record must contain. These have one right answer per provider and a wrong answer that fails silently, so llmkit decides them once, measures them against the live providers, and does not hand them to you to tune.
 
 On your side is everything that depends on your application: which models play which roles, how prompts are built, how much to retry, how hard to drive a metered account, where logs and cached answers live, and what counts as a good answer. These have no right answer outside your application, so llmkit takes no position on them. Where it must ship a default, the default is safe and the setting is yours.
 
-In practice the line sorts every setting into one of three groups:
+The line sorts every setting into one of three groups:
 
-- **Fixed, because it is correctness:** the structured-output mode each provider runs in, instructor's in-call repair budget, the separation of transport retries from schema retries, and the content of a call record.
+- **Fixed, because it is correctness:** the output mode each provider runs in, how a malformed answer is repaired, the separation of transport retries from answer retries, and the content of a call record.
 - **Configurable with a safe default, because it is policy:** retry budgets and backoff, concurrency and per-minute ceilings, the circuit breaker, log destination and retention, and the response-cache store.
 - **Absent, because it is yours alone:** model roles, prompt construction, domain validation of a schema-valid answer, and infrastructure.
 
@@ -22,56 +22,51 @@ The remaining principles are this one line applied to each part of the library.
 
 ## One function call
 
-Pass a prompt, plus a Pydantic model when you want structured output, and get a result. `structured_llm_call` returns a validated instance, `text_llm_call` plain text, and `tool_llm_call` the model's requested tool calls. The only bookkeeping you add is a `feature`/`label` pair, which identifies the call in the logs.
+Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. Depending on the call you choose, the result is a validated instance, plain text, or the model's requested tool calls. The only bookkeeping you add is a name that identifies the call in the logs. Every call is async, and every call has a sync twin that makes the same promises.
 
-The surface is async-first, because LLM calls are I/O-bound and usually fanned out. Every call has a `_sync` twin that drives the same async path and inherits the same retries, rate limiting, and logging.
+llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. Async is the primary form because LLM calls are I/O-bound and usually fanned out; the sync twin means a synchronous codebase gives up nothing for that choice.
 
 ## Structured output always validates
 
-You pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and validators; your application owns domain correctness. A schema-valid answer can still be empty or wrong for your purpose, so reject it with constraints or an [`on_result` hook](README.md#re-rolling-on-a-semantically-bad-result).
+Pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and its validators. Your application owns domain correctness, because a schema-valid answer can still be empty or wrong for your purpose, and only you can say so.
 
-Making that contract hold is llmkit's side of the line. Across every provider, structured output is pinned to the mode that *actually* validates, verified against the live APIs; instructor's automatic mode silently regresses some providers to empty results, and llmkit refuses it. The same contract covers a [tool turn's final answer](README.md#tool-calls-with-a-structured-final-answer) on routes measured to support it; an unmeasured or preview-only route fails loudly rather than guess.
+llmkit holds this principle because a structured answer that is silently wrong is the most expensive failure in LLM code: it passes through the call and breaks something downstream, far from the cause. Whether a given provider actually validates is a per-provider fact that can change without notice, so holding the contract across providers is llmkit's side of the line, and a route llmkit has not measured fails loudly rather than guess.
 
 ## Switching providers and models is easy
 
-OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama sit behind one `Provider` enum and one flat [`LLMClientConfig`](README.md#configuration), registered once at startup. Switching vendors is a config edit, not a refactor, and call sites never name a provider. Switching models is lighter still: every call takes an optional `model=` that overrides the default for that call alone, and llmkit imposes no role system on top. A single call can also take a [`provider=` override](README.md#constructing-a-provider-for-a-per-call-override) built on the fly, so routing one call through another vendor or credential needs no change to global state. The same model is often reachable by more than one route: Gemini through AI Studio or Google's Agent Platform, Claude direct or through Bedrock, so a route can change for residency or billing reasons while the model stays put.
+Every supported provider sits behind one configuration, registered once at startup, and call sites never name a provider. Switching vendors is a config edit, not a refactor. Switching models is lighter still: the model is an argument any call can override, and llmkit imposes no role system on top. A single call can also be routed through another provider or credential without touching global state. The same model is often reachable by more than one route, so a route can change for residency or billing reasons while the model stays put.
 
-What makes the switch safe rather than merely short is the other side of the line. Each provider's structured-output mode, retry classification, rate limiter, and log record are llmkit's decisions, measured per provider, and they move with the switch. Without that, a one-line change of vendor could silently turn validated answers into empty ones.
-
-Some things do change with a route, and each changes loudly. Model identifiers are provider-specific. Bedrock and the Agent Platform read region and project settings that no other provider accepts, and a config field the selected provider does not read is rejected at construction. A tool turn that asks for a validated final answer is enabled only on routes measured to support it, and refuses elsewhere rather than guess.
+llmkit holds this principle because providers and models change for reasons that have nothing to do with your code: price, availability, data residency, a better model this month. The cost of acting on such a reason should match the size of the decision. What makes the switch safe rather than merely short is the main principle: each provider's correctness decisions are llmkit's, so they travel with the switch, and a one-line change of vendor cannot silently turn validated answers into empty ones. What cannot be made uniform across routes changes loudly: a setting the selected provider does not read is rejected, and a capability a route has not been measured to support is refused rather than guessed.
 
 ## Reliable by default
 
-[Retries](README.md#retries) and [rate limiting](README.md#rate-limiting) are on by default, and the policy that makes them safe is fixed:
+Retries and rate limiting are on by default, and the policy that makes them safe is fixed: what counts as retryable, what must never be retried, and how a retry is paced are llmkit's decisions. The budgets are yours. You tune or opt out of retries per call, set the ceilings for your account, and choose whether a failing provider is failed fast or waited out.
 
-- Transient transport failures get a larger retry budget than schema-validation failures, so a deterministically malformed answer cannot spend the transport budget on doomed re-asks. Backoff is bounded and jittered, and a provider's `Retry-After` takes precedence.
-- A streaming call is not retried once output has reached you, because replaying consumed output would change the meaning of the call.
-- A completion cut off by its output-token limit fails fast, as does a call refused by an open circuit breaker. Programming errors propagate immediately.
-- Rate limiting is adaptive and scoped per provider: overload lowers concurrency, and recovery raises it back toward your cap.
-
-The budgets and the failure policy are yours. Tune or opt out of retries per call, set the concurrency and per-minute ceilings for your account, and arm the [circuit breaker](README.md#circuit-breaker) only if failing fast suits you; it is opt-in because it changes "eventually succeeds" into "fails fast", which is an application decision. instructor's [in-call schema repair](README.md#instructors-in-call-schema-repair) stays on the fixed side, separate from your outer retries, because it is a correctness setting rather than a budget.
+llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so every caller would otherwise write the same loop and get a detail wrong. The dangerous retries are the ones that look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, or retrying a programming error. Those have one right answer, so they are fixed. How many attempts a call is worth depends on your application, so it is yours. Anything that turns "eventually succeeds" into "fails fast" is opt-in, because that trade is an application decision.
 
 ## Logging is on by default
 
 Every call llmkit makes is recorded, with nothing to set up. The record stays on your machine as a plain file. You choose where the files live, how long they are kept, and whether to send records somewhere else or turn logging off. A problem writing a record never fails the call it describes.
 
-llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, anyone using llmkit can look back at what was actually asked and answered, and improve their work from the evidence rather than from memory. The [README](README.md#logging-agent-readable-by-default) describes the record, where it goes, how to keep it private, and how to opt out.
+llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, you can look back at what was actually asked and answered, and improve your work from the evidence rather than from memory.
 
 ## Logs are written for agents
 
-The reader llmkit writes for is a coding agent, or a person, opening the log directory cold to find out what happened in a run, not a dashboard. So every record begins with the verdict: whether the call succeeded, what it was for, which model it went to, how long it took, and, when the provider reports it, roughly what it cost. The full prompt and response follow beneath. A compact index across all calls answers questions about a whole run, such as which calls failed or which were slowest or most expensive, without opening every record.
+The reader llmkit writes for is a coding agent, or a person, opening the log directory cold to find out what happened in a run, not a dashboard. Every record begins with the verdict: whether the call succeeded, what it was for, which model it went to, how long it took, and, when the provider reports it, roughly what it cost. The full prompt and response follow beneath. A compact index across all calls answers questions about a whole run, such as which calls failed or which were slowest or most expensive, without opening every record. What a record contains is llmkit's decision, so every reader finds the same shape in every project. Where the records go is yours.
 
-What a record contains is llmkit's decision, so every reader finds the same shape in every project. Where the records go is yours. llmkit holds this principle so that anyone using it can find a failing call, read exactly what was sent and what came back, and improve their prompts, model choices, and spend from the record. The [README](README.md#logging-agent-readable-by-default) shows a record and the index.
+llmkit holds this principle because a record nobody can read cold is not evidence. The reader is increasingly an agent working from files, with no dashboard and no memory of the run. A fixed, verdict-first shape lets anyone find a failing call, read exactly what was sent and what came back, and improve prompts, model choices, and spend from the record.
 
 ## Local-first, no infrastructure
 
-llmkit needs no collector, llmkit account, or hosted service. Configure access to your provider and go: logs are plain local files, and a local Ollama server keeps inference on your host. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
+llmkit needs no collector, llmkit account, or hosted service. Configure access to your provider and go. Logs are plain local files, and a local Ollama server keeps inference on your host. External systems can be plugged in later, never required: records can be shipped anywhere and cached answers stored wherever you keep them, but nothing waits on either. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
 
-External systems can be plugged in later, never required. A [custom `LogSink`](README.md#write-your-own-logsink) ships records anywhere; a [custom `LLMCache`](README.md#write-your-own-store) stores answers wherever you keep them. The [response cache](README.md#response-cache) shows the line exactly: it is off until you configure a store, llmkit owns the request fingerprint, the hit records, and the coalescing of identical in-flight requests, and you own where the answers live.
+llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data: it should leave your machine only when you send it. Infrastructure is also policy, so every optional system sits on your side of the line.
 
 ## A thin layer, not a gateway
 
-llmkit owns the call ergonomics, the structured-output mode pinning, the retry and rate-limit policy, and the logging convention, and stops there. It does not reimplement HTTP transport, construct provider endpoints, or run a proxy: that is LiteLLM's job, and taking it on is the one thing this library deliberately will not do. Staying thin keeps the library small and predictable, and keeps the set of correctness decisions narrow enough to measure and hold.
+llmkit owns the call ergonomics, the structured-output mode pinning, the retry and rate-limit policy, and the logging convention, and stops there. It does not reimplement HTTP transport, construct provider endpoints, or run a proxy: that is LiteLLM's job, and taking it on is the one thing this library deliberately will not do.
+
+llmkit holds this principle because the set of correctness decisions it promises to hold must stay narrow enough to measure against live providers and keep measured. Every layer added beneath the call would widen that set, and a gateway would widen it past what one small library can honestly promise.
 
 ## See also
 
