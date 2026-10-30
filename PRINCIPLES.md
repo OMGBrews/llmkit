@@ -22,7 +22,7 @@ The remaining principles are this one line applied to each part of the library.
 
 ## One function call
 
-Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. The call is async. Code that cannot await uses a sync form of the same call, which carries every promise the async form does.
+Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. The call is async, and a sync form of the same call carries every promise the async form does.
 
 llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. The call is async because LLM calls are I/O-bound and usually fanned out. The sync form exists because a codebase that cannot await should not have to give up any of the library's promises to use it.
 
@@ -34,33 +34,33 @@ llmkit holds this principle because a structured answer that is silently wrong i
 
 ## Switching providers and models is easy
 
-Every supported provider sits behind one configuration, registered once at startup, and call sites never name a provider. Switching vendors is a config edit, not a refactor. Switching models is lighter still: the model is an argument any call can override, and llmkit imposes no role system on top. A single call can also be routed through another provider or credential without touching global state. The same model is often reachable by more than one route, so a route can change for residency or billing reasons while the model stays put.
+Switching providers is a config edit, not a refactor, and switching models is one argument on a call. Call sites never name a provider.
 
-llmkit holds this principle because providers and models change for reasons that have nothing to do with your code: price, availability, data residency, a better model this month. The cost of acting on such a reason should match the size of the decision. What makes the switch safe rather than merely short is the main principle: each provider's correctness decisions are llmkit's, so they travel with the switch, and a one-line change of vendor cannot silently turn validated answers into empty ones. What cannot be made uniform across routes changes loudly: a setting the selected provider does not read is rejected, and a capability a route has not been measured to support is refused rather than guessed.
+llmkit holds this principle because providers and models change for reasons that have nothing to do with your code: price, availability, data residency, a better model this month, or a different route to the same model. The cost of acting on such a reason should match the size of the decision, so a single call can be rerouted through another provider or credential without touching global state, and llmkit imposes no role system between you and a model name. What makes the switch safe rather than merely short is the main principle: each provider's correctness decisions are llmkit's, so they travel with the switch, and a one-line change of vendor cannot silently turn validated answers into empty ones. What cannot be made uniform across routes changes loudly: a setting the selected provider does not read is rejected, and a capability a route has not been measured to support is refused rather than guessed.
 
 ## Reliable by default
 
-Retries and rate limiting are on by default, and the policy that makes them safe is fixed: what counts as retryable, what must never be retried, and how a retry is paced are llmkit's decisions. The budgets are yours. You tune or opt out of retries per call, set the ceilings for your account, and choose whether a failing provider is failed fast or waited out.
+Retries and rate limiting are on by default. The policy that makes them safe is fixed; the budgets and ceilings are yours.
 
-llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so every caller would otherwise write the same loop and get a detail wrong. The dangerous retries are the ones that look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, or retrying a programming error. Those have one right answer, so they are fixed. How many attempts a call is worth depends on your application, so it is yours. Anything that turns "eventually succeeds" into "fails fast" is opt-in, because that trade is an application decision.
+llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so every caller would otherwise write the same loop and get a detail wrong. What counts as retryable, what must never be retried, and how a retry is paced have one right answer, so they are fixed. The dangerous retries are the ones that look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, or retrying a programming error. How many attempts a call is worth and how hard to drive a metered account depend on your application, so retries are tunable per call and the ceilings are yours. Anything that turns "eventually succeeds" into "fails fast" is opt-in, because that trade is an application decision.
 
 ## Logging is on by default
 
-Every call llmkit makes is recorded, with nothing to set up. The record stays on your machine as a plain file. You choose where the files live, how long they are kept, and whether to send records somewhere else or turn logging off. A problem writing a record never fails the call it describes.
+Every call llmkit makes is recorded as a plain file on your machine, with nothing to set up. You choose where the records live, how long they are kept, and whether logging stays on.
 
-llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, you can look back at what was actually asked and answered, and improve your work from the evidence rather than from memory.
+llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, you can look back at what was actually asked and answered, and improve your work from the evidence rather than from memory. The record is an aid, not a dependency, so a problem writing one never fails the call it describes.
 
 ## Logs are written for agents
 
-The reader llmkit writes for is a coding agent, or a person, opening the log directory cold to find out what happened in a run, not a dashboard. Every record begins with the verdict: whether the call succeeded, what it was for, which model it went to, how long it took, and, when the provider reports it, roughly what it cost. The full prompt and response follow beneath. A compact index across all calls answers questions about a whole run, such as which calls failed or which were slowest or most expensive, without opening every record. What a record contains is llmkit's decision, so every reader finds the same shape in every project. Where the records go is yours.
+Every record is written for a coding agent, or a person, opening the log directory cold to find out what happened in a run. The verdict comes first, the full prompt and response follow, and a compact index answers questions about a whole run without opening every record.
 
-llmkit holds this principle because a record nobody can read cold is not evidence. The reader is increasingly an agent working from files, with no dashboard and no memory of the run. A fixed, verdict-first shape lets anyone find a failing call, read exactly what was sent and what came back, and improve prompts, model choices, and spend from the record.
+llmkit holds this principle because a record nobody can read cold is not evidence. The reader is increasingly an agent working from files, with no dashboard and no memory of the run, so the first lines must answer the first questions: whether the call succeeded, what it was for, which model it went to, how long it took, and roughly what it cost. What a record contains is llmkit's decision, so the shape is the same in every project; where the records go is yours. That shape lets anyone find a failing call, read exactly what was sent and what came back, and improve prompts, model choices, and spend from the record.
 
 ## Local-first, no infrastructure
 
-llmkit needs no collector, llmkit account, or hosted service. Configure access to your provider and go. Logs are plain local files, and a local Ollama server keeps inference on your host. External systems can be plugged in later, never required: records can be shipped anywhere and cached answers stored wherever you keep them, but nothing waits on either. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
+llmkit needs no collector, account, or hosted service: configure access to your provider and go. External systems can be plugged in later, never required.
 
-llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data: it should leave your machine only when you send it. Infrastructure is also policy, so every optional system sits on your side of the line.
+llmkit holds this principle because a library that needs infrastructure before it is useful turns the first call into a project, and because the record of your prompts and answers is your data: it should leave your machine only when you send it. So logs are plain local files, a local Ollama server can keep even inference on your host, and shipping records elsewhere or keeping cached answers in a store of your own is a choice you make later. Infrastructure is policy, so every optional system sits on your side of the line. (The underlying LiteLLM dependency may fetch model-cost metadata from GitHub.)
 
 ## A thin layer, not a gateway
 
