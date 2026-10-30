@@ -42,7 +42,7 @@ llmkit holds this principle because providers and models change for reasons that
 
 Retries and rate limiting are on by default, with the policy that makes them safe fixed and the budgets yours.
 
-llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so without a default every caller writes the same loop and gets a detail wrong. The details that go wrong look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, retrying a programming error. Those have one right answer, so llmkit fixes them. How many attempts a call is worth, how hard to drive a metered account, and whether to keep trying or fail fast depend on your application, so those are yours.
+llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so without a default every caller writes the same loop and gets a detail wrong. The details that go wrong look harmless and have one right answer, so llmkit fixes them. How many attempts a call is worth, how hard to drive a metered account, and whether to keep trying or fail fast depend on your application, so those are yours. That reasoning also binds llmkit itself: nothing it adds around a call may make the call less reliable than it would be without it.
 
 ## Logging is on by default
 
