@@ -40,9 +40,9 @@ llmkit holds this principle because providers and models change for reasons that
 
 ## Reliable by default
 
-Retries and rate limiting are on by default. The policy that makes them safe is fixed; the budgets and ceilings are yours.
+Retries and rate limiting are on by default, with the policy that makes them safe fixed and the budgets yours.
 
-llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so every caller would otherwise write the same loop and get a detail wrong. What counts as retryable, what must never be retried, and how a retry is paced have one right answer, so they are fixed. The dangerous retries are the ones that look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, or retrying a programming error. How many attempts a call is worth and how hard to drive a metered account depend on your application, so retries are tunable per call and the ceilings are yours. Anything that turns "eventually succeeds" into "fails fast" is opt-in, because that trade is an application decision.
+llmkit holds this principle because transient failures and rate limits are universal to LLM providers, so without a default every caller writes the same loop and gets a detail wrong. The details that go wrong look harmless: replaying a stream whose output you have already consumed, re-asking for an answer that will be malformed every time, retrying a programming error. Those have one right answer, so llmkit fixes them. How many attempts a call is worth, how hard to drive a metered account, and whether to keep trying or fail fast depend on your application, so those are yours.
 
 ## Logging is on by default
 
