@@ -74,7 +74,7 @@ class LLMCallOptions:
     :func:`tool_llm_call_sync` and :func:`tool_llm_call_stream`): a feature
     module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
-    instead of repeating the same nine-keyword block at each site. The flat
+    instead of repeating the same seven-keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.
 
     Every field is **optional and unset by default** (the :data:`UNSET`

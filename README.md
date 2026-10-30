@@ -148,7 +148,7 @@ The call's log record lands under `data/llm-logs/` in your project by default �
 see [Where the logs go](#where-the-logs-go).
 
 > **Two defaults worth knowing up front.**
-> - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
+> - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it, logs a warning the first time each model refuses, and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
 > - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
 
 For local calls, first start an Ollama server and pull the model as described
@@ -453,7 +453,7 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
 `None` is accepted on every call surface — structured, plain-text, streaming, tool calls, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
 
-**A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
+**A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for, and the `llmkit._litellm` logger warns the first time each model refuses, naming the model and the dropped value; later drops for that model log at DEBUG. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
 
 **Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded on every provider, Gemini included, and a Gemini model that rejects it with an error naming `temperature` gets the request re-issued once without it, as above. One wrinkle remains on the Google AI Studio and Google's Agent Platform routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
 
@@ -615,7 +615,7 @@ Rate limiting is **on by default**, scoped **per provider** (keyed by the effect
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them. Each call changes only the keywords it passes and keeps the rest, so setting `rpm=` at startup and `breaker=True` later leaves both in force; pass `rpm=None` or `tpm=None` to turn that dimension off again. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
 from llmkit import configure_rate_limit
@@ -635,8 +635,8 @@ It only ever lowers the limit *below* `max_concurrent`, never above, so a provid
 ```python
 from llmkit import configure_rate_limit
 
-configure_rate_limit(max_concurrent=8)             # adaptive (the default)
-configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, never adjusted
+configure_rate_limit(adaptive=False)  # fixed cap at max_concurrent, never adjusted
+configure_rate_limit(adaptive=True)   # adaptive again (the default)
 ```
 
 ### Observing backpressure
@@ -1333,19 +1333,10 @@ routing preference, so a request only lands on a serving endpoint that honors
 *every* parameter sent — including the structured `response_format` and native
 `reasoning` control when configured. The trade-off
 is that restricting routing to capable endpoints can in principle reduce
-availability or shift cost. To opt out (and accept the silent-free-form-JSON
-risk), construct the provider directly:
-
-```python
-from llmkit import structured_llm_call
-from llmkit.providers import OpenRouterProvider
-
-provider = OpenRouterProvider(api_key="sk-or-...", require_parameters=False)
-result = await structured_llm_call(prompt, MySchema, feature="x", provider=provider)
-```
-
-Routing stays on for the config-driven path (`configure_llm_client` /
-`build_provider`); the direct constructor above is the way to turn it off.
+availability or shift cost. There is no switch to turn it off: whether your
+schema is enforced is a correctness decision, and an endpoint that ignores it
+fails silently and far from the cause. A host that knowingly wants wider routing
+can subclass `OpenRouterProvider` and override `completion_kwargs`.
 
 ## Retries
 

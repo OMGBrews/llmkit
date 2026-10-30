@@ -19,6 +19,7 @@ from collections.abc import AsyncGenerator, Generator
 
 import llmkit.rate_limiting._tuning as _tuning
 from llmkit.exceptions import CircuitOpenError
+from llmkit.options import UNSET, Unset
 from llmkit.rate_limiting._adaptive import AdaptiveGate, AdaptiveState, SyncAdaptiveGate
 from llmkit.rate_limiting._breaker import Admit, CircuitBreaker
 from llmkit.rate_limiting._buckets import RateBucket, RateLimitSlot
@@ -132,18 +133,21 @@ class GlobalRateLimiter:
     @classmethod
     def configure(
         cls,
-        max_concurrent: int = 8,
-        enabled: bool = True,
-        rpm: int | None = None,
-        tpm: int | None = None,
-        adaptive: bool = True,
-        breaker: bool = False,
+        max_concurrent: int | Unset = UNSET,
+        enabled: bool | Unset = UNSET,
+        rpm: int | None | Unset = UNSET,
+        tpm: int | None | Unset = UNSET,
+        adaptive: bool | Unset = UNSET,
+        breaker: bool | Unset = UNSET,
     ) -> None:
         """Configure the global per-provider rate limit.
 
-        Intended to be called once at startup before any LLM calls run.
-        Calling again resets every dimension and clears all limiter registries
-        (gates, adaptive states, circuit breakers, RPM/TPM buckets), so the new
+        Each call changes only the settings it passes: an omitted keyword keeps
+        its current value, so ``configure(rpm=3_500)`` followed by
+        ``configure(breaker=True)`` leaves the RPM ceiling in place. ``None``
+        for ``rpm`` or ``tpm`` turns that dimension off. Every call, including
+        one that passes nothing, still clears all limiter registries (gates,
+        adaptive states, circuit breakers, RPM/TPM buckets), so the resulting
         limits apply to *subsequent* acquires; in-flight callers continue to
         release on the gate object (and debit the TPM bucket) they snapshotted at
         acquire time, so reconfiguration is always safe.
@@ -181,19 +185,31 @@ class GlobalRateLimiter:
                 would admit nothing, so without this check a ``max_concurrent=0``
                 would silently hang every subsequent LLM call.
         """
-        if max_concurrent < 1:
+        if not isinstance(max_concurrent, Unset) and max_concurrent < 1:
             raise ValueError(f"max_concurrent must be a positive integer, got {max_concurrent!r}")
-        if rpm is not None and rpm <= 0:
+        if not isinstance(rpm, Unset) and rpm is not None and rpm <= 0:
             raise ValueError(f"rpm must be a positive integer or None, got {rpm!r}")
-        if tpm is not None and tpm <= 0:
+        if not isinstance(tpm, Unset) and tpm is not None and tpm <= 0:
             raise ValueError(f"tpm must be a positive integer or None, got {tpm!r}")
         with cls._lock:
-            cls._max_concurrent = max_concurrent
-            cls._enabled = enabled
-            cls._rpm = rpm
-            cls._tpm = tpm
-            cls._adaptive = adaptive
-            cls._breaker = breaker
+            if not isinstance(max_concurrent, Unset):
+                cls._max_concurrent = max_concurrent
+            if not isinstance(enabled, Unset):
+                cls._enabled = enabled
+            if not isinstance(rpm, Unset):
+                cls._rpm = rpm
+            if not isinstance(tpm, Unset):
+                cls._tpm = tpm
+            if not isinstance(adaptive, Unset):
+                cls._adaptive = adaptive
+            if not isinstance(breaker, Unset):
+                cls._breaker = breaker
+            max_concurrent = cls._max_concurrent
+            enabled = cls._enabled
+            rpm = cls._rpm
+            tpm = cls._tpm
+            adaptive = cls._adaptive
+            breaker = cls._breaker
             cls._async_gates = {}
             cls._adaptive_states = {}
             cls._breaker_states = {}
@@ -209,6 +225,18 @@ class GlobalRateLimiter:
             enabled,
             adaptive,
             breaker,
+        )
+
+    @classmethod
+    def _reset(cls) -> None:
+        """Restore every setting to its shipped default and clear the registries.
+
+        Private: :meth:`configure` merges, so nothing public returns the limiter
+        to a known state in one call. The test support package calls this
+        around each test.
+        """
+        cls.configure(
+            max_concurrent=8, enabled=True, rpm=None, tpm=None, adaptive=True, breaker=False
         )
 
     @classmethod

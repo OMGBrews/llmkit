@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
 from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
@@ -161,6 +162,41 @@ def _refuses_temperature(exc: Exception, kwargs: dict[str, object]) -> bool:
     return _TEMPERATURE in str(exc).lower()
 
 
+# Models whose refused temperature has already been reported at WARNING. A
+# refusal is a fact about the model, not about one call, so one warning per
+# model is enough; every later drop logs at DEBUG. The lock makes the
+# check-and-add atomic across the sync bridge's loop and host loops alike.
+_temperature_warned_models: set[str] = set()
+_temperature_warned_lock = threading.Lock()
+
+
+def _report_dropped_temperature(model: object, value: object) -> None:
+    """Tell the caller their ``temperature`` was dropped for *model*.
+
+    The caller's choice was overridden by a correctness decision, so it must
+    be visible rather than surface only as ``temperature: None`` in a record.
+    """
+    name = str(model)
+    with _temperature_warned_lock:
+        first = name not in _temperature_warned_models
+        _temperature_warned_models.add(name)
+    level = logging.WARNING if first else logging.DEBUG
+    logger.log(
+        level,
+        "%s refused temperature=%r, so llmkit re-sent the request without it; "
+        + "the provider's own default applied. Stop passing temperature for this "
+        + "model to silence this.",
+        name,
+        value,
+    )
+
+
+def reset_temperature_warnings() -> None:
+    """Forget which models were warned about; for the test support package."""
+    with _temperature_warned_lock:
+        _temperature_warned_models.clear()
+
+
 def _without_temperature(kwargs: dict[str, object]) -> dict[str, object]:
     """*kwargs* plus LiteLLM's per-call ``additional_drop_params=["temperature"]``.
 
@@ -205,7 +241,9 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     never the process-global ``litellm.drop_params``. If the re-issue fails too,
     the *original* refusal is raised, the second error chained as its context.
     The temperature actually sent is stamped for the call record (see
-    :func:`sent_temperature`). A host that sets the global
+    :func:`sent_temperature`), and the drop is logged: at WARNING the first
+    time a model refuses, naming the model and the dropped value, and at
+    DEBUG after that. A host that sets the global
     ``litellm.drop_params`` makes LiteLLM drop silently instead, so no refusal
     reaches here and the record shows the caller's value.
 
@@ -244,6 +282,7 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
                 # ``__context__`` while the caller sees the refusal it caused.
                 raise refused  # noqa: B904 — the original is the error to surface
             _ = _sent_temperature.set(None)
+            _report_dropped_temperature(kwargs.get("model"), kwargs.get(_TEMPERATURE))
             return result
         sent = kwargs.get(_TEMPERATURE)
         _ = _sent_temperature.set(sent if isinstance(sent, (int, float)) else None)

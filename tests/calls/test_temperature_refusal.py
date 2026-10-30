@@ -15,6 +15,7 @@ test runs the real lane, transport and funnel over a scripted LiteLLM.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import final
 from unittest.mock import MagicMock, patch
@@ -427,3 +428,72 @@ async def test_a_truncated_text_attempt_records_the_temperature_sent(lane: _Lane
     [record] = records
     assert record.temperature is None
     assert record.partial_text == "cut"
+
+
+# --- (e) the drop is reported, once per model --------------------------------
+
+_DROP_LOGGER = "llmkit._litellm"
+
+
+def _drop_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if r.name == _DROP_LOGGER and "refused temperature" in r.message
+    ]
+
+
+@pytest.mark.parametrize(("lane", "stream", "content"), _LANE_PARAMS)
+async def test_a_dropped_temperature_warns_naming_model_and_value(
+    lane: _Lane, stream: bool, content: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=_DROP_LOGGER)
+    fake = _ScriptedLiteLLM(_client_refusal(), stream=stream, content=content)
+
+    _ = await _run(lane, fake, temperature=0.0)
+
+    [log] = _drop_logs(caplog)
+    assert log.levelno == logging.WARNING
+    assert str(fake.requests[0]["model"]) in log.message
+    assert "temperature=0.0" in log.message
+
+
+async def test_a_second_drop_for_the_same_model_logs_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=_DROP_LOGGER)
+
+    _ = await _run(_text, _ScriptedLiteLLM(_client_refusal()), temperature=0.0)
+    _ = await _run(_text, _ScriptedLiteLLM(_client_refusal()), temperature=0.0)
+
+    assert [r.levelno for r in _drop_logs(caplog)] == [logging.WARNING, logging.DEBUG]
+
+
+async def test_each_model_gets_its_own_warning(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger=_DROP_LOGGER)
+
+    _ = await _run(_text, _ScriptedLiteLLM(_client_refusal()), temperature=0.0)
+    other = _provider()
+    other.litellm_model = MagicMock(return_value="openai/other-model")
+    _ = await _run(_text, _ScriptedLiteLLM(_client_refusal()), other, temperature=0.0)
+
+    logs = _drop_logs(caplog)
+    assert [r.levelno for r in logs] == [logging.WARNING, logging.WARNING]
+    assert logs[0].message != logs[1].message
+
+
+async def test_an_accepted_temperature_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger=_DROP_LOGGER)
+
+    _ = await _run(_text, _ScriptedLiteLLM(), temperature=0.0)
+
+    assert _drop_logs(caplog) == []
+
+
+async def test_a_failing_reissue_does_not_report_a_drop(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG, logger=_DROP_LOGGER)
+    second = litellm_errors.BadRequestError(message="still no", model="m", llm_provider="openai")
+    fake = _ScriptedLiteLLM(_client_refusal(), second)
+
+    with pytest.raises(litellm_errors.UnsupportedParamsError):
+        _ = await _run(_text, fake, temperature=0.0, retry=NO_RETRY)
+
+    assert _drop_logs(caplog) == []

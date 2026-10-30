@@ -174,6 +174,7 @@ import contextlib
 from collections.abc import AsyncGenerator, Generator
 from dataclasses import dataclass
 
+from llmkit.options import UNSET, Unset
 from llmkit.rate_limiting._buckets import RateLimitSlot
 from llmkit.rate_limiting._limiter import GlobalRateLimiter
 from llmkit.rate_limiting._observability import (
@@ -220,21 +221,28 @@ class RateLimitConfig:
 
 
 def configure_rate_limit(
-    max_concurrent: int = 8,
-    enabled: bool = True,
-    rpm: int | None = None,
-    tpm: int | None = None,
-    adaptive: bool = True,
-    breaker: bool = False,
+    max_concurrent: int | Unset = UNSET,
+    enabled: bool | Unset = UNSET,
+    rpm: int | None | Unset = UNSET,
+    tpm: int | None | Unset = UNSET,
+    adaptive: bool | Unset = UNSET,
+    breaker: bool | Unset = UNSET,
 ) -> None:
     """Configure the global, per-provider LLM rate limit.
 
     Rate limiting is on by default (concurrency cap 8 per provider, adaptive; RPM
     and TPM off; circuit breaker off). Call this to change the concurrency cap,
     turn limiting off, opt into a per-provider requests-/tokens-per-minute
-    ceiling, turn off adaptive concurrency, or arm the circuit breaker. Call once
-    at startup before any LLM calls run. When enabled, every provider call routed
-    through the LiteLLM call layer passes through that provider's limiters.
+    ceiling, turn off adaptive concurrency, or arm the circuit breaker. When
+    enabled, every provider call routed through the LiteLLM call layer passes
+    through that provider's limiters.
+
+    Each call changes only the keywords it passes; an omitted keyword keeps its
+    current value, so ``configure_rate_limit(rpm=3_500)`` at startup and
+    ``configure_rate_limit(breaker=True)`` later leave both in force. Pass
+    ``rpm=None`` or ``tpm=None`` to turn that dimension off again. Every call
+    also clears the per-provider limiter state (adaptive limits, breaker
+    windows, token buckets), so call it at startup rather than mid-run.
 
     The binding limit on a metered cloud account is usually RPM/TPM rather than
     concurrency: set ``rpm=`` / ``tpm=`` to your account's published per-minute
@@ -263,23 +271,31 @@ def configure_rate_limit(
 
     Args:
         max_concurrent: Maximum concurrent API calls **per provider** (the
-            ceiling the adaptive limit starts at and recovers toward).
-        enabled: Whether rate limiting is active.
+            ceiling the adaptive limit starts at and recovers toward); 8 until
+            set.
+        enabled: Whether rate limiting is active; on until set.
         rpm: Sustained requests-per-minute **per provider**, or ``None`` to
-            leave the request-rate dimension off (the default).
-        tpm: Sustained tokens-per-minute **per provider**, or ``None`` to leave
-            the token-rate dimension off (the default).
+            turn the request-rate dimension off (off until set).
+        tpm: Sustained tokens-per-minute **per provider**, or ``None`` to turn
+            the token-rate dimension off (off until set).
         adaptive: Whether the concurrency limit adapts to provider overload
-            (on by default). ``False`` pins it at ``max_concurrent``.
-        breaker: Whether the per-provider circuit breaker is armed (**off** by
-            default). ``True`` makes a known-down provider fail fast for a
+            (on until set). ``False`` pins it at ``max_concurrent``.
+        breaker: Whether the per-provider circuit breaker is armed (**off**
+            until set). ``True`` makes a known-down provider fail fast for a
             cooldown instead of letting every call burn its retry budget.
 
     Raises:
         ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` / ``tpm``
             is set to a non-positive value.
     """
-    GlobalRateLimiter.configure(max_concurrent, enabled, rpm, tpm, adaptive, breaker)
+    GlobalRateLimiter.configure(
+        max_concurrent=max_concurrent,
+        enabled=enabled,
+        rpm=rpm,
+        tpm=tpm,
+        adaptive=adaptive,
+        breaker=breaker,
+    )
 
 
 def get_rate_limit_config() -> RateLimitConfig:

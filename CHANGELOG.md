@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A dropped `temperature` is now logged.** When a model refuses the
+  `temperature` you passed and llmkit re-issues the request without it, the
+  `llmkit._litellm` logger now warns the first time each model refuses, naming
+  the model and the dropped value; later drops for the same model log at
+  DEBUG. The re-issue and the `temperature: null` in the call record are
+  unchanged.
+
 - **`get_logging_health()` — see whether log records were lost.** Logging
   failures surfaced only as diagnostic warnings, which a host's logging
   configuration can hide, and the built-in sink swallowed its own failures
@@ -30,6 +37,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: `configure_rate_limit` keeps the settings a call omits.** Each
+  call used to reset every dimension to its default, so a host that set
+  `configure_rate_limit(rpm=3_500)` at startup and
+  `configure_rate_limit(breaker=True)` later silently lost its RPM ceiling. Now
+  every parameter defaults to `UNSET`, and a call changes only the keywords it
+  passes. `None` still turns `rpm` or `tpm` off, and every call still clears
+  the per-provider limiter state. **Migration:** a call that relied on the
+  reset to restore a default now passes that value explicitly, for example
+  `configure_rate_limit(adaptive=True, breaker=False)`.
+
 - **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
   1.16.0, instructor's `Mode.JSON` handler appended its schema instruction to
   the caller's own system message. A retried structured call on a `Mode.JSON`
@@ -48,7 +65,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write path. Direct calls to `write` and `write_returning_path` behave as
   before.
 
+### Removed
+
+- **Breaking: `OpenRouterProvider` no longer accepts `require_parameters`.**
+  The keyword was a direct-construction-only way to turn off OpenRouter's
+  `provider.require_parameters` routing preference, which keeps a structured
+  request off serving endpoints that ignore its schema and return free-form
+  JSON. Whether the schema is enforced is a correctness decision, so the
+  preference is now always sent. **Migration:** drop the keyword; a host that
+  needs wider routing subclasses `OpenRouterProvider` and overrides
+  `completion_kwargs`.
+
 ### Fixed
+
+- `model_json_schema` on llmkit's generated models now accepts
+  `by_alias=None`, matching pydantic 2.14's signature, so the override type
+  checks again. The default stays `True`, so the emitted schema is unchanged.
 
 - A streamed call no longer logs `approximate_cost: 0.0`. LiteLLM seeds a
   stream's cost with a `0.0` placeholder and never prices the stream, so
