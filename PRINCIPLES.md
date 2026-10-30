@@ -22,9 +22,9 @@ The remaining principles are this one line applied to each part of the library.
 
 ## One function call
 
-Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. Depending on the call you choose, the result is a validated instance, plain text, or the model's requested tool calls. The only bookkeeping you add is a name that identifies the call in the logs. Every call is async, and every call has a sync twin that makes the same promises.
+Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. The call is async. Code that cannot await uses a sync form of the same call, which carries every promise the async form does.
 
-llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. Async is the primary form because LLM calls are I/O-bound and usually fanned out; the sync twin means a synchronous codebase gives up nothing for that choice.
+llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. The call is async because LLM calls are I/O-bound and usually fanned out. The sync form exists because a codebase that cannot await should not have to give up any of the library's promises to use it.
 
 ## Structured output always validates
 
