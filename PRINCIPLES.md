@@ -46,9 +46,9 @@ llmkit holds this principle because transient failures and rate limits are unive
 
 ## Logging is on by default
 
-Every call llmkit makes is recorded as a plain file on your machine, with nothing to set up. You choose where the records live, how long they are kept, and whether logging stays on.
+Every call llmkit makes is recorded as a plain file on your machine, with nothing to set up and the option to turn it off.
 
-llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, you can look back at what was actually asked and answered, and improve your work from the evidence rather than from memory. The record is an aid, not a dependency, so a problem writing one never fails the call it describes.
+llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, you can look back at what was actually asked and answered, and improve your work from the evidence rather than from memory.
 
 ## Logs are written for agents
 
