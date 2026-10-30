@@ -615,7 +615,7 @@ Rate limiting is **on by default**, scoped **per provider** (keyed by the effect
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them; `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them. Each call changes only the keywords it passes and keeps the rest, so setting `rpm=` at startup and `breaker=True` later leaves both in force; pass `rpm=None` or `tpm=None` to turn that dimension off again. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
 from llmkit import configure_rate_limit
@@ -635,8 +635,8 @@ It only ever lowers the limit *below* `max_concurrent`, never above, so a provid
 ```python
 from llmkit import configure_rate_limit
 
-configure_rate_limit(max_concurrent=8)             # adaptive (the default)
-configure_rate_limit(max_concurrent=8, adaptive=False)  # fixed cap, never adjusted
+configure_rate_limit(adaptive=False)  # fixed cap at max_concurrent, never adjusted
+configure_rate_limit(adaptive=True)   # adaptive again (the default)
 ```
 
 ### Observing backpressure

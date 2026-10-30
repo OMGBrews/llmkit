@@ -45,6 +45,7 @@ from llmkit import CircuitOpenError, _litellm
 from llmkit import calls as llm_calls
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
+    RateLimitConfig,
     RateLimitSlot,
     _tuning,
     configure_rate_limit,
@@ -262,7 +263,64 @@ def test_get_rate_limit_config_reports_effective_values() -> None:
 
     configure_rate_limit(breaker=True)
     assert get_rate_limit_config().breaker is True  # explicit opt-in reflected
-    assert get_rate_limit_config().adaptive is True  # breaker opt-in doesn't disturb adaptive
+    assert get_rate_limit_config().adaptive is False  # an omitted keyword keeps its value
+
+
+def test_reconfiguration_merges_omitted_keywords() -> None:
+    """A second ``configure_rate_limit`` call keeps every keyword it omits.
+
+    The motivating mistake: a host sets its account's RPM at startup and arms
+    the breaker later; under the old reset-on-every-call behaviour the second
+    call silently dropped the RPM ceiling.
+    """
+    configure_rate_limit(max_concurrent=3, rpm=3_500, tpm=90_000)
+    configure_rate_limit(breaker=True)
+    merged = get_rate_limit_config()
+    assert (merged.max_concurrent, merged.rpm, merged.tpm) == (3, 3_500, 90_000)
+    assert merged.breaker is True
+    assert merged.enabled is True
+    assert merged.adaptive is True
+
+
+def test_none_turns_a_rate_dimension_off_without_touching_the_rest() -> None:
+    """``None`` still means "dimension off"; only the named dimension changes."""
+    configure_rate_limit(max_concurrent=3, rpm=120, tpm=6_000, breaker=True)
+    configure_rate_limit(rpm=None)
+    config = get_rate_limit_config()
+    assert config.rpm is None
+    assert config.tpm == 6_000
+    assert config.max_concurrent == 3
+    assert config.breaker is True
+
+
+def test_reconfiguration_clears_registries_even_when_it_changes_nothing() -> None:
+    """Every call clears the per-provider limiter state, as the docstring says."""
+    configure_rate_limit(rpm=120)
+    assert GlobalRateLimiter._get_rpm_bucket("merge-test") is not None
+    assert GlobalRateLimiter._rpm_buckets
+    configure_rate_limit()
+    assert GlobalRateLimiter._rpm_buckets == {}
+    assert get_rate_limit_config().rpm == 120
+
+
+def test_a_rejected_reconfiguration_changes_nothing() -> None:
+    """Validation runs before any setting changes, so a bad call is atomic."""
+    configure_rate_limit(max_concurrent=3, rpm=120)
+    with pytest.raises(ValueError, match="tpm"):
+        configure_rate_limit(max_concurrent=5, tpm=-1)
+    config = get_rate_limit_config()
+    assert (config.max_concurrent, config.rpm, config.tpm) == (3, 120, None)
+
+
+def test_private_reset_restores_shipped_defaults() -> None:
+    """The test-support reset returns every dimension to its shipped default."""
+    configure_rate_limit(
+        max_concurrent=3, enabled=False, rpm=120, tpm=6_000, adaptive=False, breaker=True
+    )
+    GlobalRateLimiter._reset()
+    assert get_rate_limit_config() == RateLimitConfig(
+        enabled=True, max_concurrent=8, rpm=None, tpm=None, adaptive=True, breaker=False
+    )
 
 
 class _AsyncFunctionProbe:

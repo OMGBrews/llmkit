@@ -30,6 +30,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: `configure_rate_limit` keeps the settings a call omits.** Each
+  call used to reset every dimension to its default, so a host that set
+  `configure_rate_limit(rpm=3_500)` at startup and
+  `configure_rate_limit(breaker=True)` later silently lost its RPM ceiling. Now
+  every parameter defaults to `UNSET`, and a call changes only the keywords it
+  passes. `None` still turns `rpm` or `tpm` off, and every call still clears
+  the per-provider limiter state. **Migration:** a call that relied on the
+  reset to restore a default now passes that value explicitly, for example
+  `configure_rate_limit(adaptive=True, breaker=False)`.
+
 - **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
   1.16.0, instructor's `Mode.JSON` handler appended its schema instruction to
   the caller's own system message. A retried structured call on a `Mode.JSON`
