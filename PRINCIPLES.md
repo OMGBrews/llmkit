@@ -51,9 +51,17 @@ Some things do change with a route, and each changes loudly. Model identifiers a
 
 The budgets and the failure policy are yours. Tune or opt out of retries per call, set the concurrency and per-minute ceilings for your account, and arm the [circuit breaker](README.md#circuit-breaker) only if failing fast suits you; it is opt-in because it changes "eventually succeeds" into "fails fast", which is an application decision. instructor's [in-call schema repair](README.md#instructors-in-call-schema-repair) stays on the fixed side, separate from your outer retries, because it is a correctness setting rather than a budget.
 
-## Logging by default, written for agents
+## Logging is on by default
 
-Every call is [logged with zero setup](README.md#logging-agent-readable-by-default); opt out with `configure_llm_logging(None)`. The assumed reader is a coding agent debugging a run, not a dashboard. So each record leads with the verdict (ok or error, feature and label, model, duration, approximate cost), carries the full prompt and response beneath it, and an append-only index answers cross-call questions in one scan. What a record contains is llmkit's decision; where it goes is yours.
+Every call llmkit makes is recorded, with nothing to set up. The record stays on your machine as a plain file. You choose where the files live, how long they are kept, and whether to send records somewhere else or turn logging off. A problem writing a record never fails the call it describes.
+
+llmkit holds this principle because the run you most need a record of is the one you did not expect to go wrong. A debugging aid that has to be switched on in advance is missing exactly then. With every call on file, anyone using llmkit can look back at what was actually asked and answered, and improve their work from the evidence rather than from memory. The [README](README.md#logging-agent-readable-by-default) describes the record, where it goes, how to keep it private, and how to opt out.
+
+## Logs are written for agents
+
+The reader llmkit writes for is a coding agent, or a person, opening the log directory cold to find out what happened in a run, not a dashboard. So every record begins with the verdict: whether the call succeeded, what it was for, which model it went to, how long it took, and, when the provider reports it, roughly what it cost. The full prompt and response follow beneath. A compact index across all calls answers questions about a whole run, such as which calls failed or which were slowest or most expensive, without opening every record.
+
+What a record contains is llmkit's decision, so every reader finds the same shape in every project. Where the records go is yours. llmkit holds this principle so that anyone using it can find a failing call, read exactly what was sent and what came back, and improve their prompts, model choices, and spend from the record. The [README](README.md#logging-agent-readable-by-default) shows a record and the index.
 
 ## Local-first, no infrastructure
 
