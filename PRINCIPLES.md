@@ -28,9 +28,9 @@ llmkit holds this principle because everything that makes an LLM call hard to ge
 
 ## Structured output always validates
 
-Pass a Pydantic model and get back a validated instance of it, or an exception. Validation enforces your schema and its validators. Your application owns domain correctness, because a schema-valid answer can still be empty or wrong for your purpose, and only you can say so.
+Pass a Pydantic model and get back a validated instance of it, or an exception.
 
-llmkit holds this principle because a structured answer that is silently wrong is the most expensive failure in LLM code: it passes through the call and breaks something downstream, far from the cause. Whether a given provider actually validates is a per-provider fact that can change without notice, so holding the contract across providers is llmkit's side of the line, and a route llmkit has not measured fails loudly rather than guess.
+llmkit holds this principle because a structured answer that is silently wrong is the most expensive failure in LLM code: it passes through the call and breaks something downstream, far from the cause. Whether a provider actually validates is a per-provider fact that can change without notice, so llmkit holds the contract on every route it has measured and fails loudly on any it has not. Validation means your schema, not your meaning: a schema-valid answer can still be wrong for your purpose, and only your application can say so.
 
 ## Switching providers and models is easy
 
