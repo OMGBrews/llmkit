@@ -353,7 +353,10 @@ class JsonSchemaModel(BaseModel):
         schema = cast(
             "JsonDict",
             super().model_json_schema(
-                by_alias=by_alias,
+                # raw-pydantic — older supported Pydantic versions annotate
+                # this as bool; newer versions accept bool | None. Preserve
+                # the value and let the installed version interpret None.
+                by_alias=cast("bool", by_alias),
                 ref_template=ref_template,
                 schema_generator=schema_generator,
                 mode=mode,
