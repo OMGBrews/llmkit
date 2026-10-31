@@ -96,8 +96,9 @@ async def text_llm_call_stream(
     since there is no Pydantic schema applied here. The stream asks the
     provider for usage, so a stream that runs out — completed or truncated —
     records the provider's token counts as ``usage``. ``approximate_cost`` is
-    a cost LiteLLM stamps on a stream frame, which it does not do today, so it
-    is ``None``. An abandoned stream or a mid-stream error records no usage.
+    the provider's reported cost or LiteLLM's estimate from its token counts;
+    it is ``None`` when pricing is unavailable. An abandoned stream or a
+    mid-stream error records no usage.
 
     ``retry`` is the transient-error budget (default-on; pass
     :data:`~llmkit.NO_RETRY` to opt out). A partially-consumed stream

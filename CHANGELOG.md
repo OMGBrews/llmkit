@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Streamed text and tool calls now record estimated cost.** At stream end,
+  use provider-reported cost or LiteLLM pricing over reported token usage,
+  preserving cached-token discounts. Unknown prices remain `null`; local
+  Ollama streams may record zero. Pricing errors never fail a stream.
+
 - **Per-request `timeout` on every call function and `LLMCallOptions`.** Pass
   seconds to bound each provider round trip; unset or `None` sends no timeout
   keyword and preserves LiteLLM's default. Transport retries each get a fresh

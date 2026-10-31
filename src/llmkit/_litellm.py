@@ -326,20 +326,42 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
     # stream=True makes acompletion return a CustomStreamWrapper, whose async
     # iteration yields typed ModelResponseStream chunks.
     stream = cast("CustomStreamWrapper", await _acompletion(**request.kwargs))
+    usage: object = None
     try:
         async for chunk in stream:
+            frame_usage: object = getattr(chunk, "usage", None)
+            if frame_usage is not None:
+                usage = frame_usage
             yield _wire_chunk(chunk)
     except Exception as e:
         normalized = normalize_service_unavailable(e)
         if normalized is not e:
             raise normalized from e
         raise
-    # No cost from the wrapper: LiteLLM seeds its ``response_cost`` with a
-    # ``0.0`` placeholder before any frame arrives and never prices the
-    # stream (measured on LiteLLM 1.106.6, OpenAI and Anthropic), so reading
-    # it would log a paid stream as free, the value a cache hit records. A
-    # cost a frame carries still reaches the record through ``_wire_chunk``.
-    yield WireStreamEnd(usage=_wire_usage(stream))
+    # Ignore the wrapper's response_cost: LiteLLM seeds it with a 0.0
+    # placeholder. Keep raw usage so cached-prompt details reach its calculator.
+    if usage is None:
+        usage = getattr(stream, "usage", None)
+    yield WireStreamEnd(
+        usage=_wire_usage(stream), cost=_stream_cost(usage, request.kwargs.get("model"))
+    )
+
+
+def _stream_cost(usage: object, model: object) -> float | None:
+    """Best-effort pricing from provider counts, using LiteLLM's own table."""
+    reported = getattr(usage, "cost", None)
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+        return float(reported)
+    if usage is None or not isinstance(model, str):
+        return None
+    try:
+        response = ModelResponse(model=model, usage=usage)
+        cost = litellm.completion_cost(completion_response=response, model=model)
+        # Nonlocal zero entries may be placeholders, not evidence of a free call.
+        return cost if cost != 0 or model.startswith("ollama_chat/") else None
+    except Exception:
+        logger.debug("Could not price streamed response for %s", model, exc_info=True)
+        return None
 
 
 def _wire_usage(raw: object) -> WireUsage:

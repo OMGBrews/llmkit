@@ -236,3 +236,150 @@ async def test_the_record_carries_the_streams_usage_and_cost(debits: list[int | 
     assert records[0].approximate_cost == 0.004
     assert cast("object", records[0].response) == "hello"
     assert debits == [33]
+
+
+@pytest.mark.parametrize("on_frame", [True, False])
+async def test_stream_prices_provider_counts(on_frame: bool, debits: list[int | None]) -> None:
+    from litellm.types.utils import Usage
+
+    usage = Usage(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+        prompt_tokens_details={"cached_tokens": 40},
+    )
+    stream = _FakeStream(
+        [_FakeChunk(content="hi"), _FakeChunk(usage=usage if on_frame else None)],
+        usage=_FakeUsage(1, 2, 3) if on_frame else usage,
+        cost=0.0,
+    )
+    with patch("llmkit._litellm.litellm.completion_cost", return_value=0.012) as price:
+        items, _ = await _drive(stream)
+    assert items[-1] == StreamedTextEnd(usage=(100, 50, 150), approximate_cost=0.012)
+    assert price.call_args.kwargs["model"] == "openai/fake"
+    response = cast("object", price.call_args.kwargs["completion_response"])
+    raw_usage = cast("object", getattr(response, "usage"))
+    details = cast("object", getattr(raw_usage, "prompt_tokens_details"))
+    assert getattr(details, "cached_tokens") == 40
+    assert debits == [150]
+
+
+async def test_usage_reported_cost_wins(debits: list[int | None]) -> None:
+    from litellm.types.utils import Usage
+
+    usage = Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3, cost=0.034)
+    with patch("llmkit._litellm.litellm.completion_cost") as price:
+        items, _ = await _drive(_FakeStream([_FakeChunk(content="hi", usage=usage)]))
+    assert items[-1] == StreamedTextEnd(usage=(1, 2, 3), approximate_cost=0.034)
+    price.assert_not_called()
+    assert debits == [3]
+
+
+@pytest.mark.parametrize("model,expected", [("openai/fake", None), ("ollama_chat/local", 0.0)])
+async def test_zero_table_cost_is_only_kept_for_local_models(
+    model: str, expected: float | None, debits: list[int | None]
+) -> None:
+    from litellm.types.utils import Usage
+
+    provider = _provider()
+    provider.litellm_model = MagicMock(return_value=model)
+    with (
+        patch("llmkit._litellm.litellm.completion_cost", return_value=0.0),
+        patch(__name__ + "._provider", return_value=provider),
+    ):
+        items, _ = await _drive(_FakeStream([_FakeChunk(usage=Usage(prompt_tokens=1))]))
+    end = items[-1]
+    assert isinstance(end, StreamedTextEnd)
+    assert end.approximate_cost == expected
+    assert debits == [0]
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("calculator unavailable"), ValueError("bad usage")]
+)
+async def test_pricing_failure_preserves_text_and_record(
+    failure: Exception, debits: list[int | None], caplog: pytest.LogCaptureFixture
+) -> None:
+    from litellm.types.utils import Usage
+
+    stream = _FakeStream([_FakeChunk(content="hello", usage=Usage(prompt_tokens=1))])
+
+    async def complete(**_kwargs: object) -> _FakeStream:
+        return stream
+
+    with (
+        patch("llmkit._litellm.litellm.acompletion", side_effect=complete),
+        patch("llmkit._litellm.litellm.completion_cost", side_effect=failure),
+        caplog.at_level("DEBUG", logger="llmkit._litellm"),
+        capture_llm_records() as records,
+    ):
+        chunks = [
+            chunk
+            async for chunk in text_llm_call_stream(
+                "hi", feature="pricing", provider=_provider(), retry=NO_RETRY, cache=False
+            )
+        ]
+    assert chunks == ["hello"]
+    assert len(records) == 1
+    assert records[0].error is None
+    assert records[0].approximate_cost is None
+    assert "Could not price streamed response" in caplog.text
+    assert debits == [0]
+
+
+async def test_unmapped_model_has_no_cost(debits: list[int | None]) -> None:
+    from litellm.types.utils import Usage
+
+    items, _ = await _drive(_FakeStream([_FakeChunk(content="hi", usage=Usage(prompt_tokens=1))]))
+    assert items[-1] == StreamedTextEnd(usage=(1, 0, 0), approximate_cost=None)
+    assert debits == [0]
+
+
+async def test_frames_may_omit_usage(debits: list[int | None]) -> None:
+    frame = _FakeChunk(content="hi")
+    del frame.usage
+    items, _ = await _drive(_FakeStream([frame]))
+    assert items == ["hi", StreamedTextEnd(usage=(None, None, None), approximate_cost=None)]
+    assert debits == [None]
+
+
+async def test_calculated_cost_reaches_the_text_record(debits: list[int | None]) -> None:
+    from litellm.types.utils import Usage
+
+    stream = _FakeStream([_FakeChunk(content="hello", usage=Usage(prompt_tokens=1))])
+
+    async def complete(**_kwargs: object) -> _FakeStream:
+        return stream
+
+    with (
+        patch("llmkit._litellm.litellm.acompletion", side_effect=complete),
+        patch("llmkit._litellm.litellm.completion_cost", return_value=0.012),
+        capture_llm_records() as records,
+    ):
+        chunks = [
+            chunk
+            async for chunk in text_llm_call_stream(
+                "hi", feature="pricing", provider=_provider(), retry=NO_RETRY, cache=False
+            )
+        ]
+    assert chunks == ["hello"]
+    assert len(records) == 1
+    assert records[0].error is None
+    assert records[0].approximate_cost == 0.012
+    assert debits == [0]
+
+
+def test_real_calculator_prices_known_model_and_cached_tokens() -> None:
+    from litellm.types.utils import Usage
+
+    from llmkit._litellm import _stream_cost
+
+    uncached = _stream_cost(Usage(prompt_tokens=100, completion_tokens=50), "openai/gpt-4.1-mini")
+    cached = _stream_cost(
+        Usage(
+            prompt_tokens=100, completion_tokens=50, prompt_tokens_details={"cached_tokens": 100}
+        ),
+        "openai/gpt-4.1-mini",
+    )
+    assert uncached is not None and uncached > 0
+    assert cached is not None and 0 < cached < uncached

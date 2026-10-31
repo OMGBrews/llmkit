@@ -472,3 +472,19 @@ async def test_cancelling_the_consumer_records_the_abandonment() -> None:
             await task
 
     assert any(record.error == STREAM_ABANDONED_ERROR for record in records)
+
+
+async def test_transport_prices_the_tool_stream_end() -> None:
+    from litellm.types.utils import Usage
+
+    with patch("llmkit._litellm.litellm.completion_cost", return_value=0.012):
+        items, _ = await _drive_transport(
+            [
+                _FakeChunk(content="hi"),
+                _FakeChunk(usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)),
+            ]
+        )
+    turn = items[-1]
+    assert isinstance(turn, StreamedToolTurn)
+    assert turn.approximate_cost == 0.012
+    assert turn.usage == (10, 5, 15)

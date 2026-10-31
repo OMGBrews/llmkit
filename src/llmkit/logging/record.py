@@ -41,10 +41,10 @@ class LLMCallRecord:
 
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
-    per-response cost (no local price table) and is ``None`` when the
-    provider does not report it (LiteLLM does not price a stream,
-    so a streamed call records ``None``). A cache hit records
-    ``0.0``: nothing was paid for it.
+    per-response cost or its calculator over streamed token usage (no local
+    price table), preferring a provider-reported cost. It is ``None`` when
+    pricing is unavailable, including nonlocal zero-price table placeholders.
+    A cache hit records ``0.0``: nothing was paid for it.
 
     ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
     1-based attempt number within it, so the N records a retried call

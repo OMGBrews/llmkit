@@ -1029,11 +1029,8 @@ async def test_live_text_stream_reports_usage(provider: Provider) -> None:
     provider added later is measured here as soon as its enum member exists;
     only Bedrock is excluded, for the credential reason above.
 
-    ``approximate_cost`` is whatever cost LiteLLM stamps on a stream frame,
-    which on LiteLLM 1.106.6 is none, so it is printed rather than required.
-    What is asserted is that a paid stream never records ``0.0``: LiteLLM's
-    stream wrapper carries that placeholder, and logging it would claim the
-    call was free. Ollama runs locally and may honestly cost nothing.
+    Stream-end pricing must produce a positive estimate on paid routes.
+    Ollama runs locally and records zero. Wrapper placeholders are ignored.
     """
     built = make_provider(provider, model=None, **_live_credentials(provider))
     with capture_llm_records() as records:
@@ -1062,7 +1059,7 @@ async def test_live_text_stream_reports_usage(provider: Provider) -> None:
     assert prompt_tokens is not None and prompt_tokens > 0, usage
     assert completion_tokens is not None and completion_tokens > 0, usage
     cost = record.approximate_cost
-    assert provider is Provider.OLLAMA or cost is None or cost > 0, cost
+    assert cost == 0 if provider is Provider.OLLAMA else cost is not None and cost > 0, cost
     print(
         f"text-stream usage {provider.value} {built.litellm_model()}: {usage}"
         + f" approximate_cost={record.approximate_cost!r}"
@@ -1125,3 +1122,29 @@ async def test_live_tiny_request_timeout() -> None:
             cache=False,
         )
     assert isinstance(caught.value, APITimeoutError), repr(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", _TEXT_STREAM_USAGE_PROVIDERS)
+async def test_live_tool_stream_reports_cost(provider: Provider) -> None:
+    """A streamed tool turn records a price from provider usage on every route."""
+    built = make_provider(provider, model=None, **_live_credentials(provider))
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    with capture_llm_records() as records:
+        events = [
+            event
+            async for event in tool_llm_call_stream(
+                "Use the add tool to calculate 2 plus 3.",
+                [add],
+                feature="integration-tool-stream-cost",
+                provider=built,
+                max_tokens=512,
+                reasoning_effort=_REASONING_EFFORT.get(provider),
+            )
+        ]
+    assert events
+    assert len(records) == 1, records
+    assert records[0].error is None
+    cost = records[0].approximate_cost
+    assert cost == 0 if provider is Provider.OLLAMA else cost is not None and cost > 0, cost
+    print(f"tool-stream cost {provider.value} {built.litellm_model()}: {cost!r}")
