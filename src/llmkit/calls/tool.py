@@ -58,6 +58,7 @@ async def tool_llm_call(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -77,6 +78,7 @@ async def tool_llm_call[T: BaseModel](
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -95,6 +97,7 @@ async def tool_llm_call[T: BaseModel](
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -102,6 +105,10 @@ async def tool_llm_call[T: BaseModel](
     output_schema: type[T] | None = None,
 ) -> ToolCallResult | ToolComposeResult[T]:
     """Run one tool-enabled turn, optionally accepting a schema-validated final answer.
+
+    ``timeout`` is seconds for one provider round trip (each wait for the
+    next chunk when streaming). Unset or ``None`` sends no timeout keyword
+    and leaves LiteLLM's default in effect.
 
     A round in which only *some* requested calls are malformed keeps the
     well-formed ones on ``tool_calls`` and reports the rest on
@@ -114,6 +121,7 @@ async def tool_llm_call[T: BaseModel](
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
@@ -154,6 +162,7 @@ async def tool_llm_call[T: BaseModel](
                 temperature=args.temperature,
                 model=args.model,
                 max_tokens=args.max_tokens,
+                timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
                 response_format=(
@@ -274,6 +283,7 @@ def tool_llm_call_sync(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -293,6 +303,7 @@ def tool_llm_call_sync[T: BaseModel](
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -304,5 +315,11 @@ def tool_llm_call_sync[T: BaseModel](
 def tool_llm_call_sync(
     *args: object, **kwargs: object
 ) -> ToolCallResult | ToolComposeResult[BaseModel]:
-    """Synchronous wrapper around :func:`tool_llm_call`."""
+    """Synchronous wrapper around :func:`tool_llm_call`.
+
+    ``timeout`` is seconds for one provider round trip; unset or ``None``
+    sends no timeout keyword. The sync bridge's separate 600-second whole-call
+    ceiling still applies: a larger per-request timeout cannot extend it,
+    and retries can reach that ceiling before their request timeout expires.
+    """
     return run_sync(tool_llm_call(*args, **kwargs))  # pyright: ignore[reportArgumentType, reportCallIssue, reportUnknownArgumentType]  # dynamic forwarding wrapper

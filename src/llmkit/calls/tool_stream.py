@@ -72,12 +72,17 @@ async def tool_llm_call_stream(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[TextDeltaEvent | ToolCallResult]:
     """Stream one tool-enabled turn: text deltas, then the completed result.
+
+    ``timeout`` is seconds for one provider round trip (each wait for the
+    next chunk when streaming). Unset or ``None`` sends no timeout keyword
+    and leaves LiteLLM's default in effect.
 
     Yields a :class:`~llmkit.TextDeltaEvent` per chunk of assistant prose as it
     arrives, and finally exactly one :class:`~llmkit.ToolCallResult` — the same
@@ -129,6 +134,7 @@ async def tool_llm_call_stream(
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
@@ -152,6 +158,7 @@ async def tool_llm_call_stream(
             temperature=args.temperature,
             model=args.model,
             max_tokens=args.max_tokens,
+            timeout=args.timeout,
             reasoning_effort=args.reasoning_effort,
             provider=provider,
             call_id=call_id,
@@ -188,6 +195,7 @@ async def _stream_tools_once(
     temperature: float | None,
     model: str | None,
     max_tokens: int | None,
+    timeout: float | None,
     reasoning_effort: ReasoningEffort | None,
     provider: LLMProviderInterface | None,
     call_id: str,
@@ -235,6 +243,7 @@ async def _stream_tools_once(
                 temperature=temperature,
                 model=model,
                 max_tokens=max_tokens,
+                timeout=timeout,
                 reasoning_effort=reasoning_effort,
                 provider=provider,
                 feature=feature,

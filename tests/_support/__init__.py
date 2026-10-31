@@ -178,6 +178,7 @@ def _transport_provider(
 def capture_structured_provider_kwargs(
     *,
     temperature: float | None = None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
@@ -212,6 +213,7 @@ def capture_structured_provider_kwargs(
                 "hi",
                 OkSchema,
                 temperature=temperature,
+                timeout=timeout,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
@@ -225,6 +227,7 @@ def capture_structured_provider_kwargs(
 def capture_text_provider_kwargs(
     *,
     temperature: float | None = None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
@@ -254,6 +257,7 @@ def capture_text_provider_kwargs(
             _litellm.acompletion_text(
                 "hi",
                 temperature=temperature,
+                timeout=timeout,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,
@@ -267,6 +271,7 @@ def capture_text_provider_kwargs(
 def capture_stream_provider_kwargs(
     *,
     temperature: float | None = None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
     provider_effort: str | None = None,
@@ -305,6 +310,7 @@ def capture_stream_provider_kwargs(
             async for chunk in _litellm.astream_text(
                 "hi",
                 temperature=temperature,
+                timeout=timeout,
                 model=None,
                 max_tokens=max_tokens,
                 reasoning_effort=reasoning_effort,

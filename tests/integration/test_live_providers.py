@@ -97,6 +97,7 @@ import pytest
 from pydantic import BaseModel, field_validator
 
 from llmkit import (
+    NO_RETRY,
     ChatMessage,
     LLMProviderInterface,
     Provider,
@@ -1104,3 +1105,23 @@ async def test_refused_temperature_zero_is_dropped_live(
     [record] = records
     assert record.error is None
     assert record.temperature is None
+
+
+@pytest.mark.asyncio
+async def test_live_tiny_request_timeout() -> None:
+    """An explicit timeout reaches a real provider with transport retries disabled."""
+    from openai import APITimeoutError
+
+    from llmkit.exceptions import LLM_TRANSPORT_ERRORS
+
+    provider = make_provider(Provider.OPENAI, **_live_credentials(Provider.OPENAI))
+    with pytest.raises(LLM_TRANSPORT_ERRORS) as caught:
+        _ = await text_llm_call(
+            "Reply with ok.",
+            feature="integration-request-timeout",
+            provider=provider,
+            timeout=0.001,
+            retry=NO_RETRY,
+            cache=False,
+        )
+    assert isinstance(caught.value, APITimeoutError), repr(caught.value)

@@ -74,7 +74,7 @@ class LLMCallOptions:
     :func:`tool_llm_call_sync` and :func:`tool_llm_call_stream`): a feature
     module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
-    instead of repeating the same seven-keyword block at each site. The flat
+    instead of repeating the same eight-keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.
 
     Every field is **optional and unset by default** (the :data:`UNSET`
@@ -120,6 +120,8 @@ class LLMCallOptions:
             (:func:`structured_llm_call`, :func:`text_llm_call` and their sync
             wrappers) and :func:`text_llm_call_stream`; the tool families
             ignore it.
+        timeout: Seconds for one provider round trip. Unset or ``None`` sends
+            no timeout keyword; LiteLLM supplies its default.
     """
 
     temperature: float | None | Unset = UNSET
@@ -129,11 +131,12 @@ class LLMCallOptions:
     retry: RetryPolicy | Unset = UNSET
     provider: LLMProviderInterface | None | Unset = UNSET
     cache: bool | Unset = UNSET
+    timeout: float | None | Unset = UNSET
 
     @override
     def __repr__(self) -> str:
         # Only the fields actually set: ``LLMCallOptions(temperature=0.9)``,
-        # not seven ``=UNSET`` entries drowning the one value a user debugging
+        # not eight ``=UNSET`` entries drowning the one value a user debugging
         # a merge is looking for. (Generated repr suppressed via
         # ``repr=False``; ``field(repr=False)`` would wrongly hide set
         # fields too.)
@@ -162,6 +165,7 @@ class ResolvedCallArgs:
     retry: RetryPolicy
     provider: LLMProviderInterface | None
     cache: bool
+    timeout: float | None
 
 
 def resolve_call_args(
@@ -174,6 +178,7 @@ def resolve_call_args(
     retry: RetryPolicy | Unset,
     provider: LLMProviderInterface | None | Unset,
     cache: bool | Unset,
+    timeout: float | None | Unset,
 ) -> ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
@@ -187,8 +192,8 @@ def resolve_call_args(
     * otherwise a field that is *set* on ``options`` is used;
     * otherwise the true default stands (:data:`DEFAULT_TEMPERATURE`,
       :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``True`` for ``cache``, ``None``
-      for the rest — the ``None``s the transport then resolves against the
-      configured client).
+      for the rest — ``model`` and ``reasoning_effort`` resolve against the
+      configured client; unset ``timeout`` sends no keyword).
 
     For ``temperature`` specifically, the default is ``None``: llmkit
     chooses no temperature, the transport forwards **no** ``temperature``
@@ -211,6 +216,7 @@ def resolve_call_args(
         retry=_pick(retry, opts.retry, DEFAULT_RETRY_POLICY),
         provider=_pick(provider, opts.provider, None),
         cache=_pick(cache, opts.cache, True),
+        timeout=_pick(timeout, opts.timeout, None),
     )
 
 

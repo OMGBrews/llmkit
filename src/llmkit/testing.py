@@ -118,6 +118,7 @@ class TransportRequest:
         model: The resolved, provider-routed model id.
         provider: The provider's name.
         temperature: The temperature the call requested, or ``None``.
+        timeout: Per-request timeout in seconds, or ``None``; never fires under a fake.
         max_tokens: The output-token cap, or ``None``.
         reasoning_effort: The effective reasoning effort, or ``None``.
     """
@@ -136,6 +137,7 @@ class TransportRequest:
     model: str
     provider: str
     temperature: float | None
+    timeout: float | None
     max_tokens: int | None
     reasoning_effort: ReasoningEffort | None
 
@@ -302,6 +304,7 @@ def _public_request(call: CallContext) -> TransportRequest:
         model=call.model,
         provider=call.provider,
         temperature=call.temperature,
+        timeout=call.timeout,
         max_tokens=call.max_tokens,
         reasoning_effort=call.reasoning_effort,
     )

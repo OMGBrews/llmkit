@@ -156,6 +156,7 @@ def prepare_call(
     feature: str,
     label: str | None,
     cache: bool | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
@@ -183,6 +184,7 @@ def prepare_call(
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,

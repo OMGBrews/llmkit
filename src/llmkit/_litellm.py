@@ -845,6 +845,7 @@ def _call_context(
     *,
     model: str,
     temperature: float | None,
+    timeout: float | None,
     max_tokens: int | None,
     reasoning_effort: ReasoningEffort | None,
     feature: str | None,
@@ -863,6 +864,7 @@ def _call_context(
         model=model,
         provider=provider.name,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         feature=feature,
@@ -881,6 +883,7 @@ async def acompletion_structured[T: BaseModel](
     *,
     temperature: float | None,
     model: str | None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
@@ -954,6 +957,7 @@ async def acompletion_structured[T: BaseModel](
         provider,
         model=litellm_model,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
         feature=feature,
@@ -994,7 +998,7 @@ async def acompletion_structured[T: BaseModel](
                 # call — tenacity retrying objects mutate iteration state. The
                 # cross-call transient/validation budgets live in llmkit.retry.
                 max_retries=_schema_repair_retrying(),
-                **request_kwargs,  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential/native kwargs
+                **{**request_kwargs, **({"timeout": timeout} if timeout is not None else {})},  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential/native kwargs
                 **({"max_tokens": max_tokens} if max_tokens is not None else {}),
                 # Gate temperature like max_tokens / reasoning_effort: a
                 # ``None`` resolved value sends no ``temperature`` key at all
@@ -1066,6 +1070,7 @@ async def acompletion_text(
     *,
     temperature: float | None,
     model: str | None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
@@ -1108,6 +1113,7 @@ async def acompletion_text(
         provider,
         model=litellm_model,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
         feature=feature,
@@ -1125,6 +1131,7 @@ async def acompletion_text(
             # keeps ``0.0`` a real, forwarded value.
             **({"temperature": temperature} if temperature is not None else {}),
             **request_kwargs,
+            **({"timeout": timeout} if timeout is not None else {}),
             # Gate max_tokens like the structured/stream paths: an unset cap
             # sends no ``max_tokens`` key at all (not an explicit ``None``), so
             # the request stays byte-identical to prior behaviour. Creds are
@@ -1155,6 +1162,7 @@ async def acompletion_tools(
     tool_choice: ToolChoice | None,
     temperature: float | None,
     model: str | None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
@@ -1187,6 +1195,7 @@ async def acompletion_tools(
         provider,
         model=litellm_model,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
         feature=feature,
@@ -1206,6 +1215,7 @@ async def acompletion_tools(
             **({"tool_choice": choice} if choice is not None else {}),
             **({"temperature": temperature} if temperature is not None else {}),
             **request_kwargs,
+            **({"timeout": timeout} if timeout is not None else {}),
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
@@ -1376,6 +1386,7 @@ async def astream_tools(
     tool_choice: ToolChoice | None,
     temperature: float | None,
     model: str | None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
@@ -1418,6 +1429,7 @@ async def astream_tools(
         provider,
         model=litellm_model,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
         feature=feature,
@@ -1437,6 +1449,7 @@ async def astream_tools(
             "stream": True,
             "stream_options": {"include_usage": True},
             **request_kwargs,
+            **({"timeout": timeout} if timeout is not None else {}),
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
@@ -1482,6 +1495,7 @@ async def astream_text(
     *,
     temperature: float | None,
     model: str | None,
+    timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
     provider: LLMProviderInterface | None = None,
@@ -1528,6 +1542,7 @@ async def astream_text(
         provider,
         model=litellm_model,
         temperature=temperature,
+        timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
         feature=feature,
@@ -1551,6 +1566,7 @@ async def astream_text(
             # no text, so the yielded deltas are unchanged.
             "stream_options": {"include_usage": True},
             **request_kwargs,
+            **({"timeout": timeout} if timeout is not None else {}),
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,

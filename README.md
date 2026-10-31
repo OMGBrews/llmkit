@@ -18,6 +18,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
   - [Telling the model a tool failed](#telling-the-model-a-tool-failed)
   - [Tool schemas: hand them over unprocessed](#tool-schemas-hand-them-over-unprocessed)
   - [Reusing call options](#reusing-call-options)
+  - [Per-request timeout](#per-request-timeout)
   - [Contracts as JSON-schema dicts](#contracts-as-json-schema-dicts)
 - [Rate limiting](#rate-limiting)
   - [Adaptive concurrency](#adaptive-concurrency)
@@ -421,7 +422,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -433,7 +434,7 @@ The flat-keyword path is unchanged — pass no `options` and nothing about exist
 
 **config < `options` < explicit per-call keyword**
 
-So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and a numeric `LLMCallOptions(temperature=0.9)` is used when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
+So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and a numeric `LLMCallOptions(temperature=0.9)` is used when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). The same precedence applies to `timeout`: `timeout=5.0` overrides `LLMCallOptions(timeout=30.0)`, while explicit `timeout=None` overrides the options value and sends no timeout. An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
 
 `Unset` (the type) and `UNSET` (the value) are exported for one idiom: your own typed wrapper can declare `temperature: float | None | Unset = UNSET` and forward it unconditionally, letting llmkit resolve "not passed" vs "provider default" (`None`) vs a number instead of re-inventing the sentinel. Compare with `is`/`is not` only — never truthiness.
 
@@ -456,6 +457,29 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 **A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for, and the `llmkit._litellm` logger warns the first time each model refuses, naming the model and the dropped value; later drops for that model log at DEBUG. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
 
 **Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded on every provider, Gemini included, and a Gemini model that rejects it with an error naming `temperature` gets the request re-issued once without it, as above. One wrinkle remains on the Google AI Studio and Google's Agent Platform routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
+
+### Per-request timeout
+
+Every call function, including the sync wrappers and the deprecated
+`stream_text_with_log` alias, accepts `timeout` in seconds, directly or through
+`LLMCallOptions(timeout=30.0)`. A number is forwarded to LiteLLM; unset or
+`None` sends no `timeout` keyword, leaving LiteLLM's request timeout in force
+(600 seconds by default, or its `REQUEST_TIMEOUT` environment setting).
+An explicit call value overrides a provider subclass's `completion_kwargs()`
+timeout too.
+
+The value bounds one provider round trip: each transport retry, instructor
+schema-repair re-ask and refused-temperature re-issue gets its own timeout.
+For a stream, it bounds connection and each wait for the next chunk, rather
+than the stream's total duration. It does not include waiting for a
+rate-limiter slot or retry backoff sleeps. Timeout errors are transport errors
+and are retried with a fresh timeout per attempt; pass `retry=NO_RETRY` to
+turn those retries off.
+
+The sync wrappers still have the sync bridge's separate 600-second whole-call
+ceiling. A per-request timeout above that ceiling cannot extend the sync wait,
+and retries or queue waits can exhaust the bridge ceiling before a request's
+own timeout. This setting is not a whole-call deadline.
 
 ### Contracts as JSON-schema dicts
 
@@ -971,6 +995,8 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 
 llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
+`timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait.
+
 Credentials are never part of the key, so rotating an API key keeps your hits. `feature` and `label` are telemetry, not part of the request, so two features asking the identical question share one answer. Two schemas with the same fields in a different order are different requests, because the order is sent to the model and steers the order it writes fields in. A request that cannot be fingerprinted — a content part that is not JSON-serialisable, a third-party provider missing an attribute the key reads — skips the cache and runs normally.
 
 ### What a hit looks like in the log
@@ -1349,7 +1375,7 @@ one attempt.
 
 Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
 
-- **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds.
+- **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds. A timed-out request gets a fresh per-request `timeout` on each attempt.
 - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
 - **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. `tool_llm_call_stream` does not re-ask them — see the streaming caveat below.
 - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
@@ -1471,7 +1497,7 @@ The fake is a plain function or a coroutine function. It receives one frozen `Tr
 
 - **identity:** `feature`, `label`, `kind` (`"structured"`, `"text"`, `"tool"`, `"text_stream"` or `"tool_stream"`), and the `call_id` and `attempt` the call log records, so a retried call reaches the fake once per attempt;
 - **inputs:** `prompt` as you passed it, `messages` as sent (they differ only for structured calls, whose output mode can add a schema instruction), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema-repair re-ask;
-- **effective settings:** the routed `model`, `provider`, `temperature`, `max_tokens` and `reasoning_effort`.
+- **effective settings:** the routed `model`, `provider`, `temperature`, `max_tokens`, `reasoning_effort` and `timeout`.
 
 It never carries credentials or provider-native request settings.
 
@@ -1496,6 +1522,7 @@ Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait 
 
 - **Cache hits and shared in-flight requests.** The [response cache](#response-cache) sits above the fake. A hit never reaches it, and an identical buffered request that joins one already in flight shares that one round trip. Configure no cache, or pass `cache=False`, when a test counts requests.
 - **Calls with no configured provider.** The provider is resolved before the round trip, and a key-based provider raises without its key. Configure one that needs none, such as Ollama, or give the provider a placeholder key.
+- **Timeout enforcement.** A fake answers before LiteLLM is reached, so `timeout` never fires under it. A `Reply(delay=...)` longer than the request timeout still returns normally.
 - **Mid-stream failures.** A fake can fail a streaming call before its first chunk, not partway through.
 
 Patching llmkit's private modules (`llmkit._litellm` and its functions) is unsupported: those are internal test seams and change without notice. `llmkit.testing` is the supported way.

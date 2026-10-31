@@ -138,6 +138,23 @@ async def _typecheck_temperature_accepts_none() -> None:
     _ = wrapper
 
 
+async def _typecheck_timeout_accepted_on_every_lane() -> None:
+    tools = [ToolDefinition("lookup", "", {"type": "object"})]
+    for timeout in (None, 0.0, 1.5, UNSET):
+        _ = await structured_llm_call("hi", _Out, feature="t", timeout=timeout)
+        _ = structured_llm_call_sync("hi", _Out, feature="t", timeout=timeout)
+        _ = await text_llm_call("hi", feature="t", timeout=timeout)
+        _ = text_llm_call_sync("hi", feature="t", timeout=timeout)
+        _ = text_llm_call_stream("hi", feature="t", timeout=timeout)
+        _ = stream_text_with_log("hi", feature="t", timeout=timeout)
+        _ = await tool_llm_call("hi", tools, feature="t", timeout=timeout)
+        _ = tool_llm_call_sync("hi", tools, feature="t", timeout=timeout)
+        _ = await tool_llm_call("hi", tools, feature="t", output_schema=_Out, timeout=timeout)
+        _ = tool_llm_call_sync("hi", tools, feature="t", output_schema=_Out, timeout=timeout)
+        _ = tool_llm_call_stream("hi", tools, feature="t", timeout=timeout)
+        _ = LLMCallOptions(timeout=timeout)
+
+
 async def _typecheck_cache_accepted_on_every_caching_lane() -> None:
     # ``cache`` reaches the response cache from every lane that reads it — the
     # streamed text family included — directly and through options.
@@ -189,6 +206,7 @@ def test_typecheck_helpers_exist() -> None:
         _typecheck_reasoning_effort_accepts_values,
         _typecheck_temperature_accepts_none,
         _typecheck_cache_accepted_on_every_caching_lane,
+        _typecheck_timeout_accepted_on_every_lane,
         _typecheck_prompt_rejects_invalid_shapes,
         _typecheck_streaming_tool_lane_rejects_compose,
     ):

@@ -58,6 +58,7 @@ async def text_llm_call_stream(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -65,6 +66,10 @@ async def text_llm_call_stream(
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
+
+    ``timeout`` is seconds for one provider round trip (each wait for the
+    next chunk when streaming). Unset or ``None`` sends no timeout keyword
+    and leaves LiteLLM's default in effect.
 
     Yields each chunk's textual content as it arrives. Callers parse the
     accumulated text themselves — typically as in-progress JSON, when the
@@ -133,6 +138,7 @@ async def text_llm_call_stream(
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
@@ -210,6 +216,7 @@ async def text_llm_call_stream(
             temperature=args.temperature,
             model=args.model,
             max_tokens=args.max_tokens,
+            timeout=args.timeout,
             reasoning_effort=args.reasoning_effort,
             provider=provider,
             call_id=call_id,
@@ -265,6 +272,7 @@ def stream_text_with_log(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -272,6 +280,9 @@ def stream_text_with_log(
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[str]:
     """Deprecated alias for :func:`text_llm_call_stream`; removed in llmkit 1.0.
+
+    ``timeout`` is seconds for one provider round trip (each wait for the
+    next chunk). Unset or ``None`` sends no timeout keyword.
 
     A plain ``def`` (not ``async def``): ``text_llm_call_stream`` is an
     async-generator function, so *calling* it returns the async generator
@@ -292,6 +303,7 @@ def stream_text_with_log(
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         provider=provider,
         retry=retry,
@@ -308,6 +320,7 @@ async def _stream_once(
     temperature: float | None,
     model: str | None,
     max_tokens: int | None,
+    timeout: float | None,
     reasoning_effort: ReasoningEffort | None,
     provider: LLMProviderInterface | None,
     call_id: str,
@@ -354,6 +367,7 @@ async def _stream_once(
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
+            timeout=timeout,
             reasoning_effort=reasoning_effort,
             provider=provider,
             feature=feature,

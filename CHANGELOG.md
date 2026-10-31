@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Per-request `timeout` on every call function and `LLMCallOptions`.** Pass
+  seconds to bound each provider round trip; unset or `None` sends no timeout
+  keyword and preserves LiteLLM's default. Transport retries each get a fresh
+  timeout. Streams bound connection and each chunk wait, and sync wrappers
+  retain their separate 600-second whole-call ceiling. The fake transport
+  exposes the resolved value without enforcing it.
+
 - **A dropped `temperature` is now logged.** When a model refuses the
   `temperature` you passed and llmkit re-issues the request without it, the
   `llmkit._litellm` logger now warns the first time each model refuses, naming

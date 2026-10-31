@@ -39,6 +39,7 @@ async def text_llm_call(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -74,6 +75,8 @@ async def text_llm_call(
             to ``None``). *Dual-homed* with
             :class:`~llmkit.LLMClientConfig`: per-call overrides
             ``options`` overrides config.
+        timeout: Seconds for one provider round trip; unset or ``None`` sends
+            no timeout keyword and leaves LiteLLM's default in effect.
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set. A completion the provider cuts off at the
             cap (or at its own ceiling) raises :class:`~llmkit.OutputLimitError`
@@ -119,6 +122,7 @@ async def text_llm_call(
         temperature=temperature,
         model=model,
         max_tokens=max_tokens,
+        timeout=timeout,
         reasoning_effort=reasoning_effort,
         retry=retry,
         provider=provider,
@@ -158,6 +162,7 @@ async def text_llm_call(
                 temperature=args.temperature,
                 model=args.model,
                 max_tokens=args.max_tokens,
+                timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
                 provider=provider,
                 feature=feature,
@@ -261,6 +266,7 @@ def text_llm_call_sync(
     temperature: float | None | Unset = UNSET,
     model: str | None | Unset = UNSET,
     max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
@@ -276,6 +282,11 @@ def text_llm_call_sync(
     per-provider concurrency cap) is enforced inside the async path on the shared
     persistent loop, with no separate calling-thread semaphore (see
     :func:`structured_llm_call_sync`).
+
+    ``timeout`` is seconds for one provider round trip; unset or ``None`` sends
+    no timeout keyword. The sync bridge's separate 600-second whole-call
+    ceiling still applies: a larger per-request timeout cannot extend it,
+    and retries can reach that ceiling before their request timeout expires.
     """
     return run_sync(
         text_llm_call(
@@ -285,6 +296,7 @@ def text_llm_call_sync(
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
+            timeout=timeout,
             reasoning_effort=reasoning_effort,
             provider=provider,
             retry=retry,

@@ -159,6 +159,7 @@ class CallContext:
     tools: Sequence[ToolDefinition] = ()
     tool_choice: ToolChoice | None = None
     repair: bool = False
+    timeout: float | None = None
 
 
 @dataclass(frozen=True)

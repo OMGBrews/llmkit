@@ -358,8 +358,8 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     :class:`concurrent.futures.TimeoutError` mid-flight on a slow-but-valid call.
     The global rate limiter (:class:`~llmkit.rate_limiting.GlobalRateLimiter`) is
     the real concurrency backpressure; this ceiling exists only to bound a *hung*
-    provider. Pass ``None`` to wait unbounded (relying on LiteLLM's own request
-    timeout).
+    provider. Pass ``None`` to wait unbounded at the bridge, relying on the
+    call function's per-request ``timeout`` or LiteLLM's default when unset.
 
     On the persistent-loop path — including reentrant calls from a foreign
     loop — a timeout (or a :class:`KeyboardInterrupt` in the calling thread)
