@@ -226,7 +226,7 @@ async def test_compose_validates_final_answer_and_logs_distinct_schema() -> None
     assert cast("dict[str, object]", records[0].response) == {
         "text": '{"summary":"sunny"}',
         "tool_calls": [],
-        "parsed": _Forecast(summary="sunny"),
+        "parsed": {"summary": "sunny"},
     }
     assert [r.output_schema for r in installed.requests] == [_Forecast]
 

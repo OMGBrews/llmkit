@@ -71,6 +71,7 @@ from llmkit.exceptions import (
     OutputLimitError,
     ReasoningEffortUnsupportedError,
     ResultValidationError,
+    SchemaEngineError,
     ServiceUnavailableError,
     ToolArgumentError,
 )
@@ -241,6 +242,7 @@ __all__ = [
     "ResultValidationError",
     "ComposeUnsupportedError",
     "ServiceUnavailableError",
+    "SchemaEngineError",
     "ToolArgumentError",
     # Package metadata
     "__version__",

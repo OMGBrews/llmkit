@@ -1,17 +1,7 @@
-"""Emitted-schema shape tests for generated models — OpenAI strict compatibility.
+"""Generation guidance preserves schema shapes independently of local authority.
 
-instructor serialises the generated model class with a **zero-argument**
-``model_json_schema()`` call, and OpenAI's strict structured-outputs
-validator (``response_format`` with ``"strict": true``) rejects any node
-where ``$ref`` carries sibling keywords (``$ref cannot have keywords
-{'description'}``) as well as ``allOf`` wholesale. Measured live 2026-07-24
-against gpt-4o-mini: the pre-fix shapes 400, the post-fix shapes are
-accepted. These tests pin the exact call instructor makes, so every
-assertion here runs against the document a provider actually receives.
-
-Validation behaviour of the generated models (what they accept and dump)
-lives in ``test_json_schema_build.py`` / ``test_json_schema_constraints.py``;
-this file is only about the *emitted document*.
+Simple described enums and object references remain free of reference siblings.
+Composition supplied by callers stays in guidance, and is validated locally.
 """
 
 from __future__ import annotations
@@ -206,7 +196,7 @@ def test_shared_enum_def_lands_each_description_on_its_own_property() -> None:
     assert "$defs" not in doc
 
 
-def test_described_object_ref_inlines_def_and_bare_ref_stays_shared() -> None:
+def test_described_and_bare_refs_are_inlined() -> None:
     """A described reference to an object def is inlined at the use site (its
     own copy of the def's shape, description merged on top — outer wins), while
     a bare reference to the same def keeps the strict-legal shared ``$ref``,
@@ -216,13 +206,14 @@ def test_described_object_ref_inlines_def_and_bare_ref_stays_shared() -> None:
     )
     doc = model.model_json_schema()
     props = cast("dict[str, dict[str, object]]", doc["properties"])
-    assert props["a"] == {"$ref": "#/$defs/Party"}
+    assert props["a"]["type"] == "object"
+    assert "$ref" not in props["a"]
     inlined = props["b"]
     assert inlined["type"] == "object"
     assert inlined["description"] == "The counterparty."
     assert "name" in cast("dict[str, object]", inlined["properties"])
     assert "$ref" not in inlined
-    assert "Party" in cast("dict[str, object]", doc["$defs"])
+    assert "$defs" not in doc
 
 
 def test_fully_inlined_document_drops_defs_entirely() -> None:
@@ -236,7 +227,7 @@ def test_fully_inlined_document_drops_defs_entirely() -> None:
     assert inner["description"] == "A nested object with guidance."
 
 
-def test_single_value_enum_emits_const_shape() -> None:
+def test_single_value_enum_preserves_caller_shape() -> None:
     """A one-member enum serialises as pydantic's ``const`` form — documented
     as supported by OpenAI strict mode — and still validates as the enum."""
     model = model_from_json_schema(
@@ -249,10 +240,10 @@ def test_single_value_enum_emits_const_shape() -> None:
     )
     doc = model.model_json_schema()
     prop = cast("dict[str, dict[str, object]]", doc["properties"])["only"]
-    assert prop["const"] == "fixed"
+    assert prop["enum"] == ["fixed"]
     assert prop["type"] == "string"
     _assert_strict_ref_hygiene(doc)
-    assert model(only="fixed").model_dump() == {"only": "fixed"}
+    assert model.model_validate({"only": "fixed"}).model_dump() == {"only": "fixed"}
 
 
 def test_nullable_enum_emits_inline_anyof_branch() -> None:
@@ -262,10 +253,8 @@ def test_nullable_enum_emits_inline_anyof_branch() -> None:
     model = model_from_json_schema(_STRICT_BATTERY["nullable-enum-described"], name="Nullable")
     doc = model.model_json_schema()
     prop = cast("dict[str, dict[str, object]]", doc["properties"])["choice"]
-    branches = cast("list[dict[str, object]]", prop["anyOf"])
-    assert {"type": "null"} in branches
-    enum_branch = next(b for b in branches if "enum" in b)
-    assert enum_branch["enum"] == ["a", "b"]
+    assert prop["type"] == ["string", "null"]
+    assert prop["enum"] == ["a", "b", None]
     assert prop["description"] == "d"
     assert "$defs" not in doc
 
@@ -290,7 +279,7 @@ def test_generated_models_carry_a_pinned_module_so_colliding_defs_stay_stable() 
     only shows up when two definitions collide on ``title``.
     """
     model = model_from_json_schema({"type": "object", "properties": {"a": {"type": "string"}}})
-    assert model.__module__ == "llmkit.json_schema"
+    assert model.__module__ == "llmkit.json_schema.convert"
 
     colliding = {
         "type": "object",
@@ -304,8 +293,48 @@ def test_generated_models_carry_a_pinned_module_so_colliding_defs_stay_stable() 
         },
     }
     emitted = cast("dict[str, object]", model_from_json_schema(colliding).model_json_schema())
-    defs = cast("dict[str, object]", emitted.get("$defs", {}))
-    # Both definitions survive under distinct keys, and neither key carries a
-    # module path that would move with the converter.
-    assert len(defs) == 2, defs
-    assert not any("convert" in key for key in defs), sorted(defs)
+    props = cast("dict[str, dict[str, object]]", emitted["properties"])
+    assert props["left"]["properties"] == {"x": {"type": "string"}}
+    assert props["right"]["properties"] == {"y": {"type": "integer"}}
+    assert "$defs" not in emitted
+
+
+def test_guidance_keeps_caller_composition_and_unknown_annotation_payloads() -> None:
+    schema: dict[str, object] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "allOf": [{"required": ["x"]}],
+        "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "number"}]}},
+        "x-vendor": {"$ref": "https://example.com/annotation", "title": "not a schema"},
+    }
+    model = model_from_json_schema(schema)
+    emitted = model.model_json_schema()
+    assert "$schema" not in emitted
+    assert emitted["allOf"] == schema["allOf"]
+    assert emitted["x-vendor"] == schema["x-vendor"]
+
+
+def test_legacy_definitions_ref_sibling_is_inlined() -> None:
+    model = model_from_json_schema(
+        {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "definitions": {"Value": {"type": "string"}},
+            "properties": {"x": {"$ref": "#/definitions/Value", "description": "a value"}},
+        }
+    )
+    doc = model.model_json_schema()
+    prop = cast("dict[str, dict[str, object]]", doc["properties"])["x"]
+    assert prop == {"type": "string", "description": "a value"}
+    assert "definitions" not in doc
+
+
+def test_multiple_reference_applicators_are_all_inlined() -> None:
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "$defs": {"a": {"minimum": 2}, "b": {"maximum": 5}},
+            "properties": {"x": {"$ref": "#/$defs/a", "$dynamicRef": "#/$defs/b"}},
+        }
+    )
+    assert model.model_json_schema()["properties"] == {"x": {"minimum": 2, "maximum": 5}}

@@ -583,3 +583,12 @@ class ReasoningEffortUnsupportedError(Exception):
     A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS``:
     retrying cannot establish a missing capability or disable an always-on model.
     """
+
+
+class SchemaEngineError(Exception):
+    """The JSON Schema validator could not evaluate the contract.
+
+    A permanent engine or configuration fault, outside the repairable parse
+    and recoverable error sets: another generated answer cannot repair it.
+    The original engine exception is available through ``__cause__``.
+    """

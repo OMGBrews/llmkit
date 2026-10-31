@@ -64,7 +64,8 @@ def llm_cache_key(
     credential); the messages as sent; the output schema's JSON schema, or
     ``"text"``; temperature; max_tokens; the effective reasoning effort; and,
     for a structured call, the provider's structured-output mode and strict
-    JSON-schema flag. ``feature`` and ``label`` are telemetry and are not part
+    JSON-schema flag. Schema-backed models additionally include their original
+    validation contract and policy. ``feature`` and ``label`` are telemetry and are not part
     of it. The temperature is the *requested* value, which may be omitted on
     the wire when the model refuses it; the omission is a deterministic
     function of the same request, so keying on the request never conflates two
@@ -96,5 +97,8 @@ def llm_cache_key(
         getattr(mode, "value", mode),
         provider.strict_json_schema if structured else None,
     ]
+    contract_identity = getattr(output_schema, "__llmkit_contract_identity__", None)
+    if callable(contract_identity):
+        canonical.append(contract_identity())
     encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

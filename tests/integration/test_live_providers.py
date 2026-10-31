@@ -1148,3 +1148,50 @@ async def test_live_tool_stream_reports_cost(provider: Provider) -> None:
     cost = records[0].approximate_cost
     assert cost == 0 if provider is Provider.OLLAMA else cost is not None and cost > 0, cost
     print(f"tool-stream cost {provider.value} {built.litellm_model()}: {cost!r}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", list(Provider), ids=[p.value for p in Provider])
+async def test_schema_backed_constraints_live(provider: Provider) -> None:
+    """Measure pattern/const generation and local authority on each shipped route.
+
+    Adds one paid call per provider to the weekly live suite; a provider rejecting
+    this guidance is a failure, rather than evidence inferred from offline parsing.
+    """
+    built = make_provider(provider, **_live_credentials(provider))
+    await _assert_schema_backed_constraints(built, _REASONING_EFFORT.get(provider))
+
+
+@pytest.mark.asyncio
+async def test_schema_backed_constraints_gemini_json_live() -> None:
+    built = make_provider(
+        Provider.GOOGLE, gemini_structured_output="json", **_live_credentials(Provider.GOOGLE)
+    )
+    await _assert_schema_backed_constraints(built, _REASONING_EFFORT.get(Provider.GOOGLE))
+
+
+async def _assert_schema_backed_constraints(
+    provider: LLMProviderInterface, effort: str | None
+) -> None:
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "code": {"type": "string", "pattern": "^[0-9]{3}$"},
+                "status": {"type": "string", "const": "ok"},
+            },
+            "required": ["code", "status"],
+        },
+        name="SchemaBackedProbe",
+    )
+    result = await structured_llm_call(
+        'Return exactly {"code":"123","status":"ok"}.',
+        model,
+        feature="integration-smoke",
+        label="schema-backed-constraints",
+        provider=provider,
+        reasoning_effort=effort,
+        max_tokens=1024,
+    )
+    assert result.root == {"code": "123", "status": "ok"}

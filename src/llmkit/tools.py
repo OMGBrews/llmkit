@@ -197,7 +197,10 @@ class ToolComposeResult[T: BaseModel](ToolCallResult):
 
     @override
     def to_log_dict(self) -> dict[str, object]:
-        return {**super().to_log_dict(), "parsed": self.parsed}
+        return {
+            **super().to_log_dict(),
+            "parsed": self.parsed.model_dump() if self.parsed is not None else None,
+        }
 
 
 def tool_result_message(

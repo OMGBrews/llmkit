@@ -46,7 +46,12 @@ from pydantic import BaseModel
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import cache_key_or_none, read_through
-from llmkit.exceptions import OutputLimitDiagnostics, ResultValidationError, ToolArgumentError
+from llmkit.exceptions import (
+    OutputLimitDiagnostics,
+    ResultValidationError,
+    SchemaEngineError,
+    ToolArgumentError,
+)
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
@@ -348,6 +353,8 @@ def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> 
         validated = (
             definition.model.model_validate(parsed) if definition.model is not None else None
         )
+    except SchemaEngineError:
+        raise
     except Exception as exc:
         raise ToolArgumentError(
             name, call_id, arguments_raw, f"tool arguments failed validation: {exc}"

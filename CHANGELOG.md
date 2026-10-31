@@ -49,6 +49,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: JSON-schema contracts now return schema-backed root models.**
+  `model_from_json_schema` validates an immutable snapshot with `jsonschema`
+  (draft-07, 2019-09, or 2020-12; default 2020-12), replacing the handwritten
+  field translator and its silently dropped constraints. Construct with
+  `Model.model_validate({...})`, access values with `.root["name"]`, and use
+  `model_dump()` for the JSON object. Nested values are plain dicts/lists;
+  generated property `model_fields` no longer exist. Explicit nulls survive
+  default serialization, absent keys stay absent, extras follow the schema,
+  and defaults never populate values. `exclude_none` no longer selects an
+  llmkit optional-null policy. Object roots remain required. Formats remain
+  annotations by default; `assert_formats=True` requires available checkers.
+  Unavailable/recursive references and unsupported dialects fail at construction.
+  Provider guidance is a separate copy; original schema and policy also identify
+  cache entries. Engine faults raise `SchemaEngineError` without repair retries.
+  Caller-written Pydantic models retain their interface and cache keys.
+
 - **Breaking: `configure_rate_limit` keeps the settings a call omits.** Each
   call used to reset every dimension to its default, so a host that set
   `configure_rate_limit(rpm=3_500)` at startup and
@@ -90,9 +106,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- `model_json_schema` on llmkit's generated models now accepts
-  `by_alias=None`, matching pydantic 2.14's signature, so the override type
-  checks again. The default stays `True`, so the emitted schema is unchanged.
+- `model_json_schema` on llmkit's schema-backed models accepts
+  `by_alias=None`, matching pydantic 2.14's signature. Guidance now comes from
+  the original schema snapshot rather than generated property fields.
 
 - A streamed call no longer logs `approximate_cost: 0.0`. LiteLLM seeds a
   stream's cost with a `0.0` placeholder and never prices the stream, so

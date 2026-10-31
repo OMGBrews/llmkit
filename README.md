@@ -517,119 +517,89 @@ result = await structured_llm_call(
 )
 ```
 
-**Supported structural subset** (unsupported structural constructs raise `ValueError`; unsupported leaf constraints can be silently dropped, as detailed under [Schema constraints](#schema-constraints)): `object` with `properties` and a `required` array; scalars (`string` / `integer` / `number` / `boolean`, plus `null` / nullable); `array` with `items` (including arrays of objects); `enum` (string or integer members); nested objects inline or via local `$ref` (`#/$defs/...`); and `additionalProperties` as `true` / `false` / absent (a *typed* `additionalProperties` map is rejected). A non-required field becomes an optional defaulting to `None`, and the generated model's `model_dump` / `model_dump_json` **drop a `None` left in an optional field by default** — so an omitted optional is *absent*, not `"field": null` (which would fail downstream re-validation against the same schema). The drop is scoped to optionals: a *required*-but-nullable field explicitly set to `None` is kept. Pass `exclude_none=False` to keep every null, or `exclude_none=True` to drop them all. A title-less schema still gets a valid default class name (`JsonSchemaModel`); pass `name=` to set it explicitly. Generated models default to **`extra="forbid"`**, so a response carrying a key not in the schema is *rejected* rather than silently kept — for an LLM output contract you want a hallucinated extra field to fail loudly (stricter than JSON Schema's permissive `additionalProperties` default); `"additionalProperties": true` opts an object into `extra="allow"` (extra keys accepted and kept), while `false` or absent stays strict. An `"type": "object"` with **no properties** — `properties` absent *or* an explicit empty `{}` — raises rather than silently building a zero-field model that rejects every real response; set `"additionalProperties": true` for an intentionally free-form object.
-
-**Want plain data back, not a model instance?** Call `.model_dump()` on the result — it inherits the optional-`None` drop above, so omitted optional fields stay absent:
+The factory snapshots the original schema and builds a **schema-backed Pydantic
+root model**. The original schema governs local validation before coercion and
+again over the default JSON serialization. Changing your input schema later
+does not change an existing model's contract. Caller-written Pydantic models
+keep their existing interface.
 
 ```python
-Person = model_from_json_schema(person_schema)   # build once, at import
-
-result = await structured_llm_call(prompt, Person, feature="extraction")
-data = result.model_dump()                        # {"name": "Ada", "age": 36}
+invoice = Invoice.model_validate({
+    "id": "INV-1", "total": 12, "status": "open", "lines": [], "note": None,
+})
+invoice.root["id"]                 # "INV-1"
+invoice.root["lines"]              # ordinary lists and dictionaries
+invoice.model_dump()               # the original JSON object, including note: None
+invoice.model_dump_json()          # JSON text with "note": null
 ```
+
+**Migration from generated fields:** replace `Invoice(id=...)` with
+`Invoice.model_validate({...})`, and replace `invoice.id` with
+`invoice.root["id"]`. Nested objects are dictionaries and arrays are lists;
+there are no generated property entries in `model_fields`. `model_dump()`
+returns the JSON object directly. Explicit nulls are preserved by default and
+absent keys stay absent; `exclude_none` no longer has llmkit's former optional
+null preservation policy. Extra keys follow the schema: absent
+`additionalProperties` permits them, `false` rejects them, and a schema value
+validates their values. Propertyless objects are supported. Defaults are
+annotations and never fill missing values. A title-less schema gets the name
+`JsonSchemaModel`; `name=` sets it explicitly.
+
+A schema-backed model also works with `ToolDefinition.from_model`: declare an
+object schema, and read the validated arguments from the handler's `.root`.
 
 #### Schema constraints
 
-`model_from_json_schema` carries a small, fixed set of per-field JSON-schema
-constraints through to the generated Pydantic `Field`, so the model validates
-*value bounds*, not just shape. The supported set is **exactly**:
+Local validation uses `jsonschema` over the original schema, including
+`pattern`, `multipleOf`, `const`, `uniqueItems`, composition (`allOf`, `anyOf`,
+`oneOf`, `not`, conditionals), and rules inside nested properties, array items,
+and referenced definitions. Invalid instances raise Pydantic `ValidationError`
+with instance and schema locations and use the existing bounded repair loop.
+Validator engine faults use `SchemaEngineError` and fail without response
+repair. Structured calls may carry it inside Instructor's exception wrapper;
+`llmkit.exceptions.underlying_provider_error` retrieves that cause. No legacy
+path silently drops validation rules.
 
-| JSON schema | Pydantic `Field` | Applies to |
-|-------------|------------------|------------|
-| `minimum` | `ge` | numbers / integers |
-| `maximum` | `le` | numbers / integers |
-| `exclusiveMinimum` | `gt` | numbers / integers |
-| `exclusiveMaximum` | `lt` | numbers / integers |
-| `minLength` | `min_length` | strings |
-| `maxLength` | `max_length` | strings |
-| `minItems` | `min_length` | arrays |
-| `maxItems` | `max_length` | arrays |
-| `description` | `Field(description=...)` | any field (surfaced to the model by `instructor`) |
+The supported dialects are **draft-07, 2019-09, and 2020-12**. `$schema` selects
+the dialect; omission selects 2020-12, and any other dialect is rejected during
+construction. Subresources must use the same dialect as the root; a nested
+`$schema` selecting a different dialect is rejected. The root, after resolving
+a root reference, must declare the single string `"type": "object"`. Array, scalar, nullable-object, and typeless
+roots remain unsupported. Applicators alongside an object type are supported.
+Malformed known keywords, unsupported required vocabularies, unavailable
+references, and recursive references fail at construction with schema locations.
+References resolve only against resources within the supplied document; llmkit
+never fetches schemas over the network. Dialect rules govern reference siblings
+(in particular, draft-07 ignores assertion siblings of `$ref`).
 
-```python
-Score = model_from_json_schema(
-    {
-        "type": "object",
-        "properties": {"score": {"type": "integer", "minimum": 1, "maximum": 5}},
-        "required": ["score"],
-    }
-)
-Score(score=3)   # ok
-Score(score=6)   # raises pydantic.ValidationError
-```
+Unknown keywords and vendor extensions are annotations, including arbitrary JSON
+payloads; they do not become validation rules. `default`, `examples`, `title`,
+`description`, `$comment`, `deprecated`, `readOnly`, and `writeOnly` likewise do
+not alter data. **`format` is an annotation by default.** Opt into assertions
+with `model_from_json_schema(schema, assert_formats=True)`. Construction then
+fails for formats absent from the installed format checker, including formats
+whose optional checker dependencies are unavailable.
 
-Bounds are resolved through `$ref` chains of any depth and through nullable
-wrappers, so a constraint declared inside a `$def` (even several `$ref` hops
-deep) or on the non-null branch of a nullable field is still enforced (and
-`null` itself still passes for a nullable field). The same resolution carries a
-`$def`'s **`description`** through, including behind a nullable wrapper — a
-nullable `$ref` field surfaces the target's model-facing guidance just like a
-bare `$ref` does.
+JSON integers remain exact Python integers, including values above `2**53`.
+Floating-point values use Python double precision: `9007199254740993.0` is
+rounded before validation, and floating-point `multipleOf` arithmetic can reject
+`0.3` against `0.1`. Non-finite numbers (`NaN`, infinity, or overflow such as
+`1e400`) are rejected. Patterns use Python `re`; ECMA-only regex syntax that
+Python cannot compile fails during construction.
 
-Keywords that sit **beside** a `$ref` are handled by kind. Metadata and the
-bounds above merge with the referenced schema, the outer (property-level) value
-winning on conflict — so `{"$ref": "#/$defs/Count", "minimum": 5}` keeps the
-bound. A keyword that would redefine the reference's *structure* (`type`,
-`enum`, `items`, `properties`, `required`, `additionalProperties`, `anyOf`,
-`oneOf`) is a JSON-Schema conjunction a merge cannot express, so it is
-**rejected** unless it restates the target's own value — an `enum` beside a
-`$ref` raises a clear `ValueError` rather than silently widening the field to an
-unconstrained scalar. Move such a keyword into the referenced `$def`, or inline
-the schema.
-
-**Subschema applicators are rejected everywhere, not only beside a `$ref`.**
-`allOf`, `not`, `if` / `then` / `else`, `dependentSchemas`,
-`dependentRequired`, `propertyNames`, `patternProperties`, `prefixItems`,
-`contains`, `unevaluatedProperties`, and `unevaluatedItems` constrain an
-instance by *composition*, and a generated field is one annotation plus the
-bounds in the table above — so an applicator has nowhere to land. Each raises a
-`ValueError` naming the keyword and its path, at every site: a property, an
-array's `items`, a nested object, the body of a `$def` reached through a
-`$ref`, the non-null branch of a nullable `anyOf`, and the root object.
-
-```python
-model_from_json_schema(
-    {
-        "type": "object",
-        "properties": {"score": {"type": "integer", "allOf": [{"maximum": 10}]}},
-        "required": ["score"],
-    }
-)
-# ValueError: Unsupported keyword 'allOf' at '$.score': subschema applicators ...
-```
-
-Rejecting is not pedantry — dropping one is wrong in *both* directions. A
-dropped `allOf` bound makes the model accept a value the schema forbids; a
-dropped `prefixItems` changes what the sibling `items` means (Draft 2020-12
-reads it as "every element *after* the prefix"), so the model rejects a
-response the schema permits and the spurious `ValidationError` is paid for in
-retries. Either express the constraint with a supported keyword, or validate it
-outside the generated model. The nullable spellings — `anyOf` / `oneOf` with a
-single non-null branch plus a `null` branch — are unaffected and still build.
-
-A propertyless object is rejected the same way: `{"type": "object"}` with no
-`properties` — or an explicit empty `{"properties": {}}` — raises at translation
-time (it would otherwise build a zero-field model that rejects every real
-response), unless it opts into open-ended keys with `"additionalProperties":
-true`.
-
-One form caveat: `exclusiveMinimum` / `exclusiveMaximum` are recognised in
-their **numeric** (Draft 2020-12) form only. The Draft-4 / OpenAPI-3.0
-*boolean* form (`"exclusiveMinimum": true` qualifying a sibling `"minimum"`)
-is not recognised and is dropped — the bound is enforced as the sibling's
-*inclusive* `minimum`/`maximum`. If your schema comes from an OpenAPI 3.0
-document, rewrite exclusive bounds in the numeric form.
-
-**Leaf constraints outside the table above are silently dropped** — `pattern`,
-`format`, `multipleOf`, `uniqueItems`, `const`, and the rest are *not*
-enforced. The generated model therefore does not establish conformance to those parts
-of the original schema. If a schema relies on one of them, validate it separately
-or express the rule in a Pydantic model you provide directly. The drop
-is scoped to per-value keywords like these; a *structural* construct outside
-the supported subset — a subschema applicator, a multi-variant union, a typed
-`additionalProperties` map — raises instead of vanishing, because losing one
-silently changes the shape the model validates rather than merely leaving a
-value unchecked.
+The schema sent to a provider is **generation guidance**, separate from the
+local validation authority. Each `model_json_schema()` call returns a fresh
+adapted copy: `$schema` is omitted, acyclic references are inlined (including
+bare references), and the definition containers are removed. Caller composition
+remains present; llmkit does not flatten arbitrary intersections. Existing route-specific LiteLLM filtering can
+limit the guidance a provider sees, but never weakens local validation. A
+provider rejecting guidance surfaces its error rather than causing a silent
+schema downgrade. The OpenRouter strict upgrade applies only to plain object
+roots with absent or false `additionalProperties` and no unsupported strict
+composition; other shapes remain non-strict and use local validation and repair.
+The live suite exercises a schema with `pattern` and `const` on each shipped
+provider route, including Gemini's `"json"` strategy; these cases add real calls,
+cost, and potential failures to the weekly live check.
 
 ## Rate limiting
 
@@ -996,6 +966,8 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
 `timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait.
+
+For schema-backed models the key also includes the original schema snapshot, selected dialect, and format-assertion policy, so contracts with identical provider guidance still have separate cache entries. Caller-written Pydantic models keep their existing key format.
 
 Credentials are never part of the key, so rotating an API key keeps your hits. `feature` and `label` are telemetry, not part of the request, so two features asking the identical question share one answer. Two schemas with the same fields in a different order are different requests, because the order is sent to the model and steers the order it writes fields in. A request that cannot be fingerprinted — a content part that is not JSON-serialisable, a third-party provider missing an attribute the key reads — skips the cache and runs normally.
 

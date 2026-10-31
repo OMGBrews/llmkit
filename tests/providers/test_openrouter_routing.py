@@ -305,3 +305,41 @@ async def test_compose_tools_request_keeps_openrouter_strict_shape() -> None:
     json_schema = cast("dict[str, object]", response_format["json_schema"])
     assert json_schema["strict"] is True
     assert cast("dict[str, object]", json_schema["schema"])["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "additionalProperties": True},
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        {"type": "object", "anyOf": [{"required": ["x"]}]},
+        {"type": "object", "allOf": [{"required": ["x"]}]},
+        {"type": "object", "oneOf": [{"required": ["x"]}]},
+        {"type": "object", "properties": {"x": {"not": {"type": "null"}}}},
+        {"type": "object", "$defs": {"x": {"oneOf": []}}},
+    ],
+)
+def test_strict_upgrade_preserves_open_and_composed_guidance(schema: dict[str, object]) -> None:
+    from copy import deepcopy
+
+    original = deepcopy(schema)
+    document: dict[str, object] = {"name": "Answer", "schema": schema}
+    _litellm._stricten_json_schema_response_format(
+        {"response_format": {"type": "json_schema", "json_schema": document}}
+    )
+    assert "strict" not in document
+    assert schema == original
+
+
+def test_strict_upgrade_does_not_interpret_annotations_as_schemas() -> None:
+    schema: dict[str, object] = {
+        "type": "object",
+        "examples": [{"not": "an applicator"}],
+        "x-extension": {"oneOf": "annotation"},
+    }
+    document: dict[str, object] = {"name": "Answer", "schema": schema}
+    _litellm._stricten_json_schema_response_format(
+        {"response_format": {"type": "json_schema", "json_schema": document}}
+    )
+    assert document["strict"] is True
+    assert schema["additionalProperties"] is False

@@ -534,32 +534,73 @@ async def _instructor_completion(
 
 
 def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
-    """Upgrade a ``json_schema`` ``response_format`` in *kwargs* to strict.
+    """Upgrade only guidance compatible with the existing strict wire shape.
 
-    instructor's ``JSON_SCHEMA`` handler emits ``response_format`` without
-    ``"strict": true`` or ``additionalProperties: false``, and a provider that
-    treats a non-strict json_schema as *advisory* (OpenRouter) then lets weak
-    models drift — measured 2026-07-14: ``mistralai/mistral-nemo``
-    stochastically echoing the schema itself. The pre-1.15.3
-    ``OPENROUTER_STRUCTURED_OUTPUTS`` handler sent exactly this strict shape,
-    so this restores the measured wire contract at the one seam the library
-    owns (the completion callable handed to ``from_litellm``). Used only for
-    providers that opt in via
-    :pyattr:`~llmkit.providers.base.BaseProvider.strict_json_schema`; the
-    mutation targets the request dict instructor builds fresh per call.
+    OpenRouter opts into this upgrade. Open objects and composed contracts
+    remain non-strict so the request never silently closes their root or
+    claims strict support for applicators the server rejects.
     """
     response_format = kwargs.get("response_format")
+    if not isinstance(response_format, dict):
+        return
+    response_format = cast("dict[str, object]", response_format)
+    if response_format.get("type") != "json_schema":
+        return
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, dict):
+        return
+    json_schema = cast("dict[str, object]", json_schema)
+    schema = json_schema.get("schema")
+    if not isinstance(schema, dict):
+        return
+    schema = cast("dict[str, object]", schema)
     if (
-        isinstance(response_format, dict)
-        and cast("dict[str, object]", response_format).get("type") == "json_schema"
+        schema.get("type") != "object"
+        or any(key in schema for key in ("$ref", "allOf", "anyOf", "oneOf"))
+        or ("additionalProperties" in schema and schema["additionalProperties"] is not False)
+        or _has_strict_unsupported_applicator(schema)
     ):
-        json_schema = cast("dict[str, object]", response_format).get("json_schema")
-        if isinstance(json_schema, dict):
-            json_schema = cast("dict[str, object]", json_schema)
-            json_schema["strict"] = True
-            schema = json_schema.get("schema")
-            if isinstance(schema, dict):
-                cast("dict[str, object]", schema)["additionalProperties"] = False
+        return
+    json_schema["strict"] = True
+    schema["additionalProperties"] = False
+
+
+def _has_strict_unsupported_applicator(schema: dict[str, object]) -> bool:
+    """Inspect schema locations, leaving annotation payloads uninterpreted."""
+    if any(key in schema for key in ("allOf", "oneOf", "not")):
+        return True
+    children: list[object] = []
+    for key in ("$defs", "definitions", "properties", "patternProperties", "dependentSchemas"):
+        value = schema.get(key)
+        if isinstance(value, dict):
+            children.extend(cast("dict[str, object]", value).values())
+    for key in (
+        "additionalProperties",
+        "additionalItems",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "contains",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+        "items",
+        "prefixItems",
+        "anyOf",
+    ):
+        value = schema.get(key)
+        if isinstance(value, list):
+            children.extend(cast("list[object]", value))
+        else:
+            children.append(value)
+    dependencies = schema.get("dependencies")
+    if isinstance(dependencies, dict):
+        children.extend(cast("dict[str, object]", dependencies).values())
+    return any(
+        _has_strict_unsupported_applicator(cast("dict[str, object]", child))
+        for child in children
+        if isinstance(child, dict)
+    )
 
 
 async def drain_async_logging(*, timeout: float | None) -> None:

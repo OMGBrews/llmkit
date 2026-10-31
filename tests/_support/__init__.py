@@ -14,7 +14,6 @@ import asyncio
 from collections.abc import AsyncIterator, Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import cast
 from unittest.mock import MagicMock, patch
 
 from pydantic import BaseModel
@@ -43,18 +42,6 @@ class OkSchema(BaseModel):
     """The minimal structured-output target: a single boolean field."""
 
     ok: bool
-
-
-def model_attr(instance: BaseModel, name: str) -> object:
-    """Read a dynamically-built model field as a statically-known ``object``.
-
-    ``model_from_json_schema`` returns ``type[BaseModel]``, so an instance's
-    runtime fields (``.score``, ``.tags``, …) are not statically known and a
-    bare ``inst.score`` is an unknown-member access. Routing each assertion's
-    read through here gives it a real ``object`` type — which still supports the
-    ``==`` / ``is`` checks at call sites — without weakening the assertion.
-    """
-    return cast("object", getattr(instance, name))
 
 
 def provider_mock(

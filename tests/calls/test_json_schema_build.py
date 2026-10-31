@@ -1,897 +1,351 @@
-"""Tests for ``model_from_json_schema`` — building a model from a schema dict.
-
-Covers the conversion subset (nested objects, ``$defs``/``$ref``, arrays,
-enums, required/optional fields), the two CaCL footguns (omitted optionals
-serialising as ``null``; title-less schemas), clear failures on unsupported
-constructs (multi-branch unions, recursion, bad ``$ref``), and a full
-round-trip through ``structured_llm_call`` against an :mod:`llmkit.testing`
-fake, so the real parser reads the provider's JSON into the generated model. Per-field constraint handling lives in
-``test_json_schema_constraints.py``.
-"""
+"""Construction policy and lossless representation of schema-backed models."""
 
 from __future__ import annotations
 
-import asyncio
+import copy
 import json
-import warnings
-from enum import Enum
-from typing import Literal, get_args, get_origin
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
-from llmkit import calls as llm_calls
 from llmkit import model_from_json_schema
-from llmkit.testing import Reply, TransportRequest, install
-from tests._support import model_attr as _attr
-
-# A representative schema: nested objects (inline + via $defs/$ref), an array
-# of objects, an enum, and a mix of required and optional fields.
-_INVOICE_SCHEMA: dict[str, object] = {
-    "title": "Invoice",
-    "type": "object",
-    "properties": {
-        "id": {"type": "string"},
-        "total": {"type": "number"},
-        "paid": {"type": "boolean"},
-        "note": {"type": ["string", "null"]},
-        "status": {"enum": ["open", "closed", "void"]},
-        "customer": {"$ref": "#/$defs/Party"},
-        "lines": {"type": "array", "items": {"$ref": "#/$defs/Line"}},
-        "tags": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["id", "total", "status", "customer", "lines"],
-    "$defs": {
-        "Party": {
-            "title": "Party",
-            "type": "object",
-            "properties": {"name": {"type": "string"}, "vip": {"type": "boolean"}},
-            "required": ["name"],
-        },
-        "Line": {
-            "title": "Line",
-            "type": "object",
-            "properties": {"sku": {"type": "string"}, "qty": {"type": "integer"}},
-            "required": ["sku"],
-        },
-    },
-}
 
 
-def test_builds_named_model_for_representative_schema() -> None:
-    model = model_from_json_schema(_INVOICE_SCHEMA)
-    assert issubclass(model, BaseModel)
-    assert model.__name__ == "Invoice"
-    # Required field is required; optional field has a default.
-    assert model.model_fields["id"].is_required()
-    assert not model.model_fields["note"].is_required()
-
-
-def test_validates_and_rejects_per_schema() -> None:
-    model = model_from_json_schema(_INVOICE_SCHEMA)
-    inst = model(
-        id="INV-1",
-        total=42.0,
-        status="open",
-        customer={"name": "Acme"},
-        lines=[{"sku": "A", "qty": 2}, {"sku": "B"}],
-    )
-    dumped = inst.model_dump()
-    assert dumped["id"] == "INV-1"
-    assert dumped["status"] == "open"
-    assert dumped["lines"][0] == {"sku": "A", "qty": 2}
-    # A missing required field raises.
-    with pytest.raises(ValidationError):
-        _ = model(total=1.0, status="open", customer={"name": "X"}, lines=[])
-    # An out-of-enum value raises.
-    with pytest.raises(ValidationError):
-        _ = model(
-            id="x",
-            total=1.0,
-            status="nonsense",
-            customer={"name": "X"},
-            lines=[],
-        )
-
-
-def test_forbids_unexpected_extra_field() -> None:
-    """Generated models set ``extra='forbid'`` — a key not in the schema is
-    rejected (deliberately stricter than JSON Schema's permissive default, so a
-    hallucinated extra field fails loudly rather than passing silently)."""
-    model = model_from_json_schema(
-        {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
-    )
-    assert model(id="ok").model_dump() == {"id": "ok"}
-    with pytest.raises(ValidationError):
-        _ = model(id="ok", hallucinated="nope")
-
-
-def test_multi_branch_union_raises_clear_value_error() -> None:
-    """A genuine multi-type union (not just ``<type>`` + null) is unsupported
-    and fails loudly rather than mis-converting."""
-    with pytest.raises(ValueError, match="Unsupported union type"):
-        _ = model_from_json_schema(
-            {
-                "type": "object",
-                "properties": {"x": {"type": ["string", "integer"]}},
-                "required": ["x"],
-            }
-        )
-    with pytest.raises(ValueError, match=r"Unsupported anyOf with \d+ non-null branches"):
-        _ = model_from_json_schema(
-            {
-                "type": "object",
-                "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
-                "required": ["x"],
-            }
-        )
-    with pytest.raises(ValueError, match=r"Unsupported oneOf with \d+ non-null branches"):
-        _ = model_from_json_schema(
-            {
-                "type": "object",
-                "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
-                "required": ["x"],
-            }
-        )
-
-
-def test_non_mapping_schema_raises_clear_value_error() -> None:
-    """A non-mapping argument fails loudly with a clear message."""
-    with pytest.raises(ValueError, match="mapping schema"):
-        _ = model_from_json_schema([{"type": "object"}])  # pyright: ignore[reportArgumentType]
-
-
-def test_ref_to_same_def_yields_one_class() -> None:
-    """A ``$def`` referenced from two places resolves to the *same* class —
-    build-once, not a fresh model per reference site."""
-    schema: dict[str, object] = {
-        "title": "Pair",
-        "type": "object",
-        "properties": {"a": {"$ref": "#/$defs/Point"}, "b": {"$ref": "#/$defs/Point"}},
-        "required": ["a", "b"],
-        "$defs": {
-            "Point": {
-                "title": "Point",
-                "type": "object",
-                "properties": {"x": {"type": "integer"}},
-                "required": ["x"],
-            }
-        },
-    }
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        None,
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2019-09/schema",
+        "https://json-schema.org/draft/2020-12/schema",
+    ],
+)
+def test_supported_dialects(dialect: str | None) -> None:
+    schema: dict[str, object] = {"type": "object", "properties": {"n": {"const": 1}}}
+    if dialect is not None:
+        schema["$schema"] = dialect
     model = model_from_json_schema(schema)
-    assert model.model_fields["a"].annotation is model.model_fields["b"].annotation
+    assert model.model_validate({"n": 1}).root == {"n": 1}
+    with pytest.raises(ValidationError):
+        _ = model.model_validate({"n": 2})
 
 
-# --- Footgun #1: omitted optional must not serialise as null ---------------
-
-
-def test_omitted_optional_is_absent_not_null() -> None:
-    """An omitted optional must NOT round-trip as ``"field": null`` and fail
-    downstream re-validation against the same JSON schema."""
-    schema: dict[str, object] = {
-        "title": "Record",
-        "type": "object",
-        "properties": {"required_field": {"type": "string"}, "optional_field": {"type": "string"}},
-        "required": ["required_field"],
-    }
-    model = model_from_json_schema(schema)
-    inst = model(required_field="present")
-
-    # model_dump / model_dump_json default to exclude_none: the optional is
-    # absent, not present-and-null.
-    assert inst.model_dump() == {"required_field": "present"}
-    assert "optional_field" not in inst.model_dump()
-    assert "null" not in inst.model_dump_json()
-
-    # The dumped payload re-validates cleanly against the same model (the
-    # downstream re-validation that the null would have broken).
-    revalidated = model.model_validate(inst.model_dump())
-    assert revalidated.model_dump() == {"required_field": "present"}
-
-    # Opt back in to the nulls explicitly when actually wanted.
-    assert inst.model_dump(exclude_none=False) == {
-        "required_field": "present",
-        "optional_field": None,
-    }
-
-
-# --- Footgun #2: title-less / empty-title schema --------------------------
-
-
-def test_titleless_schema_gets_safe_default_name() -> None:
-    model = model_from_json_schema({"type": "object", "properties": {"x": {"type": "string"}}})
-    assert model.__name__ == "JsonSchemaModel"
-    assert model.__name__  # non-empty — instructor/create_model need a real name
-
-
-def test_empty_title_gets_safe_default_name() -> None:
-    model = model_from_json_schema(
-        {"title": "   ", "type": "object", "properties": {"x": {"type": "string"}}}
-    )
-    assert model.__name__ == "JsonSchemaModel"
-
-
-def test_explicit_name_overrides_title() -> None:
-    model = model_from_json_schema(_INVOICE_SCHEMA, name="MyInvoice")
-    assert model.__name__ == "MyInvoice"
-
-
-# --- Unsupported constructs fail loudly -----------------------------------
-
-
-def test_unsupported_type_raises_clear_value_error() -> None:
-    with pytest.raises(ValueError, match="Unsupported JSON-schema type 'foobar'"):
-        _ = model_from_json_schema(
-            {"title": "Bad", "type": "object", "properties": {"x": {"type": "foobar"}}}
-        )
-
-
-def test_unresolvable_ref_raises_clear_value_error() -> None:
-    with pytest.raises(ValueError, match="Unresolvable \\$ref"):
-        _ = model_from_json_schema(
-            {
-                "title": "Bad",
-                "type": "object",
-                "properties": {"x": {"$ref": "#/$defs/Missing"}},
-                "required": ["x"],
-            }
-        )
-
-
-def test_non_object_root_raises_clear_value_error() -> None:
+@pytest.mark.parametrize(
+    "schema", [{}, {"type": "array"}, {"type": "string"}, {"type": ["object", "null"]}]
+)
+def test_nonobject_roots_fail_at_construction(schema: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="top level must be an object"):
-        _ = model_from_json_schema({"type": "array", "items": {"type": "string"}})
+        _ = model_from_json_schema(schema)
 
 
-def test_typeless_enum_root_raises_clear_value_error() -> None:
-    """A bare ``{"enum": [...]}`` root must fail loudly naming the construct —
-    pre-fix it silently built a zero-field ``extra='forbid'`` model that
-    rejected every real response (or validated ``{}``, losing the data)."""
-    with pytest.raises(ValueError, match="top level must be an object, got 'enum'"):
-        _ = model_from_json_schema({"enum": ["a", "b", "c"]})
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "$schema": "https://example.com/dialect"},
+        {"type": "object", "required": "x"},
+        {"type": "object", "properties": {"x": {"pattern": "["}}},
+        {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}},
+        {"type": "object", "properties": {"x": {"$ref": "https://example.com/missing"}}},
+        {"type": "object", "properties": {"x": {"$ref": "#"}}},
+    ],
+)
+def test_invalid_or_unavailable_semantics_fail_early(schema: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        _ = model_from_json_schema(schema)
 
 
-def test_typeless_anyof_root_raises_clear_value_error() -> None:
-    with pytest.raises(ValueError, match="top level must be an object, got 'anyOf'"):
-        _ = model_from_json_schema({"anyOf": [{"type": "string"}, {"type": "null"}]})
+def test_root_reference_to_object() -> None:
+    model = model_from_json_schema(
+        {"$ref": "#/$defs/Root", "$defs": {"Root": {"type": "object", "required": ["x"]}}}
+    )
+    assert model.model_validate({"x": None}).root == {"x": None}
 
 
-def test_typeless_oneof_root_raises_clear_value_error() -> None:
-    with pytest.raises(ValueError, match="top level must be an object, got 'oneOf'"):
-        _ = model_from_json_schema({"oneOf": [{"type": "string"}, {"type": "integer"}]})
+def test_original_snapshot_and_guidance_are_independent() -> None:
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"x": {"pattern": "^[0-9]+$"}},
+        "required": ["x"],
+    }
+    original = copy.deepcopy(schema)
+    model = model_from_json_schema(schema)
+    schema.clear()
+    guidance = model.model_json_schema()
+    guidance.clear()
+    assert model.model_json_schema() == original
+    with pytest.raises(ValidationError, match="pattern"):
+        _ = model.model_validate({"x": "letters"})
 
 
-def test_empty_root_raises_clear_value_error() -> None:
-    """A root with neither ``type`` nor ``properties`` is not recognisably an
-    object — fail clearly rather than build an empty everything-rejecting model."""
-    with pytest.raises(ValueError, match="top level must be an object"):
-        _ = model_from_json_schema({})
-    with pytest.raises(ValueError, match="top level must be an object"):
-        _ = model_from_json_schema({"title": "JustATitle"})
+def test_annotations_are_not_subschemas_or_defaults() -> None:
+    schema: dict[str, object] = {
+        "type": "object",
+        "default": {"x": 2},
+        "properties": {"x": {"type": "integer", "default": 1}},
+        "x-vendor": {
+            "$ref": "https://unavailable.example/schema",
+            "format": "not-a-format",
+            "pattern": "[",
+        },
+        "examples": [{"$ref": "https://unavailable.example/schema"}],
+    }
+    model = model_from_json_schema(schema, assert_formats=True)
+    assert model.model_validate({}).root == {}
+    assert model.model_json_schema()["x-vendor"] == schema["x-vendor"]
 
 
-def test_ref_root_to_enum_def_raises_clear_value_error() -> None:
-    """A root ``$ref`` resolving to an enum def is the same non-object root —
-    the typeless-root gate applies to the resolved target too."""
-    with pytest.raises(ValueError, match="top level must be an object, got 'enum'"):
+def test_format_annotation_and_opt_in_assertion() -> None:
+    schema = {"type": "object", "properties": {"email": {"type": "string", "format": "email"}}}
+    assert model_from_json_schema(schema).model_validate({"email": "bad"}).root == {"email": "bad"}
+    strict = model_from_json_schema(schema, assert_formats=True)
+    assert strict.model_validate({"email": "a@example.com"}).root == {"email": "a@example.com"}
+    with pytest.raises(ValidationError):
+        _ = strict.model_validate({"email": "bad"})
+    with pytest.raises(ValueError, match="format"):
         _ = model_from_json_schema(
-            {"$ref": "#/$defs/Status", "$defs": {"Status": {"enum": ["open", "closed"]}}}
+            {"type": "object", "properties": {"x": {"format": "unknown-format"}}},
+            assert_formats=True,
         )
 
 
-def test_bare_properties_root_still_builds() -> None:
-    """Regression: a typeless root that carries ``properties`` is recognisably
-    an object and must keep building (the shape the typeless-root gate exists
-    to preserve)."""
-    model = model_from_json_schema({"properties": {"x": {"type": "string"}}, "required": ["x"]})
-    assert _attr(model(x="hi"), "x") == "hi"
-    with pytest.raises(ValidationError):
-        _ = model()
-
-
-def test_propertyless_object_root_raises_clear_value_error() -> None:
-    """An explicit ``{"type": "object"}`` with no ``properties`` must fail loud
-    (suggesting ``additionalProperties: true`` for free-form intent) — pre-fix
-    it silently built a zero-field ``extra='forbid'`` model that validated only
-    ``{}`` and rejected every real response."""
-    with pytest.raises(
-        ValueError, match=r"Unsupported object at '\$'.*'additionalProperties': true"
-    ):
-        _ = model_from_json_schema({"type": "object"})
-
-
-def test_propertyless_nested_object_raises_naming_field_path() -> None:
-    """The same propertyless-object failure nested as a field names the field's
-    path, not the root."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"meta": {"type": "object"}},
-        "required": ["meta"],
-    }
-    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no properties"):
-        _ = model_from_json_schema(schema)
-
-
-def test_empty_properties_object_root_raises_clear_value_error() -> None:
-    """An explicit ``properties: {}`` is as propertyless as an absent key and must
-    fail loud at translation time — pre-fix it slipped past the ``is None`` guard
-    and built the same zero-field ``extra='forbid'`` model that rejects every real
-    response, surfacing only as a confusing per-response validation error."""
-    with pytest.raises(
-        ValueError, match=r"Unsupported object at '\$'.*no properties.*'additionalProperties': true"
-    ):
-        _ = model_from_json_schema({"type": "object", "properties": {}})
-
-
-def test_empty_properties_nested_object_raises_naming_field_path() -> None:
-    """The explicit-empty case nested as a field names the field's path, not the root."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"meta": {"type": "object", "properties": {}}},
-        "required": ["meta"],
-    }
-    with pytest.raises(ValueError, match=r"Unsupported object at '\$\.meta'.*no properties"):
-        _ = model_from_json_schema(schema)
-
-
-def test_empty_properties_with_additional_properties_true_builds_open() -> None:
-    """``additionalProperties: true`` still rescues an *explicitly* empty
-    ``properties`` map into a meaningful free-form object, exactly as it does for
-    an absent ``properties`` key — the guard keys off open-endedness, not spelling."""
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"x": None},
+        {"extra": {"nested": [None, 9007199254740993]}},
+        {},
+        {"x": None, "extra": 9007199254740993},
+    ],
+)
+def test_default_serialization_preserves_json(value: dict[str, object]) -> None:
     model = model_from_json_schema(
-        {"type": "object", "properties": {}, "additionalProperties": True}
+        {"type": "object", "properties": {"x": {"type": ["string", "null"]}}}
     )
-    assert model.model_validate({"anything": 1}).model_dump() == {"anything": 1}
+    result = model.model_validate(value)
+    assert result.root == value
+    assert result.model_dump() == value
+    assert json.loads(result.model_dump_json()) == value
+    assert model.model_validate_json(result.model_dump_json()).root == value
+    assert set(model.model_fields) == {"root"}
 
 
-def test_propertyless_object_with_additional_properties_true_builds_open() -> None:
-    """``additionalProperties: true`` is the one shape that makes a propertyless
-    object meaningful (free-form): it builds ``extra='allow'`` and keeps
-    whatever keys arrive, at the root and nested."""
-    root = model_from_json_schema({"type": "object", "additionalProperties": True})
-    assert root.model_validate({"anything": 1}).model_dump() == {"anything": 1}
-
-    nested = model_from_json_schema(
-        {
-            "type": "object",
-            "properties": {"meta": {"type": "object", "additionalProperties": True}},
-            "required": ["meta"],
-        }
-    )
-    inst = nested.model_validate({"meta": {"free": "form"}})
-    assert inst.model_dump() == {"meta": {"free": "form"}}
-
-
-# --- Malformed ``required`` fails loudly ------------------------------------
-
-
-def test_non_list_required_raises_clear_value_error() -> None:
-    """``"required": "a"`` (a bare string, not a list) must fail loud — pre-fix
-    it was silently ignored, so every field built optional and the model
-    validated payloads missing fields the author marked required."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "required": "a",
-    }
-    with pytest.raises(ValueError, match=r"'required' must be a list of property-name strings"):
-        _ = model_from_json_schema(schema)
-
-
-def test_non_string_required_entry_raises_clear_value_error() -> None:
-    """A non-string entry inside ``required`` is the same malformed-`required`
-    failure and names the offending entry."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "required": ["a", 1],
-    }
-    with pytest.raises(ValueError, match=r"'required' entries must be property-name strings"):
-        _ = model_from_json_schema(schema)
-
-
-def test_required_name_missing_from_properties_raises_clear_value_error() -> None:
-    """A ``required`` name with no matching property (a schema typo) must fail
-    loud naming the missing property — pre-fix it degraded silently in BOTH
-    directions: payloads missing 'ghost' were accepted, and payloads carrying
-    it were rejected as an extra under ``extra='forbid'``."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "required": ["a", "ghost"],
-    }
-    with pytest.raises(ValueError, match=r"'required' names \['ghost'\] not present"):
-        _ = model_from_json_schema(schema)
-
-
-# --- Required-but-nullable fields accept null ------------------------------
-
-
-def test_required_nullable_list_form_accepts_null() -> None:
-    """A REQUIRED field typed ``["string", "null"]`` must accept the provider's
-    ``null`` (not be mis-converted to a plain non-nullable ``str``)."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"a": {"type": ["string", "null"]}},
-        "required": ["a"],
-    }
-    model = model_from_json_schema(schema)
-    # Required: must be present...
-    assert model.model_fields["a"].is_required()
-    with pytest.raises(ValidationError):
-        _ = model()
-    # ...but null is a valid value.
-    assert _attr(model(a=None), "a") is None
-    assert _attr(model(a="x"), "a") == "x"
-
-    # An explicitly-null REQUIRED field must SURVIVE the default dump: the
-    # exclude-none scoping drops only unset *optionals*, never a required null
-    # (dropping it would break the re-validation this module exists to protect).
-    assert model(a=None).model_dump() == {"a": None}
-    assert "null" in model(a=None).model_dump_json()
-    revalidated = model.model_validate(model(a=None).model_dump())
-    assert _attr(revalidated, "a") is None
-
-
-def test_required_nullable_anyof_form_accepts_null() -> None:
-    """Same, via the ``anyOf`` + null-branch shape."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"a": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
-        "required": ["a"],
-    }
-    model = model_from_json_schema(schema)
-    assert model.model_fields["a"].is_required()
-    assert _attr(model(a=None), "a") is None
-    assert _attr(model(a="x"), "a") == "x"
-
-    # Required null survives the default dump and re-validates cleanly.
-    assert model(a=None).model_dump() == {"a": None}
-    assert model.model_validate(model(a=None).model_dump()) is not None
-
-
-def test_required_null_and_unset_optional_dump_independently() -> None:
-    """A model mixing a required-nullable null with an unset optional drops only
-    the optional — the required null stays, so the payload re-validates."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {
-            "req": {"type": ["string", "null"]},
-            "opt": {"type": "string"},
-        },
-        "required": ["req"],
-    }
-    model = model_from_json_schema(schema)
-    inst = model(req=None)
-    # Required null kept; unset optional dropped.
-    assert inst.model_dump() == {"req": None}
-    # Escape hatch still surfaces every null.
-    assert inst.model_dump(exclude_none=False) == {"req": None, "opt": None}
-    # Native "drop all nulls" remains available when explicitly requested.
-    assert inst.model_dump(exclude_none=True) == {}
-    # The default payload re-validates against the same model.
-    assert model.model_validate(inst.model_dump()).model_dump() == {"req": None}
-
-
-# --- anyOf/oneOf nullable shape (optional) ---------------------------------
-
-
-def test_optional_nullable_anyof_excluded_when_unset() -> None:
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"a": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
-    }
-    model = model_from_json_schema(schema)
-    assert not model.model_fields["a"].is_required()
-    inst = model()
-    assert _attr(inst, "a") is None
-    assert inst.model_dump() == {}
-    assert _attr(model(a=5), "a") == 5
-
-
-def test_optional_nullable_oneof_excluded_when_unset() -> None:
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"a": {"oneOf": [{"type": "string"}, {"type": "null"}]}},
-    }
-    model = model_from_json_schema(schema)
-    assert not model.model_fields["a"].is_required()
-    assert model().model_dump() == {}
-    assert _attr(model(a="hi"), "a") == "hi"
-
-
-# --- Integer enums ---------------------------------------------------------
-
-
-def test_integer_enum_accepts_rejects_and_dumps_raw_int() -> None:
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"level": {"enum": [1, 2, 3]}},
-        "required": ["level"],
-    }
-    model = model_from_json_schema(schema)
-    inst = model(level=2)
-    # Dumps as a raw int — enum fields are ``Literal`` annotations, so an
-    # instance holds the scalar itself, never an Enum member.
-    dumped = inst.model_dump()
-    assert dumped["level"] == 2
-    assert isinstance(dumped["level"], int)
-    assert "2" in model(level=2).model_dump_json()
-    assert not isinstance(dumped["level"], Enum)
-    # Out-of-enum value rejected.
-    with pytest.raises(ValidationError):
-        _ = model(level=9)
-
-
-def test_signed_integer_enum_builds_and_dumps_raw() -> None:
-    """A non-contiguous integer enum with a negative sentinel (FiW's eval-judge
-    schema) must build without raising and round-trip as raw ints.
-
-    Historically this shape stressed Enum member-name mangling (``-1`` and
-    ``1`` collided into a reserved ``_sunder_`` name); the ``Literal``
-    annotation has no member names to mangle, but the shape stays covered."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"score": {"type": "integer", "enum": [-1, 1, 2, 3, 4, 5]}},
-        "required": ["score"],
-    }
-    model = model_from_json_schema(schema)  # must not raise
-    # Every member is accepted and the non-contiguous gaps are rejected.
-    for value in (-1, 1, 2, 3, 4, 5):
-        dumped: dict[str, object] = model(score=value).model_dump()
-        assert dumped == {"score": value}
-        assert type(dumped["score"]) is int  # raw scalar, not an Enum member
-    for bad in (0, -2, 6):
-        with pytest.raises(ValidationError):
-            _ = model(score=bad)
-
-
-def test_enum_annotation_is_inline_literal_with_every_member() -> None:
-    """An enum field's annotation is ``Literal[...]`` — no generated ``Enum``
-    class, so no member-name mangling to get wrong: every schema value
-    survives as itself, in order, including the negative / digit-led /
-    would-collide values that used to stress the mangler."""
+def test_large_integer_number_const_does_not_coerce_to_float() -> None:
     model = model_from_json_schema(
         {
             "type": "object",
-            "properties": {"v": {"type": "integer", "enum": [-1, 0, 1, -2, 2]}},
-            "required": ["v"],
+            "properties": {"x": {"type": "number", "const": 9007199254740993}},
+            "required": ["x"],
         }
     )
-    annotation = model.model_fields["v"].annotation
-    assert get_origin(annotation) is Literal
-    assert get_args(annotation) == (-1, 0, 1, -2, 2)
+    result = model.model_validate_json('{"x":9007199254740993}')
+    assert result.root["x"] == 9007199254740993
+    assert type(result.root["x"]) is int
+    assert json.loads(result.model_dump_json())["x"] == 9007199254740993
 
 
-def test_int_enum_rejects_numeric_string() -> None:
-    """A quoted number (``"2"``) is REJECTED for an integer enum — the
-    ``Literal`` annotation does not coerce, where the former int-based
-    ``Enum`` did. Deliberate strictness (documented in the changelog): a
-    strict provider guarantees a real integer on the wire, so a quoted number
-    only ever comes from a weak non-strict model, which should hit
-    instructor's re-ask rather than slide through."""
+@pytest.mark.parametrize("raw", ['{"x":NaN}', '{"x":Infinity}', '{"x":-Infinity}', '{"x":1e400}'])
+def test_nonfinite_numbers_are_rejected(raw: str) -> None:
+    model = model_from_json_schema({"type": "object"})
+    with pytest.raises(ValidationError):
+        _ = model.model_validate_json(raw)
+
+
+def test_existing_instance_revalidation() -> None:
+    model = model_from_json_schema({"type": "object", "properties": {"x": {"const": 1}}})
+    instance = model.model_validate({"x": 1})
+    assert model.model_validate(instance).root == {"x": 1}
+    instance.root["x"] = 2
+    with pytest.raises(ValidationError):
+        _ = model.model_validate(instance)
+
+
+def test_required_unknown_vocabulary_fails_at_its_location() -> None:
+    with pytest.raises(ValueError, match="vocabulary"):
+        _ = model_from_json_schema(
+            {"type": "object", "$vocabulary": {"https://example.com/required": True}}
+        )
+    model = model_from_json_schema(
+        {"type": "object", "$vocabulary": {"https://example.com/optional": False}}
+    )
+    assert model.model_validate({}).root == {}
+
+
+def test_scoped_ids_and_anchors_resolve_offline() -> None:
     model = model_from_json_schema(
         {
+            "$id": "https://example.com/root",
             "type": "object",
-            "properties": {"score": {"type": "integer", "enum": [-1, 1, 2, 3, 4, 5]}},
-            "required": ["score"],
-        }
-    )
-    assert model(score=2).model_dump() == {"score": 2}
-    with pytest.raises(ValidationError):
-        _ = model(score="2")
-
-
-# --- Canonical nullable enum (null as an enum member) ----------------------
-
-
-def test_nullable_enum_list_form_accepts_members_and_null() -> None:
-    """The canonical nullable-enum spelling — ``type: ["string", "null"]`` with
-    ``null`` as an enum member — must build a nullable enum that accepts every
-    string member AND an actual ``null`` (JSON Schema requires ``null`` in the
-    ``enum`` list for it to validate)."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"choice": {"type": ["string", "null"], "enum": ["a", "b", None]}},
-        "required": ["choice"],
-    }
-    model = model_from_json_schema(schema)
-    # Required field, but null is one of its valid values.
-    assert model.model_fields["choice"].is_required()
-    for value in ("a", "b"):
-        assert _attr(model(choice=value), "choice") == value
-    assert _attr(model(choice=None), "choice") is None
-    # An out-of-enum string is still rejected — null didn't widen the field.
-    with pytest.raises(ValidationError):
-        _ = model(choice="c")
-    # A real null round-trips: it survives the default dump and re-validates.
-    assert model(choice=None).model_dump() == {"choice": None}
-    revalidated = model.model_validate(model(choice=None).model_dump())
-    assert _attr(revalidated, "choice") is None
-    assert _attr(model.model_validate({"choice": "a"}), "choice") == "a"
-
-
-def test_nullable_enum_anyof_form_accepts_members_and_null() -> None:
-    """Same canonical spelling via the ``anyOf`` + null-branch shape: the
-    non-null branch carries a ``null``-bearing enum, handled consistently."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {
-            "choice": {"anyOf": [{"type": "string", "enum": ["a", "b", None]}, {"type": "null"}]}
-        },
-        "required": ["choice"],
-    }
-    model = model_from_json_schema(schema)
-    assert _attr(model(choice="a"), "choice") == "a"
-    assert _attr(model(choice=None), "choice") is None
-    with pytest.raises(ValidationError):
-        _ = model(choice="c")
-    assert model(choice=None).model_dump() == {"choice": None}
-
-
-def test_non_nullable_enum_with_null_member_raises() -> None:
-    """A ``null`` enum member on a field whose type is NOT nullable is a
-    contradiction (an enum that permits ``null`` but a type that forbids it).
-    It must fail loud naming the field path — not silently drop the ``null``."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"choice": {"type": "string", "enum": ["a", None]}},
-        "required": ["choice"],
-    }
-    with pytest.raises(ValueError, match=r"choice"):
-        _ = model_from_json_schema(schema)
-
-
-def test_nullable_enum_with_only_null_member_raises() -> None:
-    """A nullable enum whose only member is ``null`` collapses to an empty value
-    list once ``null`` is dropped — it must fail loud (no empty ``Enum``) with a
-    message naming the ACTUAL defect (only-null members), not the misleading
-    "must be a non-empty list" the post-strip emptiness used to produce."""
-    schema: dict[str, object] = {
-        "title": "M",
-        "type": "object",
-        "properties": {"choice": {"type": ["string", "null"], "enum": [None]}},
-        "required": ["choice"],
-    }
-    with pytest.raises(ValueError, match=r"non-null member.*only null"):
-        _ = model_from_json_schema(schema)
-
-
-# --- $defs sharing a title must NOT collapse to one class ------------------
-
-
-def test_distinct_defs_with_same_title_stay_distinct() -> None:
-    """Two structurally-different $defs that happen to share a ``title`` must
-    resolve to DIFFERENT classes — not silently collapse to one (a wrong
-    model the task forbids)."""
-    schema: dict[str, object] = {
-        "title": "Pair",
-        "type": "object",
-        "properties": {"a": {"$ref": "#/$defs/A"}, "b": {"$ref": "#/$defs/B"}},
-        "required": ["a", "b"],
-        "$defs": {
-            "A": {
-                "title": "Item",
-                "type": "object",
-                "properties": {"x": {"type": "string"}},
-                "required": ["x"],
+            "$defs": {
+                "scope": {
+                    "$id": "child",
+                    "$defs": {"n": {"$anchor": "number", "type": "integer"}},
+                    "type": "object",
+                    "properties": {"n": {"$ref": "#number"}},
+                }
             },
-            "B": {
-                "title": "Item",
-                "type": "object",
-                "properties": {"y": {"type": "integer"}},
-                "required": ["y"],
-            },
-        },
+            "properties": {"child": {"$ref": "child"}},
+        }
+    )
+    assert model.model_validate({"child": {"n": 1}}).root == {"child": {"n": 1}}
+    with pytest.raises(ValidationError):
+        _ = model.model_validate({"child": {"n": "1"}})
+
+
+def test_escaped_json_pointer_names() -> None:
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "$defs": {"a/b~c": {"type": "integer"}},
+            "properties": {"x/y~z": {"$ref": "#/$defs/a~1b~0c"}},
+        }
+    )
+    assert model.model_validate({"x/y~z": 1}).root == {"x/y~z": 1}
+    assert model.model_json_schema()["properties"] == {"x/y~z": {"type": "integer"}}
+    with pytest.raises(ValidationError):
+        _ = model.model_validate({"x/y~z": "1"})
+
+
+@pytest.mark.parametrize("target", [True, False])
+def test_root_boolean_reference_has_clear_object_root_error(target: bool) -> None:
+    with pytest.raises(ValueError, match="top level must be an object"):
+        _ = model_from_json_schema({"$ref": "#/$defs/root", "$defs": {"root": target}})
+
+
+def test_default_json_is_validated_after_serialization() -> None:
+    from pydantic import model_serializer
+
+    base = model_from_json_schema(
+        {"type": "object", "required": ["x"], "properties": {"x": {"type": "null"}}}
+    )
+
+    from llmkit.json_schema.emitted import JsonSchemaModel
+
+    class LosingNull(JsonSchemaModel):
+        @model_serializer
+        def lose_null(self) -> dict[str, object]:
+            return {key: value for key, value in self.root.items() if value is not None}
+
+    LosingNull.__llmkit_validate__ = staticmethod(base.__llmkit_validate__)
+    # Input satisfies the schema. A lossy serializer must not escape merely
+    # because the input was valid; the actual default JSON bytes are checked.
+    with pytest.raises(ValidationError):
+        _ = LosingNull.model_validate({"x": None})
+
+
+def test_invalid_input_is_checked_before_field_coercion() -> None:
+    model = model_from_json_schema({"type": "object", "properties": {"x": {"type": "integer"}}})
+    with pytest.raises(ValidationError):
+        _ = model.model_validate({"x": "1"})
+
+
+@pytest.mark.parametrize("keyword", ["items", "dependentSchemas"])
+def test_2019_subschema_references_are_checked_at_construction(keyword: str) -> None:
+    node: object = (
+        [{"$ref": "https://example.com/unavailable"}]
+        if keyword == "items"
+        else {"x": {"$ref": "https://example.com/unavailable"}}
+    )
+    schema: dict[str, object] = {
+        "$schema": "https://json-schema.org/draft/2019-09/schema",
+        "type": "object",
+        "properties": {"array": {keyword: node}},
+    }
+    with pytest.raises(ValueError, match=r"Unresolvable.*properties/array"):
+        _ = model_from_json_schema(schema)
+
+
+def test_2019_prefixitems_payload_is_an_annotation() -> None:
+    schema: dict[str, object] = {
+        "$schema": "https://json-schema.org/draft/2019-09/schema",
+        "type": "object",
+        "prefixItems": [{"$ref": "https://example.com/unavailable", "pattern": "["}],
     }
     model = model_from_json_schema(schema)
-    # Distinct classes despite the shared title.
-    assert model.model_fields["a"].annotation is not model.model_fields["b"].annotation
-    # And each validates against its OWN shape.
-    inst = model(a={"x": "hello"}, b={"y": 5})
-    assert inst.model_dump() == {"a": {"x": "hello"}, "b": {"y": 5}}
-    # b validated against A's shape would have passed wrongly; assert it fails.
-    with pytest.raises(ValidationError):
-        _ = model(a={"x": "hello"}, b={"x": "wrong"})
+    assert model.model_validate({}).root == {}
+    assert model.model_json_schema()["prefixItems"] == schema["prefixItems"]
 
 
-# --- Recursive / self-referential schema fails loud ------------------------
+def test_draft7_dynamicref_is_an_annotation() -> None:
+    model = model_from_json_schema(
+        {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "$dynamicRef": "https://example.com/unavailable",
+        }
+    )
+    assert model.model_validate({}).root == {}
+    assert model.model_json_schema()["$dynamicRef"] == "https://example.com/unavailable"
 
 
-def test_self_referential_schema_raises_clear_value_error() -> None:
-    """A self-referential (tree/Node) schema must raise a clear ValueError
-    naming the recursive $ref — never a RecursionError."""
-    schema: dict[str, object] = {
-        "title": "Node",
-        "type": "object",
-        "properties": {
-            "value": {"type": "string"},
-            "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}},
-        },
-        "required": ["value"],
-        "$defs": {
-            "Node": {
-                "title": "Node",
+def test_nested_different_dialect_is_rejected_with_location() -> None:
+    with pytest.raises(ValueError, match=r"properties/x.*\$schema"):
+        _ = model_from_json_schema(
+            {
                 "type": "object",
                 "properties": {
-                    "value": {"type": "string"},
-                    "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}},
+                    "x": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                    }
                 },
-                "required": ["value"],
             }
-        },
-    }
-    with pytest.raises(ValueError, match="recursive"):
-        _ = model_from_json_schema(schema)
-
-
-def test_mutually_recursive_schema_raises_clear_value_error() -> None:
-    schema: dict[str, object] = {
-        "title": "A",
-        "type": "object",
-        "properties": {"b": {"$ref": "#/$defs/B"}},
-        "required": ["b"],
-        "$defs": {
-            "A": {
-                "title": "A",
-                "type": "object",
-                "properties": {"b": {"$ref": "#/$defs/B"}},
-                "required": ["b"],
-            },
-            "B": {
-                "title": "B",
-                "type": "object",
-                "properties": {"a": {"$ref": "#/$defs/A"}},
-                "required": ["a"],
-            },
-        },
-    }
-    with pytest.raises(ValueError, match="recursive"):
-        _ = model_from_json_schema(schema)
-
-
-def test_deep_ref_chain_resolves() -> None:
-    """A ``$ref`` chain deeper than two hops resolves to the final scalar
-    rather than falling through to the self-contradictory "no 'type'" error."""
-    schema: dict[str, object] = {
-        "title": "Deep",
-        "type": "object",
-        "properties": {"x": {"$ref": "#/$defs/A"}},
-        "required": ["x"],
-        "$defs": {
-            "A": {"$ref": "#/$defs/B"},
-            "B": {"$ref": "#/$defs/C"},
-            "C": {"type": "integer"},
-        },
-    }
-    model = model_from_json_schema(schema)
-    assert model.model_fields["x"].annotation is int
-
-
-def test_pure_ref_cycle_raises_clear_value_error() -> None:
-    """A cycle made only of ``$ref``s (no object in between) fails with the
-    recursive-schema error, never an infinite loop or the "no 'type'" message."""
-    schema: dict[str, object] = {
-        "title": "Loop",
-        "type": "object",
-        "properties": {"x": {"$ref": "#/$defs/A"}},
-        "required": ["x"],
-        "$defs": {
-            "A": {"$ref": "#/$defs/B"},
-            "B": {"$ref": "#/$defs/A"},
-        },
-    }
-    with pytest.raises(ValueError, match="recursive"):
-        _ = model_from_json_schema(schema)
-
-
-@pytest.mark.parametrize("reserved", ["_id", "model_config", "model_dump", "model_fields"])
-def test_reserved_property_name_raises_clear_value_error(reserved: str) -> None:
-    """A genuinely-breaking property name — leading underscore (silently dropped
-    as a private attribute) or the ``model_`` protected namespace (TypeError /
-    conflicts-with-member errors, or shadowed model machinery) — fails with a
-    clear ValueError naming the property and its path."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {reserved: {"type": "string"}},
-        "required": [reserved],
-    }
-    with pytest.raises(ValueError, match=rf"Unsupported property '{reserved}' at"):
-        _ = model_from_json_schema(schema)
-
-
-def test_v1_shim_property_names_build_and_round_trip() -> None:
-    """Names that shadow pydantic's deprecated v1 shims (``schema``, ``json``,
-    ``copy``, ...) are perfectly good fields — the reserved-name guard lets them
-    through, and the shadow ``UserWarning`` pydantic emits for them is
-    suppressed so a legitimate schema builds without warning spam."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"schema": {"type": "string"}, "json": {"type": "string"}},
-        "required": ["schema", "json"],
-    }
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")  # any leaked UserWarning fails the build
-        model = model_from_json_schema(schema)
-    inst = model.model_validate({"schema": "s", "json": "j"})
-    assert inst.model_dump() == {"schema": "s", "json": "j"}
-    # And the dump re-validates — a full round-trip through the shim names.
-    assert model.model_validate(inst.model_dump()).model_dump() == {"schema": "s", "json": "j"}
-
-
-@pytest.mark.parametrize("keyword", ["anyOf", "oneOf"])
-def test_non_dict_union_branch_raises_clear_value_error(keyword: str) -> None:
-    """A non-dict branch in ``anyOf``/``oneOf`` (e.g. the bare string ``"string"``)
-    fails with a clear ValueError naming the keyword and path, not an
-    ``AttributeError`` from calling ``.get`` on a ``str``."""
-    schema: dict[str, object] = {
-        "type": "object",
-        "properties": {"x": {keyword: ["string", {"type": "null"}]}},
-        "required": ["x"],
-    }
-    with pytest.raises(ValueError, match=rf"Unsupported {keyword} branch at"):
-        _ = model_from_json_schema(schema)
-
-
-# --- Round-trip through structured_llm_call against a faked transport -------
-
-
-def test_round_trip_through_structured_call() -> None:
-    """A representative schema drives ``structured_llm_call`` against a faked
-    provider and returns the validated instance — the build-once model is
-    passed straight in as ``output_schema``."""
-    model = model_from_json_schema(_INVOICE_SCHEMA)
-
-    answer = {
-        "id": "INV-9",
-        "total": 99.5,
-        "status": "closed",
-        "customer": {"name": "Globex", "vip": True},
-        "lines": [{"sku": "Z", "qty": 3}],
-    }
-    with install(lambda _request: Reply.text(json.dumps(answer))) as installed:
-        result = asyncio.run(
-            llm_calls.structured_llm_call("Extract the invoice.", model, feature="billing")
         )
 
-    # The request carries exactly the generated model as its output schema.
-    assert [r.output_schema for r in installed.requests] == [model]
-    assert _attr(result, "id") == "INV-9"
-    assert _attr(result, "status") == "closed"
-    # Omitted optionals stay absent on the way back out.
-    dumped = result.model_dump()
-    assert "note" not in dumped
-    assert dumped["customer"] == {"name": "Globex", "vip": True}
 
-
-def test_build_once_model_reused_across_calls() -> None:
-    """The same generated model object can be reused across multiple calls
-    (build-once-reuse pattern) — no per-call rebuild required."""
-    model = model_from_json_schema(_INVOICE_SCHEMA)
-    answer: dict[str, object] = {
-        "id": "X",
-        "total": 1.0,
-        "status": "open",
-        "customer": {"name": "N"},
-        "lines": [],
+def test_draft7_vocabulary_is_an_unknown_annotation() -> None:
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "$vocabulary": {"https://example.test/custom": True},
     }
+    model = model_from_json_schema(schema)
+    assert model.model_validate({}).root == {}
+    assert model.model_json_schema()["$vocabulary"] == schema["$vocabulary"]
 
-    def fake(_request: TransportRequest) -> Reply:
-        return Reply.text(json.dumps(answer))
 
-    with install(fake) as installed:
-        for _ in range(3):
-            _ = asyncio.run(llm_calls.structured_llm_call("go", model, feature="billing"))
+def test_relative_root_id_is_not_applied_twice() -> None:
+    model = model_from_json_schema(
+        {
+            "$id": "schemas/root.json",
+            "type": "object",
+            "$defs": {"value": {"type": "integer"}},
+            "properties": {"x": {"$ref": "#/$defs/value"}},
+        }
+    )
+    assert model.model_validate({"x": 1}).root == {"x": 1}
+    assert model.model_json_schema()["properties"] == {"x": {"type": "integer"}}
 
-    seen = [r.output_schema for r in installed.requests]
-    assert len(seen) == 3
-    assert all(s is model for s in seen)  # the very same object each time
+
+def test_reference_to_nonschema_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match="not a schema"):
+        _ = model_from_json_schema(
+            {
+                "type": "object",
+                "x-annotation": 3,
+                "properties": {"x": {"$ref": "#/x-annotation"}},
+            }
+        )
+
+
+def test_shared_annotation_values_are_never_rewritten_as_schemas() -> None:
+    child = {"$ref": "#/$defs/value"}
+    model = model_from_json_schema(
+        {
+            "type": "object",
+            "$defs": {"value": {"type": "integer"}},
+            "properties": {"x": child},
+            "x-annotation": {"payload": child},
+        }
+    )
+    assert model.model_json_schema()["x-annotation"] == {"payload": child}
+
+
+def test_draft7_mixed_dependencies_check_every_schema() -> None:
+    with pytest.raises(ValueError, match="Unresolvable"):
+        _ = model_from_json_schema(
+            {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "dependencies": {"a": ["b"], "x": {"$ref": "https://unavailable.example/schema"}},
+            }
+        )

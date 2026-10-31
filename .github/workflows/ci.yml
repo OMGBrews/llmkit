@@ -76,17 +76,14 @@ jobs:
   floors:
     # Lowest declared direct-dependency versions (`--resolution lowest-direct`).
     # Guards the compatibility floors in pyproject.toml: if a change starts
-    # relying on a newer-than-floor API of litellm/instructor/pydantic, this job
+    # relying on a newer-than-floor API of the direct dependencies, this job
     # fails instead of the declared floor quietly becoming a lie a fresh
     # `pip install` would resolve into. The critical 0.7.0 mode-pin break was a
     # live instance of exactly this — an untested resolution shipping broken.
     #
     # pytest only, not the full gate — the floors' value is the *runtime* signal.
-    # basedpyright is deliberately excluded: json_schema.py's `_DumpKwargs`
-    # TypedDict mirrors *current* pydantic's dump surface (a documented superset
-    # that is never actually passed at runtime), so type-checking against the
-    # floor pydantic's stubs reports false signature-mismatch errors. Ruff and
-    # format are dependency-independent and already covered by `check`.
+    # Test direct dependency floors, including jsonschema and referencing.
+    # Ruff, formatting and types run in the normal-resolution check job.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

@@ -90,6 +90,11 @@ class LLMCallRecord:
     A ``None`` ``run_id`` is the pre-``run_id`` shape of every record, YAML
     body and index line.
 
+    ``response`` contains plain JSON data for structured output, including
+    schema-backed roots with nested dictionaries, lists, and explicit nulls;
+    text calls store text. Tool-compose records likewise dump the parsed model
+    rather than rendering its Python representation.
+
     The remaining fields are the call's own identity and request shape:
     ``started_at`` (UTC, when the attempt began), ``feature`` / ``label`` (the
     caller-supplied telemetry pair that scopes the log filename and the

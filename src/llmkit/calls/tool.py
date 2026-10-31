@@ -30,7 +30,7 @@ from llmkit.calls._shared import (
     usage_log_dict,
 )
 from llmkit.capture import record_call_async
-from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError
+from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError, SchemaEngineError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
@@ -200,6 +200,8 @@ async def tool_llm_call[T: BaseModel](
                     raise ResultValidationError("compose response had neither tool calls nor text")
                 try:
                     parsed = output_schema.model_validate_json(text)
+                except SchemaEngineError:
+                    raise
                 except Exception as exc:
                     raise ResultValidationError(
                         f"compose response failed validation: {exc}"

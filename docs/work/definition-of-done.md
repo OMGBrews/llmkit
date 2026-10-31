@@ -77,7 +77,7 @@ siblings), and `ci-ok` succeeds only when every CI job does.
     dependencies. Keep `--no-sync`: without it `uv run` re-resolves at the highest
     versions and reinstalls them before the tests run.
   - Applies to: any change to `pyproject.toml` or to code that may rely on a newer
-    `litellm`, `instructor` or `pydantic` API than the declared floor.
+    `litellm`, `instructor`, `pydantic`, `jsonschema` or `referencing` API than the declared floor.
   - Evidence type: automated
   - Enforcement: procedural
   - Evidence state: available

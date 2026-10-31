@@ -178,3 +178,44 @@ def test_feature_and_label_are_not_inputs() -> None:
     """Telemetry is not part of the request, so it is not a parameter."""
     with pytest.raises(TypeError):
         _ = _key(feature="extraction")
+
+
+def test_hidden_contract_changes_key_without_changing_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local validation policy remains part of identity after wire adaptation."""
+    contract: dict[str, object] = {"schema": {"pattern": "a"}, "assert_formats": False}
+
+    def identity(_cls: type[BaseModel]) -> dict[str, object]:
+        return contract
+
+    monkeypatch.setattr(
+        _Verdict, "__llmkit_contract_identity__", classmethod(identity), raising=False
+    )
+    original = _key()
+    contract["schema"] = {"pattern": "b"}
+    assert _key() != original
+    changed_schema = _key()
+    contract["assert_formats"] = True
+    assert _key() != changed_schema
+
+
+def test_real_schema_contracts_and_format_policies_separate_identical_guidance() -> None:
+    from llmkit import model_from_json_schema
+
+    def schema(minimum: int) -> dict[str, object]:
+        return {
+            "type": "object",
+            "$defs": {"n": {"type": "integer", "minimum": minimum}},
+            "properties": {"x": {"$ref": "#/$defs/n", "minimum": 1}},
+        }
+
+    first = model_from_json_schema(schema(5))
+    second = model_from_json_schema(schema(10))
+    assert first.model_json_schema() == second.model_json_schema()
+    assert _key(output_schema=first) != _key(output_schema=second)
+    formatted = {"type": "object", "properties": {"x": {"format": "email"}}}
+    annotation = model_from_json_schema(formatted)
+    assertion = model_from_json_schema(formatted, assert_formats=True)
+    assert annotation.model_json_schema() == assertion.model_json_schema()
+    assert _key(output_schema=annotation) != _key(output_schema=assertion)
