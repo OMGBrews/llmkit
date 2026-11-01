@@ -30,12 +30,10 @@ def test_signatures_expose_timeout() -> None:
         calls.text_llm_call_stream,
         calls.stream_text_with_log,
         calls.tool_llm_call,
+        calls.tool_llm_call_sync,
         calls.tool_llm_call_stream,
     ):
         assert "timeout" in inspect.signature(surface).parameters
-    # The sync tool implementation forwards dynamically; its overloads are
-    # checked by _typecheck_timeout_accepted_on_every_lane.
-    assert "kwargs" in inspect.signature(calls.tool_llm_call_sync).parameters
 
 
 @pytest.mark.parametrize(

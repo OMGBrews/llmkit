@@ -49,6 +49,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`tool_llm_call_sync` declares its parameters.** It used to accept
+  `*args, **kwargs` and forward them, so introspection, editors and runtime
+  argument errors saw no keywords. It now lists the same parameters as
+  `tool_llm_call`, and a new test compares every sync form's signature with
+  its async form's, so a keyword added to one side alone fails the suite.
+
 - **Breaking: JSON-schema contracts now return schema-backed root models.**
   `model_from_json_schema` validates an immutable snapshot with `jsonschema`
   (draft-07, 2019-09, or 2020-12; default 2020-12), replacing the handwritten
