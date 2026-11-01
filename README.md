@@ -1463,6 +1463,8 @@ The re-roll is charged against the **validation budget** (`RetryPolicy.validatio
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 
+The hook runs inside the call, on the event loop the call runs on, so keep it quick and non-blocking. A hook that blocks stalls that whole loop. For the sync wrappers that loop is llmkit's own, which every concurrent sync call shares, so a blocking hook in one sync call delays all the others, not only its own.
+
 ## Testing your app with a fake transport
 
 `llmkit.testing` lets your own tests answer llmkit's calls without a provider. Install a fake, and every call made while it is in place reaches the fake instead of the network. Everything around the provider round trip still runs: option merging, the response cache, the rate limiter and circuit breaker, retries, schema parsing and in-call repair, tool-argument parsing, and the call log.
