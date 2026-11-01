@@ -338,9 +338,8 @@ def tool_llm_call_sync[T: BaseModel](
     result. Every argument is forwarded untouched.
 
     ``timeout`` is seconds for one provider round trip; unset or ``None``
-    sends no timeout keyword. The sync bridge's separate 600-second whole-call
-    ceiling still applies: a larger per-request timeout cannot extend it,
-    and retries can reach that ceiling before their request timeout expires.
+    sends no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
+    async form, the per-request timeout and the retry budget bound the call.
     """
     return run_sync(
         tool_llm_call(
@@ -360,5 +359,6 @@ def tool_llm_call_sync[T: BaseModel](
             # The cast only selects an overload for the type checker; the
             # implementation takes ``None`` and returns a ToolCallResult.
             output_schema=cast("type[T]", output_schema),
-        )
+        ),
+        timeout=None,
     )

@@ -476,10 +476,9 @@ rate-limiter slot or retry backoff sleeps. Timeout errors are transport errors
 and are retried with a fresh timeout per attempt; pass `retry=NO_RETRY` to
 turn those retries off.
 
-The sync wrappers still have the sync bridge's separate 600-second whole-call
-ceiling. A per-request timeout above that ceiling cannot extend the sync wait,
-and retries or queue waits can exhaust the bridge ceiling before a request's
-own timeout. This setting is not a whole-call deadline.
+The sync wrappers behave the same way: the sync bridge adds no whole-call
+ceiling of its own. This setting is not a whole-call deadline on either form;
+the retry budget and each request's timeout are what bound a call.
 
 ### Contracts as JSON-schema dicts
 

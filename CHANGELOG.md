@@ -16,8 +16,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Per-request `timeout` on every call function and `LLMCallOptions`.** Pass
   seconds to bound each provider round trip; unset or `None` sends no timeout
   keyword and preserves LiteLLM's default. Transport retries each get a fresh
-  timeout. Streams bound connection and each chunk wait, and sync wrappers
-  retain their separate 600-second whole-call ceiling. The fake transport
+  timeout. Streams bound connection and each chunk wait. The fake transport
   exposes the resolved value without enforcing it.
 
 - **A dropped `temperature` is now logged.** When a model refuses the
@@ -98,6 +97,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that overrides `write_returning_path` is no longer called by the configured
   write path. Direct calls to `write` and `write_returning_path` behave as
   before.
+
+- **Breaking: the sync wrappers no longer impose a 600-second whole-call
+  ceiling.** `structured_llm_call_sync`, `text_llm_call_sync` and
+  `tool_llm_call_sync` used to wait at most 600 seconds at the sync bridge and
+  then cancel the call with a builtin `TimeoutError`, a limit the async calls
+  do not have; it could expire while transport retries were still within
+  their budget. A sync call is now bounded exactly as its async form is, by
+  the per-request `timeout` and the retry budget. `run_sync` itself keeps its
+  600-second default for direct callers, and the loop-on-loop fallback's
+  logging drains now have their own 10-second bound. **Migration:** a caller
+  that relied on the ceiling passes `timeout=` per request, or wraps the call
+  in its own deadline.
 
 ### Removed
 

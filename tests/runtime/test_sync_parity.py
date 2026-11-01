@@ -210,3 +210,32 @@ def test_a_bridge_that_bypasses_the_persistent_loop_fails(
     monkeypatch.setattr(text_module, "run_sync", fresh_loop)
     with pytest.raises(AssertionError, match="persistent loop"):
         _check_sync_lane_drives_async_path(_text)
+
+
+# --- No added ceiling ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lane", sorted(_LANES))
+def test_sync_form_adds_no_whole_call_ceiling(lane: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sync call may outlast ``run_sync``'s default wait, as the async call may.
+
+    The default is shrunk below the fake's reply delay: the wrapper still
+    returns, while a direct ``run_sync`` of the same length times out.
+    """
+    import llmkit.sync as sync_module
+
+    monkeypatch.setattr(sync_module, "_DEFAULT_TIMEOUT_SECONDS", 0.05)
+
+    def slow(request: TransportRequest) -> Reply:
+        answer = _answer(request)
+        return Reply(
+            content=answer.content,
+            tool_calls=answer.tool_calls,
+            delay=0.3,
+        )
+
+    with install(slow):
+        assert _LANES[lane]() is not None
+
+    with pytest.raises(TimeoutError):
+        run_sync(asyncio.sleep(0.3))
