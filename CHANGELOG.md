@@ -128,6 +128,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Removed
 
+- **Breaking: `stream_text_with_log` is removed.** The pre-1.0 name for
+  `text_llm_call_stream` warned `DeprecationWarning` since its rename and was
+  scheduled for removal; it goes in this breaking release rather than waiting
+  for 1.0. **Migration:** call `text_llm_call_stream` with the same arguments.
+
 - **Breaking: `OpenRouterProvider` no longer accepts `require_parameters`.**
   The keyword was a direct-construction-only way to turn off OpenRouter's
   `provider.require_parameters` routing preference, which keeps a structured

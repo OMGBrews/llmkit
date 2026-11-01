@@ -188,10 +188,6 @@ bridges a coroutine; an async generator is not one, and there is no way to hand
 a synchronous caller a lazily-produced stream without inventing a thread-backed
 iterator llmkit deliberately does not own. Consume them from async code.
 
-> **Deprecated alias.** `stream_text_with_log` is the old name for
-> `text_llm_call_stream`; it still works (same signature and behaviour) but
-> warns `DeprecationWarning` and is removed in 1.0. Switch the call.
-
 `prompt` is typed `str | Sequence[ChatMessage]` on all call functions. A plain string is sent as-is; the sequence form is a conversation, where `ChatMessage` is `Message | AssistantToolMessage | ToolResultMessage`:
 
 - `llmkit.Message` — a `TypedDict` whose `role` is `"system"`, `"user"`, or `"assistant"` and whose `content` is either a string or a list of content-part dicts, the multimodal shape LiteLLM accepts (`{"type": "text", ...}`, `{"type": "image_url", ...}`), forwarded verbatim;
@@ -452,7 +448,7 @@ llmkit chooses no temperature of its own (`DEFAULT_TEMPERATURE` is `None`), so t
 reaches the provider; the exception is Gemini 3 on Google AI Studio and Google's Agent Platform,
 where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
-`None` is accepted on every call surface — structured, plain-text, streaming, tool calls, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
+`None` is accepted on every call surface — structured, plain-text, streaming, tool calls, and the sync wrappers — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
 
 **A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for, and the `llmkit._litellm` logger warns the first time each model refuses, naming the model and the dropped value; later drops for that model log at DEBUG. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
 
@@ -460,8 +456,8 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
 ### Per-request timeout
 
-Every call function, including the sync wrappers and the deprecated
-`stream_text_with_log` alias, accepts `timeout` in seconds, directly or through
+Every call function, including the sync wrappers, accepts `timeout` in
+seconds, directly or through
 `LLMCallOptions(timeout=30.0)`. A number is forwarded to LiteLLM; unset or
 `None` sends no `timeout` keyword, leaving LiteLLM's request timeout in force
 (600 seconds by default, or its `REQUEST_TIMEOUT` environment setting).

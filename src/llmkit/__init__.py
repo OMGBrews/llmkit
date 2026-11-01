@@ -44,7 +44,6 @@ from llmkit.cache import (
 )
 from llmkit.calls import (
     STREAM_ABANDONED_ERROR,
-    stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
@@ -204,8 +203,6 @@ __all__ = [
     "tool_llm_call",
     "tool_llm_call_stream",
     "tool_llm_call_sync",
-    # Deprecated pre-1.0 alias for ``text_llm_call_stream`` (removed at 1.0).
-    "stream_text_with_log",
     "STREAM_ABANDONED_ERROR",
     "capture_llm_log_paths",
     "capture_llm_records",

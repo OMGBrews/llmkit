@@ -28,7 +28,6 @@ def test_signatures_expose_timeout() -> None:
         calls.text_llm_call,
         calls.text_llm_call_sync,
         calls.text_llm_call_stream,
-        calls.stream_text_with_log,
         calls.tool_llm_call,
         calls.tool_llm_call_sync,
         calls.tool_llm_call_stream,
@@ -167,15 +166,3 @@ def test_fake_delay_does_not_enforce_provider_timeout() -> None:
     with install(lambda _request: Reply.text("ok", delay=0.01)) as installed:
         assert calls.text_llm_call_sync("hi", feature="test", timeout=0.001) == "ok"
     assert [request.timeout for request in installed.requests] == [0.001]
-
-
-def test_deprecated_alias_forwards_timeout() -> None:
-    async def _drive() -> list[str]:
-        return [
-            chunk async for chunk in calls.stream_text_with_log("hi", feature="test", timeout=3.0)
-        ]
-
-    with install(lambda _request: Reply.text("ok")) as installed:
-        with pytest.warns(DeprecationWarning):
-            assert asyncio.run(_drive()) == ["ok"]
-    assert [request.timeout for request in installed.requests] == [3.0]

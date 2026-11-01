@@ -18,8 +18,7 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator
 
-import pytest
-
+import llmkit
 from llmkit import calls as llm_calls
 from llmkit.testing import Reply, install
 from tests._support import capture_stream_provider_kwargs, capturing_sink
@@ -99,20 +98,8 @@ def test_log_record_carries_kwargs() -> None:
     assert captured[0].reasoning_effort == "disable"
 
 
-def test_deprecated_alias_warns_at_call_time_and_matches_new_name() -> None:
-    """``stream_text_with_log`` is a deprecated alias for ``text_llm_call_stream``.
-
-    It warns ``DeprecationWarning`` **eagerly at call time** (a plain ``def``, so
-    the warning fires before the first ``__anext__``, not on first iteration) and
-    yields chunks identical to the canonical name over the same faked transport.
-    """
-    with capturing_sink(), install(lambda _request: Reply(chunks=["he", "llo"])):
-        canonical = asyncio.run(_drain(llm_calls.text_llm_call_stream("hi", feature="test")))
-        # The warning fires when the alias is *called*, before any chunk is
-        # pulled — so wrapping only the call (not the drain) captures it, which
-        # is exactly the eager-at-call-time contract.
-        with pytest.warns(DeprecationWarning, match="text_llm_call_stream"):
-            stream = llm_calls.stream_text_with_log("hi", feature="test")
-        aliased = asyncio.run(_drain(stream))
-
-    assert aliased == canonical == ["he", "llo"]
+def test_deprecated_alias_is_removed() -> None:
+    """``stream_text_with_log``, the pre-1.0 name for ``text_llm_call_stream``,
+    was removed in a breaking minor; only the canonical name remains."""
+    assert not hasattr(llm_calls, "stream_text_with_log")
+    assert "stream_text_with_log" not in llmkit.__all__
