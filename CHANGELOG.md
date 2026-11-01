@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`configure_llm_client` takes the config itself.** Pass an
+  `LLMClientConfig` directly: `configure_llm_client(LLMClientConfig(...))`.
+  Calling it again replaces the registration. The zero-argument callable
+  stays supported for a host whose config is resolved late or per context,
+  and is still re-read on every provider construction.
+
+- **`LlmkitError`, one base for every exception llmkit defines.**
+  `except LlmkitError` catches `ServiceUnavailableError`, `CircuitOpenError`,
+  `OutputLimitError`, `ToolArgumentError`, `ResultValidationError`,
+  `ComposeUnsupportedError`, `ReasoningEffortUnsupportedError`,
+  `SchemaEngineError` and the new `LLMClientNotConfiguredError`. It does not
+  catch third-party transport or validation errors; the `LLM_*_ERRORS`
+  tuples are unchanged and remain the sets for retry-shaped handling. Do not
+  list the base in `RetryPolicy.retry_on`: it would re-enable retries for
+  the subclasses that deliberately get none.
+
 - **Streamed text and tool calls now record estimated cost.** At stream end,
   use provider-reported cost or LiteLLM pricing over reported token usage,
   preserving cached-token discounts. Unknown prices remain `null`; local
@@ -122,6 +138,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `completion_kwargs`.
 
 ### Fixed
+
+- **A call made before `configure_llm_client` now fails before its first
+  attempt, and says so.** It used to run the retry loop, log a failed attempt,
+  and, on the compose form of `tool_llm_call`, report
+  `ComposeUnsupportedError` about "the configured provider" instead. Every
+  call function now raises `LLMClientNotConfiguredError` up front when it has
+  neither a registered config nor a per-call `provider=`; a stream raises it
+  on its first iteration. The class subclasses `RuntimeError`, so existing
+  handlers keep working.
 
 - `model_json_schema` on llmkit's schema-backed models accepts
   `by_alias=None`, matching pydantic 2.14's signature. Guidance now comes from

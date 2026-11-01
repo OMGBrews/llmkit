@@ -163,7 +163,39 @@ class _LiteLLMServiceUnavailableError(Exception, metaclass=_LazyServiceUnavailab
     """
 
 
-class ServiceUnavailableError(Exception):
+class LlmkitError(Exception):
+    """The base of every exception class llmkit defines.
+
+    ``except LlmkitError`` catches every failure llmkit itself raises: a
+    provider outage it normalized (:class:`ServiceUnavailableError`), its
+    own fail-fast signals (:class:`CircuitOpenError`,
+    :class:`OutputLimitError`), validation it ran
+    (:class:`ToolArgumentError`, :class:`ResultValidationError`), and its
+    configuration errors (:class:`LLMClientNotConfiguredError`,
+    :class:`ComposeUnsupportedError`, :class:`ReasoningEffortUnsupportedError`,
+    :class:`SchemaEngineError`). It does not catch the third-party errors a
+    call can also raise (``openai`` and ``httpx`` transport errors, pydantic
+    and instructor validation errors); :data:`LLM_RECOVERABLE_ERRORS` and its
+    subsets name those, and remain the sets to catch for retry-shaped policy.
+
+    Do not list this class in :attr:`~llmkit.RetryPolicy.retry_on`: retry
+    matching is ``isinstance``, so it would re-enable retries for every
+    subclass that is deliberately given no budget, such as
+    :class:`CircuitOpenError` and :class:`OutputLimitError`.
+    """
+
+
+class LLMClientNotConfiguredError(LlmkitError, RuntimeError):
+    """A call needed the registered client config and none is registered.
+
+    Raised before the first attempt when a call names no ``provider=`` and
+    :func:`~llmkit.configure_llm_client` was never called, and by any other
+    read of the registration. A :class:`RuntimeError` subclass, so code that
+    caught the earlier plain ``RuntimeError`` keeps working.
+    """
+
+
+class ServiceUnavailableError(LlmkitError):
     """A provider reported itself unavailable (HTTP 503).
 
     llmkit's **owned, catchable** form of litellm's ``ServiceUnavailableError``.
@@ -273,7 +305,7 @@ LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-class ToolArgumentError(Exception):
+class ToolArgumentError(LlmkitError):
     """A model requested an unknown tool or supplied invalid arguments."""
 
     def __init__(
@@ -316,7 +348,7 @@ REPAIRABLE_PARSE_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-class CircuitOpenError(Exception):
+class CircuitOpenError(LlmkitError):
     """Raised by the per-provider circuit breaker when it declines to admit a call.
 
     The breaker (opt-in via ``configure_rate_limit(breaker=True)``) is the
@@ -400,7 +432,7 @@ class OutputLimitDiagnostics:
         }
 
 
-class OutputLimitError(Exception):
+class OutputLimitError(LlmkitError):
     """A structured or text completion was truncated by the output-token limit.
 
     Raised by the structured path when the provider stopped generating at the
@@ -548,7 +580,7 @@ def underlying_provider_error(exc: BaseException) -> BaseException:
     return exc
 
 
-class ResultValidationError(Exception):
+class ResultValidationError(LlmkitError):
     """Raised by a call function's ``on_result`` hook to reject a result.
 
     The signal a host uses to fold an LLM-then-validate-then-re-roll loop into
@@ -567,7 +599,7 @@ class ResultValidationError(Exception):
     """
 
 
-class ComposeUnsupportedError(Exception):
+class ComposeUnsupportedError(LlmkitError):
     """Raised before transport when tools and a response schema cannot compose.
 
     This is a permanent route/model configuration error, intentionally outside
@@ -577,7 +609,7 @@ class ComposeUnsupportedError(Exception):
     """
 
 
-class ReasoningEffortUnsupportedError(Exception):
+class ReasoningEffortUnsupportedError(LlmkitError):
     """Thinking cannot be disabled, or the model's off capability is unknown.
 
     A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS``:
@@ -585,7 +617,7 @@ class ReasoningEffortUnsupportedError(Exception):
     """
 
 
-class SchemaEngineError(Exception):
+class SchemaEngineError(LlmkitError):
     """The JSON Schema validator could not evaluate the contract.
 
     A permanent engine or configuration fault, outside the repairable parse
