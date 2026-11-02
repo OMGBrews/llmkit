@@ -28,7 +28,11 @@ opposite directions, and llmkit's own concurrency shapes hit both:
   task on the persistent loop inside that copy, precisely so context-scoped
   state (the capture lists, the retry progress callback) crosses the thread
   boundary — see that module's docstring. So :func:`run_scope` reaches records
-  produced on the shared loop.
+  produced on the shared loop. A sync stream
+  (:func:`llmkit.sync.iterate_sync`, behind the ``*_stream_sync`` calls)
+  captures that copy once, when the stream is created, and runs every item
+  inside it: a scope entered between creating the stream and iterating it
+  does not reach that stream's records.
 * A ContextVar does **not** survive :class:`threading.Thread`. A new thread
   starts with a fresh empty context, so every ContextVar reads its default
   there: a run scope entered on the main thread is invisible to a worker pool

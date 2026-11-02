@@ -190,18 +190,26 @@ The public call surface:
 | `text_llm_call(prompt, *, feature, label=None, ...)` | Async, returns plain text (coerces provider list-content blocks) |
 | `text_llm_call_sync(...)` | The same call, run synchronously |
 | `text_llm_call_stream(prompt, *, feature, label=None, ...)` | Async generator yielding text chunks, logged on completion; retries only before the first chunk |
+| `text_llm_call_stream_sync(...)` | The same stream as a plain generator, one chunk per `next()` |
 | `tool_llm_call(prompt, tools, *, feature, ..., output_schema=None)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
 | `tool_llm_call_sync(...)` | The same call, run synchronously |
 | `tool_llm_call_stream(prompt, tools, *, feature, ...)` | Async generator yielding `TextDeltaEvent`s, ending with the completed `ToolCallResult`; retries only before the first event |
+| `tool_llm_call_stream_sync(...)` | The same stream as a plain generator, one item per `next()` |
 
 `feature` and everything after it are keyword-only. `feature` is the one
 required name: it groups the call's records in the logs. A sync form takes
 exactly the parameters of its async form, and a test holds every pair to
 that.
 
-**The two streaming functions have no `_sync` form yet.** Consume them from
-async code. A stream retries a transient failure only before its first item
-reaches you; see the [streaming caveat](#tuning-or-opting-out-per-call).
+**A stream's sync form is a plain generator.** `text_llm_call_stream_sync`
+and `tool_llm_call_stream_sync` yield the same items as their async forms, one
+per `next()`, and fetch each only when you ask for it. Each captures your
+context when you call it, so enter `capture_llm_records()` or a run scope
+before the call, not between the call and the loop. Leaving a `for` loop early,
+calling `close()`, or dropping the generator records the abandonment exactly as
+the async form does. Inside async code, use the async forms. A stream retries a
+transient failure only before its first item reaches you; see the
+[streaming caveat](#tuning-or-opting-out-per-call).
 
 `prompt` is typed `str | Sequence[ChatMessage]` on all call functions. A plain string is sent as-is; the sequence form is a conversation, where `ChatMessage` is `Message | AssistantToolMessage | ToolResultMessage`:
 
@@ -213,7 +221,7 @@ All three are exported so your own prompt builders can be annotated against them
 
 ### When a text answer is cut off
 
-When the provider reports that it stopped at the output-token limit (`finish_reason="length"`), `text_llm_call`, `text_llm_call_sync` and `text_llm_call_stream` raise `OutputLimitError` instead of handing back the cut-off text as if it were the whole answer — the same error a truncated structured call raises. A missing or any other finish reason is a normal answer. The cut-off text is not lost: it is on `exc.diagnostics.partial_text`, beside the finish reason and the token counts the provider reported, and in the call's log record.
+When the provider reports that it stopped at the output-token limit (`finish_reason="length"`), `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream` and `text_llm_call_stream_sync` raise `OutputLimitError` instead of handing back the cut-off text as if it were the whole answer — the same error a truncated structured call raises. A missing or any other finish reason is a normal answer. The cut-off text is not lost: it is on `exc.diagnostics.partial_text`, beside the finish reason and the token counts the provider reported, and in the call's log record.
 
 ```python
 from llmkit import OutputLimitError, text_llm_call
@@ -225,7 +233,7 @@ except OutputLimitError as exc:
     ...  # use the partial text, or raise max_tokens and call again
 ```
 
-A stream yields every chunk it received and then raises from the iteration, so catch the error around the `async for`, not the call that creates the stream. The text you already received is the partial answer:
+A stream yields every chunk it received and then raises from the iteration, so catch the error around the `async for` (or the `for` over the sync form), not the call that creates the stream. The text you already received is the partial answer:
 
 ```python
 received: list[str] = []
@@ -287,8 +295,8 @@ Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to cho
 
 ### Choosing which tool the model calls
 
-`tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream` take a
-`tool_choice=` keyword. Leave it `None` (the default) for the provider's own
+`tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and
+`tool_llm_call_stream_sync` take a `tool_choice=` keyword. Leave it `None` (the default) for the provider's own
 behaviour, or pass `"auto"`, `"none"`, `"required"`, or `ToolName("weather")` to
 force one named tool (`ToolName` is exported; `ToolChoice` is the union type). A
 route whose provider does not support `tool_choice` — Ollama — raises
@@ -321,14 +329,14 @@ async generator cannot return one. That is why the two shapes are distinct
 types: you discriminate on the type, never on position. Breaking out after the
 result is the intended way to stop, and is recorded as a *completed* call;
 leaving earlier records the partial transcript with `STREAM_ABANDONED_ERROR`,
-never a clean `ok`.
+never a clean `ok`. Blocking code gets the same items, with the same records,
+from a plain `for` over `tool_llm_call_stream_sync`.
 
-Four differences from `tool_llm_call`, all deliberate:
+Three differences from `tool_llm_call`, all deliberate:
 
 - **No `output_schema=`.** Compose is rejected at the signature, so the type
   checker enforces it rather than a runtime raise. Use the portable two-step
   pattern (tool loop, then `structured_llm_call`).
-- **No sync variant** — see the note under the call-surface table.
 - **Retries are transport-only.** As on `text_llm_call_stream`, only a
   transient failure *before the first yielded item* is retried; once anything
   has reached you, a mid-stream error propagates unretried. One consequence
@@ -414,7 +422,7 @@ Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transp
 
 ### Reusing call options
 
-The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
+The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
 from llmkit import LLMCallOptions, structured_llm_call
@@ -433,7 +441,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and both forms of the text stream; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -488,7 +496,8 @@ and are retried with a fresh timeout per attempt; pass `retry=NO_RETRY` to
 turn those retries off.
 
 The sync wrappers behave the same way: the sync bridge adds no whole-call
-ceiling of its own. This setting is not a whole-call deadline on either form;
+ceiling of its own, and a sync stream adds no limit to each wait for its next
+item. This setting is not a whole-call deadline on either form;
 the retry budget and each request's timeout are what bound a call.
 
 ### Contracts as JSON-schema dicts
@@ -770,7 +779,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured or text attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream`, ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured or text attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
 
 ### Grouping calls by run
 
@@ -801,7 +810,7 @@ LLMKIT_RUN_ID=nightly-eval-2026-06-05 python -m your_eval_sweep
 
 The environment variable is the lowest layer, so an explicit `set_run_id` or `run_scope` overrides it; a blank one counts as unset. A blank *programmatic* value raises instead — pass `None` to mean "no run id". With nothing set, `run_id` is `null` and the rest of each record is unchanged.
 
-Which of the two programmatic setters you want depends on your concurrency, because they fail in opposite directions. `run_scope` is context-scoped: it survives the sync bridge (a `*_sync` call runs on llmkit's persistent loop inside a copy of your context), but a `threading.Thread` you start yourself gets a *fresh* context and will not see it. `set_run_id` is a process global — visible from every thread and every loop, but a single value, so it cannot express two runs overlapping in one process. Use `set_run_id` for "this process is one run" (including a thread-pool fan-out), `run_scope` for a host driving several runs at once.
+Which of the two programmatic setters you want depends on your concurrency, because they fail in opposite directions. `run_scope` is context-scoped: it survives the sync bridge (a `*_sync` call runs on llmkit's persistent loop inside a copy of your context, which a sync stream takes when you create it), but a `threading.Thread` you start yourself gets a *fresh* context and will not see it. `set_run_id` is a process global — visible from every thread and every loop, but a single value, so it cannot express two runs overlapping in one process. Use `set_run_id` for "this process is one run" (including a thread-pool fan-out), `run_scope` for a host driving several runs at once.
 
 `run_id` and `LLMKIT_LOG_DIR` are independent and compose freely — but tagging is what lets you keep *one* greppable history instead of walking N per-run directories.
 
@@ -835,7 +844,7 @@ Sink I/O never runs on the event loop: writes are offloaded to a worker thread (
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, and `tool_llm_call_stream`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
 **`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
 
@@ -955,7 +964,7 @@ from llmkit import InMemoryLLMCache, configure_llm_cache
 configure_llm_cache(InMemoryLLMCache(max_entries=1024))   # None (the default) turns it off
 ```
 
-The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers, and by `text_llm_call_stream`; the tool families do not read it. A streamed and a buffered text request for the same prompt are the same request, so either one answers the other. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
+The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers, and by `text_llm_call_stream` and its sync form; the tool families do not read it. A streamed and a buffered text request for the same prompt are the same request, so either one answers the other. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
 
 What a configured cache does on each call that reads it:
 
@@ -1366,11 +1375,11 @@ one attempt.
 
 ### Automatic retries, on by default
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, `tool_llm_call_stream_sync`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
 
 - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds. A timed-out request gets a fresh per-request `timeout` on each attempt.
 - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
-- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. `tool_llm_call_stream` does not re-ask them — see the streaming caveat below.
+- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. `tool_llm_call_stream` and its sync form do not re-ask them — see the streaming caveat below.
 - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
 - **Backpressure** (`LLM_BACKPRESSURE_ERRORS`: llmkit's own `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)) also gets **zero budget**: re-asking a circuit already known to be open is doomed by construction.
 
@@ -1412,7 +1421,7 @@ result = await structured_llm_call(
 )
 ```
 
-**Streaming caveat:** `text_llm_call_stream` and `tool_llm_call_stream` can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
+**Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
 
 ### Wrapping your own work: `with_retries()`
 
@@ -1463,7 +1472,7 @@ The re-roll is charged against the **validation budget** (`RetryPolicy.validatio
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 
-The hook runs inside the call, on the event loop the call runs on, so keep it quick and non-blocking. A hook that blocks stalls that whole loop. For the sync wrappers that loop is llmkit's own, which every concurrent sync call shares, so a blocking hook in one sync call delays all the others, not only its own.
+The hook runs inside the call, on the event loop the call runs on, so keep it quick and non-blocking. A hook that blocks stalls that whole loop. For the sync wrappers that loop is llmkit's own, which every concurrent sync call shares, so a blocking hook in one sync call delays all the others, not only its own. A hook running on llmkit's own loop cannot iterate a sync stream form: there it raises `RuntimeError` instead of deadlocking.
 
 ## Testing your app with a fake transport
 

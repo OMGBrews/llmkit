@@ -6,7 +6,8 @@ async form does. Two properties keep that true, and this module pins both:
 * **Same signature.** Every ``*_sync`` function in :mod:`llmkit.calls` takes
   exactly the parameters of its async twin (names, kinds, defaults,
   annotations, type parameters, overloads) and returns what the async form's
-  coroutine returns. A keyword added to one side and not the other fails here.
+  coroutine returns, or, for a stream, a ``Generator`` of what the async
+  generator yields. A keyword added to one side and not the other fails here.
 * **Same path.** Each sync form drives the async coroutine on llmkit's
   persistent loop, so retries, per-attempt logging, record capture and the
   retry progress callback behave identically. The loop identity check is what
@@ -14,7 +15,9 @@ async form does. Two properties keep that true, and this module pins both:
   under :func:`asyncio.run` would still retry and still capture (the fake is
   process-wide and the context carries the capture list), so only the loop it
   ran on would differ. :func:`test_a_bridge_that_bypasses_the_persistent_loop_fails`
-  demonstrates that.
+  demonstrates that for the buffered bridge and
+  :func:`test_a_stream_bridge_that_bypasses_the_persistent_loop_fails` for the
+  stream bridge.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import typing
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator, Iterator
 from typing import TypeVar, cast
 
 import pytest
@@ -33,11 +36,6 @@ from llmkit.sync import run_sync
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install, rate_limit_error
 from llmkit.tools import ToolDefinition
 from tests._support import OkSchema, ollama_call_defaults
-
-# The async call functions that have no sync form yet. Adding their sync forms
-# is filed as its own task; when one lands, its name leaves this set and the
-# parity check below covers it automatically.
-_ASYNC_ONLY = frozenset({"text_llm_call_stream", "tool_llm_call_stream"})
 
 
 @pytest.fixture(autouse=True)
@@ -71,22 +69,29 @@ def _sync_pairs() -> list[tuple[str, str]]:
     return sorted((name.removesuffix("_sync"), name) for name in names if name.endswith("_sync"))
 
 
-def test_every_async_call_has_a_sync_form_or_is_listed() -> None:
+def _is_async(fn: _Fn) -> bool:
+    return inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn)
+
+
+def test_every_async_call_has_a_sync_form() -> None:
     names = _call_functions()
-    async_names = {
-        name for name, fn in names.items() if inspect.iscoroutinefunction(fn) or name in _ASYNC_ONLY
-    }
+    async_names = {name for name, fn in names.items() if _is_async(fn)}
     paired = {base for base, _ in _sync_pairs()}
     assert paired <= async_names, "a *_sync function has no async twin"
-    assert async_names - paired == _ASYNC_ONLY
+    assert async_names == paired, "an async call function has no *_sync form"
+    assert {"text_llm_call_stream", "tool_llm_call_stream"} <= paired
 
 
-def _shape(fn: _Fn) -> tuple[object, ...]:
+def _shape(fn: _Fn, *, as_sync: bool = False) -> tuple[object, ...]:
     """A comparable rendering of *fn*'s signature, return type included.
 
     Annotations are compared as source strings (``from __future__ import
     annotations`` keeps them unevaluated in the call modules), and type
     parameters by name and bound, since each function owns its own ``T``.
+
+    With *as_sync*, an async generator function's return annotation
+    ``AsyncGenerator[X]`` is rendered as the ``Generator[X]`` its sync form
+    must declare; every other annotation is left as written.
     """
     sig = inspect.signature(fn)
     params = tuple(
@@ -95,21 +100,26 @@ def _shape(fn: _Fn) -> tuple[object, ...]:
     )
     declared = cast("tuple[TypeVar, ...]", getattr(fn, "__type_params__", ()))
     type_params = tuple((tp.__name__, str(tp.__bound__)) for tp in declared)
-    return params, str(cast("object", sig.return_annotation)), type_params
+    returns = str(cast("object", sig.return_annotation))
+    if as_sync and inspect.isasyncgenfunction(fn):
+        prefix = "AsyncGenerator["
+        assert returns.startswith(prefix), f"{fn.__name__} does not return AsyncGenerator[...]"
+        returns = "Generator[" + returns.removeprefix(prefix)
+    return params, returns, type_params
 
 
 @pytest.mark.parametrize(("async_name", "sync_name"), _sync_pairs())
 def test_sync_signature_matches_async(async_name: str, sync_name: str) -> None:
     async_fn = _fn(async_name)
     sync_fn = _fn(sync_name)
-    assert inspect.iscoroutinefunction(async_fn)
-    assert not inspect.iscoroutinefunction(sync_fn)
-    assert _shape(sync_fn) == _shape(async_fn)
+    assert _is_async(async_fn)
+    assert not _is_async(sync_fn)
+    assert _shape(sync_fn) == _shape(async_fn, as_sync=True)
     async_overloads = typing.get_overloads(async_fn)
     sync_overloads = typing.get_overloads(sync_fn)
     assert len(sync_overloads) == len(async_overloads)
     for sync_overload, async_overload in zip(sync_overloads, async_overloads, strict=True):
-        assert _shape(sync_overload) == _shape(async_overload)
+        assert _shape(sync_overload) == _shape(async_overload, as_sync=True)
 
 
 def test_the_parity_check_sees_a_divergent_keyword() -> None:
@@ -121,7 +131,23 @@ def test_the_parity_check_sees_a_divergent_keyword() -> None:
     def drifted(prompt: str, *, label: str | None = "x") -> str:
         return f"{prompt}{label}"
 
-    assert _shape(drifted) != _shape(base)
+    assert _shape(drifted) != _shape(base, as_sync=True)
+
+
+def test_the_parity_check_maps_only_to_generator() -> None:
+    """A sync stream must declare ``Generator[X]``; ``Iterator[X]`` is a mismatch."""
+
+    async def base(prompt: str) -> AsyncGenerator[str]:
+        yield prompt
+
+    def faithful(prompt: str) -> Generator[str]:
+        yield prompt
+
+    def loose(prompt: str) -> Iterator[str]:
+        yield prompt
+
+    assert _shape(faithful) == _shape(base, as_sync=True)
+    assert _shape(loose) != _shape(base, as_sync=True)
 
 
 # --- Same path -------------------------------------------------------------------
@@ -141,13 +167,28 @@ def _tool() -> object:
     return calls.tool_llm_call_sync("hi", _TOOLS, feature="parity", retry=_NO_BACKOFF)
 
 
-_LANES: dict[str, _Lane] = {"structured": _structured, "text": _text, "tool": _tool}
+def _text_stream() -> object:
+    # Consumed fully, so the stream's record is written before the lane returns.
+    return list(calls.text_llm_call_stream_sync("hi", feature="parity", retry=_NO_BACKOFF))
+
+
+def _tool_stream() -> object:
+    return list(calls.tool_llm_call_stream_sync("hi", _TOOLS, feature="parity", retry=_NO_BACKOFF))
+
+
+_LANES: dict[str, _Lane] = {
+    "structured": _structured,
+    "text": _text,
+    "tool": _tool,
+    "text_stream": _text_stream,
+    "tool_stream": _tool_stream,
+}
 
 
 def _answer(request: TransportRequest) -> Reply:
     if request.kind == "structured":
         return Reply.json(OkSchema(ok=True))
-    if request.kind == "tool":
+    if request.kind in ("tool", "tool_stream"):
         return Reply(tool_calls=[FakeToolCall("lookup", {})])
     return Reply.text("hello")
 
@@ -174,7 +215,7 @@ def _check_sync_lane_drives_async_path(lane: _Lane) -> None:
         with capture_llm_records() as records, retry_progress_callback(on_progress):
             result = lane()
 
-    assert result is not None
+    assert result, "the lane produced nothing"
     assert [r.attempt for r in transport.requests] == [1, 2], "the retry did not run"
     assert [r.attempt for r in records] == [1, 2], "each attempt is captured"
     assert records[0].error is not None and records[1].error is None
@@ -210,6 +251,24 @@ def test_a_bridge_that_bypasses_the_persistent_loop_fails(
     monkeypatch.setattr(text_module, "run_sync", fresh_loop)
     with pytest.raises(AssertionError, match="persistent loop"):
         _check_sync_lane_drives_async_path(_text)
+
+
+def test_a_stream_bridge_that_bypasses_the_persistent_loop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The targeted break for streams: a bridge that drains the stream on a fresh loop."""
+
+    def fresh_loop(agen: AsyncGenerator[object]) -> Iterator[object]:
+        async def drain() -> list[object]:
+            return [item async for item in agen]
+
+        return iter(asyncio.run(drain()))
+
+    import llmkit.calls.stream as stream_module
+
+    monkeypatch.setattr(stream_module, "iterate_sync", fresh_loop)
+    with pytest.raises(AssertionError, match="persistent loop"):
+        _check_sync_lane_drives_async_path(_text_stream)
 
 
 # --- No added ceiling ------------------------------------------------------------

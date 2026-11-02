@@ -48,9 +48,11 @@ from llmkit.calls import (
     structured_llm_call_sync,
     text_llm_call,
     text_llm_call_stream,
+    text_llm_call_stream_sync,
     text_llm_call_sync,
     tool_llm_call,
     tool_llm_call_stream,
+    tool_llm_call_stream_sync,
     tool_llm_call_sync,
 )
 from llmkit.capture import (
@@ -200,8 +202,10 @@ __all__ = [
     "text_llm_call",
     "text_llm_call_sync",
     "text_llm_call_stream",
+    "text_llm_call_stream_sync",
     "tool_llm_call",
     "tool_llm_call_stream",
+    "tool_llm_call_stream_sync",
     "tool_llm_call_sync",
     "STREAM_ABANDONED_ERROR",
     "capture_llm_log_paths",

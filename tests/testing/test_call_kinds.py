@@ -2,9 +2,7 @@
 
 Each test drives a public call function, sync or async, over a real Ollama
 provider config with a fake installed through :mod:`llmkit.testing` and
-nothing patched: the same setup a downstream project uses. The streaming kinds
-have no public sync function, so their sync form runs the stream on the
-:func:`llmkit.sync.run_sync` bridge the sync wrappers use.
+nothing patched: the same setup a downstream project uses.
 """
 
 from __future__ import annotations
@@ -27,12 +25,13 @@ from llmkit import (
     structured_llm_call_sync,
     text_llm_call,
     text_llm_call_stream,
+    text_llm_call_stream_sync,
     text_llm_call_sync,
     tool_llm_call,
     tool_llm_call_stream,
+    tool_llm_call_stream_sync,
     tool_llm_call_sync,
 )
-from llmkit.sync import run_sync
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
 
 
@@ -142,7 +141,7 @@ async def test_text_stream_records_usage_and_cost() -> None:
 
 def test_text_stream_sync() -> None:
     with install(_answer) as fake:
-        chunks = run_sync(_collect_text_stream())
+        chunks = list(text_llm_call_stream_sync("say hi", feature="greet"))
     assert chunks == ["hello ", "there ", "world"]
     assert [request.kind for request in fake.requests] == ["text_stream"]
 
@@ -159,7 +158,7 @@ async def test_tool_stream_async() -> None:
 
 def test_tool_stream_sync() -> None:
     with install(_answer) as fake:
-        events = run_sync(_collect_tool_stream())
+        events = list(tool_llm_call_stream_sync("add", [ADD], feature="math"))
     result = events[-1]
     assert isinstance(result, ToolCallResult)
     _assert_tool_result(result)

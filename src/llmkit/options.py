@@ -70,8 +70,9 @@ class LLMCallOptions:
     Opt-in ergonomics for the call functions
     (:func:`structured_llm_call`, :func:`structured_llm_call_sync`,
     :func:`text_llm_call`, :func:`text_llm_call_sync`,
-    :func:`text_llm_call_stream`, :func:`tool_llm_call`,
-    :func:`tool_llm_call_sync` and :func:`tool_llm_call_stream`): a feature
+    :func:`text_llm_call_stream`, :func:`text_llm_call_stream_sync`,
+    :func:`tool_llm_call`, :func:`tool_llm_call_sync`,
+    :func:`tool_llm_call_stream` and :func:`tool_llm_call_stream_sync`): a feature
     module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
     instead of repeating the same eight-keyword block at each site. The flat
@@ -118,8 +119,8 @@ class LLMCallOptions:
             per-call ``cache`` keyword, then to ``True``; ``False`` bypasses
             both lookup and store. Read by the buffered families
             (:func:`structured_llm_call`, :func:`text_llm_call` and their sync
-            wrappers) and :func:`text_llm_call_stream`; the tool families
-            ignore it.
+            wrappers) and :func:`text_llm_call_stream` with its sync form; the
+            tool families ignore it.
         timeout: Seconds for one provider round trip. Unset or ``None`` sends
             no timeout keyword; LiteLLM supplies its default.
     """

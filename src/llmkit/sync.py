@@ -2,7 +2,11 @@
 
 The sync call wrappers (``*_sync`` in :mod:`llmkit.calls`) need to
 drive an ``async`` coroutine to completion from synchronous code. :func:`run_sync`
-is that bridge.
+is that bridge. The two sync streams (``*_stream_sync``) need to drive an async
+generator one item at a time; :func:`iterate_sync` is that bridge, running each
+generator step as a task on the same persistent loop (see its docstring for
+what a stream adds: one context for the whole stream, closing on abandonment,
+and a loop-thread check on every step).
 
 **Why one persistent loop, not a fresh loop per call.** LiteLLM logs successful
 calls asynchronously through a *process-global singleton*,
@@ -70,7 +74,9 @@ import contextlib
 import contextvars
 import logging
 import threading
-from collections.abc import Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Generator
+from types import TracebackType
+from typing import cast, final, overload, override
 
 from llmkit.options import UNSET, Unset
 
@@ -88,6 +94,10 @@ _DEFAULT_TIMEOUT_SECONDS: float = 600.0
 # unbounded LiteLLM ``flush()`` is the hang the module docstring describes.
 # Ten seconds matches :func:`shutdown`'s default drain bound.
 _DRAIN_TIMEOUT_SECONDS: float = 10.0
+
+# The error a sync stream raises when the loop its async generator is bound to
+# has been shut down (see ``_submit_to_loop``'s ``loop`` keyword).
+_LOOP_GONE_MESSAGE = "llmkit's sync loop was shut down while this stream was open"
 
 # The single persistent loop and the daemon thread that runs it, started lazily
 # on first use under ``_lock`` so concurrent first-callers can't race two loops
@@ -152,7 +162,13 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
-def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | None) -> T:
+def _submit_to_loop[T](
+    coro: Coroutine[object, object, T],
+    *,
+    timeout: float | None,
+    context: contextvars.Context | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> T:
     """Drive *coro* on the persistent loop, preserving the caller's context.
 
     Captures ``contextvars.copy_context()`` in the calling thread and creates the
@@ -173,8 +189,16 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
     freshly restarted persistent loop instead of enqueueing a callback onto a
     stopped-but-not-closed loop (which would hang for the full ``timeout`` with
     the coroutine leaked) or a closed one (which would raise ``RuntimeError``).
+
+    The sync stream bridge (:class:`_SyncGenerator`) passes two more keywords.
+    ``context`` replaces the per-submission copy with one :class:`contextvars.Context`
+    the caller reuses, so successive submissions share one context. ``loop``
+    pins the submission to the loop the stream's async generator is bound to:
+    the pinned path never starts a loop, and when that loop has been shut down
+    it raises :class:`RuntimeError` instead of retrying, because a generator
+    bound to a closed loop cannot be resumed on a fresh one.
     """
-    ctx = contextvars.copy_context()
+    ctx = contextvars.copy_context() if context is None else context
     result: concurrent.futures.Future[T] = concurrent.futures.Future()
     task_box: list[asyncio.Task[T]] = []
 
@@ -201,7 +225,7 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
         # calling thread. The context copy makes the coroutine see the caller's
         # ContextVars (shared by reference, so its appends are visible on return).
         try:
-            task = loop.create_task(coro, context=ctx)
+            task = target.create_task(coro, context=ctx)
         except BaseException as exc:  # pragma: no cover - create_task rarely raises
             result.set_exception(exc)
             return
@@ -225,15 +249,25 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
     # ``CancelledError``) or retried onto a fresh loop, never left to hang or
     # raise. One uncontended lock acquire per call; no retry cap is needed
     # because livelock would require an adversarial ``shutdown()`` every
-    # iteration.
-    while True:
-        loop = _ensure_loop()
+    # iteration. A pinned submission makes the same check but raises instead
+    # of retrying, and never calls ``_ensure_loop``.
+    target: asyncio.AbstractEventLoop
+    if loop is not None:
+        target = loop
         with _lock:
-            if _loop is loop:
-                _ = loop.call_soon_threadsafe(_schedule)
-                break
-        # shutdown() claimed the loop between obtaining and submitting: retry —
-        # _ensure_loop lazily starts a fresh persistent loop.
+            if _loop is not target:
+                coro.close()  # never started: close it so no "never awaited" warning
+                raise RuntimeError(_LOOP_GONE_MESSAGE)
+            _ = target.call_soon_threadsafe(_schedule)
+    else:
+        while True:
+            target = _ensure_loop()
+            with _lock:
+                if _loop is target:
+                    _ = target.call_soon_threadsafe(_schedule)
+                    break
+            # shutdown() claimed the loop between obtaining and submitting:
+            # retry — _ensure_loop lazily starts a fresh persistent loop.
     try:
         return result.result(timeout)
     except BaseException:
@@ -242,7 +276,7 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
         # ``RuntimeError("Event loop is closed")`` loses nothing and stops it from
         # masking the real exception being propagated.
         with contextlib.suppress(RuntimeError):
-            _ = loop.call_soon_threadsafe(_cancel)
+            _ = target.call_soon_threadsafe(_cancel)
         raise
 
 
@@ -439,6 +473,262 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None | U
         return future.result(timeout=wait)
     finally:
         executor.shutdown(wait=False)
+
+
+def _reject_loop_thread(loop: asyncio.AbstractEventLoop | None) -> None:
+    """Raise when the calling thread is running *loop*, llmkit's sync loop.
+
+    A sync stream advanced from a coroutine on the persistent loop would enqueue
+    each step onto the loop it is blocking and wait forever, and the
+    loop-on-loop fallback cannot help: its fresh loop is closed after one call,
+    finalizing the generator with it.
+    """
+    if loop is None:
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if running is loop:
+        raise RuntimeError(
+            "a sync stream cannot be created or iterated on llmkit's own sync loop "
+            + "thread, where it would deadlock; iterate the async form with "
+            + "`async for` instead"
+        )
+
+
+@final
+class _StreamState[T]:
+    """What the loop-side coroutines of one :class:`_SyncGenerator` share.
+
+    Kept apart from the iterator object so that nothing the loop holds refers
+    back to the iterator: a reference cycle would delay its finalizer from the
+    ``break`` that drops it to the next garbage-collector pass.
+    """
+
+    __slots__ = ("agen", "finished", "step")
+
+    def __init__(self, agen: AsyncGenerator[T]) -> None:
+        self.agen: AsyncGenerator[T] = agen
+        # Written on the loop thread; read by the consumer after a step's
+        # result has crossed back, which orders the two.
+        self.finished: bool = False
+        # The most recent step's task, so a close can wait out a step that an
+        # interrupted consumer left in flight.
+        self.step: asyncio.Task[object] | None = None
+
+
+async def _step[T](
+    state: _StreamState[T], make_step: Callable[[], Awaitable[T]]
+) -> tuple[bool, T | None]:
+    """On the loop: run one generator step, reporting exhaustion as a flag.
+
+    *make_step* is called here, inside the task, so the generator method is
+    first *called* on the loop thread: that is what binds the generator to the
+    persistent loop's finalization hooks.
+    """
+    state.step = asyncio.current_task()
+    try:
+        return True, await make_step()
+    except StopAsyncIteration:
+        state.finished = True
+        return False, None
+    except BaseException:
+        # An exception out of the generator body finishes the generator.
+        state.finished = True
+        raise
+
+
+async def _aclose[T](state: _StreamState[T]) -> None:
+    """On the loop: wait out an in-flight step, then close the generator.
+
+    ``aclose()`` on a generator that is still running raises
+    :class:`RuntimeError`, and a step can still be settling its cancellation
+    when the consumer that abandoned it asks for a close.
+    """
+    step = state.step
+    if step is not None and not step.done():
+        _ = await asyncio.wait([step])
+    await state.agen.aclose()
+    state.finished = True
+
+
+@final
+class _SyncGenerator[T](Generator[T, None, None]):
+    """A synchronous generator that drives an async generator on the sync loop.
+
+    The bridge behind the ``*_stream_sync`` call functions. It mirrors the
+    async generator protocol method for method: ``__next__`` and ``send`` drive
+    ``asend``, ``throw`` drives ``athrow``, and ``close`` drives ``aclose``.
+    Each step runs as a task on llmkit's persistent loop, created inside the
+    one :class:`contextvars.Context` captured when the iterator was made, so
+    the stream's retry scope, queue-wait stamp and record capture see a single
+    context from the first item to the last, as they do on the async form.
+
+    Like a generator, it is not safe to advance from two threads at once; a
+    second concurrent call raises :class:`ValueError`.
+    """
+
+    def __init__(
+        self,
+        agen: AsyncGenerator[T],
+        context: contextvars.Context,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._state: _StreamState[T] = _StreamState(agen)
+        self._context: contextvars.Context = context
+        self._loop: asyncio.AbstractEventLoop = loop
+        self._running: threading.Lock = threading.Lock()
+
+    def _run[R](self, coro: Coroutine[object, object, R]) -> R:
+        if not self._running.acquire(blocking=False):
+            coro.close()
+            raise ValueError("generator already executing")
+        try:
+            return _submit_to_loop(coro, timeout=None, context=self._context, loop=self._loop)
+        finally:
+            self._running.release()
+
+    def _advance(self, make_step: Callable[[], Awaitable[T]]) -> T:
+        _reject_loop_thread(self._loop)
+        has_item, item = self._run(_step(self._state, make_step))
+        if not has_item:
+            raise StopIteration
+        return cast("T", item)
+
+    @override
+    def __next__(self) -> T:
+        return self.send(None)
+
+    @override
+    def send(self, value: None, /) -> T:
+        state = self._state
+        if state.finished:
+            raise StopIteration
+        agen = state.agen
+        return self._advance(lambda: agen.asend(value))
+
+    @overload
+    def throw(
+        self,
+        typ: type[BaseException],
+        val: BaseException | object = None,
+        tb: TracebackType | None = None,
+        /,
+    ) -> T: ...
+    @overload
+    def throw(
+        self, typ: BaseException, val: None = None, tb: TracebackType | None = None, /
+    ) -> T: ...
+    @override
+    def throw(
+        self,
+        typ: type[BaseException] | BaseException,
+        val: object = None,
+        tb: TracebackType | None = None,
+        /,
+    ) -> T:
+        if isinstance(typ, BaseException):
+            exc = typ
+        elif isinstance(val, BaseException):
+            exc = val
+        else:
+            exc = typ() if val is None else typ(val)
+        if tb is not None:
+            exc = exc.with_traceback(tb)
+        state = self._state
+        if state.finished:
+            raise exc
+        agen = state.agen
+        return self._advance(lambda: agen.athrow(exc))
+
+    @override
+    def close(self) -> None:
+        """Close the async generator on the loop and wait until it has closed.
+
+        This is the deterministic abandonment path: the stream's ``finally``
+        blocks run, and its abandoned-stream record is written, before
+        ``close`` returns. A no-op once the stream has finished, when it was
+        never started, or when the sync loop has already been shut down (its
+        own shutdown finalized the generator).
+        """
+        state = self._state
+        if state.finished:
+            return
+        if state.step is None:
+            # Never started: the body never ran, so there is nothing to close.
+            state.finished = True
+            return
+        _reject_loop_thread(self._loop)
+        with _lock:
+            loop_gone = _loop is not self._loop
+        if loop_gone:
+            return
+        self._run(_aclose(state))
+
+    def __del__(self) -> None:
+        # A dropped iterator closes its generator best-effort. Garbage
+        # collection can run this on any thread, at any allocation, so it never
+        # takes ``_lock`` (the thread may already hold it), never raises, and
+        # never waits unbounded. An iterator still alive at interpreter exit
+        # is finalized after the atexit ``shutdown()``, whose
+        # ``shutdown_asyncgens`` has already closed the generator.
+        with contextlib.suppress(BaseException):
+            state = self._state
+            if state.finished or state.step is None:
+                return
+            loop = self._loop
+            if _loop is not loop or loop.is_closed():
+                return
+            context = self._context
+            done = threading.Event()
+
+            def _settled(task: asyncio.Task[None]) -> None:
+                if not task.cancelled():
+                    _ = task.exception()
+                done.set()
+
+            def _schedule() -> None:
+                task = loop.create_task(_aclose(state), context=context)
+                task.add_done_callback(_settled)
+
+            _ = loop.call_soon_threadsafe(_schedule)
+            try:
+                on_loop = asyncio.get_running_loop() is loop
+            except RuntimeError:
+                on_loop = False
+            if not on_loop:
+                _ = done.wait(_DRAIN_TIMEOUT_SECONDS)
+
+
+def iterate_sync[T](agen: AsyncGenerator[T]) -> Generator[T]:
+    """Iterate an async generator synchronously, one item per ``next()``.
+
+    The sync stream bridge, as :func:`run_sync` is the coroutine bridge: the
+    ``*_stream_sync`` call functions return ``iterate_sync(<async stream>)``.
+    Each item is produced by a step on llmkit's persistent loop, so the stream
+    holds no item it has not been asked for and every guarantee of the async
+    stream applies unchanged. The caller's :mod:`contextvars` context is
+    captured **once, here**, and every step runs inside that one copy: a
+    context entered after this call (a :func:`~llmkit.capture_llm_records`
+    block, a run scope) does not reach the stream.
+
+    No step has a wait ceiling; the async stream's own per-request timeout
+    bounds each item. Closing the returned generator — explicitly, by
+    ``break`` out of a ``for`` loop that holds its only reference, or by
+    dropping it — closes the async generator on the loop, so the stream
+    records its abandonment. :func:`shutdown` cancels a step in flight, which
+    the caller sees as :class:`asyncio.CancelledError`; a stream left between
+    items is closed by the shutdown, and its next ``next()`` raises
+    :class:`RuntimeError`.
+
+    Raises :class:`RuntimeError` when called, or iterated, on the persistent
+    loop's own thread, where it would deadlock.
+    """
+    _reject_loop_thread(_loop)
+    context = contextvars.copy_context()
+    loop = _ensure_loop()
+    return _SyncGenerator(agen, context, loop)
 
 
 async def _drain_and_close(timeout: float | None) -> None:

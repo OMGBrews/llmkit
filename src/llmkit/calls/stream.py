@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
@@ -40,6 +40,7 @@ from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait
 from llmkit.retry import RetryPolicy, with_retries_stream
+from llmkit.sync import iterate_sync
 from llmkit.tools import TokenUsage
 
 #: The ``error`` recorded when a stream's consumer abandons it mid-flight
@@ -262,6 +263,55 @@ async def text_llm_call_stream(
                 call_id=call_id,
             ),
         )
+
+
+def text_llm_call_stream_sync(
+    prompt: str | Sequence[ChatMessage],
+    *,
+    feature: str,
+    label: str | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    cache: bool | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+) -> Generator[str]:
+    """Synchronous form of :func:`text_llm_call_stream`.
+
+    Same arguments, same chunks, same records, same retry and cache behavior as
+    the async form: the returned generator drives the async stream one chunk
+    per ``next()`` on llmkit's persistent sync loop (see
+    :func:`~llmkit.sync.iterate_sync`), so no chunk is fetched before it is
+    asked for. ``timeout`` bounds each wait for the next chunk, as on the async
+    form; the sync bridge adds no whole-stream ceiling.
+
+    The caller's :mod:`contextvars` context is captured when this function is
+    called, not when iteration starts, so enter :func:`~llmkit.capture_llm_records`
+    or a run scope before calling it. Closing the generator, breaking out of a
+    ``for`` loop over it, or dropping it records the abandonment exactly as
+    closing the async stream does. Calling or iterating it on the sync loop's own
+    thread raises :class:`RuntimeError`; async code should use the async form.
+    """
+    return iterate_sync(
+        text_llm_call_stream(
+            prompt,
+            feature=feature,
+            label=label,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            retry=retry,
+            cache=cache,
+            options=options,
+        )
+    )
 
 
 async def _stream_once(

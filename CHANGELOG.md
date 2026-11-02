@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sync forms of the two streams: `text_llm_call_stream_sync` and
+  `tool_llm_call_stream_sync`.** Each takes exactly the parameters of its
+  async form and returns a plain generator of the same items, fetched one per
+  `next()` on llmkit's persistent sync loop, so every call family now has a
+  sync form. Retries before the first item, the response cache, the
+  per-request `timeout` (bounding each wait for the next item) and the call
+  records behave as on the async form. The caller's context is captured when
+  the function is called, so enter `capture_llm_records()` or a run scope
+  before calling it. Closing the generator, breaking out of a `for` loop over
+  it, or dropping it records `STREAM_ABANDONED_ERROR`, as closing the async
+  stream does; `shutdown()` cancels a stream waiting on its next item.
+  Creating or iterating one on llmkit's own loop thread raises
+  `RuntimeError`.
+
 - **`configure_llm_client` takes the config itself.** Pass an
   `LLMClientConfig` directly: `configure_llm_client(LLMClientConfig(...))`.
   Calling it again replaces the registration. The zero-argument callable

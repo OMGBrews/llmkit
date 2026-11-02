@@ -18,7 +18,15 @@ from llmkit.testing import Reply, install
 from tests._support import OkSchema
 
 _TOOLS = [ToolDefinition("lookup", "", {"type": "object"})]
-_LANES = ("text", "structured", "tool", "text_stream", "tool_stream")
+_LANES = (
+    "text",
+    "structured",
+    "tool",
+    "text_stream",
+    "tool_stream",
+    "text_stream_sync",
+    "tool_stream_sync",
+)
 
 
 def test_signatures_expose_timeout() -> None:
@@ -28,9 +36,11 @@ def test_signatures_expose_timeout() -> None:
         calls.text_llm_call,
         calls.text_llm_call_sync,
         calls.text_llm_call_stream,
+        calls.text_llm_call_stream_sync,
         calls.tool_llm_call,
         calls.tool_llm_call_sync,
         calls.tool_llm_call_stream,
+        calls.tool_llm_call_stream_sync,
     ):
         assert "timeout" in inspect.signature(surface).parameters
 
@@ -69,6 +79,22 @@ async def _call(lane: str, timeout: float | None | Unset) -> None:
         _ = await calls.tool_llm_call(
             "hi", _TOOLS, feature="test", timeout=timeout, provider=provider
         )
+    elif lane == "text_stream_sync":
+        # Called inside ``asyncio.run``: a foreign loop, which the sync form
+        # blocks per chunk while the stream runs on llmkit's sync loop.
+        chunks = list(
+            calls.text_llm_call_stream_sync(
+                "hi", feature="test", timeout=timeout, provider=provider
+            )
+        )
+        assert chunks == ["ok"]
+    elif lane == "tool_stream_sync":
+        events = list(
+            calls.tool_llm_call_stream_sync(
+                "hi", _TOOLS, feature="test", timeout=timeout, provider=provider
+            )
+        )
+        assert events
     elif lane == "text_stream":
         chunks = [
             chunk
