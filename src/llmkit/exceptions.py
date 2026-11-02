@@ -189,9 +189,10 @@ class LLMClientNotConfiguredError(LlmkitError, RuntimeError):
     """A call needed the registered client config and none is registered.
 
     Raised before the first attempt when a call names no ``provider=`` and
-    :func:`~llmkit.configure_llm_client` was never called, and by any other
-    read of the registration. A :class:`RuntimeError` subclass, so code that
-    caught the earlier plain ``RuntimeError`` keeps working.
+    :func:`~llmkit.configure_llm_client` was never called or the registration
+    was cleared, and by any other read of the registration. A
+    :class:`RuntimeError` subclass, so code that caught the earlier plain
+    ``RuntimeError`` keeps working.
     """
 
 

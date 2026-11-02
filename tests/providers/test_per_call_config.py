@@ -24,7 +24,6 @@ from collections.abc import Awaitable, Callable, Iterator
 import pytest
 from pydantic import BaseModel
 
-import llmkit.providers.base as base_mod
 from llmkit import (
     LLMClientConfig,
     LLMClientNotConfiguredError,
@@ -42,7 +41,7 @@ from llmkit.calls import (
     tool_llm_call,
     tool_llm_call_stream,
 )
-from llmkit.providers.base import active_config
+from llmkit.providers.base import active_config, client_configured
 from llmkit.testing import Reply, install
 from llmkit.tools import ToolDefinition
 
@@ -55,19 +54,17 @@ _TOOLS = [ToolDefinition("lookup", "Look a thing up.", {"type": "object"})]
 
 
 @pytest.fixture
-def _no_global_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[None]:
-    """Unset the module-level config source for the duration of the test.
+def _no_global_config() -> Iterator[None]:
+    """Clear the client registration for the duration of the test.
 
-    There is no public *unregister*, and other tests may have registered a
-    source in this process; resetting the private global guarantees the
-    per-call path is exercised with genuinely no global config available, so a
-    spurious fallback read would surface as the "not configured" ``RuntimeError``.
-    Applied on top of the directory's autouse Ollama setup, which mutes logging
-    and restores the previous config source afterwards.
+    Other tests may have registered a source in this process; clearing it
+    guarantees the per-call path is exercised with genuinely no global config
+    available, so a spurious fallback read would surface as the "not
+    configured" ``RuntimeError``. Applied on top of the directory's autouse
+    Ollama setup, which mutes logging and restores the previous config source
+    afterwards.
     """
-    monkeypatch.setattr(base_mod, "_config_source", None)
+    _ = configure_llm_client(None)
     yield
 
 
@@ -172,7 +169,7 @@ def test_not_configured_error_keeps_its_runtime_error_base() -> None:
 @pytest.mark.asyncio
 async def test_configure_accepts_a_config_instance(_no_global_config: None) -> None:
     """The plain instance is the primary registration form."""
-    configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="from-instance"))
+    _ = configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="from-instance"))
 
     with install(lambda _request: Reply.text("hello")) as installed:
         assert await text_llm_call("hi", feature="t") == "hello"
@@ -183,7 +180,69 @@ async def test_configure_accepts_a_config_instance(_no_global_config: None) -> N
 
 def test_configure_still_accepts_a_callable_read_on_each_build(_no_global_config: None) -> None:
     models = iter(["first", "second"])
-    configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model=next(models)))
+    _ = configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model=next(models)))
 
     assert active_config().model == "first"
     assert active_config().model == "second"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registration",
+    [
+        LLMClientConfig(provider=Provider.OLLAMA, model="instance"),
+        lambda: LLMClientConfig(provider=Provider.OLLAMA, model="callable"),
+    ],
+    ids=["instance", "callable"],
+)
+async def test_configure_none_clears_the_registration(
+    registration: LLMClientConfig | Callable[[], LLMClientConfig],
+) -> None:
+    """``configure_llm_client(None)`` takes a registration back: a call without
+    ``provider=`` then fails as unconfigured before any attempt is made."""
+    _ = configure_llm_client(registration)
+    assert client_configured()
+
+    _ = configure_llm_client(None)
+
+    assert not client_configured()
+    with install(lambda _request: Reply.text("unreachable")) as installed:
+        with pytest.raises(LLMClientNotConfiguredError):
+            _ = await text_llm_call("hi", feature="t")
+    assert installed.requests == []
+
+
+def test_configure_returns_none_when_nothing_was_registered(_no_global_config: None) -> None:
+    assert configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="a")) is None
+    assert configure_llm_client(None) is not None
+    assert configure_llm_client(None) is None
+
+
+@pytest.mark.parametrize("form", ["instance", "callable"])
+def test_configure_returns_the_previous_source_for_restoring(
+    _no_global_config: None, form: str
+) -> None:
+    """Registering A, then B, then passing back what B's call returned resolves
+    A again, whether A was registered as an instance or as a callable."""
+    a = LLMClientConfig(provider=Provider.OLLAMA, model="a")
+    _ = configure_llm_client(a if form == "instance" else lambda: a)
+    returned = configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="b"))
+    assert active_config().model == "b"
+
+    assert callable(returned)
+    assert not isinstance(returned, LLMClientConfig)
+    restored_b = configure_llm_client(returned)
+
+    assert active_config().model == "a"
+    assert restored_b is not None
+    assert restored_b().model == "b"
+
+
+def test_restoring_a_none_previous_clears_again(_no_global_config: None) -> None:
+    """Passing back a ``None`` previous restores "nothing registered"."""
+    previous = configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="a"))
+    assert previous is None
+
+    _ = configure_llm_client(previous)
+
+    assert not client_configured()

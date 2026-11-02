@@ -72,7 +72,7 @@ async def _outer_with_retries(prompt: list[ChatMessage]) -> Verdict:
 async def test_retried_json_mode_call_sends_the_schema_once_and_leaves_the_prompt(
     call: Callable[[list[ChatMessage]], Awaitable[Verdict]],
 ) -> None:
-    configure_llm_client(
+    _ = configure_llm_client(
         lambda: LLMClientConfig(
             provider=Provider.DEEPSEEK, api_key="sk-test", model="deepseek-chat"
         )
