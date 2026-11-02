@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`configure_llm_client` takes the config itself.** Pass an
+  `LLMClientConfig` directly: `configure_llm_client(LLMClientConfig(...))`.
+  Calling it again replaces the registration. The zero-argument callable
+  stays supported for a host whose config is resolved late or per context,
+  and is still re-read on every provider construction.
+
+- **`LlmkitError`, one base for every exception llmkit defines.**
+  `except LlmkitError` catches `ServiceUnavailableError`, `CircuitOpenError`,
+  `OutputLimitError`, `ToolArgumentError`, `ResultValidationError`,
+  `ComposeUnsupportedError`, `ReasoningEffortUnsupportedError`,
+  `SchemaEngineError` and the new `LLMClientNotConfiguredError`. It does not
+  catch third-party transport or validation errors; the `LLM_*_ERRORS`
+  tuples are unchanged and remain the sets for retry-shaped handling. Do not
+  list the base in `RetryPolicy.retry_on`: it would re-enable retries for
+  the subclasses that deliberately get none.
+
 - **Streamed text and tool calls now record estimated cost.** At stream end,
   use provider-reported cost or LiteLLM pricing over reported token usage,
   preserving cached-token discounts. Unknown prices remain `null`; local
@@ -16,8 +32,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Per-request `timeout` on every call function and `LLMCallOptions`.** Pass
   seconds to bound each provider round trip; unset or `None` sends no timeout
   keyword and preserves LiteLLM's default. Transport retries each get a fresh
-  timeout. Streams bound connection and each chunk wait, and sync wrappers
-  retain their separate 600-second whole-call ceiling. The fake transport
+  timeout. Streams bound connection and each chunk wait. The fake transport
   exposes the resolved value without enforcing it.
 
 - **A dropped `temperature` is now logged.** When a model refuses the
@@ -48,6 +63,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **`tool_llm_call_sync` declares its parameters.** It used to accept
+  `*args, **kwargs` and forward them, so introspection, editors and runtime
+  argument errors saw no keywords. It now lists the same parameters as
+  `tool_llm_call`, and a new test compares every sync form's signature with
+  its async form's, so a keyword added to one side alone fails the suite.
 
 - **Breaking: JSON-schema contracts now return schema-backed root models.**
   `model_from_json_schema` validates an immutable snapshot with `jsonschema`
@@ -93,7 +114,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write path. Direct calls to `write` and `write_returning_path` behave as
   before.
 
+- **Breaking: the sync wrappers no longer impose a 600-second whole-call
+  ceiling.** `structured_llm_call_sync`, `text_llm_call_sync` and
+  `tool_llm_call_sync` used to wait at most 600 seconds at the sync bridge and
+  then cancel the call with a builtin `TimeoutError`, a limit the async calls
+  do not have; it could expire while transport retries were still within
+  their budget. A sync call is now bounded exactly as its async form is, by
+  the per-request `timeout` and the retry budget. `run_sync` itself keeps its
+  600-second default for direct callers, and the loop-on-loop fallback's
+  logging drains now have their own 10-second bound. **Migration:** a caller
+  that relied on the ceiling passes `timeout=` per request, or wraps the call
+  in its own deadline.
+
 ### Removed
+
+- **Breaking: `stream_text_with_log` is removed.** The pre-1.0 name for
+  `text_llm_call_stream` warned `DeprecationWarning` since its rename and was
+  scheduled for removal; it goes in this breaking release rather than waiting
+  for 1.0. **Migration:** call `text_llm_call_stream` with the same arguments.
 
 - **Breaking: `OpenRouterProvider` no longer accepts `require_parameters`.**
   The keyword was a direct-construction-only way to turn off OpenRouter's
@@ -105,6 +143,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `completion_kwargs`.
 
 ### Fixed
+
+- **A call made before `configure_llm_client` now fails before its first
+  attempt, and says so.** It used to run the retry loop, log a failed attempt,
+  and, on the compose form of `tool_llm_call`, report
+  `ComposeUnsupportedError` about "the configured provider" instead. Every
+  call function now raises `LLMClientNotConfiguredError` up front when it has
+  neither a registered config nor a per-call `provider=`; a stream raises it
+  on its first iteration. The class subclasses `RuntimeError`, so existing
+  handlers keep working.
 
 - `model_json_schema` on llmkit's schema-backed models accepts
   `by_alias=None`, matching pydantic 2.14's signature. Guidance now comes from

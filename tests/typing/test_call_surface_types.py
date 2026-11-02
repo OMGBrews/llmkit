@@ -33,7 +33,6 @@ from llmkit import (
     ToolComposeResult,
     ToolDefinition,
     Unset,
-    stream_text_with_log,
     structured_llm_call,
     structured_llm_call_sync,
     text_llm_call,
@@ -122,7 +121,6 @@ async def _typecheck_temperature_accepts_none() -> None:
     _ = await text_llm_call("hi", feature="t", temperature=None)
     _ = text_llm_call_sync("hi", feature="t", temperature=None)
     _ = text_llm_call_stream("hi", feature="t", temperature=None)
-    _ = stream_text_with_log("hi", feature="t", temperature=None)
     _ = await structured_llm_call("hi", _Out, feature="t", temperature=0.0)
     _ = await text_llm_call("hi", feature="t", temperature=0.7)
     opts: LLMCallOptions = LLMCallOptions(temperature=None)
@@ -146,7 +144,6 @@ async def _typecheck_timeout_accepted_on_every_lane() -> None:
         _ = await text_llm_call("hi", feature="t", timeout=timeout)
         _ = text_llm_call_sync("hi", feature="t", timeout=timeout)
         _ = text_llm_call_stream("hi", feature="t", timeout=timeout)
-        _ = stream_text_with_log("hi", feature="t", timeout=timeout)
         _ = await tool_llm_call("hi", tools, feature="t", timeout=timeout)
         _ = tool_llm_call_sync("hi", tools, feature="t", timeout=timeout)
         _ = await tool_llm_call("hi", tools, feature="t", output_schema=_Out, timeout=timeout)
@@ -162,7 +159,6 @@ async def _typecheck_cache_accepted_on_every_caching_lane() -> None:
     _ = text_llm_call_sync("hi", feature="t", cache=False)
     _ = await structured_llm_call("hi", _Out, feature="t", cache=False)
     _ = assert_type(text_llm_call_stream("hi", feature="t", cache=False), AsyncGenerator[str])
-    _ = stream_text_with_log("hi", feature="t", cache=False)
     _ = text_llm_call_stream("hi", feature="t", options=LLMCallOptions(cache=False))
 
 

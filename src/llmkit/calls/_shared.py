@@ -55,6 +55,7 @@ from llmkit.exceptions import (
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface
+from llmkit.providers.base import active_config, client_configured
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
 from llmkit.run_scope import get_run_id
@@ -195,6 +196,11 @@ def prepare_call(
         provider=provider,
         cache=cache,
     )
+    if args.provider is None and not client_configured():
+        # The one piece of setup a call needs, missing: fail before any attempt
+        # is made or logged, naming it. Other provider build failures keep the
+        # best-effort path below.
+        _ = active_config()
     call_id, attempt_offset = claim_logical_call(feature, label)
     return PreparedCall(args, build_call_provider(args.provider), call_id, attempt_offset)
 

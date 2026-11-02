@@ -25,7 +25,7 @@ The families:
   does not become another copy.
 """
 
-from llmkit.calls.stream import STREAM_ABANDONED_ERROR, stream_text_with_log, text_llm_call_stream
+from llmkit.calls.stream import STREAM_ABANDONED_ERROR, text_llm_call_stream
 from llmkit.calls.structured import structured_llm_call, structured_llm_call_sync
 from llmkit.calls.text import text_llm_call, text_llm_call_sync
 from llmkit.calls.tool import tool_llm_call, tool_llm_call_sync
@@ -33,7 +33,6 @@ from llmkit.calls.tool_stream import tool_llm_call_stream
 
 __all__ = [
     "STREAM_ABANDONED_ERROR",
-    "stream_text_with_log",
     "structured_llm_call",
     "structured_llm_call_sync",
     "text_llm_call",

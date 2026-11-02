@@ -15,7 +15,7 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import overload
+from typing import cast, overload
 
 from pydantic import BaseModel
 
@@ -314,14 +314,51 @@ def tool_llm_call_sync[T: BaseModel](
 ) -> ToolComposeResult[T]: ...
 
 
-def tool_llm_call_sync(
-    *args: object, **kwargs: object
-) -> ToolCallResult | ToolComposeResult[BaseModel]:
+def tool_llm_call_sync[T: BaseModel](
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+    output_schema: type[T] | None = None,
+) -> ToolCallResult | ToolComposeResult[T]:
     """Synchronous wrapper around :func:`tool_llm_call`.
 
+    The same call as the async form, driven on llmkit's persistent loop by
+    :func:`run_sync`: same arguments, same retries, logging, rate limits and
+    result. Every argument is forwarded untouched.
+
     ``timeout`` is seconds for one provider round trip; unset or ``None``
-    sends no timeout keyword. The sync bridge's separate 600-second whole-call
-    ceiling still applies: a larger per-request timeout cannot extend it,
-    and retries can reach that ceiling before their request timeout expires.
+    sends no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
+    async form, the per-request timeout and the retry budget bound the call.
     """
-    return run_sync(tool_llm_call(*args, **kwargs))  # pyright: ignore[reportArgumentType, reportCallIssue, reportUnknownArgumentType]  # dynamic forwarding wrapper
+    return run_sync(
+        tool_llm_call(
+            prompt,
+            tools,
+            feature=feature,
+            label=label,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            retry=retry,
+            options=options,
+            # The cast only selects an overload for the type checker; the
+            # implementation takes ``None`` and returns a ToolCallResult.
+            output_schema=cast("type[T]", output_schema),
+        ),
+        timeout=None,
+    )

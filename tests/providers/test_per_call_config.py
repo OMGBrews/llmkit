@@ -19,19 +19,39 @@ provider objects are real, so they run the real request path up to the fake.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 
 import pytest
 from pydantic import BaseModel
 
 import llmkit.providers.base as base_mod
-from llmkit import Provider, capture_llm_records, make_provider
-from llmkit.calls import structured_llm_call, text_llm_call
+from llmkit import (
+    LLMClientConfig,
+    LLMClientNotConfiguredError,
+    LlmkitError,
+    Provider,
+    capture_llm_records,
+    configure_llm_client,
+    make_provider,
+)
+from llmkit.calls import (
+    structured_llm_call,
+    text_llm_call,
+    text_llm_call_stream,
+    text_llm_call_sync,
+    tool_llm_call,
+    tool_llm_call_stream,
+)
+from llmkit.providers.base import active_config
 from llmkit.testing import Reply, install
+from llmkit.tools import ToolDefinition
 
 
 class _Schema(BaseModel):
     ok: bool
+
+
+_TOOLS = [ToolDefinition("lookup", "Look a thing up.", {"type": "object"})]
 
 
 @pytest.fixture
@@ -102,5 +122,68 @@ async def test_no_provider_and_no_global_config_still_raises_clearly(
     provider nor a registered source raises the clear "not configured" error
     (the transport reaches ``build_provider`` -> ``active_config``). The error
     is non-transient, so it propagates immediately rather than being retried."""
-    with pytest.raises(RuntimeError, match="not configured"):
+    with pytest.raises(LLMClientNotConfiguredError, match="not configured"):
         _ = await structured_llm_call("hi", _Schema, feature="t")
+
+
+def _unconfigured_lanes() -> dict[str, Callable[[], Awaitable[object]]]:
+    async def text_stream() -> object:
+        return [chunk async for chunk in text_llm_call_stream("hi", feature="t")]
+
+    async def tool_stream() -> object:
+        return [event async for event in tool_llm_call_stream("hi", _TOOLS, feature="t")]
+
+    return {
+        "structured": lambda: structured_llm_call("hi", _Schema, feature="t"),
+        "text": lambda: text_llm_call("hi", feature="t"),
+        "tool": lambda: tool_llm_call("hi", _TOOLS, feature="t"),
+        "compose": lambda: tool_llm_call("hi", _TOOLS, feature="t", output_schema=_Schema),
+        "text_stream": text_stream,
+        "tool_stream": tool_stream,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", sorted(_unconfigured_lanes()))
+async def test_unconfigured_call_fails_before_any_attempt(
+    _no_global_config: None, lane: str
+) -> None:
+    """Forgetting to configure fails before any round trip or log record, and
+    says so, on every lane — the compose lane included, which used to report
+    an unsupported provider instead."""
+    with install(lambda _request: Reply.text("unreachable")) as installed:
+        with capture_llm_records() as records, pytest.raises(LLMClientNotConfiguredError):
+            _ = await _unconfigured_lanes()[lane]()
+
+    assert installed.requests == []
+    assert records == []
+
+
+def test_unconfigured_sync_call_fails_with_the_same_error(_no_global_config: None) -> None:
+    with pytest.raises(LLMClientNotConfiguredError, match="configure_llm_client"):
+        _ = text_llm_call_sync("hi", feature="t")
+
+
+def test_not_configured_error_keeps_its_runtime_error_base() -> None:
+    assert issubclass(LLMClientNotConfiguredError, RuntimeError)
+    assert issubclass(LLMClientNotConfiguredError, LlmkitError)
+
+
+@pytest.mark.asyncio
+async def test_configure_accepts_a_config_instance(_no_global_config: None) -> None:
+    """The plain instance is the primary registration form."""
+    configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="from-instance"))
+
+    with install(lambda _request: Reply.text("hello")) as installed:
+        assert await text_llm_call("hi", feature="t") == "hello"
+
+    assert [r.model for r in installed.requests] == ["ollama_chat/from-instance"]
+    assert active_config().model == "from-instance"
+
+
+def test_configure_still_accepts_a_callable_read_on_each_build(_no_global_config: None) -> None:
+    models = iter(["first", "second"])
+    configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model=next(models)))
+
+    assert active_config().model == "first"
+    assert active_config().model == "second"

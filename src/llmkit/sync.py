@@ -72,7 +72,22 @@ import logging
 import threading
 from collections.abc import Coroutine
 
+from llmkit.options import UNSET, Unset
+
 logger = logging.getLogger(__name__)
+
+# The wait :func:`run_sync` applies when its caller passes no ``timeout``. Read
+# at call time, not bound as the parameter default, so it is one place to
+# change. The call functions' sync forms do not use it: they pass
+# ``timeout=None``, because a sync call must not add a limit the async call
+# lacks (the per-request ``timeout`` and the retry budget bound both forms).
+_DEFAULT_TIMEOUT_SECONDS: float = 600.0
+
+# The bound on each logging drain the loop-on-loop fallback runs after its
+# call settles. Independent of the call's own wait, which may be unbounded: an
+# unbounded LiteLLM ``flush()`` is the hang the module docstring describes.
+# Ten seconds matches :func:`shutdown`'s default drain bound.
+_DRAIN_TIMEOUT_SECONDS: float = 10.0
 
 # The single persistent loop and the daemon thread that runs it, started lazily
 # on first use under ``_lock`` so concurrent first-callers can't race two loops
@@ -231,7 +246,7 @@ def _submit_to_loop[T](coro: Coroutine[object, object, T], *, timeout: float | N
         raise
 
 
-def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | None) -> T:
+def _run_and_drain[T](coro: Coroutine[object, object, T]) -> T:
     """Run *coro* on a fresh loop in *this* (worker) thread, then drain stragglers.
 
     The fresh-loop path retained **only** for the loop-on-loop fallback in
@@ -258,10 +273,10 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
       (LiteLLM's logging-worker loop is an intentionally infinite task). By this
       point every such task has been *started*, so cancelling it is warning-free.
 
-    Both drains are bounded by the same ``timeout`` as the call, so a hung
-    callback can't wedge the bridge; the call's own result/exception always
-    propagates ahead of any straggler outcome. The drains run whether *coro*
-    succeeded or raised.
+    Each drain is bounded by ``_DRAIN_TIMEOUT_SECONDS``, independent of the
+    call's own wait (which may be unbounded), so a hung callback can't wedge
+    the bridge; the call's own result/exception always propagates ahead of any
+    straggler outcome. The drains run whether *coro* succeeded or raised.
     """
     # Function-local + module-bound; see :mod:`llmkit._litellm`.
     import llmkit._litellm as _litellm
@@ -276,8 +291,10 @@ def _run_and_drain[T](coro: Coroutine[object, object, T], *, timeout: float | No
                 # Drain pending LiteLLM logging whether the call succeeded or
                 # raised — an undrained coroutine/task is otherwise destroyed
                 # (and warned about) at ``loop.close()``.
-                loop.run_until_complete(_litellm.drain_async_logging(timeout=timeout))
-                _drain_pending(loop, timeout=timeout)
+                loop.run_until_complete(
+                    _litellm.drain_async_logging(timeout=_DRAIN_TIMEOUT_SECONDS)
+                )
+                _drain_pending(loop, timeout=_DRAIN_TIMEOUT_SECONDS)
         finally:
             try:
                 # Asyncgen finalizers may schedule one last off-loop log write
@@ -320,7 +337,7 @@ def _drain_pending(loop: asyncio.AbstractEventLoop, *, timeout: float | None) ->
         _ = loop.run_until_complete(asyncio.wait_for(drain, timeout=timeout))
 
 
-def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 600) -> T:
+def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None | Unset = UNSET) -> T:
     """Run an async coroutine synchronously, handling event-loop detection.
 
     Drives *coro* on llmkit's single **persistent** event loop (one dedicated
@@ -352,14 +369,15 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
       offloaded to a one-shot worker thread with its own fresh loop
       (:func:`_run_and_drain`), serialized so fresh loops never coexist.
 
-    ``timeout`` bounds the **wait** and defaults to **600 seconds** (10 minutes),
+    ``timeout`` bounds the **wait**. Unset, it is **600 seconds** (10 minutes),
     not a few seconds: structured generations routinely run tens of seconds and a
     large capped prompt can run minutes, so a short default would raise
-    :class:`concurrent.futures.TimeoutError` mid-flight on a slow-but-valid call.
-    The global rate limiter (:class:`~llmkit.rate_limiting.GlobalRateLimiter`) is
-    the real concurrency backpressure; this ceiling exists only to bound a *hung*
-    provider. Pass ``None`` to wait unbounded at the bridge, relying on the
-    call function's per-request ``timeout`` or LiteLLM's default when unset.
+    :class:`TimeoutError` mid-flight on a slow-but-valid call. The global rate
+    limiter (:class:`~llmkit.rate_limiting.GlobalRateLimiter`) is the real
+    concurrency backpressure; this ceiling exists only to bound a *hung*
+    coroutine. Pass ``None`` to wait unbounded. The call functions' sync forms
+    pass ``None``: like their async forms, they are bounded by the per-request
+    ``timeout`` and the retry budget, not by a whole-call ceiling.
 
     On the persistent-loop path — including reentrant calls from a foreign
     loop — a timeout (or a :class:`KeyboardInterrupt` in the calling thread)
@@ -381,11 +399,12 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
        is generous: timing out is a last-resort signal that something is wrong,
        not a routine control-flow path.
     """
+    wait = _DEFAULT_TIMEOUT_SECONDS if isinstance(timeout, Unset) else timeout
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         # No loop running in this thread: the common path → the persistent loop.
-        return _submit_to_loop(coro, timeout=timeout)
+        return _submit_to_loop(coro, timeout=wait)
 
     # A stale read of ``_loop`` (no lock) is benign here: if the persistent loop
     # was never started or was concurrently shut down, ``running`` is a foreign
@@ -397,7 +416,7 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
         # Blocking this thread is what the old fresh-loop fallback did anyway —
         # and routing here keeps LiteLLM's logging worker on one loop even when
         # many reentrant calls overlap.
-        return _submit_to_loop(coro, timeout=timeout)
+        return _submit_to_loop(coro, timeout=wait)
 
     # The persistent loop itself is running in this thread → loop-on-loop
     # fallback. Run the worker inside a *copy* of the caller's context so the
@@ -406,7 +425,7 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     ctx = contextvars.copy_context()
 
     def _drive() -> T:
-        return _run_and_drain(coro, timeout=timeout)
+        return _run_and_drain(coro)
 
     # Deliberately *not* a ``with`` block: the context manager's ``__exit__``
     # calls ``executor.shutdown(wait=True)``, which blocks until the worker
@@ -417,7 +436,7 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None = 6
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(ctx.run, _drive)
     try:
-        return future.result(timeout=timeout)
+        return future.result(timeout=wait)
     finally:
         executor.shutdown(wait=False)
 

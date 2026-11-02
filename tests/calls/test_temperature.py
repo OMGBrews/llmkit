@@ -12,7 +12,7 @@ These tests pin three seams (the call-surface ones through an
 :mod:`llmkit.testing` fake, whose request carries the resolved temperature):
 
 * every public call surface (structured, plain-text, streaming, the sync
-  wrappers, and the deprecated ``stream_text_with_log`` alias) accepts
+  wrappers) accepts
   ``temperature=None``;
 * the three transports (``acompletion_structured``, ``acompletion_text``,
   ``astream_text``) omit the ``temperature`` key when the resolved value is
@@ -58,7 +58,6 @@ def test_signatures_expose_temperature() -> None:
         llm_calls.text_llm_call,
         llm_calls.text_llm_call_sync,
         llm_calls.text_llm_call_stream,
-        llm_calls.stream_text_with_log,
     ):
         assert "temperature" in inspect.signature(surface).parameters
 
@@ -274,24 +273,6 @@ def test_keyword_none_reaches_transport_sync_text() -> None:
     with install(lambda _request: Reply.text("ok")) as installed:
         _ = llm_calls.text_llm_call_sync("hi", feature="test", temperature=None)
 
-    assert [r.temperature for r in installed.requests] == [None]
-
-
-def test_deprecated_alias_omits_key() -> None:
-    """The deprecated ``stream_text_with_log`` alias forwards
-    ``temperature=None`` to the streaming path."""
-
-    async def _drive() -> list[str]:
-        chunks: list[str] = []
-        async for chunk in llm_calls.stream_text_with_log("hi", feature="test", temperature=None):
-            chunks.append(chunk)
-        return chunks
-
-    with install(lambda _request: Reply.text("ok")) as installed:
-        with pytest.warns(DeprecationWarning, match="text_llm_call_stream"):
-            chunks = asyncio.run(_drive())
-
-    assert chunks == ["ok"]
     assert [r.temperature for r in installed.requests] == [None]
 
 

@@ -284,9 +284,8 @@ def text_llm_call_sync(
     :func:`structured_llm_call_sync`).
 
     ``timeout`` is seconds for one provider round trip; unset or ``None`` sends
-    no timeout keyword. The sync bridge's separate 600-second whole-call
-    ceiling still applies: a larger per-request timeout cannot extend it,
-    and retries can reach that ceiling before their request timeout expires.
+    no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
+    async form, the per-request timeout and the retry budget bound the call.
     """
     return run_sync(
         text_llm_call(
@@ -303,5 +302,6 @@ def text_llm_call_sync(
             cache=cache,
             on_result=on_result,
             options=options,
-        )
+        ),
+        timeout=None,
     )

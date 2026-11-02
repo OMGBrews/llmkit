@@ -121,10 +121,11 @@ from llmkit import (
     Provider,
     configure_llm_client,
     structured_llm_call,
+    structured_llm_call_sync,
 )
 
 # Point the library at a provider once, at startup.
-configure_llm_client(lambda: LLMClientConfig(
+configure_llm_client(LLMClientConfig(
     provider=Provider.OPENROUTER,
     model="google/gemini-2.5-flash",
     api_key="sk-or-...",
@@ -134,19 +135,29 @@ class Summary(BaseModel):
     title: str
     bullets: list[str]
 
-result: Summary = await structured_llm_call(
+# From synchronous code:
+result: Summary = structured_llm_call_sync(
     prompt="Summarize the attached report.",
     output_schema=Summary,
     feature="reports",      # groups calls in the logs
     label="exec_summary",   # names this specific call in the logs
 )
+
+# From async code, the same call awaited:
+async def summarize() -> Summary:
+    return await structured_llm_call(
+        prompt="Summarize the attached report.",
+        output_schema=Summary,
+        feature="reports",
+        label="exec_summary",
+    )
 ```
 
-The call functions are async: run the snippet inside an event loop (an async
-framework, or `asyncio.run(...)` around an `async def main()`), or call
-`structured_llm_call_sync(...)` with the same arguments from synchronous code.
-The call's log record lands under `data/llm-logs/` in your project by default —
-see [Where the logs go](#where-the-logs-go).
+The two forms are the same call. They take the same arguments and give the
+same retries, logging and result; the sync form runs the async call on
+llmkit's own event loop and waits for it. Inside async code, await the async
+form. The call's log record lands under `data/llm-logs/` in your project by
+default — see [Where the logs go](#where-the-logs-go).
 
 > **Two defaults worth knowing up front.**
 > - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it, logs a warning the first time each model refuses, and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
@@ -157,7 +168,7 @@ in [Contributing: live provider tests](CONTRIBUTING.md#live-provider-tests).
 Then replace the provider registration above with:
 
 ```python
-configure_llm_client(lambda: LLMClientConfig(
+configure_llm_client(LLMClientConfig(
     provider=Provider.OLLAMA,
     model="llama3.2",
     base_url="http://localhost:11434",
@@ -174,23 +185,23 @@ The public call surface:
 
 | Function | Use |
 |----------|-----|
-| `structured_llm_call(prompt, output_schema, feature, label, ...)` | Async, returns a validated Pydantic instance |
-| `structured_llm_call_sync(...)` | Synchronous wrapper around `structured_llm_call` |
-| `text_llm_call(prompt, feature, label, ...)` | Async, returns plain text (coerces provider list-content blocks) |
-| `text_llm_call_sync(...)` | Synchronous wrapper around `text_llm_call` |
-| `text_llm_call_stream(prompt, feature, label, ...)` | Async generator yielding text chunks, logged on completion |
-| `tool_llm_call(prompt, tools, feature, ..., output_schema=...)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
-| `tool_llm_call_sync(...)` | Synchronous wrapper around the tool turn |
-| `tool_llm_call_stream(prompt, tools, feature, ...)` | Async generator yielding `TextDeltaEvent`s, ending with the completed `ToolCallResult` |
+| `structured_llm_call(prompt, output_schema, *, feature, label=None, ...)` | Async, returns a validated Pydantic instance |
+| `structured_llm_call_sync(...)` | The same call, run synchronously |
+| `text_llm_call(prompt, *, feature, label=None, ...)` | Async, returns plain text (coerces provider list-content blocks) |
+| `text_llm_call_sync(...)` | The same call, run synchronously |
+| `text_llm_call_stream(prompt, *, feature, label=None, ...)` | Async generator yielding text chunks, logged on completion; retries only before the first chunk |
+| `tool_llm_call(prompt, tools, *, feature, ..., output_schema=None)` | Async tool turn; with a schema, returns tool calls or a validated final answer |
+| `tool_llm_call_sync(...)` | The same call, run synchronously |
+| `tool_llm_call_stream(prompt, tools, *, feature, ...)` | Async generator yielding `TextDeltaEvent`s, ending with the completed `ToolCallResult`; retries only before the first event |
 
-**The two streaming functions have no `_sync` twin, and cannot.** `run_sync`
-bridges a coroutine; an async generator is not one, and there is no way to hand
-a synchronous caller a lazily-produced stream without inventing a thread-backed
-iterator llmkit deliberately does not own. Consume them from async code.
+`feature` and everything after it are keyword-only. `feature` is the one
+required name: it groups the call's records in the logs. A sync form takes
+exactly the parameters of its async form, and a test holds every pair to
+that.
 
-> **Deprecated alias.** `stream_text_with_log` is the old name for
-> `text_llm_call_stream`; it still works (same signature and behaviour) but
-> warns `DeprecationWarning` and is removed in 1.0. Switch the call.
+**The two streaming functions have no `_sync` form yet.** Consume them from
+async code. A stream retries a transient failure only before its first item
+reaches you; see the [streaming caveat](#tuning-or-opting-out-per-call).
 
 `prompt` is typed `str | Sequence[ChatMessage]` on all call functions. A plain string is sent as-is; the sequence form is a conversation, where `ChatMessage` is `Message | AssistantToolMessage | ToolResultMessage`:
 
@@ -422,7 +433,7 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and `text_llm_call_stream`; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -452,7 +463,7 @@ llmkit chooses no temperature of its own (`DEFAULT_TEMPERATURE` is `None`), so t
 reaches the provider; the exception is Gemini 3 on Google AI Studio and Google's Agent Platform,
 where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
-`None` is accepted on every call surface — structured, plain-text, streaming, tool calls, the sync wrappers, and the deprecated `stream_text_with_log` alias — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
+`None` is accepted on every call surface — structured, plain-text, streaming, tool calls, and the sync wrappers — both as a direct keyword and through `LLMCallOptions`. When the resolved value is `None`, llmkit omits the `temperature` kwarg from the provider request entirely (an identity check, so `0.0` is never mistaken for unset). Log records reflect the omission: `LLMCallRecord.temperature` is `None` and the YAML sink writes `temperature: null`, for a default call and an explicit `None` alike.
 
 **A refused temperature is omitted, once.** Some models accept no sampling temperature: LiteLLM refuses any value but `1` on GPT-5 models whose effective reasoning effort is not `none` (including a model whose own default effort is not `none`, such as `gpt-5-mini` with no `reasoning_effort` passed) and on Claude 5.5-era models on the Anthropic and Bedrock routes, and a provider may refuse it with an HTTP 400 of its own. When either refusal names `temperature`, llmkit re-issues the same request exactly once with LiteLLM's per-call `additional_drop_params=["temperature"]` — never the process-global `litellm.drop_params` — so the call runs at the model's own sampling. The record then shows what was sent, `temperature: null`, rather than the value you asked for, and the `llmkit._litellm` logger warns the first time each model refuses, naming the model and the dropped value; later drops for that model log at DEBUG. If the re-issue fails too, the original refusal is raised. A [cache](#response-cache) hit records the temperature you asked for, because it sent nothing. One limitation: if your process sets the global `litellm.drop_params = True`, LiteLLM drops the value silently, no refusal reaches llmkit, and the record shows your value.
 
@@ -460,8 +471,8 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
 ### Per-request timeout
 
-Every call function, including the sync wrappers and the deprecated
-`stream_text_with_log` alias, accepts `timeout` in seconds, directly or through
+Every call function, including the sync wrappers, accepts `timeout` in
+seconds, directly or through
 `LLMCallOptions(timeout=30.0)`. A number is forwarded to LiteLLM; unset or
 `None` sends no `timeout` keyword, leaving LiteLLM's request timeout in force
 (600 seconds by default, or its `REQUEST_TIMEOUT` environment setting).
@@ -476,10 +487,9 @@ rate-limiter slot or retry backoff sleeps. Timeout errors are transport errors
 and are retried with a fresh timeout per attempt; pass `retry=NO_RETRY` to
 turn those retries off.
 
-The sync wrappers still have the sync bridge's separate 600-second whole-call
-ceiling. A per-request timeout above that ceiling cannot extend the sync wait,
-and retries or queue waits can exhaust the bridge ceiling before a request's
-own timeout. This setting is not a whole-call deadline.
+The sync wrappers behave the same way: the sync bridge adds no whole-call
+ceiling of its own. This setting is not a whole-call deadline on either form;
+the retry budget and each request's timeout are what bound a call.
 
 ### Contracts as JSON-schema dicts
 
@@ -1241,7 +1251,7 @@ pip install "omg-llmkit[vertex]"
 **`gemini_structured_output` picks Gemini's structured-output strategy** and is read only by the two Gemini providers (`VERTEX`, `GOOGLE`); a non-default value on any other provider is rejected (the default `"schema"` is always accepted). `"schema"` (the default) keeps Gemini's native JSON-schema constrained decoding (`instructor.Mode.JSON_SCHEMA`) with server-side schema enforcement — the pre-existing wire behavior, unchanged. `"json"` switches to `Mode.JSON`: the response is still server-side guaranteed to be JSON *syntax*, but the schema moves into the system prompt and is validated client-side (with instructor's single repair re-ask on a mismatch). If you observe repeated output running into `max_tokens` with `"schema"`, compare `"json"` on your own model, prompts, and schemas. This is a workload-dependent workaround, not a guarantee that repetition or truncation will stop. The trade is giving up server-side *schema* enforcement for an occasional repair round-trip. An unrecognized value raises at provider construction rather than silently falling back.
 
 ```python
-configure_llm_client(lambda: LLMClientConfig(
+configure_llm_client(LLMClientConfig(
     provider=Provider.VERTEX,
     gemini_structured_output="json",   # compare this mode on your workload
 ))
@@ -1251,7 +1261,7 @@ Per-call `model=` overrides the default, so "strong/small/current" model roles a
 
 `reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. Reasoning can consume the output-token budget. The meaning of `"disable"` depends on the route and model: some disable reasoning, some reduce it to the lowest supported effort, and others reject the request. Do not assume it eliminates reasoning tokens or prevents truncation. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
 
-Register the config with `configure_llm_client(source)`, where `source` is a zero-arg callable returning an `LLMClientConfig` (re-read on each provider construction, so it tracks live settings changes).
+Register the config with `configure_llm_client(LLMClientConfig(...))`. Calling it again replaces the registration, so a host that changes provider occasionally re-registers. For a single call, pass `provider=` instead; see the next section.
 
 ### Constructing a provider for a per-call override
 
@@ -1289,8 +1299,19 @@ global source to register, the call runs on the per-call provider alone, and the
 log records that provider as the effective one. The "configure once globally" and
 "provide per call" models are independent: use either, or mix them (a global
 default with per-call overrides where needed). A call that passes *neither* a
-per-call `provider=` nor a registered global source raises a clear
-`RuntimeError` telling you to configure one.
+per-call `provider=` nor a registered global config raises
+`LLMClientNotConfiguredError` before its first attempt, naming both remedies.
+The class subclasses `RuntimeError`.
+
+**A config resolved late or per context.** `configure_llm_client` also accepts
+a zero-argument callable that returns an `LLMClientConfig`. llmkit calls it on
+every provider construction, so it suits a host whose settings reload at
+runtime or whose config depends on context, such as a tenant chosen per
+request:
+
+```python
+configure_llm_client(lambda: settings.current().llm_config)
+```
 
 To build from a full config instead, use `build_provider(config)`:
 
@@ -1355,7 +1376,9 @@ Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_ll
 
 The two zero-budget subsets are fail-fast *defaults*, not prohibitions: a caller that genuinely wants the retry opts back in by listing `OutputLimitError` or `CircuitOpenError` explicitly in a `retry_on`. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
-**`LLM_RECOVERABLE_ERRORS` is the single catch-set** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
+**`LlmkitError` is the base of every exception llmkit defines**, from `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises. It does not catch third-party transport or validation errors, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
+
+**`LLM_RECOVERABLE_ERRORS` is the single catch-set for transient failures** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
 
 ### Backoff and `Retry-After`
 
@@ -1440,6 +1463,8 @@ The re-roll is charged against the **validation budget** (`RetryPolicy.validatio
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 
+The hook runs inside the call, on the event loop the call runs on, so keep it quick and non-blocking. A hook that blocks stalls that whole loop. For the sync wrappers that loop is llmkit's own, which every concurrent sync call shares, so a blocking hook in one sync call delays all the others, not only its own.
+
 ## Testing your app with a fake transport
 
 `llmkit.testing` lets your own tests answer llmkit's calls without a provider. Install a fake, and every call made while it is in place reaches the fake instead of the network. Everything around the provider round trip still runs: option merging, the response cache, the rate limiter and circuit breaker, retries, schema parsing and in-call repair, tool-argument parsing, and the call log.
@@ -1449,7 +1474,7 @@ from llmkit import LLMClientConfig, Provider, configure_llm_client
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
 
 # A provider must still be configured; Ollama needs no key.
-configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="test"))
+configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="test"))
 
 def fake(request: TransportRequest) -> Reply:
     if request.feature == "health":

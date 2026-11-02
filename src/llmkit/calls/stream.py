@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import warnings
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
@@ -263,54 +262,6 @@ async def text_llm_call_stream(
                 call_id=call_id,
             ),
         )
-
-
-def stream_text_with_log(
-    prompt: str | Sequence[ChatMessage],
-    *,
-    feature: str,
-    label: str | None = None,
-    temperature: float | None | Unset = UNSET,
-    model: str | None | Unset = UNSET,
-    max_tokens: int | None | Unset = UNSET,
-    timeout: float | None | Unset = UNSET,
-    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
-    retry: RetryPolicy | Unset = UNSET,
-    cache: bool | Unset = UNSET,
-    options: LLMCallOptions | None = None,
-) -> AsyncGenerator[str]:
-    """Deprecated alias for :func:`text_llm_call_stream`; removed in llmkit 1.0.
-
-    ``timeout`` is seconds for one provider round trip (each wait for the
-    next chunk). Unset or ``None`` sends no timeout keyword.
-
-    A plain ``def`` (not ``async def``): ``text_llm_call_stream`` is an
-    async-generator function, so *calling* it returns the async generator
-    without awaiting — a plain ``def`` wrapper therefore preserves
-    ``async for chunk in stream_text_with_log(...)`` exactly, and warns
-    **eagerly at call time** rather than deferring to first iteration.
-    """
-    warnings.warn(
-        "stream_text_with_log() is deprecated; use text_llm_call_stream(). "
-        + "The alias will be removed in llmkit 1.0.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return text_llm_call_stream(
-        prompt,
-        feature=feature,
-        label=label,
-        temperature=temperature,
-        model=model,
-        max_tokens=max_tokens,
-        timeout=timeout,
-        reasoning_effort=reasoning_effort,
-        provider=provider,
-        retry=retry,
-        cache=cache,
-        options=options,
-    )
 
 
 async def _stream_once(

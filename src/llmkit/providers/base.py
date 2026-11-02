@@ -43,6 +43,7 @@ from typing import ClassVar, Literal, Protocol, cast, overload, override, runtim
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.exceptions import LLMClientNotConfiguredError
 
 logger = logging.getLogger(__name__)
 
@@ -422,26 +423,44 @@ class LLMClientConfig:
 _config_source: Callable[[], LLMClientConfig] | None = None
 
 
-def configure_llm_client(config_source: Callable[[], LLMClientConfig]) -> None:
-    """Register the source that supplies the active :class:`LLMClientConfig`.
+def configure_llm_client(
+    config_source: LLMClientConfig | Callable[[], LLMClientConfig],
+) -> None:
+    """Register the active :class:`LLMClientConfig`.
 
-    The source is a zero-arg callable invoked on each :func:`build_provider`
-    call, mirroring the previous behaviour of reading the host's
-    (cached) settings on every provider construction — so a settings
-    change is picked up without re-registration.
+    Pass the config itself — the usual form::
+
+        configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="llama3.2"))
+
+    Calling again replaces it, so a host that changes provider occasionally
+    re-registers. A host whose config is resolved late or depends on context
+    (settings reloaded at runtime, a tenant chosen per request) passes a
+    zero-argument callable instead; it is invoked on each
+    :func:`build_provider` call, so a change is picked up without
+    re-registration. A single call can bypass the registration entirely with
+    its ``provider=`` keyword.
     """
     global _config_source
-    _config_source = config_source
+    if isinstance(config_source, LLMClientConfig):
+        config = config_source
+        _config_source = lambda: config  # noqa: E731 - a constant source
+    else:
+        _config_source = config_source
 
 
 def active_config() -> LLMClientConfig:
     """Return the configured :class:`LLMClientConfig`, or raise if unset."""
     if _config_source is None:
-        raise RuntimeError(
+        raise LLMClientNotConfiguredError(
             "LLM client not configured: call configure_llm_client(...) at "
-            + "application startup before constructing a provider."
+            + "application startup, or pass provider= to the call."
         )
     return _config_source()
+
+
+def client_configured() -> bool:
+    """Whether :func:`configure_llm_client` has registered a config."""
+    return _config_source is not None
 
 
 @runtime_checkable

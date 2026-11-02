@@ -14,9 +14,9 @@ The line gives every decision one of three shapes: fixed, because it is correctn
 
 ## One function call
 
-Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. The call is async, and a sync form of the same call carries every promise the async form does.
+Calling an LLM is one function call: pass a prompt, and a Pydantic model when you want structured output, and get a result back. The call is async, and its sync form is the same call: the same arguments, the same promises and the same result, differing only in that it runs synchronously.
 
-llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. The call is async because LLM calls are I/O-bound and usually fanned out. The sync form exists because a codebase that cannot await should not have to give up any of the library's promises to use it.
+llmkit holds this principle because everything that makes an LLM call hard to get right is the same for every call, so it belongs behind the function rather than repeated at every call site. The call is async because LLM calls are I/O-bound and usually fanned out. The sync form exists because a codebase that cannot await should not have to give up any of the library's promises to use it, nor take on any the async form does not make.
 
 ## Structured output always validates
 

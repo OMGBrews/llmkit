@@ -76,21 +76,18 @@ def test_capture_records_crosses_the_sync_bridge() -> None:
 def test_capture_records_crosses_the_sync_bridge_from_a_running_loop() -> None:
     """Capture survives a ``*_sync`` call made from *inside* a running loop.
 
-    On that path ``run_sync`` cannot use the persistent loop (a loop is already
-    running in this thread), so it offloads to a worker thread. A bare
-    ``executor.submit`` would not propagate the capture ``ContextVar``, so the
-    record would be silently lost — the buffer lives in the parent context the
-    worker never sees. Regression for that running-loop sync-bridge case (the
-    no-running-loop test above exercises the persistent-loop path, which also
-    crosses a thread boundary and so needs the same context copy).
+    The running loop here is a foreign one, so ``run_sync`` submits the call to
+    the persistent loop on its own thread, as it does with no loop running. The
+    capture ``ContextVar`` reaches that thread only because the bridge runs the
+    task inside a copy of the caller's context; without the copy the record
+    would be silently lost. Regression for the reentrant sync-bridge case.
     """
     with install(_fake_structured):
 
         async def _run() -> tuple[list[LLMCallRecord], OkSchema]:
             with capture_llm_records() as records:
-                # Called directly (blocking) from inside the running loop, so
-                # run_sync detects it and offloads to a worker thread whose
-                # context must carry this capture buffer.
+                # Called directly (blocking) from inside the running loop;
+                # the persistent loop's task must see this capture buffer.
                 result = llm_calls.structured_llm_call_sync(
                     "hi", OkSchema, feature="classification"
                 )
