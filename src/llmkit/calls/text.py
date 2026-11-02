@@ -72,10 +72,9 @@ async def text_llm_call(
             refuses it as unsupported for the model (GPT-5 models with
             reasoning active, Claude 5.5-era models), the request is
             re-issued once without it and the call record shows ``None``.
-        model: Optional model override (provider default when it resolves
-            to ``None``). *Dual-homed* with
-            :class:`~llmkit.LLMClientConfig`: per-call overrides
-            ``options`` overrides config.
+        model: Optional model override. Unset defers to ``options``, then
+            to the default model of the provider the call runs on (see
+            :func:`structured_llm_call`).
         timeout: Seconds for one provider round trip; unset or ``None`` sends
             no timeout keyword and leaves LiteLLM's default in effect.
         max_tokens: Optional cap on the completion length, forwarded to
@@ -84,10 +83,12 @@ async def text_llm_call(
             rather than returning the partial text.
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort; unset defers to ``options``, then to
-            the configured :class:`~llmkit.LLMClientConfig` value.
-            *Dual-homed* like ``model``.
-        provider: Optional provider override for THIS call only (unset
-            uses the globally-configured provider).
+            the ``reasoning_effort`` of the provider the call runs on (see
+            :func:`structured_llm_call`).
+        provider: Optional provider for this call (see
+            :func:`structured_llm_call`); unset defers to ``options``, then
+            to the provider registered with
+            :func:`~llmkit.configure_llm_client`.
         retry: Transient-error retry budget (default-on; see
             :func:`structured_llm_call`). Pass :data:`~llmkit.NO_RETRY` to
             opt out. Each attempt is its own logged call.

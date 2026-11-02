@@ -1035,16 +1035,16 @@ async def acompletion_structured[T: BaseModel](
     :func:`_acompletion`, which re-issues the request once without it.
 
     ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
-    ``"disable"`` turns Gemini thinking off). When ``None``, the provider's
-    configured :pyattr:`~llmkit.providers.LLMProviderInterface.reasoning_effort`
-    (from :class:`~llmkit.LLMClientConfig`) is used; an explicit value here
-    overrides it for this call. The kwarg is only included when the resolved
-    value is not ``None``, so the default request is byte-identical to before.
+    ``"disable"`` turns Gemini thinking off). When ``None``, the
+    :pyattr:`~llmkit.providers.LLMProviderInterface.reasoning_effort` of the
+    provider the call runs on is used (the registered one, or ``provider``);
+    an explicit value here overrides it for this call. The kwarg is only
+    included when the resolved value is not ``None``, so the default request
+    is byte-identical to before.
 
-    ``provider`` overrides the configured provider for this call only
-    (``None`` uses the globally-configured one) — the seam that lets a
-    single call route through a different provider family without changing
-    the app-wide registration.
+    ``provider`` is the provider this call runs on (``None`` builds the
+    registered one), so calls in one program can go to different providers
+    without changing the registration.
 
     Returns ``(parsed, approximate_cost, usage, text)``, where ``usage`` is the
     completion's ``(prompt_tokens, completion_tokens, total_tokens)`` from
@@ -1288,8 +1288,8 @@ async def acompletion_text(
     overrides it); the kwarg is only forwarded when the resolved value is
     not ``None``. ``temperature`` is forwarded only when not ``None`` — a
     resolved ``None`` sends no ``temperature`` key at all (the provider's
-    default sampling applies). ``provider`` overrides the configured
-    provider for this call only (``None`` uses the globally-configured one).
+    default sampling applies). ``provider`` is the provider this
+    call runs on (``None`` builds the registered one).
 
     Returns ``(text, approximate_cost, usage)``, ``usage`` being the
     :class:`~llmkit._transport.WireUsage` triple the call log records. The text is the first
@@ -1713,8 +1713,8 @@ async def astream_text(
     Like :func:`astream_tools` this requests
     ``stream_options={"include_usage": True}``, so the provider's token usage
     and any cost LiteLLM stamps on a frame reach the terminal item, and the
-    TPM limiter is debited with the reported total. ``provider`` overrides the
-    configured provider for this call only (``None`` uses the global one).
+    TPM limiter is debited with the reported total. ``provider`` is the
+    provider this call runs on (``None`` builds the registered one).
 
     ``max_tokens`` caps the streamed completion length and ``reasoning_effort``
     controls provider thinking tokens — parity with the non-streaming text and

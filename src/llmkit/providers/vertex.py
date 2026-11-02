@@ -32,7 +32,7 @@ class VertexProvider(BaseProvider):
     and ``vertex_location``, and each only when set; the credentials stay in the ambient chain and
     never pass through :class:`~llmkit.LLMClientConfig`. When both are left unset they resolve from
     the environment (``VERTEXAI_PROJECT`` / ``VERTEXAI_LOCATION``), with the location otherwise
-    falling back to Google's default region.
+    falling back to LiteLLM's default, ``us-central1``, which does not serve the default model.
 
     ``vertex_location`` is the **data-processing residency** control: it selects the endpoint where
     the request is processed. LiteLLM derives three shapes from it —

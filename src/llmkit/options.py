@@ -6,10 +6,11 @@ A feature module builds one :class:`LLMCallOptions` and passes it as
 :func:`~llmkit.tool_llm_call`, :func:`~llmkit.tool_llm_call_stream`, and the
 sync wrappers) instead of repeating the same per-call keyword block at each
 site. This module owns only the *merge*: collapsing the three precedence
-layers — the configured client, a shared ``LLMCallOptions``, and the explicit
-per-call keywords — into the single :class:`ResolvedCallArgs` shape every call
-function forwards to the transport. It carries no logging or transport concern;
-those live in :mod:`llmkit.capture` and :mod:`llmkit.calls`.
+layers — the provider the call runs on (the registered one, or ``provider``),
+a shared ``LLMCallOptions``, and the explicit per-call keywords — into the
+single :class:`ResolvedCallArgs` shape every call function forwards to the
+transport. It carries no logging or transport concern; those live in
+:mod:`llmkit.capture` and :mod:`llmkit.calls`.
 
 "Explicitly passed" is a structural fact here, not a guess: every mergeable
 call-function keyword defaults to :data:`UNSET`, so a keyword that arrives as
@@ -57,7 +58,7 @@ class Unset(Enum):
 
 #: The "this argument was not passed" sentinel. An unset call-function keyword
 #: defers to :class:`LLMCallOptions`, then to the true default (and, for the
-#: config-backed fields, through it to the configured client). An unset
+#: config-backed fields, through it to the provider the call runs on). An unset
 #: options field defers to the same chain minus itself — it never clobbers a
 #: config value with a default.
 UNSET = Unset.UNSET
@@ -80,10 +81,12 @@ class LLMCallOptions:
 
     Every field is **optional and unset by default** (the :data:`UNSET`
     sentinel, not ``None``): an unset field defers to the per-call keyword,
-    which in turn defers to the configured :class:`~llmkit.LLMClientConfig`
-    for the dual-homed ``model`` / ``reasoning_effort``. This is what makes
-    "unset option does not clobber config" work — only a field you *set* on
-    the options participates in the merge. Precedence, lowest to highest:
+    which in turn defers, for the dual-homed ``model`` / ``reasoning_effort``,
+    to the provider the call runs on: the one built from the configured
+    :class:`~llmkit.LLMClientConfig`, or a ``provider`` given here or per
+    call. This is what makes "unset option does not clobber config" work —
+    only a field you *set* on the options participates in the merge.
+    Precedence, lowest to highest:
     **config < options < explicit per-call keyword** — exactly, because the
     call functions' keywords also default to :data:`UNSET`, any keyword you
     pass (including ``None``, including a value equal to the documented
@@ -109,11 +112,13 @@ class LLMCallOptions:
         max_tokens: Completion-length cap. Unset defers to the per-call
             ``max_tokens`` keyword (uncapped when also unset).
         reasoning_effort: Provider reasoning/thinking effort. Unset defers
-            to the per-call keyword, then to the configured client value.
+            to the per-call keyword, then to the ``reasoning_effort`` of the
+            provider the call runs on (the registered one, or ``provider``).
         retry: Transient-error retry budget. Unset defers to the per-call
             ``retry`` keyword (:data:`~llmkit.DEFAULT_RETRY_POLICY`).
-        provider: Per-call provider override. Unset defers to the per-call
-            ``provider`` keyword (the globally-configured provider).
+        provider: Provider for the call, for example one built with
+            :func:`~llmkit.make_provider`. Unset defers to the per-call
+            ``provider`` keyword, then to the registered provider.
         cache: Whether the call reads and writes the configured response
             cache (:func:`~llmkit.configure_llm_cache`). Unset defers to the
             per-call ``cache`` keyword, then to ``True``; ``False`` bypasses
@@ -193,8 +198,9 @@ def resolve_call_args(
     * otherwise a field that is *set* on ``options`` is used;
     * otherwise the true default stands (:data:`DEFAULT_TEMPERATURE`,
       :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``True`` for ``cache``, ``None``
-      for the rest — ``model`` and ``reasoning_effort`` resolve against the
-      configured client; unset ``timeout`` sends no keyword).
+      for the rest — ``model`` and ``reasoning_effort`` then fall to the
+      provider the call runs on, the registered one or ``provider``; unset
+      ``timeout`` sends no keyword).
 
     For ``temperature`` specifically, the default is ``None``: llmkit
     chooses no temperature, the transport forwards **no** ``temperature``

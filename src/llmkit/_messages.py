@@ -54,11 +54,12 @@ def resolve_reasoning_effort(
 ) -> ReasoningEffort | None:
     """Resolve the effective reasoning effort for a call.
 
-    A per-call ``override`` wins when set; otherwise the provider's
-    configured value (from :class:`~llmkit.LLMClientConfig`) applies. Both
-    ``None`` means no reasoning kwarg is forwarded — byte-identical to the
-    pre-feature request. ``getattr`` keeps third-party providers that predate
-    the ``reasoning_effort`` property working (they degrade to ``None``).
+    A per-call ``override`` wins when set; otherwise the value of the
+    provider the call runs on (the registered one, or ``provider=``)
+    applies. Both ``None`` means no reasoning kwarg is forwarded —
+    byte-identical to the pre-feature request. ``getattr`` keeps third-party
+    providers that predate the ``reasoning_effort`` property working (they
+    degrade to ``None``).
     """
     if override is not None:
         return override

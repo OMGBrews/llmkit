@@ -130,18 +130,22 @@ def make_provider(
 ) -> BaseProvider:
     """Construct a provider directly from raw credentials.
 
-    The one-liner for the per-call ``provider=`` override: build a provider
+    The one-liner for the per-call ``provider=`` argument: build a provider
     from a raw key (and optional model) without standing up an
-    :class:`LLMClientConfig` or touching the module-level config source. Reach
-    for it to route a single call through a different provider family, model, or
-    credential than the globally-configured one::
+    :class:`LLMClientConfig` or touching the module-level config source.
+    Passing the result as ``provider=`` switches that call's provider, model, or
+    credential the way ``model=`` switches its model, so one program can send
+    calls to several providers, for example to compare them on the same prompt,
+    with or without a registered config::
 
         provider = make_provider(Provider.ANTHROPIC, api_key=key)
         result = structured_llm_call_sync(..., provider=provider)
 
-    Note this does not isolate rate-limit budgets: the limiter is keyed by
-    provider *name*, so calls sharing a provider share its budget (llmkit is
-    single-tenant by design — see :mod:`llmkit.rate_limiting`).
+    Note this does not isolate one credential from another: two instances of
+    the same provider, for example two accounts, share its rate-limit budget
+    and circuit breaker (both keyed by provider *name*) and its cached answers
+    (the response-cache key leaves credentials out). llmkit is single-tenant by
+    design; see :mod:`llmkit.rate_limiting`.
 
     This function's keywords are the fields of :class:`LLMClientConfig`, but a knob the selected
     provider does not read is **rejected**, not silently ignored: passing ``api_key`` to Ollama,
@@ -155,19 +159,21 @@ def make_provider(
         provider: Which provider to construct.
         api_key: Bearer credential for the key-authenticated providers
             (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras); resolves from
-            this value, else the provider's environment variable, else raises. Not accepted by
+            this value, else the provider's environment variable as ``os.environ`` holds it when
+            this function runs (a key kept only in a ``.env`` file is not loaded until the first
+            call imports LiteLLM, so load the file first), else raises. Not accepted by
             Ollama (local) or Bedrock or Google's Agent Platform (which sign via their ambient
             AWS/Google credential chains).
         model: Default model for this provider; ``None`` uses the provider's
             built-in default.
         base_url: Endpoint (gateway, proxy, compatible endpoint) for every
-            key-authenticated provider and Ollama, forwarded to LiteLLM as ``api_base``: it
-            resolves from this value, else the provider's own documented endpoint variable(s)
-            (``OPENAI_BASE_URL`` and friends, still honoured), else that provider's measured
-            default — resolved per call, so it reflects the environment the call goes out in. That
-            keeps a source llmkit does not read from choosing the endpoint, with two documented
-            exceptions: Google AI Studio owns no default (its base carries a model-derived API
-            version) and so sends nothing when neither is set, and Ollama's LiteLLM route ranks
+            key-authenticated provider and Ollama, forwarded to LiteLLM as ``api_base``.
+            Anthropic, OpenAI, DeepSeek, Cerebras and Google AI Studio resolve it per call from
+            this value, else their endpoint variable(s) (``OPENAI_BASE_URL``, ``GEMINI_API_BASE``
+            and friends), else a measured default. Google AI Studio has no default and sends
+            nothing when neither this value nor ``GEMINI_API_BASE`` is set (its base carries a
+            model-derived API version). OpenRouter and Ollama read no variable: this value, else
+            llmkit's default, fixed when the provider is built. Ollama's LiteLLM route ranks
             ``litellm.api_base`` above the value sent. Not accepted by Bedrock or Google's Agent
             Platform, whose endpoints LiteLLM derives from ``aws_region_name`` /
             ``vertex_location`` — for those two an ambient endpoint value can override the pinned
@@ -181,7 +187,8 @@ def make_provider(
             provider. ``None`` resolves from the environment / ADC.
         vertex_location: Google's Agent Platform region — the data-residency control; not
             accepted by any other provider. ``None`` resolves from the
-            environment, else Google's default region.
+            environment, else LiteLLM's default ``us-central1``, which does
+            not serve the default model.
         gemini_structured_output: Structured-output strategy for the Gemini
             providers (Google's Agent Platform, Google AI Studio); a non-default value is not
             accepted by any other provider. ``"schema"`` (default) keeps Gemini's native

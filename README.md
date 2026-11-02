@@ -38,7 +38,8 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
   - [Write your own store](#write-your-own-store)
 - [Configuration](#configuration)
   - [`BEDROCK` and `VERTEX` do not own their endpoints](#bedrock-and-vertex-do-not-own-their-endpoints)
-  - [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override)
+  - [Switching provider for a whole program](#switching-provider-for-a-whole-program)
+  - [Switching provider per call](#switching-provider-per-call)
   - [OpenRouter: schema-honoring routing](#openrouter-schema-honoring-routing)
 - [Retries](#retries)
   - [Automatic retries, on by default](#automatic-retries-on-by-default)
@@ -57,7 +58,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (A completion *truncated by the output-token limit* is the one thing never re-asked — it fails fast as `OutputLimitError`; see [Retries](#retries).)
-- **Provider switching is config, not code.** OpenRouter / Google AI Studio / Google's Agent Platform / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Call sites never change when you switch. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Google's Agent Platform (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
+- **Switching providers and models is easy.** OpenRouter / Google AI Studio / Google's Agent Platform / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Switching the provider for a whole program is a config edit, and switching it for one call is one argument on that call, the same as switching the model, so comparing vendors in one program is an ordinary use. Call sites that do not care which vendor answers never name one. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Google's Agent Platform (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see [Logging](#logging-agent-readable-by-default)) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -125,12 +126,9 @@ from llmkit import (
     structured_llm_call_sync,
 )
 
-# Point the library at a provider once, at startup.
-configure_llm_client(LLMClientConfig(
-    provider=Provider.OPENROUTER,
-    model="google/gemini-2.5-flash",
-    api_key="sk-or-...",
-))
+# Point the library at a provider once, at startup. The key comes from
+# OPENROUTER_API_KEY, and with no model set OpenRouter's default model answers.
+configure_llm_client(LLMClientConfig(provider=Provider.OPENROUTER))
 
 class Summary(BaseModel):
     title: str
@@ -162,19 +160,24 @@ default — see [Where the logs go](#where-the-logs-go).
 
 > **Two defaults worth knowing up front.**
 > - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it, logs a warning the first time each model refuses, and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
-> - **Any call takes a per-call `provider=` override** — route a single call through a different provider family, model, or credential without touching the global `configure_llm_client(...)` registration. See [Constructing a provider for a per-call override](#constructing-a-provider-for-a-per-call-override).
+> - **Any call switches provider with one argument, as it switches model.** `provider=make_provider(Provider.ANTHROPIC)` sends that call to Anthropic and leaves the registration above alone, so one program can compare several vendors on the same prompt. See [Switching provider per call](#switching-provider-per-call).
 
-For local calls, first start an Ollama server and pull the model as described
-in [Contributing: live provider tests](CONTRIBUTING.md#live-provider-tests).
-Then replace the provider registration above with:
+Switching this whole program to Ollama, or to a provider whose key is already
+in its own environment variable, is one field: change `provider=`. The new
+provider reads its own credentials and answers with its own default model, both
+listed under [configuration](#configuration). Bedrock and Google's Agent
+Platform also need their extra and a region or location; see
+[Switching provider for a whole program](#switching-provider-for-a-whole-program).
+For local calls, first start an Ollama server and pull the model as described in
+[Contributing: live provider tests](CONTRIBUTING.md#live-provider-tests). Then
+change the registration above to:
 
 ```python
-configure_llm_client(LLMClientConfig(
-    provider=Provider.OLLAMA,
-    model="llama3.2",
-    base_url="http://localhost:11434",
-))
+configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA))  # llama3.2 on localhost:11434
 ```
+
+Pinning `model` makes a switch two fields, because model ids are spelled per
+route; see [Switching provider for a whole program](#switching-provider-for-a-whole-program).
 
 For the next step, see [call reference](#call-reference) for tools, streaming,
 and shared options; [configuration](#configuration) for provider defaults;
@@ -341,7 +344,8 @@ class AddArgs(BaseModel):
 class Answer(BaseModel):
     total: int
 
-# Requires OPENAI_API_KEY; this overrides the quick start's OpenRouter route.
+# Compose is measured on OpenAI and Anthropic, so this loop names its provider
+# on each call, whatever the program registered. The key comes from OPENAI_API_KEY.
 provider = make_provider(Provider.OPENAI, model="gpt-4.1-mini")
 tools = [ToolDefinition.from_model("add", AddArgs, "Add two integers")]
 history: list[ChatMessage] = [
@@ -500,10 +504,11 @@ Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transp
 The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
-from llmkit import LLMCallOptions, structured_llm_call
+from llmkit import LLMCallOptions, Provider, make_provider, structured_llm_call
 
 # Built once per feature module.
 RISK_OPTS = LLMCallOptions(
+    provider=make_provider(Provider.GOOGLE),
     temperature=0.0,
     model="gemini-2.5-flash",
     reasoning_effort="high",
@@ -516,7 +521,9 @@ async def extract(prompt: str) -> RiskRegister:
     )
 ```
 
-`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and both forms of the text stream; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the configured client), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+`LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and both forms of the text stream; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the provider the call runs on), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
+
+The bundle sets `provider` beside `model` because a model id is spelled for one route (`gemini-2.5-flash` is the Google AI Studio and Google's Agent Platform spelling), so the route and its id travel together. `make_provider` reads `GEMINI_API_KEY` when the module is imported, so a key kept only in `.env` must be loaded before then; see [Switching provider per call](#switching-provider-per-call).
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -528,7 +535,9 @@ The flat-keyword path is unchanged — pass no `options` and nothing about exist
 
 **config < `options` < explicit per-call keyword**
 
-So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and a numeric `LLMCallOptions(temperature=0.9)` is used when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or the configured `LLMClientConfig` resolution for `model`/`reasoning_effort`). The same precedence applies to `timeout`: `timeout=5.0` overrides `LLMCallOptions(timeout=30.0)`, while explicit `timeout=None` overrides the options value and sends no timeout. An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
+A call that passes `provider=` takes the lowest layer from that provider instead: its own `model` and `reasoning_effort` (as given to `make_provider` or `build_provider`), not the registered config's.
+
+So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and a numeric `LLMCallOptions(temperature=0.9)` is used when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or, for `model`/`reasoning_effort`, the provider the call runs on: the registered config's, or a per-call `provider=`'s own). The same precedence applies to `timeout`: `timeout=5.0` overrides `LLMCallOptions(timeout=30.0)`, while explicit `timeout=None` overrides the options value and sends no timeout. An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
 
 `Unset` (the type) and `UNSET` (the value) are exported for one idiom: your own typed wrapper can declare `temperature: float | None | Unset = UNSET` and forward it unconditionally, letting llmkit resolve "not passed" vs "provider default" (`None`) vs a number instead of re-inventing the sentinel. Compare with `is`/`is not` only — never truthiness.
 
@@ -825,14 +834,14 @@ you do not want stored. See [Security: scope](SECURITY.md#scope).
 2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, cache_hit, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
 ```yaml
-# ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 1840ms | $0.0007
+# ok | reports/exec_summary | google/gemini-3.1-flash-lite | Summary | 1840ms | $0.0007
 # 2026-06-05T14:22:31.004512 | call=9f3c21ab attempt=1
 
 timestamp: '2026-06-05T14:22:31.004512'
 feature: reports
 label: exec_summary
-model: google/gemini-2.5-flash
-provider: openrouter
+model: google/gemini-3.1-flash-lite
+provider: OpenRouter
 schema: Summary
 run_id: nightly-eval-2026-06-05
 call_id: 9f3c21ab54d64f1f8f2c14febc03a7d1
@@ -1074,7 +1083,7 @@ Credentials are never part of the key, so rotating an API key keeps your hits. `
 A hit writes one record like any call, with `cache_hit: true`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight — for a streamed hit, also the time your code spends on its one chunk, as every stream record's duration includes the consumer's handling. A streamed hit's `schema` is `stream`, like any stream record. A replay your code abandons before its end logs as any abandoned stream does, `# ERROR` with the abandonment marker, and still carries `cache=hit` and `$0`. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
 
 ```text
-# ok | reports/exec_summary | google/gemini-2.5-flash | Summary | 2ms | $0
+# ok | reports/exec_summary | google/gemini-3.1-flash-lite | Summary | 2ms | $0
 # 2026-06-05T14:25:02.118204 | call=4be0d913 attempt=1 cache=hit
 ```
 
@@ -1118,7 +1127,7 @@ class LLMClientConfig:
     provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
-    base_url: str | None = None      # endpoint: config, then env var, then a default (sent as api_base; see below); not accepted by Bedrock or Google's Agent Platform
+    base_url: str | None = None      # endpoint: config, else the provider's env var if it reads one, else its default if it has one (sent as api_base; see below); not accepted by Bedrock or Google's Agent Platform
     reasoning_effort: ReasoningEffort | None = None  # "disable" | "low" | "medium" | "high", or any provider value
     aws_region_name: str | None = None   # AWS Bedrock region; not accepted by any other provider
     vertex_project: str | None = None    # Google's Agent Platform GCP project; not accepted by any other provider
@@ -1127,23 +1136,29 @@ class LLMClientConfig:
 ```
 
 When `model` is omitted or empty, these are the built-in defaults (before
-LiteLLM route prefixes). Pin `model` explicitly when you need stable selection:
+LiteLLM route prefixes). Pin `model` explicitly when you need stable selection.
+The last column is OpenRouter's id for the same model, from OpenRouter's model
+list; *(none)* marks OpenRouter's own row and Ollama's local model:
 
-| Provider | Default model |
-|---|---|
-| `OPENROUTER` | `google/gemini-3.1-flash-lite` |
-| `GOOGLE` | `gemini-3.1-flash-lite` |
-| `VERTEX` | `gemini-3.1-flash-lite` |
-| `ANTHROPIC` | `claude-sonnet-4-6` |
-| `OPENAI` | `gpt-4.1-mini` |
-| `DEEPSEEK` | `deepseek-chat` |
-| `CEREBRAS` | `gpt-oss-120b` |
-| `BEDROCK` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| `OLLAMA` | `llama3.2` |
+| Provider | Default model | On OpenRouter |
+|---|---|---|
+| `OPENROUTER` | `google/gemini-3.1-flash-lite` | *(none)* |
+| `GOOGLE` | `gemini-3.1-flash-lite` | `google/gemini-3.1-flash-lite` |
+| `VERTEX` | `gemini-3.1-flash-lite` | `google/gemini-3.1-flash-lite` |
+| `ANTHROPIC` | `claude-sonnet-4-6` | `anthropic/claude-sonnet-4.6` |
+| `OPENAI` | `gpt-4.1-mini` | `openai/gpt-4.1-mini` |
+| `DEEPSEEK` | `deepseek-chat` | `deepseek/deepseek-chat` |
+| `CEREBRAS` | `gpt-oss-120b` | `openai/gpt-oss-120b` |
+| `BEDROCK` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | `anthropic/claude-haiku-4.5` |
+| `OLLAMA` | `llama3.2` | *(none)* |
 
 The defaults are declared by `_default_model` in each module under
-[`src/llmkit/providers/`](src/llmkit/providers/). Bedrock and Vertex also require
-region/project configuration; see [their setup and endpoint caveats](#bedrock-and-vertex-do-not-own-their-endpoints).
+[`src/llmkit/providers/`](src/llmkit/providers/), and a test checks this table
+against them. Bedrock also needs a region, and Google's Agent Platform a project
+and location; each comes from the config or, when unset, from the environment.
+See [their setup and endpoint caveats](#bedrock-and-vertex-do-not-own-their-endpoints).
+To run the same model on another route, see
+[Switching provider for a whole program](#switching-provider-for-a-whole-program).
 
 **Populating a knob the selected provider does not read is rejected, not
 ignored.** Each provider declares which provider-shaped fields it honours, and
@@ -1326,7 +1341,7 @@ pip install "omg-llmkit[bedrock]"
 
 The default model is Claude Haiku 4.5 via its **cross-region inference profile** id (`us.anthropic.claude-haiku-4-5-20251001-v1:0`) — current Claude models on Bedrock are typically reached through inference profiles rather than plain on-demand ids. Pass a different profile- or partition-prefixed id as `model` (e.g. `eu.anthropic.claude-...`) when your account routes elsewhere.
 
-`vertex_project` and `vertex_location` are the equivalents for Google's Agent Platform and are not accepted by any other provider. Google's Agent Platform reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to Google's default region. Google's Agent Platform routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
+`vertex_project` and `vertex_location` are the equivalents for Google's Agent Platform and are not accepted by any other provider. Google's Agent Platform reaches the same Gemini models as the `GOOGLE` (AI Studio) provider, but through Google Cloud — and like Bedrock it carries **no secret** here: Google credentials resolve from **Application Default Credentials** (`gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or a workload-identity / metadata-server token), never through `LLMClientConfig`. Leave `vertex_project` / `vertex_location` `None` to resolve them from the environment (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`), with the location otherwise falling back to LiteLLM's default, `us-central1`, which does not serve the default model. Google's Agent Platform routing needs `google-auth` to mint its OAuth token — install it with the opt-in extra:
 
 ```bash
 pip install "omg-llmkit[vertex]"
@@ -1347,30 +1362,121 @@ configure_llm_client(LLMClientConfig(
 
 Per-call `model=` overrides the default, so "strong/small/current" model roles are the host's concern — resolve them to a model string and pass it at the call site. The library has no opinion about roles.
 
-`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. Reasoning can consume the output-token budget. The meaning of `"disable"` depends on the route and model: some disable reasoning, some reduce it to the lowest supported effort, and others reject the request. Do not assume it eliminates reasoning tokens or prevents truncation. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
+`reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. The setting belongs to the provider: set it on `LLMClientConfig` (e.g. `"disable"`) for the registered provider, or pass `make_provider(..., reasoning_effort=...)` for a per-call one, which does not inherit the registered value. A call's `reasoning_effort=` overrides either for that call. Reasoning can consume the output-token budget. The meaning of `"disable"` depends on the route and model: some disable reasoning, some reduce it to the lowest supported effort, and others reject the request. Do not assume it eliminates reasoning tokens or prevents truncation. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. OpenRouter requests always carry `require_parameters` (see [OpenRouter: schema-honoring routing](#openrouter-schema-honoring-routing)), so an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On DeepSeek, `"disable"` becomes `"none"`, which turns thinking off on `deepseek-chat` and `deepseek-reasoner` alike. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
 
-Register the config with `configure_llm_client(LLMClientConfig(...))`. Calling it again replaces the registration, so a host that changes provider occasionally re-registers. `configure_llm_client(None)` clears the registration, after which a call without `provider=` raises `LLMClientNotConfiguredError`. Every call returns the previous registration (or `None` if there was none), so a test teardown can restore it with `configure_llm_client(previous)`. For a single call, pass `provider=` instead; see the next section.
+Register the config with `configure_llm_client(LLMClientConfig(...))`. Calling it again replaces the registration, so a host that changes provider occasionally re-registers. `configure_llm_client(None)` clears the registration, after which a call without `provider=` raises `LLMClientNotConfiguredError`. Every call returns the previous registration (or `None` if there was none), so a test teardown can restore it with `configure_llm_client(previous)`. To switch one call, pass `provider=` on that call; see [Switching provider per call](#switching-provider-per-call).
 
-### Constructing a provider for a per-call override
+### Switching provider for a whole program
 
-Most callers configure one provider once via `configure_llm_client(...)` and let
-every call pick it up. To send a *single* call through a different provider
-family, model, or credential, build a provider on the fly and pass it as the
-per-call `provider=` override. `make_provider` is the one-liner for that — it
-builds straight from raw credentials, with no `LLMClientConfig` and no
-module-level config source:
+With `model` unset and the key in the provider's own environment variable, a
+program-wide switch is the `provider=` field alone:
+
+```python
+configure_llm_client(LLMClientConfig(provider=Provider.ANTHROPIC))  # was Provider.OPENROUTER
+```
+
+A pinned `model` is a second edit, because model ids are spelled per route.
+Other pinned fields depend on the direction:
+
+- Moving to Bedrock, Google's Agent Platform, or Ollama means removing
+  `api_key`, which those three reject; Bedrock and the Agent Platform also
+  reject `base_url`. Bedrock adds `aws_region_name` and the
+  `bedrock` extra; Google's Agent Platform adds `vertex_project` and
+  `vertex_location` and the `vertex` extra. These can also come from the
+  environment, as described above, but the Agent Platform's default model needs
+  `vertex_location` (or `VERTEXAI_LOCATION`) set to `global`, `us`, or `eu`.
+- Moving away from them means removing the fields only they read:
+  `aws_region_name`, `vertex_project`, and `vertex_location`.
+- A non-default `gemini_structured_output` must go whenever the new route is
+  neither `GOOGLE` nor `VERTEX`.
+- Any switch between key-authenticated routes means removing or changing a
+  pinned `api_key` or `base_url`, and so does a pinned `base_url` on a switch to
+  or from Ollama. These routes accept the fields, so a stale key or endpoint is
+  not rejected; it goes to the new vendor. Keeping each key in its provider's
+  own environment variable avoids this.
+
+**Running the same model on another route.** Use the vendor's own id on the
+direct route and the platform's own id on Bedrock and Google's Agent Platform.
+OpenRouter ids are `<vendor-slug>/<name>`, and the name sometimes differs from
+the vendor's own (Claude versions use dots), so take it from
+[OpenRouter's model list](https://openrouter.ai/models). The "On OpenRouter"
+column of the [default-model table](#configuration) gives it for each default:
+`model="claude-sonnet-4-6"` on `ANTHROPIC` is
+`model="anthropic/claude-sonnet-4.6"` on `OPENROUTER`, and Cerebras's
+`gpt-oss-120b` sits under its author, `openai/gpt-oss-120b`. Bedrock's
+inference-profile ids do not carry to other routes, and Ollama's local models
+have no hosted twin.
+
+What llmkit decides changes with the provider, not with the model's name: the
+new route brings its own structured-output mode, its own translation of
+`reasoning_effort` (`"disable"` in particular differs by route, as described
+above), and its own rate-limit budget, because budgets are per provider. The
+limiter's `rpm`, `tpm` and `max_concurrent` settings, though, are one setting for
+all providers, so they stay as you tuned them for the old account. To
+confirm a switch before the first call, run `describe_llm(config)` (from
+`llmkit.providers`). It builds the provider, so a missing key, a missing extra,
+or a rejected field raises there, and it reports the provider and model the
+calls will use.
+
+### Switching provider per call
+
+A call takes `provider=` the way it takes `model=`: one argument sends that call
+to another provider, model, or credential and leaves the registered config
+alone. `make_provider` builds the provider straight from raw credentials, with
+no `LLMClientConfig` and no module-level config source:
 
 ```python
 from llmkit import make_provider, structured_llm_call_sync, Provider
 
-provider = make_provider(Provider.ANTHROPIC, api_key=anthropic_key)
 result = structured_llm_call_sync(
     prompt,
     output_schema=MyModel,
     feature="summarize",
-    provider=provider,
+    provider=make_provider(Provider.ANTHROPIC),  # key from ANTHROPIC_API_KEY
 )
 ```
+
+**Comparing vendors side by side.** Because each call names its own provider,
+one program can send the same prompt to several vendors and keep every answer.
+No `configure_llm_client(...)` is needed when every call passes `provider=`:
+
+```python
+import asyncio
+
+from llmkit import Provider, make_provider, structured_llm_call
+
+# Each key comes from its provider's own environment variable.
+contenders = {
+    "anthropic": make_provider(Provider.ANTHROPIC),
+    "openai": make_provider(Provider.OPENAI),
+    "gemini": make_provider(Provider.GOOGLE),
+    "claude-via-openrouter": make_provider(
+        Provider.OPENROUTER, model="anthropic/claude-sonnet-4.6"
+    ),
+}
+
+async def compare(prompt: str) -> dict[str, Summary]:
+    answers = await asyncio.gather(*(
+        structured_llm_call(prompt, Summary, feature="compare", label=name, provider=p)
+        for name, p in contenders.items()
+    ))
+    return dict(zip(contenders, answers, strict=True))
+```
+
+Each call keeps its own provider's structured-output mode, reasoning
+translation, rate-limit budget, circuit breaker (when enabled), and log
+identity, so one vendor's rate limit or open breaker never slows the calls to
+another, and the `label` tells the records apart. Budgets are keyed by provider, not by credential: two
+`make_provider(Provider.OPENAI, api_key=...)` instances with different keys
+share one OpenAI budget. With a [response cache](#response-cache) installed they
+also share cached answers, because the cache key leaves credentials out, so pass
+`cache=False` when comparing accounts or run-to-run variation.
+
+These providers do not inherit the registered config's `reasoning_effort`; pass
+it to `make_provider` or on the call. `make_provider` reads each key when it
+runs, and llmkit sees a `.env` file only once its first call imports LiteLLM, so
+a host whose keys live in `.env` loads it first (for example with
+python-dotenv's `load_dotenv()`).
 
 `make_provider` takes the same knobs as `LLMClientConfig`, and — like
 `build_provider` — **rejects** any that the selected provider does not read
@@ -1385,8 +1491,9 @@ always well-formed (e.g. `anthropic/claude-sonnet-4-6`).
 on *every* call, you don't have to call `configure_llm_client(...)` — there is no
 global source to register, the call runs on the per-call provider alone, and the
 log records that provider as the effective one. The "configure once globally" and
-"provide per call" models are independent: use either, or mix them (a global
-default with per-call overrides where needed). A call that passes *neither* a
+"provide per call" models are independent: use either, or mix them (a registered
+default for the calls that do not care which vendor answers, and `provider=` on
+the calls that do). A call that passes *neither* a
 per-call `provider=` nor a registered global config raises
 `LLMClientNotConfiguredError` before its first attempt, naming both remedies.
 The class subclasses `RuntimeError`.

@@ -74,14 +74,17 @@ test belongs to never changes with your environment:
 Run the full live suite (export every key first):
 
 ```bash
-OPENROUTER_API_KEY=sk-or-...   # https://openrouter.ai/keys
-GEMINI_API_KEY=...             # https://aistudio.google.com/apikey
-ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
-OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
-DEEPSEEK_API_KEY=...           # https://platform.deepseek.com/api_keys
-CEREBRAS_API_KEY=...           # https://cloud.cerebras.ai
+export OPENROUTER_API_KEY=sk-or-...   # https://openrouter.ai/keys
+export GEMINI_API_KEY=...             # https://aistudio.google.com/apikey
+export ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
+export OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
+export DEEPSEEK_API_KEY=...           # https://platform.deepseek.com/api_keys
+export CEREBRAS_API_KEY=...           # https://cloud.cerebras.ai
 uv run pytest tests/integration --run-live -v
 ```
+
+If the keys are in a `.env` file, export them all with `set -a; . ./.env; set +a`
+before running pytest.
 
 To exercise just one provider you hold a key for, select it explicitly instead
 of relying on which keys are set: `uv run pytest tests/integration --run-live -k openai`.
@@ -113,15 +116,18 @@ uv run pytest tests/integration --run-live -k bedrock
 has no API key — it authenticates through Google **Application Default
 Credentials** and needs the `google-auth`-bearing `[vertex]` extra — so its only
 allowed skip is `pytest.importorskip("google.auth")` when the extra isn't
-installed. Once present, a missing `VERTEXAI_PROJECT` / `VERTEXAI_LOCATION` or an
-unresolvable ADC chain **fails** the test under `--run-live`. `vertex_location`
-selects the data-residency region, and this test is where Google's Agent Platform
-`Mode.JSON_SCHEMA` pin is *measured*:
+installed. Once present, a missing project (`VERTEXAI_PROJECT`, else `GOOGLE_CLOUD_PROJECT`),
+a missing `VERTEXAI_LOCATION`, or an unresolvable ADC chain **fails** the test under
+`--run-live`. `vertex_location` selects the data-residency region. The suite's
+default model needs the `global`, `us`, or `eu` multi-region endpoint, so the
+example uses `us`; a regional value such as `europe-west4` pins in-region
+processing but may not serve that model. This test is where Google's Agent
+Platform `Mode.JSON_SCHEMA` pin is *measured*:
 
 ```bash
 uv sync                      # the dev group already pulls [vertex]
 gcloud auth application-default login          # resolvable ADC
-export VERTEXAI_PROJECT=my-gcp-project VERTEXAI_LOCATION=europe-west4
+export VERTEXAI_PROJECT=my-gcp-project VERTEXAI_LOCATION=us
 uv run pytest tests/integration --run-live -k vertex
 ```
 
