@@ -5,7 +5,7 @@ system message. instructor before 1.16.0 made that addition to the caller's
 own message dicts, which llmkit passes through unchanged, so every re-send of
 the same prompt carried one more copy of the schema and the caller was left
 holding an edited prompt. 1.16.0 edits a copy instead, and llmkit's floor
-requires it. These tests were shown to fail on instructor 1.15.4 (the second
+(now 1.17.0) includes it. These tests were shown to fail on instructor 1.15.4 (the second
 attempt carried two copies of the schema) and pass on 1.16.0 and later.
 
 DeepSeek pins ``Mode.JSON`` by default, so it is the configured provider here.

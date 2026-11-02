@@ -195,7 +195,7 @@ def capture_structured_provider_kwargs(
     provider = _transport_provider(reasoning_effort=provider_effort)
 
     with patch("llmkit._litellm.instructor.from_litellm", return_value=fake_client):
-        parsed, _cost, _usage = asyncio.run(
+        parsed, _cost, _usage, _text = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 OkSchema,

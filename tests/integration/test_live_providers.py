@@ -88,11 +88,17 @@ Google's Agent Platform is *measured*, not trusted.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import enum
 import os
 import socket
-from typing import NoReturn, Protocol, TypedDict, assert_never, cast
+from collections.abc import Awaitable, Callable, Generator
+from typing import NoReturn, Protocol, TypedDict, assert_never, cast, override
+from unittest.mock import patch
 
+import instructor
+import litellm
 import pytest
 from pydantic import BaseModel, field_validator
 
@@ -114,7 +120,7 @@ from llmkit import (
     tool_llm_call_stream,
     tool_result_message,
 )
-from llmkit.providers import make_provider
+from llmkit.providers import LLMClientConfig, OpenRouterProvider, make_provider
 
 # Every test in this module makes a real API call. The marker is what the
 # ``--run-live`` switch in conftest.py keys off of: without the flag these are
@@ -684,6 +690,196 @@ async def test_openrouter_strict_schema_ref_hygiene_live() -> None:
     }
 
 
+# An OpenAI model on OpenRouter, for the two tests below that pin the request to
+# an OpenAI-served endpoint. Overridable like the other smoke models; the pin
+# makes a non-OpenAI override fail loudly (no endpoint matches) rather than
+# quietly measure another vendor's validator.
+_OPENROUTER_OPENAI_MODEL = os.getenv("OPENROUTER_OPENAI_SMOKE_MODEL", "openai/gpt-4o-mini")
+
+#: OpenRouter's provider-routing preferences that restrict a request to OpenAI's
+#: own endpoints, with no fallback to another serving provider.
+_OPENAI_ONLY_ROUTING: dict[str, object] = {"order": ["openai"], "allow_fallbacks": False}
+
+
+class _OpenAIServedOpenRouter(OpenRouterProvider):
+    """OpenRouter with its routing narrowed to OpenAI-served endpoints.
+
+    The override the provider docstring names for a host that needs different
+    routing. It extends, rather than replaces, the shipped ``require_parameters``
+    preference, so the request differs from the shipped provider's only in where
+    OpenRouter may route it. Pinning matters because an unpinned request can
+    land on an endpoint whose validator differs from OpenAI's: when measured on
+    2026-11-02, OpenAI- and Azure-served endpoints answered HTTP 400 to a
+    ``strict`` schema with an open nested object or a defaulted field, and
+    routing to Bedrock masked that 400.
+    """
+
+    @override
+    def completion_kwargs(self) -> dict[str, object]:
+        kwargs = super().completion_kwargs()
+        body = cast("dict[str, object]", kwargs["extra_body"])
+        routing = cast("dict[str, object]", body["provider"])
+        return {
+            **kwargs,
+            "extra_body": {**body, "provider": {**routing, **_OPENAI_ONLY_ROUTING}},
+        }
+
+
+def _openai_served_openrouter() -> OpenRouterProvider:
+    return _OpenAIServedOpenRouter.build(
+        LLMClientConfig(
+            provider=Provider.OPENROUTER,
+            model=_OPENROUTER_OPENAI_MODEL,
+            **_live_credentials(Provider.OPENROUTER),
+        )
+    )
+
+
+@contextlib.contextmanager
+def _spy_on_the_wire() -> Generator[list[dict[str, object]]]:
+    """Record every request's kwargs while still sending it to the provider.
+
+    Wraps the real ``litellm.acompletion`` (the patch point the offline suite
+    uses); each recorded entry is a deep copy taken at send time, after llmkit's
+    wire mutations (the strict upgrade) have run.
+    """
+    real_acompletion = cast("Callable[..., Awaitable[object]]", litellm.acompletion)
+    sent: list[dict[str, object]] = []
+
+    async def _spy(**kwargs: object) -> object:
+        sent.append(copy.deepcopy(kwargs))
+        return await real_acompletion(**kwargs)
+
+    with patch("llmkit._litellm.litellm.acompletion", _spy):
+        yield sent
+
+
+async def _structured_call_on_the_wire[T: BaseModel](
+    prompt: str, schema: type[T], label: str
+) -> tuple[T, list[dict[str, object]]]:
+    """Run one live structured call and return its result plus every request's kwargs.
+
+    The requests are recorded by :func:`_spy_on_the_wire`, so each one still
+    reaches the provider.
+    """
+    with _spy_on_the_wire() as sent:
+        result = await structured_llm_call(
+            prompt,
+            schema,
+            feature="integration-smoke",
+            label=label,
+            provider=_openai_served_openrouter(),
+            max_tokens=1024,
+        )
+    assert sent, "no request reached litellm.acompletion"
+    for kwargs in sent:
+        # The pin reached the wire on every request, so the answer came from an
+        # OpenAI-served endpoint or the call failed.
+        assert kwargs["extra_body"] == {
+            "provider": {"require_parameters": True, **_OPENAI_ONLY_ROUTING}
+        }, kwargs["extra_body"]
+    return result, sent
+
+
+def _wire_json_schema(kwargs: dict[str, object]) -> dict[str, object]:
+    response_format = cast("dict[str, object]", kwargs["response_format"])
+    assert response_format["type"] == "json_schema", response_format
+    return cast("dict[str, object]", response_format["json_schema"])
+
+
+class _Residence(BaseModel):
+    city: str
+    country: str
+
+
+# A hand-written model as a host would write it: a nested model and a defaulted
+# field, with no ``extra="forbid"``, so the nested object is open and
+# ``nickname`` is absent from ``required``. OpenAI's strict validator rejects
+# both under ``"strict": true``, so llmkit must send this schema non-strict. The
+# rationale is a comment, not a docstring, because pydantic sends a model's
+# docstring to the provider as the schema's ``description``.
+class _IdiomaticPerson(BaseModel):
+    name: str
+    residence: _Residence
+    nickname: str | None = None
+
+
+@pytest.mark.asyncio
+async def test_openrouter_openai_served_idiomatic_model_live() -> None:
+    """An idiomatic hand-written model validates on an OpenAI-served OpenRouter endpoint.
+
+    Before the strict upgrade was narrowed, llmkit sent this schema with
+    ``"strict": true`` and OpenAI answered HTTP 400. The wire assertions pin the
+    narrowing itself: the request carried no ``strict`` and its root was not
+    closed by llmkit.
+    """
+    result, sent = await _structured_call_on_the_wire(
+        "Extract the following facts into the schema. Name: Ada Lovelace. "
+        + "City: London. Country: United Kingdom. Nickname: Countess.",
+        _IdiomaticPerson,
+        "openrouter-openai-idiomatic",
+    )
+
+    assert type(result) is _IdiomaticPerson
+    assert result.name.strip().lower() == "ada lovelace"
+    assert type(result.residence) is _Residence
+    assert result.residence.city.strip().lower() == "london"
+    assert result.residence.country.strip().lower() == "united kingdom"
+    assert result.nickname is not None
+    assert result.nickname.strip().lower() == "countess"
+    for kwargs in sent:
+        json_schema = _wire_json_schema(kwargs)
+        schema = cast("dict[str, object]", json_schema["schema"])
+        # The shape under test really was sent: a defaulted field, a nested model.
+        assert "nickname" not in cast("list[object]", schema["required"]), schema
+        assert "$defs" in schema, schema
+        assert "strict" not in json_schema, json_schema
+        assert "additionalProperties" not in schema, schema
+        # Nor did llmkit close the nested model's definition.
+        defs = cast("dict[str, dict[str, object]]", schema["$defs"])
+        assert "additionalProperties" not in defs["_Residence"], defs
+
+
+@pytest.mark.asyncio
+async def test_openrouter_openai_served_closed_schema_keeps_strict_live() -> None:
+    """A closed, all-required generated schema is still sent strict, and validates.
+
+    The counterpart to the idiomatic-model test: narrowing the upgrade must not
+    drop ``strict`` for the schemas OpenAI's validator accepts, including a
+    nested object that is itself closed.
+    """
+    schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "residence": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"city": {"type": "string"}, "country": {"type": "string"}},
+                "required": ["city", "country"],
+            },
+        },
+        "required": ["name", "residence"],
+    }
+    result, sent = await _structured_call_on_the_wire(
+        "Extract the following facts into the schema. Name: Ada Lovelace. "
+        + "City: London. Country: United Kingdom.",
+        model_from_json_schema(schema, name="closed_person"),
+        "openrouter-openai-closed",
+    )
+
+    dumped = cast("dict[str, dict[str, str] | str]", result.model_dump())
+    residence = cast("dict[str, str]", dumped["residence"])
+    assert cast("str", dumped["name"]).strip().lower() == "ada lovelace"
+    assert residence["city"].strip().lower() == "london"
+    assert residence["country"].strip().lower() == "united kingdom"
+    for kwargs in sent:
+        json_schema = _wire_json_schema(kwargs)
+        assert json_schema["strict"] is True, json_schema
+        assert cast("dict[str, object]", json_schema["schema"])["additionalProperties"] is False
+
+
 @pytest.mark.asyncio
 async def test_openrouter_live() -> None:
     """OpenRouter on the *override* model — the strict-enforcement canary.
@@ -835,6 +1031,39 @@ async def test_bedrock_schema_repair_reask_is_accepted_live(model: str, effort: 
 async def test_vertex_live() -> None:
     # This call is what *measures* the Mode.JSON_SCHEMA pin against Google's Agent Platform live.
     await _override_roundtrip(Provider.VERTEX, _VERTEX_MODEL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        pytest.param(Provider.GOOGLE, _GOOGLE_MODEL, id="google"),
+        pytest.param(Provider.VERTEX, _VERTEX_MODEL, id="vertex"),
+    ],
+)
+async def test_gemini_json_strategy_live(provider: Provider, model: str) -> None:
+    """Both Gemini providers return a validated hand-written model under ``"json"``.
+
+    ``gemini_structured_output="json"`` selects ``Mode.JSON``: JSON output with
+    the schema moved into the system prompt and validated client-side, the
+    escape from the repetition-loop trap the Gemini provider docstrings record.
+    Before this case the strategy had only a generated-model probe on Google
+    (``test_schema_backed_constraints_gemini_json_live``) and no live case on
+    Google's Agent Platform.
+    """
+    built = make_provider(
+        provider, model=model, gemini_structured_output="json", **_live_credentials(provider)
+    )
+    assert built.instructor_mode is instructor.Mode.JSON
+    with _spy_on_the_wire() as sent:
+        await _assert_structured_roundtrip(built, reasoning_effort=_REASONING_EFFORT.get(provider))
+    assert sent, "no request reached litellm.acompletion"
+    for kwargs in sent:
+        # The JSON strategy on the wire: JSON output with no schema attached and
+        # no tool forced, so the schema reached the model only through the prompt.
+        assert kwargs["response_format"] == {"type": "json_object"}, kwargs["response_format"]
+        assert "tools" not in kwargs, kwargs["tools"]
+        assert "tool_choice" not in kwargs, kwargs["tool_choice"]
 
 
 @pytest.mark.asyncio

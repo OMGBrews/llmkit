@@ -64,11 +64,15 @@ from typing import cast
 
 import instructor
 import litellm
-from instructor.core.exceptions import IncompleteOutputException
+from instructor.core.exceptions import (
+    IncompleteOutputException,
+    InstructorRetryException,
+    ResponseParsingError,
+)
 from litellm import CustomStreamWrapper
 from litellm.exceptions import BadRequestError
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices, Usage
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from llmkit._messages import resolve_reasoning_effort, wire_messages
@@ -90,7 +94,11 @@ from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitDiagnostics,
     OutputLimitError,
+    StructuredOutputError,
+    UnsupportedSchemaError,
     normalize_service_unavailable,
+    underlying_provider_error,
+    validation_failure_summary,
 )
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
@@ -517,7 +525,7 @@ async def _instructor_completion(
     caller's prompt in ``Mode.JSON``: instructor prepends a schema system
     message when the prompt starts with none, and otherwise appends the schema
     to the existing system message's content, on its own copy of the messages
-    (instructor 1.16.0 and later, which llmkit requires).
+    (instructor 1.16.0 and later; llmkit requires 1.17.0).
     """
     if strict:
         _stricten_json_schema_response_format(kwargs)
@@ -538,7 +546,13 @@ def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
 
     OpenRouter opts into this upgrade. Open objects and composed contracts
     remain non-strict so the request never silently closes their root or
-    claims strict support for applicators the server rejects.
+    claims strict support for applicators the server rejects. So does a schema
+    with any nested object that is not already closed
+    (``additionalProperties: false``), or any object whose ``required`` does not
+    list every property (a field with a default): measured on 2026-11-02,
+    OpenAI-served OpenRouter endpoints answer HTTP 400 to both under
+    ``strict: true``, and validated the same schemas sent non-strict. Only the
+    root is closed here; an ``Optional`` field that is still required passes.
     """
     response_format = kwargs.get("response_format")
     if not isinstance(response_format, dict):
@@ -559,16 +573,42 @@ def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
         or any(key in schema for key in ("$ref", "allOf", "anyOf", "oneOf"))
         or ("additionalProperties" in schema and schema["additionalProperties"] is not False)
         or _has_strict_unsupported_applicator(schema)
+        or _has_strict_incompatible_object(schema, root=True)
     ):
         return
     json_schema["strict"] = True
     schema["additionalProperties"] = False
 
 
-def _has_strict_unsupported_applicator(schema: dict[str, object]) -> bool:
-    """Inspect schema locations, leaving annotation payloads uninterpreted."""
-    if any(key in schema for key in ("allOf", "oneOf", "not")):
-        return True
+def _has_strict_incompatible_object(schema: dict[str, object], *, root: bool = False) -> bool:
+    """Whether an object below *schema* is open, or an object omits a property from ``required``.
+
+    The root may be open (the upgrade closes it); every nested object must
+    already be closed. Visits the same locations as
+    :func:`_has_strict_unsupported_applicator`.
+    """
+    properties = schema.get("properties")
+    declared = schema.get("type")
+    is_object = (
+        declared == "object"
+        or (isinstance(declared, list) and "object" in cast("list[object]", declared))
+        or isinstance(properties, dict)
+    )
+    if is_object:
+        if not root and schema.get("additionalProperties") is not False:
+            return True
+        if isinstance(properties, dict):
+            required = schema.get("required")
+            listed = (
+                set(cast("list[object]", required)) if isinstance(required, list) else set[object]()
+            )
+            if not set(cast("dict[str, object]", properties)).issubset(listed):
+                return True
+    return any(_has_strict_incompatible_object(child) for child in _subschemas(schema))
+
+
+def _subschemas(schema: dict[str, object]) -> list[dict[str, object]]:
+    """The schemas directly below *schema*, at every location that holds one."""
     children: list[object] = []
     for key in ("$defs", "definitions", "properties", "patternProperties", "dependentSchemas"):
         value = schema.get(key)
@@ -596,11 +636,14 @@ def _has_strict_unsupported_applicator(schema: dict[str, object]) -> bool:
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         children.extend(cast("dict[str, object]", dependencies).values())
-    return any(
-        _has_strict_unsupported_applicator(cast("dict[str, object]", child))
-        for child in children
-        if isinstance(child, dict)
-    )
+    return [cast("dict[str, object]", child) for child in children if isinstance(child, dict)]
+
+
+def _has_strict_unsupported_applicator(schema: dict[str, object]) -> bool:
+    """Inspect schema locations, leaving annotation payloads uninterpreted."""
+    if any(key in schema for key in ("allOf", "oneOf", "not")):
+        return True
+    return any(_has_strict_unsupported_applicator(child) for child in _subschemas(schema))
 
 
 async def drain_async_logging(*, timeout: float | None) -> None:
@@ -823,12 +866,16 @@ def _schema_repair_retrying() -> AsyncRetrying:
     exception escaping this loop — a declined transport/permanent error (**1**
     call) or an exhausted parse re-ask (**2** calls) — is caught by
     instructor's blanket ``except Exception as e: raise
-    InstructorRetryException(...) from e``, so the escaping type is always
-    ``InstructorRetryException``. What ``reraise`` controls is ``__cause__``:
-    the raw last error (``reraise=True``) rather than a tenacity ``RetryError``
-    hop. The wrap shape is therefore uniform — ``__cause__`` is the raw provider
-    error on the declined path and the raw last parse error on the exhausted
-    path — and :func:`~llmkit.exceptions.underlying_provider_error` unwraps both.
+    InstructorRetryException(...) from e``, so the type escaping instructor is
+    always ``InstructorRetryException``. What ``reraise`` controls is
+    ``__cause__``: the raw last error (``reraise=True``) rather than a tenacity
+    ``RetryError`` hop. The wrap shape is therefore uniform — ``__cause__`` is
+    the raw provider error on the declined path and the raw last parse error on
+    the exhausted path — and :func:`~llmkit.exceptions.underlying_provider_error`
+    unwraps both. :func:`acompletion_structured` then re-owns the exhausted
+    parse path as :class:`~llmkit.exceptions.StructuredOutputError`, so only
+    the declined (transport/permanent) path reaches a caller as
+    ``InstructorRetryException``.
 
     Built fresh per call — tenacity retrying objects mutate internal iteration
     state, so a shared module-level instance would race across concurrent
@@ -954,7 +1001,7 @@ async def acompletion_structured[T: BaseModel](
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
-) -> tuple[T, float | None, tuple[int | None, int | None, int | None]]:
+) -> tuple[T, float | None, tuple[int | None, int | None, int | None], str]:
     """Structured completion via instructor pinned to the provider's mode.
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
@@ -999,9 +1046,11 @@ async def acompletion_structured[T: BaseModel](
     single call route through a different provider family without changing
     the app-wide registration.
 
-    Returns ``(parsed, approximate_cost, usage)``, where ``usage`` is the
+    Returns ``(parsed, approximate_cost, usage, text)``, where ``usage`` is the
     completion's ``(prompt_tokens, completion_tokens, total_tokens)`` from
-    :class:`~llmkit._transport.WireUsage` (each ``None`` when not reported) for the call log.
+    :class:`~llmkit._transport.WireUsage` (each ``None`` when not reported) for
+    the call log, and ``text`` is the answer text instructor validated, which
+    the response cache stores. Validation is strict JSON mode.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1010,7 +1059,7 @@ async def acompletion_structured[T: BaseModel](
     # The completion callable is the library's seam under instructor: it sends
     # through the transport boundary, and providers that opt in via
     # ``strict_json_schema`` (OpenRouter) get their ``response_format``
-    # upgraded to strict enforcement on the way. ``inspect.iscoroutinefunction``
+    # upgraded to strict enforcement on the way when the schema qualifies. ``inspect.iscoroutinefunction``
     # sees through the partial, so instructor still builds its async client.
     messages = wire_messages(prompt)
     call = _call_context(
@@ -1061,6 +1110,10 @@ async def acompletion_structured[T: BaseModel](
                 # call — tenacity retrying objects mutate iteration state. The
                 # cross-call transient/validation budgets live in llmkit.retry.
                 max_retries=_schema_repair_retrying(),
+                # Strict JSON validation, explicitly: llmkit's rule on every
+                # lane (structured, compose, cache hit, tool arguments), not
+                # an inherited instructor default.
+                strict=True,
                 **{**request_kwargs, **({"timeout": timeout} if timeout is not None else {})},  # pyright: ignore[reportArgumentType]  # raw-llm — provider-owned credential/native kwargs
                 **({"max_tokens": max_tokens} if max_tokens is not None else {}),
                 # Gate temperature like max_tokens / reasoning_effort: a
@@ -1090,41 +1143,127 @@ async def acompletion_structured[T: BaseModel](
                 completion_tokens=_completion_tokens(e.last_completion),
                 diagnostics=_output_limit_diagnostics(e.last_completion),
             ) from e
+        except InstructorRetryException as e:
+            # An exhausted *parse* failure is the contract's one failure: re-own
+            # it as llmkit's type carrying what failed. A declined transport or
+            # permanent cause keeps instructor's wrap, which the retry layer and
+            # the rate limiter unwrap via underlying_provider_error.
+            cause = underlying_provider_error(e)
+            last_completion = getattr(e, "last_completion", None)
+            if _is_no_choice_crash(cause, last_completion):
+                # instructor raised its repairable "No choices" parse error,
+                # then its own repair step crashed indexing the empty choice
+                # list. That is a parse failure with no answer, not a
+                # permanent provider error.
+                raise StructuredOutputError(
+                    f"structured answer for {output_schema.__name__} failed validation: "
+                    + "the provider returned no choices",
+                    schema_name=output_schema.__name__,
+                    raw_text=None,
+                    errors=None,
+                    attempt=attempt,
+                    model=litellm_model,
+                    provider=provider.name,
+                ) from e
+            if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
+                raise
+            raise StructuredOutputError(
+                f"structured answer for {output_schema.__name__} failed validation "
+                + f"after in-call repair ({validation_failure_summary(cause)})",
+                schema_name=output_schema.__name__,
+                raw_text=_completion_text(last_completion),
+                errors=cause.errors(include_url=False)
+                if isinstance(cause, ValidationError)
+                else None,
+                attempt=attempt,
+                model=litellm_model,
+                provider=provider.name,
+            ) from e
         # instructor types the raw completion half of the tuple as Any. It is
         # the last rendered response, whose usage instructor's tally has
         # rewritten to the whole in-call total, so it is read back rather than
         # the last wire response.
-        parsed, raw_completion = cast("tuple[T, object]", result)
-        parsed = _as_output_schema(parsed, output_schema)
+        parsed, raw_completion = cast("tuple[object, object]", result)
         response = _wire_response(raw_completion)
         slot.record_tokens(response.usage.debit())
-    return parsed, response.cost, response.usage.counts()
+    # The text instructor validated: every shipped mode parses
+    # ``choices[0].message.content`` as it stands, so it is what a cache stores.
+    text = _completion_text(raw_completion) or ""
+    return (
+        _as_output_schema(parsed, output_schema, text),
+        response.cost,
+        response.usage.counts(),
+        text,
+    )
 
 
-def _as_output_schema[T: BaseModel](parsed: T, output_schema: type[T]) -> T:
-    """Rebuild instructor's *parsed* answer as an instance of *output_schema*.
+def _is_no_choice_crash(cause: BaseException, last_completion: object) -> bool:
+    """Whether *cause* is instructor's repair step crashing on an empty choice list."""
+    if not isinstance(cause, IndexError):
+        return False
+    if isinstance(cause.__context__, ResponseParsingError):
+        return True
+    choices = getattr(last_completion, "choices", None)
+    return isinstance(choices, Sequence) and not choices
 
-    instructor parses into a subclass it generates from the schema, which
-    compares unequal to an instance of the schema itself. The rebuild uses the
-    response cache's own encode and decode pair, so a paid answer equals its
-    cache hit by construction.
 
-    A schema that cannot survive its own JSON round trip (a raising
-    ``@model_serializer``, a required field with ``exclude=True``) keeps
-    instructor's instance with a warning: the answer already parsed and
-    validated, and failing the call here would re-roll a paid request on the
-    validation budget for a fault no re-ask can fix. Such a schema is never
-    stored in the cache either, so it has no cache hit to compare against.
+def _completion_text(completion: object) -> str | None:
+    """The first choice's message text of *completion*, best-effort.
+
+    For :class:`~llmkit.exceptions.StructuredOutputError`'s ``raw_text``:
+    instructor attaches the failed attempt's rendered completion as
+    ``last_completion``, and every shipped mode reads the answer from
+    ``choices[0].message.content``. ``None`` when anything on the way is
+    missing or the content is not a string.
     """
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, Sequence) or not choices:
+        return None
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    return content if isinstance(content, str) else None
+
+
+def _as_output_schema[T: BaseModel](parsed: object, output_schema: type[T], text: str) -> T:
+    """The answer as an instance of *output_schema*, validated once from *text*.
+
+    instructor validates the answer into a subclass it generates from the
+    schema, to drive its repair re-ask. The instance returned is built by
+    validating the same answer *text* once, strictly, into the caller's own
+    class: the step a cache hit takes, so a paid answer and its hit agree by
+    construction. Nothing instructor produced is serialized and validated
+    again, so a validator that transforms its input sees the model's text
+    once, a lossy serializer (``SecretStr``, rounding) never touches the
+    value, and whatever the schema's validators and ``model_post_init`` build
+    (a subclass instance, back-references, slots) is built for the object the
+    caller receives.
+
+    Only when there is no answer text (a host-defined provider whose mode
+    answers outside the message content) or the second validation unexpectedly
+    fails is instructor's answer rebuilt from its dump instead, with a warning
+    in the second case.
+
+    Raises :class:`~llmkit.exceptions.UnsupportedSchemaError` when instructor
+    returned something that is not an instance of the schema.
+    """
+    if not isinstance(parsed, output_schema):
+        raise UnsupportedSchemaError(
+            f"output_schema {output_schema.__name__} parsed into {type(parsed).__name__}, "
+            + "not an instance of the schema; instructor DSL classes are not supported"
+        )
+    if text:
+        try:
+            return output_schema.model_validate_json(text, strict=True)
+        except Exception as exc:
+            logger.warning(
+                "Structured answer for %s validated in instructor but not on its own "
+                + "text (%s); returning instructor's answer",
+                output_schema.__name__,
+                type(exc).__name__,
+            )
     try:
         return output_schema.model_validate_json(parsed.model_dump_json(by_alias=True))
-    except Exception as exc:
-        logger.warning(
-            "Structured answer for %s failed its JSON round trip (%s: %s); returning the parser's subclass instance",
-            output_schema.__name__,
-            type(exc).__name__,
-            exc,
-        )
+    except Exception:
         return parsed
 
 

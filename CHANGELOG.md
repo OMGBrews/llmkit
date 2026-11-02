@@ -37,11 +37,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `except LlmkitError` catches `ServiceUnavailableError`, `CircuitOpenError`,
   `OutputLimitError`, `ToolArgumentError`, `ResultValidationError`,
   `ComposeUnsupportedError`, `ReasoningEffortUnsupportedError`,
-  `SchemaEngineError` and the new `LLMClientNotConfiguredError`. It does not
-  catch third-party transport or validation errors; the `LLM_*_ERRORS`
-  tuples are unchanged and remain the sets for retry-shaped handling. Do not
-  list the base in `RetryPolicy.retry_on`: it would re-enable retries for
-  the subclasses that deliberately get none.
+  `SchemaEngineError`, the new `LLMClientNotConfiguredError`, and the new
+  `StructuredOutputError` and `UnsupportedSchemaError`. It does not catch third-party transport errors, a
+  bare pydantic `ValidationError`, or instructor's `InstructorRetryException`
+  around a transport or permanent provider error; the `LLM_*_ERRORS` tuples
+  remain the sets for retry-shaped handling. Do not list the base in
+  `RetryPolicy.retry_on`: it would re-enable retries for the subclasses that
+  deliberately get none.
 
 - **Streamed text and tool calls now record estimated cost.** At stream end,
   use provider-reported cost or LiteLLM pricing over reported token usage,
@@ -83,6 +85,123 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: a structured answer that fails validation raises
+  `StructuredOutputError`.** `structured_llm_call` and its sync form used to
+  raise instructor's `InstructorRetryException` when the answer still failed
+  validation after the in-call repair re-ask; `tool_llm_call` with
+  `output_schema=` raised `ResultValidationError` for a final answer that did
+  not validate or a turn with neither tool calls nor text. Both lanes now
+  raise llmkit's `StructuredOutputError`, a `LlmkitError` carrying
+  `schema_name`, the failed answer as `raw_text`, pydantic's field errors as
+  `errors`, and the `attempt`, `model` and `provider`; instructor's original
+  is on `__cause__`. It joins `LLM_SCHEMA_ERRORS`, so `except
+  LLM_RECOVERABLE_ERRORS` and the default validation budget still cover it.
+  A transport or permanent provider failure keeps instructor's wrapper, so
+  `underlying_provider_error`, `Retry-After` handling and throttle detection
+  are unchanged. To migrate, catch `StructuredOutputError` where you caught
+  `InstructorRetryException` around a validation failure, or
+  `ResultValidationError` around a compose call. On `structured_llm_call`, a
+  custom `RetryPolicy(validation_retry_on=...)` that lists
+  `InstructorRetryException` without `StructuredOutputError` no longer
+  re-asks a failed answer across calls; add the new type to keep that retry.
+  A compose call's final answer is re-asked within `validation_max_attempts`
+  whatever `validation_retry_on` lists, as before. The log
+  record's `error` for such an attempt now starts with
+  `StructuredOutputError:`, which changes the triage key in `index.jsonl`.
+
+- **Breaking: every lane validates in pydantic's strict JSON mode.** The
+  structured call was strict only by instructor's default; the compose final
+  answer, a cache hit and tool arguments were lax. Now all four are strict,
+  with `strict=True` passed to instructor explicitly, so one answer validates
+  the same way everywhere. Strict JSON rejects coercions such as `"1"` to an
+  `int`, `1.0` to an `int` and `"yes"` to a `bool`, and still accepts JSON's
+  string forms of datetimes, dates, UUIDs, enums and decimals. Tool arguments
+  are now validated from the raw JSON string, so a `strict=True` model's
+  datetime and enum fields accept their JSON strings there too. A tool or
+  compose answer that relied on coercion now fails validation and is re-asked
+  on the validation budget.
+
+- **Breaking: a structured answer is validated once and returned as exactly
+  your class.** The call used to rebuild instructor's answer by serializing it
+  and validating the result again, which ran a transforming validator twice,
+  let a lossy serializer change the returned value (a `SecretStr` came back as
+  its mask), dropped `model_fields_set`, and for a schema that could not
+  round-trip returned instructor's subclass with a warning. Now your class
+  validates the provider's answer text once, the same step a cache hit takes,
+  so whatever your validators and `model_post_init` build is built for the
+  object you receive. instructor still validates the same text first to
+  drive its repair re-ask, so a validator with side effects runs twice per
+  paid answer, as before. The response cache stores that answer text and
+  validates a hit from it with the same strict rule, so a hit equals its paid
+  answer and schemas that could not round-trip are cached too. A host
+  provider whose mode answers outside the message content (such as
+  `Mode.TOOLS`) has no answer text, so its answers are not cached. A stored entry that fails to decode is a miss with a
+  warning. `LLM_CACHE_KEY_VERSION` is 3, so entries stored by earlier
+  releases miss once. This corrects the 0.13.0 notes, which said a paid
+  answer equals its cache hit and that such a schema is never cached; neither
+  held for every schema.
+
+- **Breaking: an `output_schema` no lane can honour raises
+  `UnsupportedSchemaError` before any request.** The new `LlmkitError` (also a
+  `TypeError`) covers a schema that is not a pydantic `BaseModel` subclass,
+  which used to fail with an incidental `AttributeError`; one of instructor's
+  DSL classes (`IterableModel`, `Partial`, a simple-type adapter), which
+  returned a list on the structured lane after a paid request and was accepted
+  on the compose lane; and a schema that declares an instructor
+  `async_field_validator` or `async_model_validator`, on itself, a base or a
+  nested field model. No lane runs those validators: the structured call
+  raised `ValueError` before any request, the compose lane and instructor
+  1.16.0 skipped them silently. The 0.8.0 note about re-asking an
+  `AsyncValidationError` no longer applies, because no supported path can
+  raise one. Import it from `llmkit`.
+
+- **Breaking: `on_result` hooks must return `None`, and async hooks are
+  awaited.** An `async def` hook used to return a coroutine nobody awaited,
+  so its rejection never happened; a hook returning `False` was ignored. Now
+  an awaitable result is awaited, and any other value that is not `None`
+  raises `TypeError`. The parameter is typed
+  `Callable[[T], Awaitable[None] | None]`, so a type checker flags a predicate
+  hook. On a cache hit, an exception the call would re-roll on
+  (`ResultValidationError`, or one in the policy's `validation_retry_on`
+  such as a pydantic `ValidationError`) makes the hit a miss, as before; any
+  other exception now propagates without a paid request, where it was logged
+  as a cache decode failure and cost one. A hook that mutates the instance no
+  longer changes what is stored.
+
+- **A provider response with no choices raises `StructuredOutputError`.**
+  instructor's repair step crashed with `IndexError` on such a response, which
+  llmkit treated as a permanent error after one request. It is now a failed
+  structured answer with `raw_text` `None`, re-asked on the validation budget.
+  `llmkit.testing.Reply(no_choice=True)` simulates it; a compose call given
+  it raises `StructuredOutputError`, and text and plain tool calls see an
+  empty answer.
+
+- **OpenRouter's strict upgrade skips schemas OpenAI-served endpoints
+  reject.** The upgrade to `strict: true` now also stays off when any nested
+  object is open or any object's `required` omits a property, the shape of a
+  hand-written nested or defaulted model. Measured live: OpenAI-served
+  OpenRouter endpoints answered HTTP 400 to both under strict and validated
+  them sent non-strict. Such schemas are validated locally, as before.
+
+- **A compose answer whose schema cannot dump for the log is still
+  returned.** A raising serializer on the output schema used to escape from
+  the log write after a valid final answer; the record now writes `response:
+  null` with a warning, as the structured lane does.
+
+- **Breaking: a compose call's truncated final answer raises
+  `OutputLimitError`.**
+  `tool_llm_call` with `output_schema=` used to treat a final answer cut off
+  by the output-token limit (`finish_reason="length"`) as a validation
+  failure and re-ask it on the validation budget, where an identical budget
+  can only truncate again, and returned it as `parsed` when the cut-off text
+  happened to validate. It now raises `OutputLimitError` with the partial
+  answer on `diagnostics`, never retried by default, and logs
+  `partial_text`, `output_limit` and `usage` as the structured and text lanes
+  do. A turn that requested tools still reports the reason as `stop_reason`.
+  Catch `OutputLimitError` around a compose call as well as
+  `StructuredOutputError`: `except StructuredOutputError` does not catch a
+  truncation.
+
 - **`tool_llm_call_sync` declares its parameters.** It used to accept
   `*args, **kwargs` and forward them, so introspection, editors and runtime
   argument errors saw no keywords. It now lists the same parameters as
@@ -115,7 +234,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reset to restore a default now passes that value explicitly, for example
   `configure_rate_limit(adaptive=True, breaker=False)`.
 
-- **`instructor` is now declared `>=1.16.0,<2`** (was `>=1.15.4,<2`). Before
+- **`instructor` is now declared `>=1.17.0,<2`** (was `>=1.15.4,<2`). Before
   1.16.0, instructor's `Mode.JSON` handler appended its schema instruction to
   the caller's own system message. A retried structured call on a `Mode.JSON`
   provider (DeepSeek, or Gemini with `gemini_structured_output="json"`)
@@ -125,7 +244,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now retries such a call both ways and fails if any attempt carries the
   schema more than once or the caller's messages change. A project that pinned
   `instructor>=1.16.0` itself to avoid this can drop that constraint once it
-  requires this release.
+  requires this release. The floor is 1.17.0 because 1.16.0 silently skips a
+  schema's instructor async validators, so the call returned an instance the
+  validator would have rejected; llmkit now refuses such a schema itself (see
+  `UnsupportedSchemaError` below).
 
 - The registry now writes through `LocalYamlLogSink` with an internal
   outcome-reporting method instead of `write_returning_path`, so a subclass

@@ -17,9 +17,9 @@ class LLMCacheEntry:
     """One stored answer, as a store receives it from ``set`` and returns it from ``get``.
 
     Plain strings only, so any store can persist it without knowing a Pydantic
-    model: ``response`` is a structured result as
-    ``model_dump_json(by_alias=True)`` (the form ``model_validate_json`` reads
-    back) or the plain text of a text call. ``schema`` is the output schema's
+    model: ``response`` is the answer text the provider sent, which a
+    structured hit validates with ``model_validate_json(text, strict=True)``,
+    or the plain text of a text call. ``schema`` is the output schema's
     class name, or ``"text"``. ``provider`` and ``model`` name what produced the
     answer, and ``call_id`` is the paid call that stored it, which a hit record
     reports as its ``source_call_id``.

@@ -17,7 +17,8 @@ re-ask. These tests pin the whole contract:
 * the taxonomy holds: catchable via ``LLM_RECOVERABLE_ERRORS``, outside both
   retry-budget sets;
 * no collateral damage: the one schema-repair re-ask (and the
-  ``InstructorRetryException`` wrap on exhaustion) keeps working;
+  ``StructuredOutputError`` re-own of instructor's wrap on exhaustion) keeps
+  working;
 * the tenacity behaviour the design leans on — a *declined* retry predicate
   propagates the original exception bare, never a ``RetryError`` — is
   asserted empirically, as a tripwire for future instructor/tenacity bumps.
@@ -46,6 +47,7 @@ from llmkit import (
     LLM_TRANSPORT_ERRORS,
     OutputLimitDiagnostics,
     OutputLimitError,
+    StructuredOutputError,
     _litellm,
 )
 from llmkit import (
@@ -322,7 +324,7 @@ async def test_schema_repair_reask_still_works() -> None:
         return responses[calls - 1]
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=fake_acompletion):
-        parsed, _cost, _usage = await _litellm.acompletion_structured(
+        parsed, _cost, _usage, _text = await _litellm.acompletion_structured(
             "hi", OkSchema, temperature=0.0, model=None, provider=_fake_provider()
         )
     assert parsed.ok is True
@@ -331,9 +333,9 @@ async def test_schema_repair_reask_still_works() -> None:
 
 async def test_schema_exhaustion_still_wraps() -> None:
     """No collateral damage: two malformed responses exhaust the in-call
-    budget after exactly two generations and surface as the usual
-    ``InstructorRetryException`` — the outer layer's wrapped-exception
-    classification stays intact."""
+    budget after exactly two generations and surface as llmkit's
+    ``StructuredOutputError`` over instructor's ``InstructorRetryException`` —
+    not as an output-limit failure."""
     calls = 0
 
     async def fake_acompletion(**_kwargs: object) -> ModelResponse:
@@ -343,12 +345,14 @@ async def test_schema_exhaustion_still_wraps() -> None:
 
     with (
         patch("llmkit._litellm.litellm.acompletion", side_effect=fake_acompletion),
-        pytest.raises(InstructorRetryException),
+        pytest.raises(StructuredOutputError) as caught,
     ):
         _ = await _litellm.acompletion_structured(
             "hi", OkSchema, temperature=0.0, model=None, provider=_fake_provider()
         )
     assert calls == 2
+    assert isinstance(caught.value.__cause__, InstructorRetryException)
+    assert caught.value.raw_text == '{"ok": nope}'
 
 
 async def test_declined_predicate_propagates_bare_exception() -> None:

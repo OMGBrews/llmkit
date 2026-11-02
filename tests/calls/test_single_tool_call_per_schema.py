@@ -98,6 +98,21 @@ def test_structured_request_disables_parallel_tool_calls_only_on_claude_routes(
         assert "parallel_tool_calls" not in seen
 
 
+@pytest.mark.parametrize("provider_enum", list(Provider))
+def test_structured_request_asks_instructor_for_strict_validation_explicitly(
+    provider_enum: Provider,
+) -> None:
+    """Strict JSON validation is llmkit's rule, passed explicitly on every route.
+
+    instructor 1.17 also defaults ``strict`` to ``True``; this pins the
+    argument itself, so a change to instructor's default cannot loosen the
+    structured lane without failing here.
+    """
+    seen = _capture_structured_request(_PROVIDER_BUILDERS[provider_enum]())
+
+    assert seen["strict"] is True
+
+
 def _ok_response() -> litellm.ModelResponse:
     return litellm.ModelResponse(
         choices=[
@@ -125,7 +140,7 @@ def test_parallel_tool_calls_survives_instructor_to_litellm(provider_enum: Provi
         return _ok_response()
 
     with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
-        parsed, _cost, _usage = asyncio.run(
+        parsed, _cost, _usage, _text = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 OkSchema,

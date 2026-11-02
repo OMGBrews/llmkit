@@ -26,6 +26,16 @@ from llmkit.exceptions import ResultValidationError
 from llmkit.providers import LLMProviderInterface
 
 
+class CacheDecodeError(Exception):
+    """An *accept* callable could not decode a stored entry; ``__cause__`` says why.
+
+    The one exception :func:`read_through` treats as a cache failure (a miss,
+    warned once). Anything else *accept* raises, other than
+    :class:`~llmkit.ResultValidationError` (which the caller turns a re-rollable
+    hook failure into), comes from the caller's own hook and propagates.
+    """
+
+
 def cache_key_or_none(
     *,
     provider: LLMProviderInterface,
@@ -63,7 +73,7 @@ async def read_through[T](
     *,
     lookup: bool,
     run: Callable[[], Awaitable[T]],
-    encode: Callable[[T], LLMCacheEntry],
+    encode: Callable[[T], LLMCacheEntry | None],
     accept: Callable[[LLMCacheEntry], Awaitable[T]],
 ) -> T:
     """Answer from *cache* when it can, otherwise run the call once and store it.
@@ -73,7 +83,8 @@ async def read_through[T](
     rejection and a truncated answer out of the store. *accept* turns a stored
     entry into the call's result and writes the hit record; a
     :class:`~llmkit.ResultValidationError` from it (the caller's ``on_result``
-    rejected the stored answer) or any decode failure makes it a miss.
+    rejected the stored answer) or a :class:`CacheDecodeError` makes it a miss.
+    Any other exception from *accept* propagates.
 
     With *lookup* false — a re-roll pass of an enclosing
     :func:`~llmkit.retry.with_retries` loop, whose caller rejected the earlier
@@ -119,7 +130,7 @@ async def _run_and_store[T](
     cache: LLMCache,
     key: str,
     run: Callable[[], Awaitable[T]],
-    encode: Callable[[T], LLMCacheEntry],
+    encode: Callable[[T], LLMCacheEntry | None],
 ) -> T:
     result = await run()
     entry = _encode(encode, result)
@@ -152,12 +163,12 @@ async def store_entry(cache: LLMCache, key: str, entry: LLMCacheEntry) -> None:
         report_cache_failure("set", exc)
 
 
-def _encode[T](encode: Callable[[T], LLMCacheEntry], result: T) -> LLMCacheEntry | None:
+def _encode[T](encode: Callable[[T], LLMCacheEntry | None], result: T) -> LLMCacheEntry | None:
     try:
         return encode(result)
     except Exception as exc:
-        # A custom serializer on the schema raised: the caller still gets its
-        # answer, it is just not stored.
+        # *encode* had nothing to store (no validated answer text): the caller
+        # still gets its answer, it is just not stored.
         report_cache_failure("encode", exc)
         return None
 
@@ -172,6 +183,6 @@ async def _accept[T](
         # answer, so it asks the provider for its own.
         logger.debug("on_result rejected a cached answer; treating it as a miss")
         return None
-    except Exception as exc:
-        report_cache_failure("decode", exc)
+    except CacheDecodeError as exc:
+        report_cache_failure("decode", exc.__cause__ or exc)
         return None

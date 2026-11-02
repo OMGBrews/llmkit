@@ -119,14 +119,16 @@ class LLMCallRecord:
     every successful provider attempt (a cache hit spent no tokens and logs
     ``None``), on a structured or text attempt whose result an
     ``on_result`` hook then rejected (the tokens were spent, as its
-    ``approximate_cost`` already shows), and on a truncated structured
-    or text attempt, whose counts it shares with ``output_limit``; any other
+    ``approximate_cost`` already shows), and on a truncated structured,
+    text or compose final-answer attempt, whose counts it shares with
+    ``output_limit``; any other
     failed attempt logs ``None``. Both streams, plain text and tool, ask
     the provider for usage and log it on every attempt that runs out, completed
     or truncated. The YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
     deliberately does not, so the compact scan line keeps its fixed shape.
 
-    Two fields carry a **structured or text call cut off by its output limit**
+    Two fields carry a **structured or text call, or a compose call's final
+    answer, cut off by its output limit**
     and are ``None`` on every other attempt: ``output_limit`` is the truncated
     completion's ``finish_reason`` / ``prompt_tokens`` /
     ``completion_tokens`` / ``total_tokens`` / ``reasoning_tokens``

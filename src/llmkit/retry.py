@@ -211,8 +211,9 @@ class RetryPolicy:
     **Two separate budgets.** Transport failures (rate limits, transient
     5xx, network/timeout — :data:`~llmkit.exceptions.LLM_TRANSPORT_ERRORS`)
     get ``max_attempts`` tries, since a retry on a fresh connection
-    routinely succeeds. Schema-validation failures (pydantic
-    ``ValidationError`` / instructor ``InstructorRetryException`` —
+    routinely succeeds. Schema-validation failures (llmkit's
+    :class:`~llmkit.exceptions.StructuredOutputError`, pydantic
+    ``ValidationError``, instructor ``InstructorRetryException`` —
     :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS`) get the lower
     ``validation_max_attempts``, so a deterministically-wrong schema can't
     burn the full transport budget on doomed re-asks while a
@@ -238,7 +239,9 @@ class RetryPolicy:
     two are never conflated, so attempts are not double-counted *within* one
     call.
     Note the layering at the seam: when instructor exhausts its own repair
-    budget it raises ``InstructorRetryException``, which is in
+    budget on a parse failure, the structured lane re-raises its
+    ``InstructorRetryException`` as
+    :class:`~llmkit.exceptions.StructuredOutputError`, which is in
     :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS` — so a persistent schema
     failure triggers a *fresh outer attempt* on the lower validation budget
     (each attempt runs its own low in-call repair budget). That is layering,

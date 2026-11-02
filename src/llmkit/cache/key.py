@@ -24,8 +24,10 @@ from llmkit.providers import LLMProviderInterface
 #: A pinned-digest test fails on any change that forgets to bump it. Version 2
 #: retired every entry stored before text calls began raising on a length
 #: truncation: such an entry records no stop reason, so it could hold cut-off
-#: text that would otherwise be replayed as a complete answer.
-LLM_CACHE_KEY_VERSION: Final = 2
+#: text that would otherwise be replayed as a complete answer. Version 3
+#: retired every structured entry stored as a re-serialized instance, from
+#: before a structured call stored the answer text the provider sent.
+LLM_CACHE_KEY_VERSION: Final = 3
 
 # The provider request kwargs that say *where* a request goes, as opposed to
 # who is allowed to send it. An allowlist, so a credential (``api_key``) can

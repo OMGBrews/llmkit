@@ -10,6 +10,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Call reference](#call-reference)
+  - [When a structured answer fails validation](#when-a-structured-answer-fails-validation)
   - [When a text answer is cut off](#when-a-text-answer-is-cut-off)
   - [Tool calls with a structured final answer](#tool-calls-with-a-structured-final-answer)
   - [Choosing which tool the model calls](#choosing-which-tool-the-model-calls)
@@ -219,6 +220,80 @@ transient failure only before its first item reaches you; see the
 
 All three are exported so your own prompt builders can be annotated against them rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected. Annotate a plain conversation `list[Message]`, and a tool-loop history — which gains assistant tool turns and tool results as it runs — `list[ChatMessage]`.
 
+### When a structured answer fails validation
+
+`structured_llm_call` returns an instance of your model that passed its
+validation, or raises. When the answer still fails validation after
+instructor's one in-call repair re-ask and the policy's `validation_max_attempts`
+fresh attempts, the call raises `StructuredOutputError`. `tool_llm_call` with
+`output_schema=` raises the same type when its final answer fails validation
+or the turn carries neither tool calls nor text. The error carries what
+failed:
+
+- `schema_name`: the name of your output model;
+- `raw_text`: the answer text that failed, unparsed (`None` when there was no text);
+- `errors`: Pydantic's errors (`ValidationError.errors()`), each naming the
+  failing field in `loc` (malformed JSON reports one `json_invalid` error), or
+  `None` when the failure was not a Pydantic `ValidationError`;
+- `attempt`, `model` and `provider`: the attempt it ended and where it ran.
+
+The cause is on `__cause__`: instructor's exception on the structured lane,
+pydantic's `ValidationError` on the compose lane, and nothing when a compose
+turn had no text. The message names each failing field and the reason, never
+the answer itself. `StructuredOutputError` is in
+`LLM_SCHEMA_ERRORS`, so `except LLM_RECOVERABLE_ERRORS` still catches it. A
+transport or permanent provider failure is not a validation failure and keeps
+its own type; see [Retries](#automatic-retries-on-by-default).
+
+```python
+from llmkit import StructuredOutputError, structured_llm_call
+
+try:
+    report = await structured_llm_call(prompt, Report, feature="reports")
+except StructuredOutputError as exc:
+    for error in exc.errors or []:
+        print(error["loc"], error["msg"])
+    print(exc.raw_text)
+```
+
+A provider response with no choices at all raises the same error, with
+`raw_text` `None`, and is re-asked on the same budget.
+
+**Validation is pydantic's strict JSON mode, on every lane**: the structured
+call, a cache hit, a compose call's final answer, and tool arguments. Strict
+JSON rejects coercions a model did not ask for, such as `"1"` for an `int`,
+`1.0` for an `int` or `"yes"` for a `bool`, and still accepts JSON's string
+forms of datetimes, dates, UUIDs, enums and decimals. The instance you get is
+your class validating the provider's answer text **once**, the same step a
+cache hit takes. A validator that transforms its input sees the model's text,
+not a re-serialized answer, and a serializer never touches the returned value.
+(instructor validates the same text first to drive its repair re-ask, so a
+validator with side effects runs twice per paid answer.)
+
+An `output_schema` llmkit cannot hold to this contract raises
+`UnsupportedSchemaError` (a `TypeError`) before any request: a type that is not
+a pydantic `BaseModel` subclass; one of instructor's DSL classes
+(`IterableModel`, `Partial`, a simple-type adapter), which instructor turns
+into a list or a bare value or validates while incomplete; or a model that
+declares one of instructor's async validators (`async_field_validator`,
+`async_model_validator`), on itself, a base class or a nested model. No lane
+runs those validators, so a declared one would silently not validate.
+
+Validation means your schema, not your meaning: to reject an answer that
+validates but is wrong for your purpose, see
+[Re-rolling on a semantically-bad result](#re-rolling-on-a-semantically-bad-result).
+
+**The structured-output contract is measured per provider.** Each provider's
+structured-output mode and request traits are fixed by llmkit and checked by the
+live provider suite on that provider's default model. The model you pass is your
+choice: llmkit keeps no per-model list, and it runs any model under its
+provider's pinned mode. A provider you define yourself, by subclassing
+`BaseProvider` or implementing `LLMProviderInterface`, is a route llmkit has not
+measured: it accepts whatever instructor mode you name. Every answer is still
+validated against your schema, but a mode that produces empty or
+default-filled answers can pass that check, so whether the mode suits your
+provider is yours to measure.
+
 ### When a text answer is cut off
 
 When the provider reports that it stopped at the output-token limit (`finish_reason="length"`), `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream` and `text_llm_call_stream_sync` raise `OutputLimitError` instead of handing back the cut-off text as if it were the whole answer — the same error a truncated structured call raises. A missing or any other finish reason is a normal answer. The cut-off text is not lost: it is on `exc.diagnostics.partial_text`, beside the finish reason and the token counts the provider reported, and in the call's log record.
@@ -244,7 +319,7 @@ except OutputLimitError:
     partial = "".join(received)  # also on exc.diagnostics.partial_text
 ```
 
-The error is never retried by default and never cached; see [Retries](#automatic-retries-on-by-default). Tool calls do not raise it: they report the provider's reason as `stop_reason`.
+The error is never retried by default and never cached; see [Retries](#automatic-retries-on-by-default). Tool calls do not raise it: they report the provider's reason as `stop_reason`. The one exception is a compose call's final answer, described below.
 
 ### Tool calls with a structured final answer
 
@@ -291,7 +366,7 @@ else:
     raise RuntimeError("Tool loop did not finish within five turns")
 ```
 
-Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
+Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally, in pydantic's strict JSON mode, and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. When that budget is spent it raises `StructuredOutputError`, the same type the structured lane raises. A final answer cut off by the output-token limit raises `OutputLimitError` and is not retried; a turn that requested tools keeps reporting its reason as `stop_reason`. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
 
 ### Choosing which tool the model calls
 
@@ -358,7 +433,7 @@ returned `tool_calls`, and `usage`, exactly as the buffered tool lane does.
 
 ### When a call doesn't parse
 
-A turn can request several calls at once, and one of them can come back unusable — arguments that aren't JSON, a tool you never offered, arguments the definition's model rejects. Nothing has executed at that point, so llmkit **keeps the calls that did parse** and reports each failure on `result.invalid_calls` as the `ToolArgumentError` it raised (carrying the tool name, the call id, and the raw argument string):
+A turn can request several calls at once, and one of them can come back unusable — arguments that aren't JSON, a tool you never offered, arguments the definition's model rejects (validated from the raw JSON string in pydantic's strict JSON mode, so `{"a": "2"}` does not satisfy an `int` field). Nothing has executed at that point, so llmkit **keeps the calls that did parse** and reports each failure on `result.invalid_calls` as the `ToolArgumentError` it raised (carrying the tool name, the call id, and the raw argument string):
 
 ```python
 result = await tool_llm_call(prompt, tools, feature="assistant")
@@ -416,7 +491,7 @@ tools = [
 ]                                     # … and both go over unchanged
 ```
 
-**Where the guarantee stops.** It is delivery in the provider's accepted subset, not lossless translation: a construct the subset cannot express is *dropped, not errored*. The one to know about is that Gemini accepts `enum` only on string-typed fields, so an enum on an integer or float field is silently discarded and the model sees an unconstrained number. Keep enums as string enums when a Gemini route is in play, or validate the range yourself — `from_model()` validates the model's arguments locally either way, so a value outside the enum still fails validation on our side.
+**Where the guarantee stops.** It is delivery in the provider's accepted subset, not lossless translation: a construct the subset cannot express is *dropped, not errored*. The one to know about is that Gemini accepts `enum` only on string-typed fields, so an enum on an integer or float field is silently discarded and the model sees an unconstrained number. Keep enums as string enums when a Gemini route is in play, or validate the range yourself — `from_model()` validates the model's arguments, in strict JSON mode, locally either way, so a value outside the enum still fails validation on our side.
 
 Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transport.py` asserts the transform's output offline (so a transport upgrade that stopped normalising fails the suite), and `test_vertex_tool_schema_roundtrip_live` asserts Google's Agent Platform accepts it live.
 
@@ -573,9 +648,11 @@ Local validation uses `jsonschema` over the original schema, including
 `pattern`, `multipleOf`, `const`, `uniqueItems`, composition (`allOf`, `anyOf`,
 `oneOf`, `not`, conditionals), and rules inside nested properties, array items,
 and referenced definitions. Invalid instances raise Pydantic `ValidationError`
-with instance and schema locations and use the existing bounded repair loop.
-Validator engine faults use `SchemaEngineError` and fail without response
-repair. Structured calls may carry it inside Instructor's exception wrapper;
+with instance and schema locations and use the existing bounded repair loop; an
+answer still invalid when that loop is spent surfaces as
+`StructuredOutputError`, with those errors on its `errors`. Validator engine
+faults use `SchemaEngineError` and fail without response repair. Structured
+calls may carry it inside Instructor's exception wrapper;
 `llmkit.exceptions.underlying_provider_error` retrieves that cause. No legacy
 path silently drops validation rules.
 
@@ -615,7 +692,9 @@ limit the guidance a provider sees, but never weakens local validation. A
 provider rejecting guidance surfaces its error rather than causing a silent
 schema downgrade. The OpenRouter strict upgrade applies only to plain object
 roots with absent or false `additionalProperties` and no unsupported strict
-composition; other shapes remain non-strict and use local validation and repair.
+composition, whose nested objects are all closed (`additionalProperties: false`)
+and whose objects list every property in `required`; other shapes remain
+non-strict and use local validation and repair.
 The live suite exercises a schema with `pattern` and `const` on each shipped
 provider route, including Gemini's `"json"` strategy; these cases add real calls,
 cost, and potential failures to the weekly live check.
@@ -779,7 +858,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured or text attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured, text or compose final-answer attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call, or a compose call's final answer, was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error, except on a compose call's final answer (`tool_llm_call` with `output_schema=`). `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
 
 ### Grouping calls by run
 
@@ -968,7 +1047,7 @@ The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrapp
 
 What a configured cache does on each call that reads it:
 
-- **Hit.** When an earlier successful call stored an answer for the same request, the call returns it. A structured answer is validated into a fresh instance of your schema, and your `on_result` hook still runs on it; if the hook rejects the stored answer, this call goes to the provider as if nothing were stored, and the new answer replaces the old one. A streamed call replays the stored text as **a single chunk** and then ends — it does not re-create the chunking of the stream that stored it — so code that parses a stream incrementally receives the whole answer at once; to exercise incremental parsing, split the text in your own test double.
+- **Hit.** When an earlier successful call stored an answer for the same request, the call returns it. The store holds the answer text the provider sent, and a structured hit validates that text once, with the same strict rule as the paid call, into a fresh instance of your schema, so it equals the paid answer. A stored entry that does not decode is a miss, with one warning on the `llmkit.cache` logger. Your `on_result` hook still runs on it; if the hook rejects the stored answer, this call goes to the provider as if nothing were stored, and the new answer replaces the old one. A streamed call replays the stored text as **a single chunk** and then ends — it does not re-create the chunking of the stream that stored it — so code that parses a stream incrementally receives the whole answer at once; to exercise incremental parsing, split the text in your own test double.
 - **Identical requests in flight at once.** Buffered requests that start before an identical one has finished share its provider call: the first runs, the rest wait for its answer and record hits. If the first fails or is cancelled, each waiting call goes to the provider on its own retry budget. This works within one process; requests from separate processes each reach the store on their own. Streams take no part: a stream's answer is complete only when your code has read its last chunk, so an identical stream in flight is neither waited on nor waits, each pays for its own answer, and a stream never holds up a buffered call.
 - **Miss.** The call runs exactly as it would without a cache. Only an answer that comes back cleanly is stored — never an attempt that raised, an answer your `on_result` rejected, a truncated answer (`OutputLimitError`, structured or text, streamed or buffered), or a stream your code stopped reading before its end. A text answer counts as truncated only when the provider says so (`finish_reason="length"`).
 
@@ -982,7 +1061,7 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 
 ### What counts as the same request
 
-llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
+llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`, now 3, so entries an earlier release stored miss once and are replaced); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
 `timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait.
 
@@ -1025,7 +1104,7 @@ class RedisLLMCache:
 configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
 ```
 
-`LLMCacheEntry` is a frozen dataclass of plain strings — `response` (a structured answer as JSON, or the text), `schema`, `provider`, `model`, and the `call_id` of the call that stored it — so any store can persist it. It has no expiry field: retention is the store's policy, as it is a log sink's.
+`LLMCacheEntry` is a frozen dataclass of plain strings — `response` (the answer text the provider sent, for a structured call too), `schema`, `provider`, `model`, and the `call_id` of the call that stored it — so any store can persist it. It has no expiry field: retention is the store's policy, as it is a log sink's.
 
 `configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. A store that raises never fails a call: the call proceeds as a miss, and llmkit logs one warning on the `llmkit.cache` logger, with repeats of the same failure at DEBUG until the cache is reconfigured.
 
@@ -1366,6 +1445,15 @@ schema is enforced is a correctness decision, and an endpoint that ignores it
 fails silently and far from the cause. A host that knowingly wants wider routing
 can subclass `OpenRouterProvider` and override `completion_kwargs`.
 
+**The strict upgrade is skipped for schemas OpenAI-served endpoints reject.**
+OpenRouter's structured outputs are advisory unless the schema is sent with
+`strict: true`, so llmkit upgrades a structured request to strict where the
+schema allows it. It leaves the request non-strict when any nested object is
+open or any object leaves a property out of `required` (a field with a
+default). Measured on 2026-11-02, OpenAI-served endpoints answered HTTP 400 to
+both shapes under strict and validated them sent non-strict. llmkit validates
+every answer locally either way.
+
 ## Retries
 
 Two retry layers, kept deliberately separate: llmkit's own [automatic
@@ -1378,14 +1466,14 @@ one attempt.
 Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, `tool_llm_call_stream_sync`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
 
 - **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds. A timed-out request gets a fresh per-request `timeout` on each attempt.
-- **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (instructor wraps *transport* failures in `InstructorRetryException` too; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
+- **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: llmkit's `StructuredOutputError`, pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (A structured answer that fails validation surfaces as `StructuredOutputError`; instructor's `InstructorRetryException` now reaches you only around a failure that was not a validation failure. instructor wraps *transport* failures in it; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
 - **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. `tool_llm_call_stream` and its sync form do not re-ask them — see the streaming caveat below.
-- **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
+- **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion, or a compose call's final answer, is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
 - **Backpressure** (`LLM_BACKPRESSURE_ERRORS`: llmkit's own `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)) also gets **zero budget**: re-asking a circuit already known to be open is doomed by construction.
 
 The two zero-budget subsets are fail-fast *defaults*, not prohibitions: a caller that genuinely wants the retry opts back in by listing `OutputLimitError` or `CircuitOpenError` explicitly in a `retry_on`. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
-**`LlmkitError` is the base of every exception llmkit defines**, from `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises. It does not catch third-party transport or validation errors, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
+**`LlmkitError` is the base of every exception llmkit defines**, from `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises, including `StructuredOutputError` and `UnsupportedSchemaError`; an `on_result` hook that returns a value raises a plain `TypeError`. It does not catch third-party transport errors or instructor's `InstructorRetryException` around one, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
 
 **`LLM_RECOVERABLE_ERRORS` is the single catch-set for transient failures** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
 
@@ -1450,7 +1538,7 @@ def on_retry(*, label: str, attempt: int, max_attempts: int, error: BaseExceptio
 
 ### instructor's in-call schema repair
 
-instructor re-asks the model to fix malformed JSON *within a single call*, before any `ValidationError`/`InstructorRetryException` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError` (a failing async field validator included), or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the automatic layer, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the automatic layer: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
+instructor re-asks the model to fix malformed JSON *within a single call*, before any `StructuredOutputError` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError`, or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). instructor's async validators (`async_field_validator`, `async_model_validator`) are not supported: no lane runs them, so llmkit refuses a schema that declares one with `UnsupportedSchemaError` before any request (llmkit requires instructor 1.17.0 or later). A response with no choices gets no in-call re-ask; it raises `StructuredOutputError` and is re-asked on the validation budget. Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the automatic layer, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the automatic layer: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
 
 ### Re-rolling on a semantically-bad result
 
@@ -1471,6 +1559,8 @@ result = await structured_llm_call(
 The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
+
+The hook may be an `async def` function; llmkit awaits it. It must return `None`: any other return value raises `TypeError`, because a hook written as a predicate (`lambda r: bool(r.findings)`) would otherwise accept every result. The parameter's type says so, so a type checker flags such a hook. On a cache hit, an exception the call would re-roll on (`ResultValidationError`, or one in the policy's `validation_retry_on` such as a pydantic `ValidationError`) makes the hit a miss; any other exception propagates without a provider request.
 
 The hook runs inside the call, on the event loop the call runs on, so keep it quick and non-blocking. A hook that blocks stalls that whole loop. For the sync wrappers that loop is llmkit's own, which every concurrent sync call shares, so a blocking hook in one sync call delays all the others, not only its own. A hook running on llmkit's own loop cannot iterate a sync stream form: there it raises `RuntimeError` instead of deadlocking.
 
@@ -1510,7 +1600,7 @@ The fake is a plain function or a coroutine function. It receives one frozen `Tr
 
 It never carries credentials or provider-native request settings.
 
-A `Reply` answers every kind. `Reply.text(...)` gives text, and `Reply.json(model_instance)` gives the instance's JSON (`model_dump_json(by_alias=True)`); a model with computed fields and `extra="forbid"` does not round-trip, so send its JSON with `Reply.text`. Raw JSON and raw tool arguments (`FakeToolCall("add", '{"left": 1')`) run the real parsing, repair and malformed-call handling. A streaming call splits the text into word-sized deltas, or uses `chunks=[...]` when you give them, then delivers the tool calls; `usage` and `cost` are reported like a provider's. `finish_reason` defaults to `"tool_calls"` or `"stop"`. Set it to `"length"` to get each kind's real truncation behavior: a structured call, a text call and a text stream raise `OutputLimitError` (the stream after delivering its chunks), and a tool call reports it as `stop_reason`.
+A `Reply` answers every kind. `Reply.text(...)` gives text, and `Reply.json(model_instance)` gives the instance's JSON (`model_dump_json(by_alias=True)`). That is a re-serialization, so a model whose dump cannot be read back (computed fields with `extra="forbid"`, a serialization-only alias, an excluded required field) or whose validator transforms its input does not give back the same answer; send the JSON the model would send with `Reply.text`. `Reply(no_choice=True)` answers a buffered call with a response that has no choices, which a structured call, and a tool call with `output_schema=`, raises as `StructuredOutputError`; a text call and a plain tool call treat it as an empty answer. Raw JSON and raw tool arguments (`FakeToolCall("add", '{"left": 1')`) run the real parsing, repair and malformed-call handling. A streaming call splits the text into word-sized deltas, or uses `chunks=[...]` when you give them, then delivers the tool calls; `usage` and `cost` are reported like a provider's. `finish_reason` defaults to `"tool_calls"` or `"stop"`. Set it to `"length"` to get each kind's real truncation behavior: a structured call, a text call and a text stream raise `OutputLimitError` (the stream after delivering its chunks), as does a compose call's final answer, and any other tool call reports it as `stop_reason`.
 
 The installed fake is **process-wide**: it reaches the sync wrappers and threads your application starts itself, such as a web server under test, and concurrent tests in one process share it. Nested installs stack, and leaving a block restores the one before. With no fake installed, the real transport runs.
 

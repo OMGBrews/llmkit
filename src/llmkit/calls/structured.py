@@ -8,7 +8,7 @@ schema failure would be.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import cast
 
@@ -16,11 +16,13 @@ from pydantic import BaseModel, JsonValue
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    guard_output_schema,
     logger,
     prepare_call,
     resolve_model_and_provider,
     result_validation_budget,
     run_cached,
+    run_on_result,
     run_with_policy,
     usage_log_dict,
 )
@@ -50,7 +52,7 @@ async def structured_llm_call[T: BaseModel](
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
-    on_result: Callable[[T], object] | None = None,
+    on_result: Callable[[T], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
     """Call LLM with structured output parsing.
@@ -62,8 +64,11 @@ async def structured_llm_call[T: BaseModel](
             ``content`` may be a plain string or a list of content-part dicts
             for multimodal input.
         output_schema: Pydantic model class the LLM response is parsed
-            into, via ``instructor`` pinned to the provider's native
-            JSON-schema mode.
+            into, via ``instructor`` pinned to the provider's structured-output
+            mode, and validated once in pydantic's strict JSON mode. A schema
+            that is not a ``BaseModel`` subclass, or that declares an
+            instructor async validator, raises
+            :class:`~llmkit.UnsupportedSchemaError` before any request.
         feature: Caller feature name (e.g. ``"summarization"``,
             ``"extraction"``, ``"classification"``, ``"multi_field"``,
             ``"schema"``). Embedded in the log filename and YAML body.
@@ -134,7 +139,10 @@ async def structured_llm_call[T: BaseModel](
             default) leaves the call unchanged. Folds an
             LLM-then-validate-then-re-roll loop the caller would otherwise
             hand-roll into the call itself. A cached answer is passed through it
-            too, and a rejection makes that answer a miss for this call.
+            too, and a rejection makes that answer a miss for this call. An
+            ``async def`` hook is awaited. A hook must return ``None``: any
+            other return value raises :class:`TypeError`, so a hook written as
+            a predicate cannot accept every result silently.
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
             ``retry``/``provider``/``cache``/``timeout`` once for reuse across many calls.
@@ -147,16 +155,27 @@ async def structured_llm_call[T: BaseModel](
             flat-keyword path unchanged.
 
     Returns:
-        An instance of *output_schema* populated by the LLM, or decoded from
-        the response cache when an identical request was answered before.
+        An instance of exactly *output_schema*, validated once from the
+        answer text, either the provider's or the response cache's copy of an
+        identical request's answer text.
 
     Raises:
-        Any exception from the LLM provider or output parser — transient
-        ones (``LLM_RECOVERABLE_ERRORS``) are retried per *retry* first,
-        then re-raised on exhaustion; non-transient ones propagate
-        immediately. The log is still written on every attempt with the
-        error recorded.
+        StructuredOutputError: The answer still failed validation after
+            instructor's in-call repair and the validation budget; it carries
+            the raw answer and pydantic's field errors.
+        OutputLimitError: The completion was cut off by the output-token
+            limit; never retried by default.
+        UnsupportedSchemaError: *output_schema* is not a plain pydantic
+            model this call can validate (see ``output_schema``); raised
+            before any request.
+        TypeError: ``on_result`` returned a value other than ``None``.
+        Exception: Any other exception from the LLM provider — transient
+            ones (``LLM_RECOVERABLE_ERRORS``) are retried per *retry* first,
+            then re-raised on exhaustion; non-transient ones propagate
+            immediately. The log is still written on every attempt with the
+            error recorded.
     """
+    guard_output_schema(output_schema)
     prepared = prepare_call(
         options,
         temperature=temperature,
@@ -172,6 +191,10 @@ async def structured_llm_call[T: BaseModel](
     )
     args, provider, call_id, attempt_offset = prepared
     attempt_count = 0
+    # The validated text of the answer this call returns, which the response
+    # cache stores; set only once ``on_result`` accepted it, so a hook that
+    # mutates the instance cannot change what is stored.
+    accepted_text: str | None = None
 
     async def _attempt() -> T:
         # Function-local so ``import llmkit`` never pays litellm's import
@@ -179,7 +202,7 @@ async def structured_llm_call[T: BaseModel](
         # import is still seen (see :mod:`llmkit._litellm`).
         import llmkit._litellm as _litellm
 
-        nonlocal attempt_count
+        nonlocal attempt_count, accepted_text
         attempt_count += 1
         attempt = attempt_offset + attempt_count
         begin_queue_wait()
@@ -195,7 +218,7 @@ async def structured_llm_call[T: BaseModel](
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
         try:
-            response, cost, counts = await _litellm.acompletion_structured(
+            response, cost, counts, text = await _litellm.acompletion_structured(
                 prompt,
                 output_schema,
                 temperature=args.temperature,
@@ -215,7 +238,8 @@ async def structured_llm_call[T: BaseModel](
                 # A raise (ResultValidationError) rejects this result and
                 # re-rolls within the validation budget; the attempt is still
                 # logged below with both the rejected response and the error.
-                _ = on_result(response)
+                await run_on_result(on_result, response)
+            accepted_text = text
             return response
         except Exception as exc:
             # instructor can raise after a completion returned (a truncation),
@@ -311,9 +335,12 @@ async def structured_llm_call[T: BaseModel](
         prepared=prepared,
         prompt=prompt,
         output_schema=output_schema,
-        # By alias, because ``model_validate_json`` reads aliases back.
-        encode=lambda response: response.model_dump_json(by_alias=True),
-        decode=output_schema.model_validate_json,
+        # The answer text the provider sent, not a re-serialization: a hit
+        # validates it once, strictly, exactly as the paid answer was.
+        # ``None`` (no text: a host provider whose mode answers outside the
+        # message content) stores nothing.
+        encode=lambda _response: accepted_text or None,
+        decode=lambda stored: output_schema.model_validate_json(stored, strict=True),
         on_result=on_result,
         record_hit=_record_hit,
     )
@@ -357,7 +384,7 @@ def structured_llm_call_sync[T: BaseModel](
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
-    on_result: Callable[[T], object] | None = None,
+    on_result: Callable[[T], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
     """Synchronous wrapper around :func:`structured_llm_call`.

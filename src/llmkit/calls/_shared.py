@@ -34,23 +34,28 @@ previous attempt's queueing to an attempt that never queued.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import inspect
 import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
-from typing import NamedTuple, cast
+from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 
 from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
-from llmkit.cache.read_through import cache_key_or_none, read_through
+from llmkit.cache.read_through import CacheDecodeError, cache_key_or_none, read_through
 from llmkit.exceptions import (
     OutputLimitDiagnostics,
     ResultValidationError,
     SchemaEngineError,
+    StructuredOutputError,
     ToolArgumentError,
+    UnsupportedSchemaError,
 )
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
@@ -64,6 +69,114 @@ from llmkit.tools import TokenUsage, ToolCall, ToolDefinition
 # One logger for the whole call surface, named explicitly rather than via
 # ``__name__`` so every family module shares a single greppable name.
 logger = logging.getLogger("llmkit.calls")
+
+
+def guard_output_schema(output_schema: object) -> None:
+    """Refuse an ``output_schema`` no lane can hold to the contract, before any request.
+
+    The schema must be a pydantic ``BaseModel`` subclass, not one of
+    instructor's DSL classes (``IterableModel``, ``Partial``, a simple-type
+    adapter), that declares no instructor async validator (``async_field_validator`` /
+    ``async_model_validator``), on itself, a base, or any model reachable
+    through its field annotations (including through a ``TypedDict`` or a
+    dataclass): no lane runs one, so a declared validator
+    would silently not validate. Raises
+    :class:`~llmkit.exceptions.UnsupportedSchemaError` otherwise.
+    """
+    if not isinstance(output_schema, type) or not issubclass(output_schema, BaseModel):
+        raise UnsupportedSchemaError(
+            f"output_schema must be a pydantic BaseModel subclass, got {output_schema!r}"
+        )
+    from instructor.dsl.iterable import IterableBase
+    from instructor.dsl.partial import PartialBase
+    from instructor.dsl.simple_type import AdapterBase
+
+    if issubclass(output_schema, (IterableBase, PartialBase, AdapterBase)):
+        # instructor turns these into something other than an instance of the
+        # schema (a list, a bare value) or validates an incomplete answer.
+        raise UnsupportedSchemaError(
+            f"output_schema {output_schema.__name__} is an instructor DSL class "
+            + "(IterableModel, Partial or a simple-type adapter); pass a plain model"
+        )
+    offender = _async_validator_member(output_schema)
+    if offender is not None:
+        raise UnsupportedSchemaError(
+            f"{offender}: instructor async validators are not supported; no llmkit lane "
+            + "runs them. Use a pydantic validator, or validate in on_result."
+        )
+
+
+@functools.lru_cache(maxsize=256)
+def _async_validator_member(model: type[BaseModel]) -> str | None:
+    """``"<Model>.<member>"`` for the first async-validator marker reachable from *model*."""
+    from instructor.validation import ASYNC_MODEL_VALIDATOR_KEY, ASYNC_VALIDATOR_KEY
+
+    seen: set[int] = set()
+
+    def visit(annotation: object) -> str | None:
+        if id(annotation) in seen:
+            return None
+        seen.add(id(annotation))
+        for argument in cast("tuple[object, ...]", get_args(annotation)):
+            found = visit(argument)
+            if found is not None:
+                return found
+        if not isinstance(annotation, type):
+            return None
+        container = cast("type[object]", annotation)
+        if not issubclass(container, BaseModel):
+            if not (is_typeddict(container) or dataclasses.is_dataclass(container)):
+                return None
+            # A model can sit inside a TypedDict or a dataclass field too.
+            try:
+                hints = cast("dict[str, object]", get_type_hints(container))
+            except Exception:
+                hints = cast("dict[str, object]", getattr(container, "__annotations__", {}))
+            for hint in hints.values():
+                found = visit(hint)
+                if found is not None:
+                    return found
+            return None
+        model = container
+        members: dict[str, object] = {}
+        for base in reversed(model.__mro__):
+            members.update(vars(base))
+        for name, member in members.items():
+            if isinstance(member, (classmethod, staticmethod)):
+                member = cast("object", member.__func__)
+            if (
+                getattr(member, ASYNC_VALIDATOR_KEY, None) is not None
+                or getattr(member, ASYNC_MODEL_VALIDATOR_KEY, None) is not None
+            ):
+                return f"{model.__name__}.{name}"
+        for field in model.model_fields.values():
+            found = visit(field.annotation)
+            if found is not None:
+                return found
+        return None
+
+    return visit(model)
+
+
+async def run_on_result[T](on_result: Callable[[T], object], result: T) -> None:
+    """Run the caller's ``on_result`` hook on *result*, awaiting an async one.
+
+    A hook rejects a result by raising
+    :class:`~llmkit.exceptions.ResultValidationError`; its return value is
+    never read. So an awaitable return is awaited (an ``async def`` hook), and
+    any other value that is not ``None`` raises :class:`TypeError` rather than
+    being ignored: a hook written as a predicate (``lambda r: bool(r.items)``)
+    would otherwise accept every result silently.
+    """
+    returned = on_result(result)
+    if inspect.isawaitable(returned):
+        returned = cast("object", await returned)
+    if returned is not None:
+        raise TypeError(
+            "on_result must return None (or be an async function returning None); "
+            + f"it returned {type(returned).__name__}. Raise ResultValidationError to "
+            + "reject a result."
+        )
 
 
 def result_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], ...]:
@@ -90,9 +203,12 @@ def compose_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], 
     A turn that requested tools keeps the tool lane's contract — a round whose
     every call is malformed raises :class:`ToolArgumentError` and is re-asked —
     and a turn that answered is validated locally, raising
-    :class:`ResultValidationError` when the final answer does not parse.
+    :class:`StructuredOutputError` when the final answer does not validate.
+    The type is listed here as well as in the default
+    :data:`~llmkit.LLM_SCHEMA_ERRORS`, so a custom ``validation_retry_on``
+    that omits it still re-asks a failed final answer.
     """
-    return (*tool_validation_budget(retry), ResultValidationError)
+    return (*tool_validation_budget(retry), StructuredOutputError)
 
 
 def build_call_provider(
@@ -269,7 +385,7 @@ async def run_cached[T](
     prepared: PreparedCall,
     prompt: str | Sequence[ChatMessage],
     output_schema: type[BaseModel] | None,
-    encode: Callable[[T], str],
+    encode: Callable[[T], str | None],
     decode: Callable[[str], T],
     on_result: Callable[[T], object] | None,
     record_hit: Callable[[T, str | None, datetime, float], Awaitable[None]],
@@ -283,11 +399,16 @@ async def run_cached[T](
     A hit sits above :func:`run_with_policy` and therefore above the rate
     limiter, so it spends no retry budget and takes no slot. It still runs the
     caller's *on_result* on the decoded answer — a rejection there makes it a
-    miss for this caller — and writes its own record through *record_hit*,
+    miss for this caller, as does an exception in the policy's
+    ``validation_retry_on`` (the paid path would re-roll on it), while any other
+    exception from the hook propagates without a provider request; only a
+    decode failure is a cache failure — and
+    writes its own record through *record_hit*,
     called with the decoded answer, the ``call_id`` of the call that paid for
     it, and the hit's start time (wall clock, then monotonic).
 
-    *encode* and *decode* turn a result into the stored string and back.
+    *encode* and *decode* turn a result into the stored string and back;
+    *encode* returning ``None`` stores nothing.
     """
     args, provider, call_id, attempt_offset = prepared
     participation = cache_and_key(prepared, prompt, output_schema)
@@ -299,9 +420,13 @@ async def run_cached[T](
     model, provider_name = resolve_model_and_provider(args.model, provider)
     schema = output_schema.__name__ if output_schema is not None else "text"
 
-    def _encode(result: T) -> LLMCacheEntry:
+    def _encode(result: T) -> LLMCacheEntry | None:
+        response = encode(result)
+        if response is None:
+            # Nothing a hit could validate: answered, just not stored.
+            return None
         return LLMCacheEntry(
-            response=encode(result),
+            response=response,
             schema=schema,
             provider=provider_name,
             model=model,
@@ -309,9 +434,20 @@ async def run_cached[T](
         )
 
     async def _accept(entry: LLMCacheEntry) -> T:
-        result = decode(entry.response)
+        try:
+            result = decode(entry.response)
+        except Exception as exc:
+            # Only a decode failure is a cache failure; anything the caller's
+            # hook raises below propagates as it would on a paid answer.
+            raise CacheDecodeError from exc
         if on_result is not None:
-            _ = on_result(result)
+            try:
+                await run_on_result(on_result, result)
+            except args.retry.validation_retry_on as exc:
+                # On a paid answer the call would re-roll on this exception
+                # (it is in the validation budget), so on a hit it is a miss,
+                # like a ResultValidationError; anything else propagates.
+                raise ResultValidationError(str(exc)) from exc
         await record_hit(result, entry.call_id, started_at, start_t)
         return result
 
@@ -356,8 +492,12 @@ def _tool_call_from_raw(raw: object, definitions: dict[str, ToolDefinition]) -> 
             name, call_id, arguments_raw, "tool arguments must be a JSON object"
         )
     try:
+        # JSON mode on the raw string, strict, like every other lane: the same
+        # rule for a tool's model as for an ``output_schema``.
         validated = (
-            definition.model.model_validate(parsed) if definition.model is not None else None
+            definition.model.model_validate_json(arguments_raw, strict=True)
+            if definition.model is not None
+            else None
         )
     except SchemaEngineError:
         raise

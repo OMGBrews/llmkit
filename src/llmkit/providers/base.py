@@ -579,6 +579,14 @@ class BaseProvider(ABC):
     :func:`llmkit.providers.build_provider`; it is deliberately **not** part
     of :class:`LLMProviderInterface`, which is the surface consumers type
     against.
+
+    A provider you define yourself, by subclassing this class or by
+    implementing :class:`LLMProviderInterface`, is a route llmkit has not
+    measured: llmkit accepts whatever ``instructor_mode`` it names, including
+    a mode such as ``Mode.TOOLS`` that measurably regresses some models.
+    llmkit still validates every answer against your schema, but an empty or
+    default-filled answer from an unsuitable mode can pass that check, so
+    whether the mode suits the provider is yours to measure.
     """
 
     # Routing-contract hooks every concrete provider MUST set. They are

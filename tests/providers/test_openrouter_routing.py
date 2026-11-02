@@ -166,7 +166,7 @@ def _drive_structured_call(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
-        parsed, _cost, _usage = asyncio.run(
+        parsed, _cost, _usage, _text = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 _OkSchema,

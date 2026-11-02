@@ -171,7 +171,8 @@ class Reply:
             ``"length"`` gets each kind's real truncation behavior: a
             structured call, a text call and a text stream raise
             :class:`~llmkit.OutputLimitError` (the stream after delivering
-            its chunks), and a tool call reports it as ``stop_reason``.
+            its chunks), as does a compose call's final answer, and any other
+            tool call reports it as ``stop_reason``.
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
         cost: Approximate cost to report, or ``None``.
@@ -179,6 +180,12 @@ class Reply:
         chunks: Explicit text deltas for a streaming call. When omitted,
             ``content`` is split into word-sized deltas. Buffered calls answer
             with their concatenation.
+        no_choice: Answer a buffered call with a degenerate response that
+            carries no choices at all, as a provider occasionally does. A
+            structured call, and a tool call with ``output_schema=``, raises
+            :class:`~llmkit.StructuredOutputError`; a text call and a plain
+            tool call treat it as an empty answer. Requires no ``content``,
+            ``tool_calls`` or ``chunks``.
     """
 
     content: str | None = None
@@ -188,10 +195,15 @@ class Reply:
     cost: float | None = None
     delay: float = 0.0
     chunks: Sequence[str] | None = None
+    no_choice: bool = False
 
     def __post_init__(self) -> None:
         if self.delay < 0:
             raise ValueError("Reply.delay must not be negative")
+        if self.no_choice and (
+            self.content is not None or self.tool_calls or self.chunks is not None
+        ):
+            raise ValueError("Reply.no_choice carries no content, tool_calls or chunks")
         if (
             self.chunks is not None
             and self.content is not None
@@ -224,9 +236,13 @@ class Reply:
     ) -> Reply:
         """*instance* serialized with ``model_dump_json(by_alias=True)``.
 
-        The structured call parses it back with the real parser. A model whose
-        computed fields are serialized but rejected on input (``extra="forbid"``)
-        does not round-trip; send its JSON with :meth:`text` instead.
+        The structured call parses it back with the real parser, strictly. This
+        is a re-serialization, so a model whose dump cannot be read back
+        (computed fields with ``extra="forbid"``, a serialization-only alias,
+        an excluded required field, ``SecretStr``, a value-changing
+        serializer), or whose validator transforms its input, does not give
+        back the same answer; send the JSON the model would send with
+        :meth:`text` instead.
         """
         return cls.text(
             instance.model_dump_json(by_alias=True),
@@ -336,6 +352,8 @@ class _Double:
 
     async def respond(self, call: CallContext) -> WireResponse:
         reply = await self._reply(call)
+        if reply.no_choice:
+            return WireResponse(has_choice=False, usage=_reply_usage(reply), cost=reply.cost)
         return WireResponse(
             text=_reply_text(reply),
             tool_calls=_reply_tool_calls(reply),

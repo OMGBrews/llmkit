@@ -51,7 +51,7 @@ class ToolDefinition:
     construct the subset cannot express is *dropped, not errored*. Notably Gemini accepts ``enum``
     only on string-typed fields, so an enum on an integer field is silently discarded and the model
     sees an unconstrained number — :meth:`from_model` still validates the returned arguments
-    locally. ``tests/providers/test_gemini_tool_schema_transport.py`` pins the transform;
+    locally, from the raw argument string in pydantic's strict JSON mode. ``tests/providers/test_gemini_tool_schema_transport.py`` pins the transform;
     ``test_vertex_tool_schema_roundtrip_live`` pins that Gemini Enterprise Agent Platform (formerly
     Vertex AI) accepts its output.
     """
@@ -65,7 +65,7 @@ class ToolDefinition:
     def from_model(
         cls, name: str, model: type[BaseModel], description: str | None = None
     ) -> ToolDefinition:
-        """Build a definition whose arguments are validated by *model*.
+        """Build a definition whose arguments are validated by *model*, in strict JSON mode.
 
         A nested model or an enum renders ``$defs``/``$ref`` here, which is
         correct: the transport inlines them per provider (see the class
