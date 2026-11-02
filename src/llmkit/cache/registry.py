@@ -34,7 +34,7 @@ def configure_llm_cache(cache: LLMCache | None) -> None:
     Pass ``None`` (the default state) to turn caching off. With a cache
     configured, :func:`~llmkit.structured_llm_call`,
     :func:`~llmkit.text_llm_call` (and their sync wrappers) and
-    :func:`~llmkit.text_llm_call_stream` answer a request whose fingerprint
+    :func:`~llmkit.text_llm_call_stream` (and its sync form) answer a request whose fingerprint
     was stored by an earlier successful call from the store and store each new
     successful answer; the buffered calls also coalesce identical requests in
     flight at once into one provider call. ``cache=False`` on a call or on

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
@@ -48,6 +48,7 @@ from llmkit.providers import LLMProviderInterface
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy, with_retries_stream
 from llmkit.run_scope import get_run_id
+from llmkit.sync import iterate_sync
 from llmkit.tools import (
     TextDeltaEvent,
     TokenUsage,
@@ -97,15 +98,12 @@ async def tool_llm_call_stream(
                 result = event  # the completed turn; the stream is done
 
     Takes the same ``tools`` / ``tool_choice`` surface as
-    :func:`~llmkit.tool_llm_call`, and the same per-call keywords, with two
-    deliberate absences:
-
-    * **No ``output_schema``.** Compose is rejected at the signature rather
-      than at runtime, so the type checker enforces it. Use the portable
-      two-step pattern (tool loop, then :func:`~llmkit.structured_llm_call`).
-    * **No sync variant.** :func:`~llmkit.sync.run_sync` bridges coroutines,
-      not async generators; :func:`~llmkit.text_llm_call_stream` has no sync
-      form either, for the same reason.
+    :func:`~llmkit.tool_llm_call`, and the same per-call keywords, with one
+    deliberate absence: **no ``output_schema``.** Compose is rejected at the
+    signature rather than at runtime, so the type checker enforces it. Use the
+    portable two-step pattern (tool loop, then
+    :func:`~llmkit.structured_llm_call`). Blocking code uses
+    :func:`~llmkit.tool_llm_call_stream_sync`, which yields the same items.
 
     One log record per attempt is handed to the configured sink, under the
     ``"tools-stream"`` schema, carrying the offered ``tools``, the returned
@@ -183,6 +181,58 @@ async def tool_llm_call_stream(
     ) as stream:
         async for event in stream:
             yield event
+
+
+def tool_llm_call_stream_sync(
+    prompt: str | Sequence[ChatMessage],
+    tools: Sequence[ToolDefinition],
+    *,
+    feature: str,
+    label: str | None = None,
+    tool_choice: ToolChoice | None = None,
+    temperature: float | None | Unset = UNSET,
+    model: str | None | Unset = UNSET,
+    max_tokens: int | None | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
+    reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    provider: LLMProviderInterface | None | Unset = UNSET,
+    retry: RetryPolicy | Unset = UNSET,
+    options: LLMCallOptions | None = None,
+) -> Generator[TextDeltaEvent | ToolCallResult]:
+    """Synchronous form of :func:`tool_llm_call_stream`.
+
+    Same arguments, same items, same records and retry behavior as the async
+    form: text deltas one per ``next()``, then the completed
+    :class:`~llmkit.ToolCallResult` as the last item. The returned generator
+    drives the async stream on llmkit's persistent sync loop (see
+    :func:`~llmkit.sync.iterate_sync`), so no item is fetched before it is
+    asked for. ``timeout`` bounds each wait for the next chunk, as on the async
+    form; the sync bridge adds no whole-stream ceiling.
+
+    The caller's :mod:`contextvars` context is captured when this function is
+    called, not when iteration starts. Closing the generator, breaking out of a
+    ``for`` loop over it, or dropping it before the result records the
+    abandonment exactly as the async stream does; stopping at the result is a
+    completed call. Calling or iterating it on the sync loop's own thread raises
+    :class:`RuntimeError`; async code should use the async form.
+    """
+    return iterate_sync(
+        tool_llm_call_stream(
+            prompt,
+            tools,
+            feature=feature,
+            label=label,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            model=model,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            reasoning_effort=reasoning_effort,
+            provider=provider,
+            retry=retry,
+            options=options,
+        )
+    )
 
 
 async def _stream_tools_once(

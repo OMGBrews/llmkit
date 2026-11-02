@@ -103,9 +103,11 @@ def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     without authoring a :class:`~llmkit.logging.LogSink`. Captures every
     call function (:func:`structured_llm_call`, :func:`text_llm_call`,
     :func:`text_llm_call_stream`, :func:`tool_llm_call`,
-    :func:`tool_llm_call_stream`) and works across the ``run_sync`` bridge
-    (e.g. :func:`structured_llm_call_sync`), since the record is appended
-    inside the async call path the bridge drives.
+    :func:`tool_llm_call_stream`) and works across the sync bridges (e.g.
+    :func:`structured_llm_call_sync`, :func:`text_llm_call_stream_sync`), since
+    the record is appended inside the async call path the bridge drives. A
+    sync stream captures the context when it is created, so enter this block
+    before calling the ``*_stream_sync`` function.
 
     Like path-capture, one record is appended *per attempt* — retries each
     produce their own logged record — and capture is independent of the

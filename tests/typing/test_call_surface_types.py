@@ -17,7 +17,7 @@ negative a self-enforcing assertion that the shape is still rejected.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from typing import assert_type
 
 from pydantic import BaseModel
@@ -37,9 +37,11 @@ from llmkit import (
     structured_llm_call_sync,
     text_llm_call,
     text_llm_call_stream,
+    text_llm_call_stream_sync,
     text_llm_call_sync,
     tool_llm_call,
     tool_llm_call_stream,
+    tool_llm_call_stream_sync,
     tool_llm_call_sync,
 )
 
@@ -99,6 +101,13 @@ async def _typecheck_prompt_accepts_valid_shapes() -> None:
         AsyncGenerator[TextDeltaEvent | ToolCallResult],
     )
 
+    # The sync stream forms yield exactly what their async forms yield.
+    _ = assert_type(text_llm_call_stream_sync(msgs, feature="t"), Generator[str])
+    _ = assert_type(
+        tool_llm_call_stream_sync(msgs, tools, feature="t"),
+        Generator[TextDeltaEvent | ToolCallResult],
+    )
+
 
 async def _typecheck_reasoning_effort_accepts_values() -> None:
     # Canonical members, an arbitrary provider-specific string (the open ``| str``
@@ -144,11 +153,13 @@ async def _typecheck_timeout_accepted_on_every_lane() -> None:
         _ = await text_llm_call("hi", feature="t", timeout=timeout)
         _ = text_llm_call_sync("hi", feature="t", timeout=timeout)
         _ = text_llm_call_stream("hi", feature="t", timeout=timeout)
+        _ = text_llm_call_stream_sync("hi", feature="t", timeout=timeout)
         _ = await tool_llm_call("hi", tools, feature="t", timeout=timeout)
         _ = tool_llm_call_sync("hi", tools, feature="t", timeout=timeout)
         _ = await tool_llm_call("hi", tools, feature="t", output_schema=_Out, timeout=timeout)
         _ = tool_llm_call_sync("hi", tools, feature="t", output_schema=_Out, timeout=timeout)
         _ = tool_llm_call_stream("hi", tools, feature="t", timeout=timeout)
+        _ = tool_llm_call_stream_sync("hi", tools, feature="t", timeout=timeout)
         _ = LLMCallOptions(timeout=timeout)
 
 
@@ -160,6 +171,7 @@ async def _typecheck_cache_accepted_on_every_caching_lane() -> None:
     _ = await structured_llm_call("hi", _Out, feature="t", cache=False)
     _ = assert_type(text_llm_call_stream("hi", feature="t", cache=False), AsyncGenerator[str])
     _ = text_llm_call_stream("hi", feature="t", options=LLMCallOptions(cache=False))
+    _ = assert_type(text_llm_call_stream_sync("hi", feature="t", cache=False), Generator[str])
 
 
 def _typecheck_prompt_rejects_invalid_shapes() -> None:
@@ -191,6 +203,7 @@ def _typecheck_streaming_tool_lane_rejects_compose() -> None:
     # which makes it a self-enforcing record of the decision, not a comment.
     tools = [ToolDefinition("lookup", "", {"type": "object"})]
     _ = tool_llm_call_stream("hi", tools, feature="t", output_schema=_Out)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+    _ = tool_llm_call_stream_sync("hi", tools, feature="t", output_schema=_Out)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
 
 
 def test_typecheck_helpers_exist() -> None:
@@ -214,10 +227,9 @@ def test_public_types_are_exported_and_message_is_a_dict() -> None:
     assert "ReasoningEffort" in llmkit.__all__
     assert "TextDeltaEvent" in llmkit.__all__
     assert "tool_llm_call_stream" in llmkit.__all__
-    # There is deliberately no sync variant: ``run_sync`` bridges coroutines,
-    # not async generators, exactly as for ``text_llm_call_stream``.
-    assert not hasattr(llmkit, "tool_llm_call_stream_sync")
-    assert not hasattr(llmkit, "text_llm_call_stream_sync")
+    # Every call family has a sync form, the two streams included.
+    assert "tool_llm_call_stream_sync" in llmkit.__all__
+    assert "text_llm_call_stream_sync" in llmkit.__all__
     # A Message is a plain dict at runtime (TypedDict has no runtime identity).
     message: Message = {"role": "user", "content": "hi"}
     assert message["role"] == "user"

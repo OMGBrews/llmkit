@@ -20,8 +20,10 @@ errors propagate; a timeout cancels the abandoned coroutine *on the loop*; a
 reentrant call from a *foreign* loop (an async host) is routed onto the
 persistent loop — no fresh loop, cancellation still works; a call from the
 persistent loop itself falls back to the worker-thread fresh loop without
-deadlock and still drains LiteLLM's queued logging; and explicit
-:func:`~llmkit.sync.shutdown` is idempotent and lets the loop restart lazily.
+deadlock and still drains LiteLLM's queued logging; explicit
+:func:`~llmkit.sync.shutdown` is idempotent and lets the loop restart lazily;
+and shutdown cancels a sync stream blocked in ``next()`` the way it cancels an
+in-flight call, and closes one left between items.
 """
 
 from __future__ import annotations
@@ -32,14 +34,19 @@ import sys
 import textwrap
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import AsyncIterator, Coroutine
+from contextlib import AbstractContextManager
+from types import SimpleNamespace
 from typing import Protocol, cast
+from unittest.mock import patch
 
 import pytest
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
-from llmkit import sync
+from llmkit import STREAM_ABANDONED_ERROR, capture_llm_records, sync, text_llm_call_stream_sync
 from llmkit.sync import run_sync
+from llmkit.testing import Reply, install
+from tests._support import capturing_sink, ollama_call_defaults
 
 
 class _LoggingWorker(Protocol):
@@ -366,3 +373,89 @@ def test_shutdown_cancels_in_flight_call_and_caller_error_is_not_masked() -> Non
     assert isinstance(observed[0], asyncio.CancelledError), (
         f"expected CancelledError, got {type(observed[0]).__name__}: {observed[0]}"
     )
+
+
+# --- Sync streams ----------------------------------------------------------------
+
+
+def _chunk(text: str, finish_reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=text, tool_calls=None),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=None,
+    )
+
+
+def _parking_stream(parked: threading.Event) -> AbstractContextManager[object]:
+    """Patch the provider to stream ``"a"``, then park forever before ``"b"``."""
+
+    async def _gen() -> AsyncIterator[SimpleNamespace]:
+        yield _chunk("a")
+        parked.set()
+        _ = await asyncio.Event().wait()
+        yield _chunk("b", "stop")  # pragma: no cover - shutdown cancels first
+
+    async def _acompletion(**_kwargs: object) -> AsyncIterator[SimpleNamespace]:
+        return _gen()
+
+    return patch("llmkit._litellm.litellm.acompletion", side_effect=_acompletion)
+
+
+def test_shutdown_cancels_a_sync_stream_blocked_in_next() -> None:
+    """A sync stream parked in ``next()`` gets ``CancelledError``, as an in-flight call does.
+
+    The cancelled step runs the stream's abandonment path inside the consumer's
+    context, so the record is captured. Closing the iterator afterwards is
+    silent and does not restart the loop.
+    """
+    sync.shutdown()  # clean slate
+    parked = threading.Event()
+    observed: list[BaseException] = []
+    with ollama_call_defaults(), _parking_stream(parked), capture_llm_records() as records:
+        chunks = text_llm_call_stream_sync("hi", feature="drain")
+        assert next(chunks) == "a"
+
+        def _consumer() -> None:
+            try:
+                _ = next(chunks)
+            except BaseException as exc:  # capture the exact type the consumer observed
+                observed.append(exc)
+
+        consumer = threading.Thread(target=_consumer)
+        consumer.start()
+        assert parked.wait(timeout=5.0), "the stream never parked"
+        sync.shutdown()
+        consumer.join(timeout=5.0)
+        assert not consumer.is_alive(), "consumer did not unblock after shutdown"
+        chunks.close()
+    assert len(observed) == 1, observed
+    assert isinstance(observed[0], asyncio.CancelledError), (
+        f"expected CancelledError, got {type(observed[0]).__name__}: {observed[0]}"
+    )
+    assert [record.error for record in records] == [STREAM_ABANDONED_ERROR]
+    assert sync._loop is None, "closing after shutdown restarted the loop"
+
+
+def test_shutdown_closes_a_sync_stream_left_between_items() -> None:
+    """Shutdown finalizes a suspended sync stream; its next ``next()`` raises.
+
+    The generator was first iterated on the persistent loop, so that loop's
+    ``shutdown_asyncgens`` closes it and the abandonment reaches the sink —
+    outside the consumer's context, so it is not in the capture list. The
+    next pull raises :class:`RuntimeError` without starting a fresh loop.
+    """
+    sync.shutdown()  # clean slate
+    with ollama_call_defaults(), capturing_sink() as written:
+        with install(lambda _request: Reply(content="ab", chunks=["a", "b"])):
+            chunks = text_llm_call_stream_sync("hi", feature="drain")
+            assert next(chunks) == "a"
+            sync.shutdown()
+            assert [record.error for record in written] == [STREAM_ABANDONED_ERROR]
+            with pytest.raises(RuntimeError, match="shut down while this stream was open"):
+                _ = next(chunks)
+            chunks.close()
+    assert sync._loop is None, "a pull after shutdown restarted the loop"
