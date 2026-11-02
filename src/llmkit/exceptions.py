@@ -13,20 +13,23 @@ The recoverable set is split into five subsets the retry layer budgets
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
   limits, transient 5xx, network/timeout). These get the full transport
   retry budget, since a retry on a fresh connection routinely succeeds.
-* :data:`LLM_SCHEMA_ERRORS` — *schema-validation* failures (pydantic
-  ``ValidationError``; instructor's ``InstructorRetryException``, raised
-  when its own in-call repair budget is exhausted). These get a **lower**
-  budget: a transiently-malformed JSON response still earns one cross-call
-  retry, but a deterministically-wrong schema can't burn the full transport
-  budget on doomed re-asks.
+* :data:`LLM_SCHEMA_ERRORS` — *schema-validation* failures (llmkit's
+  :class:`StructuredOutputError`, raised when a structured answer fails
+  validation after instructor's in-call repair, or when a compose lane's final
+  answer fails validation; pydantic ``ValidationError``; instructor's
+  ``InstructorRetryException`` for an exhausted attempt that was not a parse
+  failure). These get a **lower** budget: a transiently-malformed JSON
+  response still earns one cross-call retry, but a deterministically-wrong
+  schema can't burn the full transport budget on doomed re-asks.
 
   Caveat — ``InstructorRetryException`` is a *wrapper*: instructor re-raises
   **every** exhausted attempt this way, including transport failures (a 429
-  or network blip caught inside its create call), not only schema ones. The
-  retry layer therefore unwraps it via :func:`underlying_provider_error` and
-  charges a wrapped transport cause to the transport budget — so membership
-  here is the default-but-not-final classification, not a promise the failure
-  is genuinely schema-shaped.
+  or network blip caught inside its create call). llmkit re-owns the
+  parse-shaped ones as :class:`StructuredOutputError`; the rest keep the
+  wrapper, and the retry layer unwraps it via :func:`underlying_provider_error`
+  and charges a wrapped transport cause to the transport budget — so
+  membership here is the default-but-not-final classification, not a promise
+  the failure is genuinely schema-shaped.
 * :data:`LLM_BACKPRESSURE_ERRORS` — llmkit's *own* fail-fast backpressure
   signal (:class:`CircuitOpenError`, raised by the opt-in per-provider circuit
   breaker while it is open). It is recoverable in the catch-set sense — a host
@@ -83,6 +86,7 @@ from instructor.core.exceptions import (
     ResponseParsingError,
 )
 from pydantic import ValidationError
+from pydantic_core import ErrorDetails
 from tenacity import RetryError
 
 # Transient *transport* failures — the default transport retry budget retries
@@ -169,14 +173,16 @@ class LlmkitError(Exception):
     ``except LlmkitError`` catches every failure llmkit itself raises: a
     provider outage it normalized (:class:`ServiceUnavailableError`), its
     own fail-fast signals (:class:`CircuitOpenError`,
-    :class:`OutputLimitError`), validation it ran
-    (:class:`ToolArgumentError`, :class:`ResultValidationError`), and its
-    configuration errors (:class:`LLMClientNotConfiguredError`,
-    :class:`ComposeUnsupportedError`, :class:`ReasoningEffortUnsupportedError`,
-    :class:`SchemaEngineError`). It does not catch the third-party errors a
-    call can also raise (``openai`` and ``httpx`` transport errors, pydantic
-    and instructor validation errors); :data:`LLM_RECOVERABLE_ERRORS` and its
-    subsets name those, and remain the sets to catch for retry-shaped policy.
+    :class:`OutputLimitError`), validation it ran or re-owned
+    (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
+    :class:`ResultValidationError`), and its configuration errors
+    (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
+    :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`). It
+    does not catch the third-party errors a call can also raise (``openai``
+    and ``httpx`` transport errors, a bare pydantic ``ValidationError``, and
+    instructor's ``InstructorRetryException`` wrapping a transport or
+    permanent provider error); :data:`LLM_RECOVERABLE_ERRORS` and its subsets name those, and
+    remain the sets to catch for retry-shaped policy.
 
     Do not list this class in :attr:`~llmkit.RetryPolicy.retry_on`: retry
     matching is ``isinstance``, so it would re-enable retries for every
@@ -286,21 +292,87 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     TimeoutError,
 )
 
+
+class StructuredOutputError(LlmkitError):
+    """A structured answer did not validate against the caller's schema.
+
+    Raised by :func:`~llmkit.structured_llm_call` when instructor's in-call
+    schema repair is exhausted on a genuine parse failure (malformed JSON, a
+    field or model validator that rejected the answer, required fields
+    missing), and by :func:`~llmkit.tool_llm_call` with ``output_schema=``
+    when the final answer does not validate or the turn carried neither tool
+    calls nor text. One llmkit-owned type for the one failure the contract
+    names, so a caller can read what failed without knowing instructor's
+    wrapper type. instructor's original exception, when there is one, is on
+    ``__cause__``.
+
+    Only parse-shaped failures are re-owned: a transport or permanent provider
+    error that escapes instructor keeps its ``InstructorRetryException`` wrap,
+    so :func:`underlying_provider_error`, ``Retry-After`` handling and throttle
+    detection read it exactly as before.
+
+    A member of :data:`LLM_SCHEMA_ERRORS` and so of
+    :data:`LLM_RECOVERABLE_ERRORS`: the call re-asks it on the validation
+    budget (``RetryPolicy.validation_max_attempts``), and the last one
+    propagates when that budget is spent.
+
+    Attributes:
+        schema_name: The ``__name__`` of the requested output schema.
+        raw_text: The answer text that failed, unparsed, from the last
+            in-call attempt; ``None`` when the completion carried no text
+            (no choices, or a compose turn with neither tool calls nor text).
+            Never put into the message.
+        errors: pydantic's structured errors
+            (``ValidationError.errors(include_url=False)``) when pydantic
+            rejected the answer, each naming the failing field in ``loc``
+            (malformed JSON reports one ``json_invalid`` error with an empty
+            ``loc``); ``None`` when the failure was not a pydantic
+            ``ValidationError``, such as instructor's ``ResponseParsingError``
+            for a response with nothing to parse.
+        attempt: The call-level attempt number this failure ended (the same
+            value the attempt's log record carries), or ``None``.
+        model: The model string the call ran against, or ``None``.
+        provider: The provider name the call ran against, or ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        schema_name: str,
+        raw_text: str | None,
+        errors: list[ErrorDetails] | None,
+        attempt: int | None,
+        model: str | None,
+        provider: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.schema_name: str = schema_name
+        self.raw_text: str | None = raw_text
+        self.errors: list[ErrorDetails] | None = errors
+        self.attempt: int | None = attempt
+        self.model: str | None = model
+        self.provider: str | None = provider
+
+
 # Schema-validation failures — retried on their own *lower* budget, distinct
 # from the transport set, so a deterministic schema failure can't consume the
 # full transport budget on doomed re-asks while a transiently-malformed JSON
 # response still earns one cross-call retry.
+#   - ``StructuredOutputError``     — llmkit's own type for a structured answer
+#     that failed validation, on either the structured or the compose lane.
+#     The structured lane re-raises an exhausted parse-cause
+#     ``InstructorRetryException`` as this type.
 #   - ``ValidationError``           — pydantic could not parse the response
-#   - ``InstructorRetryException``  — instructor's in-call loop gave up. For a
-#     genuine parse failure that means the repair budget (two attempts total,
-#     i.e. one schema-repair re-ask; see ``llmkit._litellm``) was exhausted.
-#     NOTE: instructor wraps *any* failure escaping that loop this way —
-#     transport and permanent errors included, which llmkit's parse-only
-#     predicate declines after a single attempt (no re-ask). The retry layer
-#     unwraps it (``underlying_provider_error``) so a wrapped transport cause is
-#     charged the transport budget rather than this lower one, and a wrapped
-#     permanent error fails fast on neither.
+#   - ``InstructorRetryException``  — instructor's in-call loop gave up on a
+#     failure that is *not* parse-shaped. instructor wraps *any* failure
+#     escaping that loop this way — transport and permanent errors included,
+#     which llmkit's parse-only predicate declines after a single attempt (no
+#     re-ask). The retry layer unwraps it (``underlying_provider_error``) so a
+#     wrapped transport cause is charged the transport budget rather than this
+#     lower one, and a wrapped permanent error fails fast on neither.
 LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
+    StructuredOutputError,
     ValidationError,
     InstructorRetryException,
 )
@@ -338,9 +410,9 @@ LLM_TOOL_ERRORS: tuple[type[Exception], ...] = (ToolArgumentError,)
 #   - ``ResponseParsingError``  — instructor couldn't parse the response at all
 #     (e.g. a blocked/empty Gemini ``Mode.JSON`` generation)
 # Deliberately *not* in the exported ``LLM_*_ERRORS`` family: these raw parse
-# types are an internal routing detail (a structured call surfaces them wrapped
-# in ``InstructorRetryException`` ∈ ``LLM_SCHEMA_ERRORS``, which is what a host
-# catches), not a user-facing catch-set.
+# types are an internal routing detail (a structured call surfaces an exhausted
+# one as :class:`StructuredOutputError` ∈ ``LLM_SCHEMA_ERRORS``, which is what a
+# host catches), not a user-facing catch-set.
 REPAIRABLE_PARSE_ERRORS: tuple[type[Exception], ...] = (
     ValidationError,
     JSONDecodeError,

@@ -151,11 +151,16 @@ async def structured_llm_call[T: BaseModel](
         the response cache when an identical request was answered before.
 
     Raises:
-        Any exception from the LLM provider or output parser — transient
-        ones (``LLM_RECOVERABLE_ERRORS``) are retried per *retry* first,
-        then re-raised on exhaustion; non-transient ones propagate
-        immediately. The log is still written on every attempt with the
-        error recorded.
+        StructuredOutputError: The answer still failed validation after
+            instructor's in-call repair and the validation budget; it carries
+            the raw answer and pydantic's field errors.
+        OutputLimitError: The completion was cut off by the output-token
+            limit; never retried by default.
+        Exception: Any other exception from the LLM provider — transient
+            ones (``LLM_RECOVERABLE_ERRORS``) are retried per *retry* first,
+            then re-raised on exhaustion; non-transient ones propagate
+            immediately. The log is still written on every attempt with the
+            error recorded.
     """
     prepared = prepare_call(
         options,

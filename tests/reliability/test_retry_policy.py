@@ -66,6 +66,7 @@ from llmkit import (
     LocalYamlLogSink,
     OutputLimitError,
     RetryPolicy,
+    StructuredOutputError,
     capture_llm_records,
     configure_llm_logging,
 )
@@ -714,11 +715,14 @@ async def test_persistent_validation_error_uses_lower_validation_budget() -> Non
     A deterministic schema failure can't burn the full transport budget."""
     with (
         install(lambda _request: _INVALID) as installed,
-        pytest.raises(InstructorRetryException) as excinfo,
+        pytest.raises(StructuredOutputError) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=_NO_BACKOFF)
 
-    assert isinstance(excinfo.value.__cause__, ValidationError)
+    assert isinstance(excinfo.value.__cause__, InstructorRetryException)
+    assert isinstance(excinfo.value.__cause__.__cause__, ValidationError)
+    assert excinfo.value.attempt == 2
+    assert excinfo.value.errors
     # validation_max_attempts default is 2 -> two attempts, not three. Each
     # attempt also sends instructor's one in-call repair re-ask.
     assert _attempts(_first_asks(installed.requests)) == [1, 2]
@@ -1002,11 +1006,12 @@ async def test_no_retry_single_attempt_for_validation_error() -> None:
     cross-call budgets only: instructor's in-call repair re-ask still runs."""
     with (
         install(lambda _request: _INVALID) as installed,
-        pytest.raises(InstructorRetryException) as excinfo,
+        pytest.raises(StructuredOutputError) as excinfo,
     ):
         _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test", retry=NO_RETRY)
 
-    assert isinstance(excinfo.value.__cause__, ValidationError)
+    assert isinstance(excinfo.value.__cause__, InstructorRetryException)
+    assert isinstance(excinfo.value.__cause__.__cause__, ValidationError)
     assert _attempts(_first_asks(installed.requests)) == [1]
     assert [r.repair for r in installed.requests] == [False, True]
 
@@ -1033,7 +1038,7 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
         with (
             install(lambda _request: _INVALID) as installed,
             capture_llm_log_paths() as paths,
-            pytest.raises(InstructorRetryException),
+            pytest.raises(StructuredOutputError),
         ):
             _ = await llm_calls.structured_llm_call(
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF

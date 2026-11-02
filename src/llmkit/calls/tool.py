@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import cast, overload
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
@@ -30,7 +30,13 @@ from llmkit.calls._shared import (
     usage_log_dict,
 )
 from llmkit.capture import record_call_async
-from llmkit.exceptions import ComposeUnsupportedError, ResultValidationError, SchemaEngineError
+from llmkit.exceptions import (
+    ComposeUnsupportedError,
+    OutputLimitDiagnostics,
+    OutputLimitError,
+    SchemaEngineError,
+    StructuredOutputError,
+)
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface
@@ -115,6 +121,12 @@ async def tool_llm_call[T: BaseModel](
     ``invalid_calls``; a round in which every call is malformed still raises
     :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
     budget. See :class:`~llmkit.ToolCallResult`.
+
+    With ``output_schema``, a final answer (a turn that requested no tools)
+    that does not validate, or a turn with neither tool calls nor text, raises
+    :class:`~llmkit.StructuredOutputError` and is re-asked on the same
+    validation budget; a final answer cut off by the output-token limit raises
+    :class:`~llmkit.OutputLimitError` and is not re-asked.
     """
     args, provider, call_id, attempt_offset = prepare_call(
         options,
@@ -150,6 +162,7 @@ async def tool_llm_call[T: BaseModel](
         result: ToolCallResult | ToolComposeResult[T] | None = None
         cost: float | None = None
         error: str | None = None
+        diagnostics: OutputLimitDiagnostics | None = None
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
@@ -196,15 +209,53 @@ async def tool_llm_call[T: BaseModel](
             elif parsed_calls:
                 result = ToolComposeResult[T](*base, parsed=None)
             else:
+                resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
+                if stop_reason == "length":
+                    # A final answer cut off by the output-token limit fails
+                    # fast like the structured lane's: a re-ask with an
+                    # identical budget can only truncate again. A turn that
+                    # requested tools is unaffected (its reason rides on
+                    # ``stop_reason``).
+                    diagnostics = OutputLimitDiagnostics(
+                        partial_text=text,
+                        finish_reason=stop_reason,
+                        prompt_tokens=counts[0],
+                        completion_tokens=counts[1],
+                        total_tokens=counts[2],
+                    )
+                    raise OutputLimitError(
+                        model=resolved_model or "unknown",
+                        max_tokens=args.max_tokens,
+                        completion_tokens=counts[1],
+                        diagnostics=diagnostics,
+                    )
                 if text is None:
-                    raise ResultValidationError("compose response had neither tool calls nor text")
+                    raise StructuredOutputError(
+                        f"compose response for {output_schema.__name__} had neither "
+                        + "tool calls nor text",
+                        schema_name=output_schema.__name__,
+                        raw_text=None,
+                        errors=None,
+                        attempt=attempt_offset + attempt_count,
+                        model=resolved_model,
+                        provider=resolved_provider,
+                    )
                 try:
                     parsed = output_schema.model_validate_json(text)
                 except SchemaEngineError:
                     raise
                 except Exception as exc:
-                    raise ResultValidationError(
-                        f"compose response failed validation: {exc}"
+                    raise StructuredOutputError(
+                        f"compose response for {output_schema.__name__} failed validation "
+                        + f"({type(exc).__name__}: {exc})",
+                        schema_name=output_schema.__name__,
+                        raw_text=text,
+                        errors=exc.errors(include_url=False)
+                        if isinstance(exc, ValidationError)
+                        else None,
+                        attempt=attempt_offset + attempt_count,
+                        model=resolved_model,
+                        provider=resolved_provider,
                     ) from exc
                 result = ToolComposeResult[T](*base, parsed=parsed)
             return result
@@ -257,7 +308,19 @@ async def tool_llm_call[T: BaseModel](
                     tool_calls=[call.to_wire() for call in result.tool_calls]
                     if result is not None
                     else None,
-                    usage=usage_log_dict(result.usage if result is not None else None),
+                    usage=usage_log_dict(
+                        result.usage
+                        if result is not None
+                        else TokenUsage(
+                            diagnostics.prompt_tokens,
+                            diagnostics.completion_tokens,
+                            diagnostics.total_tokens,
+                        )
+                        if diagnostics is not None
+                        else None
+                    ),
+                    output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
+                    partial_text=diagnostics.partial_text if diagnostics is not None else None,
                 )
             )
 

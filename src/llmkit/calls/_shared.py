@@ -50,6 +50,7 @@ from llmkit.exceptions import (
     OutputLimitDiagnostics,
     ResultValidationError,
     SchemaEngineError,
+    StructuredOutputError,
     ToolArgumentError,
 )
 from llmkit.logging import LLMCallRecord
@@ -90,9 +91,12 @@ def compose_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], 
     A turn that requested tools keeps the tool lane's contract — a round whose
     every call is malformed raises :class:`ToolArgumentError` and is re-asked —
     and a turn that answered is validated locally, raising
-    :class:`ResultValidationError` when the final answer does not parse.
+    :class:`StructuredOutputError` when the final answer does not validate.
+    The type is listed here as well as in the default
+    :data:`~llmkit.LLM_SCHEMA_ERRORS`, so a custom ``validation_retry_on``
+    that omits it still re-asks a failed final answer.
     """
-    return (*tool_validation_budget(retry), ResultValidationError)
+    return (*tool_validation_budget(retry), StructuredOutputError)
 
 
 def build_call_provider(

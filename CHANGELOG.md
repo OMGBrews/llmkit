@@ -37,11 +37,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `except LlmkitError` catches `ServiceUnavailableError`, `CircuitOpenError`,
   `OutputLimitError`, `ToolArgumentError`, `ResultValidationError`,
   `ComposeUnsupportedError`, `ReasoningEffortUnsupportedError`,
-  `SchemaEngineError` and the new `LLMClientNotConfiguredError`. It does not
-  catch third-party transport or validation errors; the `LLM_*_ERRORS`
-  tuples are unchanged and remain the sets for retry-shaped handling. Do not
-  list the base in `RetryPolicy.retry_on`: it would re-enable retries for
-  the subclasses that deliberately get none.
+  `SchemaEngineError`, the new `LLMClientNotConfiguredError` and the new
+  `StructuredOutputError`. It does not catch third-party transport errors, a
+  bare pydantic `ValidationError`, or instructor's `InstructorRetryException`
+  around a transport or permanent provider error; the `LLM_*_ERRORS` tuples
+  remain the sets for retry-shaped handling. Do not list the base in
+  `RetryPolicy.retry_on`: it would re-enable retries for the subclasses that
+  deliberately get none.
 
 - **Streamed text and tool calls now record estimated cost.** At stream end,
   use provider-reported cost or LiteLLM pricing over reported token usage,
@@ -82,6 +84,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **Breaking: a structured answer that fails validation raises
+  `StructuredOutputError`.** `structured_llm_call` and its sync form used to
+  raise instructor's `InstructorRetryException` when the answer still failed
+  validation after the in-call repair re-ask; `tool_llm_call` with
+  `output_schema=` raised `ResultValidationError` for a final answer that did
+  not validate or a turn with neither tool calls nor text. Both lanes now
+  raise llmkit's `StructuredOutputError`, a `LlmkitError` carrying
+  `schema_name`, the failed answer as `raw_text`, pydantic's field errors as
+  `errors`, and the `attempt`, `model` and `provider`; instructor's original
+  is on `__cause__`. It joins `LLM_SCHEMA_ERRORS`, so `except
+  LLM_RECOVERABLE_ERRORS` and the default validation budget still cover it.
+  A transport or permanent provider failure keeps instructor's wrapper, so
+  `underlying_provider_error`, `Retry-After` handling and throttle detection
+  are unchanged. To migrate, catch `StructuredOutputError` where you caught
+  `InstructorRetryException` around a validation failure, or
+  `ResultValidationError` around a compose call. A custom
+  `RetryPolicy(validation_retry_on=...)` that lists `InstructorRetryException`
+  without `StructuredOutputError` no longer re-asks a failed structured
+  answer across calls; add the new type to keep that retry. The log
+  record's `error` for such an attempt now starts with
+  `StructuredOutputError:`, which changes the triage key in `index.jsonl`.
+
+- **A compose call's truncated final answer raises `OutputLimitError`.**
+  `tool_llm_call` with `output_schema=` used to treat a final answer cut off
+  by the output-token limit (`finish_reason="length"`) as a validation
+  failure and re-ask it on the validation budget, where an identical budget
+  can only truncate again. It now raises `OutputLimitError` with the partial
+  answer on `diagnostics`, never retried by default, and logs
+  `partial_text` and `output_limit` as the structured and text lanes do. A
+  turn that requested tools still reports the reason as `stop_reason`.
 
 - **`tool_llm_call_sync` declares its parameters.** It used to accept
   `*args, **kwargs` and forward them, so introspection, editors and runtime

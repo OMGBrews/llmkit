@@ -64,11 +64,11 @@ from typing import cast
 
 import instructor
 import litellm
-from instructor.core.exceptions import IncompleteOutputException
+from instructor.core.exceptions import IncompleteOutputException, InstructorRetryException
 from litellm import CustomStreamWrapper
 from litellm.exceptions import BadRequestError
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices, Usage
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from llmkit._messages import resolve_reasoning_effort, wire_messages
@@ -90,7 +90,9 @@ from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     OutputLimitDiagnostics,
     OutputLimitError,
+    StructuredOutputError,
     normalize_service_unavailable,
+    underlying_provider_error,
 )
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
@@ -823,12 +825,16 @@ def _schema_repair_retrying() -> AsyncRetrying:
     exception escaping this loop — a declined transport/permanent error (**1**
     call) or an exhausted parse re-ask (**2** calls) — is caught by
     instructor's blanket ``except Exception as e: raise
-    InstructorRetryException(...) from e``, so the escaping type is always
-    ``InstructorRetryException``. What ``reraise`` controls is ``__cause__``:
-    the raw last error (``reraise=True``) rather than a tenacity ``RetryError``
-    hop. The wrap shape is therefore uniform — ``__cause__`` is the raw provider
-    error on the declined path and the raw last parse error on the exhausted
-    path — and :func:`~llmkit.exceptions.underlying_provider_error` unwraps both.
+    InstructorRetryException(...) from e``, so the type escaping instructor is
+    always ``InstructorRetryException``. What ``reraise`` controls is
+    ``__cause__``: the raw last error (``reraise=True``) rather than a tenacity
+    ``RetryError`` hop. The wrap shape is therefore uniform — ``__cause__`` is
+    the raw provider error on the declined path and the raw last parse error on
+    the exhausted path — and :func:`~llmkit.exceptions.underlying_provider_error`
+    unwraps both. :func:`acompletion_structured` then re-owns the exhausted
+    parse path as :class:`~llmkit.exceptions.StructuredOutputError`, so only
+    the declined (transport/permanent) path reaches a caller as
+    ``InstructorRetryException``.
 
     Built fresh per call — tenacity retrying objects mutate internal iteration
     state, so a shared module-level instance would race across concurrent
@@ -1090,6 +1096,26 @@ async def acompletion_structured[T: BaseModel](
                 completion_tokens=_completion_tokens(e.last_completion),
                 diagnostics=_output_limit_diagnostics(e.last_completion),
             ) from e
+        except InstructorRetryException as e:
+            # An exhausted *parse* failure is the contract's one failure: re-own
+            # it as llmkit's type carrying what failed. A declined transport or
+            # permanent cause keeps instructor's wrap, which the retry layer and
+            # the rate limiter unwrap via underlying_provider_error.
+            cause = underlying_provider_error(e)
+            if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
+                raise
+            raise StructuredOutputError(
+                f"structured answer for {output_schema.__name__} failed validation "
+                + f"after in-call repair ({type(cause).__name__}: {cause})",
+                schema_name=output_schema.__name__,
+                raw_text=_completion_text(getattr(e, "last_completion", None)),
+                errors=cause.errors(include_url=False)
+                if isinstance(cause, ValidationError)
+                else None,
+                attempt=attempt,
+                model=litellm_model,
+                provider=provider.name,
+            ) from e
         # instructor types the raw completion half of the tuple as Any. It is
         # the last rendered response, whose usage instructor's tally has
         # rewritten to the whole in-call total, so it is read back rather than
@@ -1099,6 +1125,23 @@ async def acompletion_structured[T: BaseModel](
         response = _wire_response(raw_completion)
         slot.record_tokens(response.usage.debit())
     return parsed, response.cost, response.usage.counts()
+
+
+def _completion_text(completion: object) -> str | None:
+    """The first choice's message text of *completion*, best-effort.
+
+    For :class:`~llmkit.exceptions.StructuredOutputError`'s ``raw_text``:
+    instructor attaches the failed attempt's rendered completion as
+    ``last_completion``, and every shipped mode reads the answer from
+    ``choices[0].message.content``. ``None`` when anything on the way is
+    missing or the content is not a string.
+    """
+    choices = getattr(completion, "choices", None)
+    if not isinstance(choices, Sequence) or not choices:
+        return None
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    return content if isinstance(content, str) else None
 
 
 def _as_output_schema[T: BaseModel](parsed: T, output_schema: type[T]) -> T:

@@ -11,7 +11,7 @@ from llmkit import (
     NO_RETRY,
     InMemoryLLMCache,
     Provider,
-    ResultValidationError,
+    StructuredOutputError,
     ToolDefinition,
     ToolName,
     configure_llm_cache,
@@ -46,9 +46,11 @@ async def test_invalid_answer_exhausts_bounded_repair() -> None:
 
     model = model_from_json_schema(_SCHEMA)
     with install(lambda _request: Reply.text('{"code":"bad"}')) as installed:
-        with pytest.raises(InstructorRetryException):
+        with pytest.raises(StructuredOutputError) as caught:
             _ = await structured_llm_call("q", model, feature="f", retry=NO_RETRY)
     assert 1 < len(installed.requests) <= 3
+    assert caught.value.raw_text == '{"code":"bad"}'
+    assert isinstance(caught.value.__cause__, InstructorRetryException)
 
 
 async def test_nonfinite_answer_is_repaired_before_normalization_fallback() -> None:
@@ -94,10 +96,11 @@ async def test_tool_compose_uses_original_authority() -> None:
     model = model_from_json_schema(_SCHEMA)
     provider = make_provider(Provider.OPENAI, api_key="fake")
     with install(lambda _request: Reply.text('{"code":"bad"}')):
-        with pytest.raises(ResultValidationError):
+        with pytest.raises(StructuredOutputError) as caught:
             _ = await tool_llm_call(
                 "q", [], output_schema=model, feature="f", provider=provider, retry=NO_RETRY
             )
+    assert caught.value.raw_text == '{"code":"bad"}'
     with install(lambda _request: Reply.text('{"code":"123"}')):
         result = await tool_llm_call("q", [], output_schema=model, feature="f", provider=provider)
     assert result.parsed is not None

@@ -22,7 +22,8 @@ instructor's genuine ``process_response`` / retry machinery runs, exactly like
 * a permanent error (401) is **not** re-asked and fails fast through the default
   :class:`~llmkit.RetryPolicy` with no cross-call retry and no backoff sleep;
 * a genuine parse failure **is** still re-asked once (two generations) and, on
-  exhaustion, routes to the lower *validation* budget in
+  exhaustion, surfaces as :class:`~llmkit.StructuredOutputError` and routes to
+  the lower *validation* budget in
   :func:`~llmkit.retry.with_retries` — not the transport budget;
 * ``Retry-After`` on a wrapped 429 is still recovered by
   :func:`~llmkit.retry._retry_after_seconds` under the new wrap shape.
@@ -43,7 +44,7 @@ import pytest
 from instructor.core.exceptions import InstructorRetryException
 from litellm.types.utils import ModelResponse, Usage
 
-from llmkit import RetryPolicy, _litellm
+from llmkit import RetryPolicy, StructuredOutputError, _litellm
 from llmkit import calls as llm_calls
 from llmkit.exceptions import underlying_provider_error
 from llmkit.retry import _retry_after_seconds
@@ -154,9 +155,9 @@ async def test_parse_failure_uses_validation_budget_through_real_loop() -> None:
     policy whose two budgets are deliberately far apart (5 transport / 2
     validation): validation routing makes ``2 x 2 = 4`` provider generations,
     where transport routing would make ``5 x 2 = 10``. So ``calls == 4`` pins
-    the routing unambiguously — the exhaustion ``InstructorRetryException``
-    (``__cause__`` now the raw parse error) is classified as validation-shaped,
-    not transport."""
+    the routing unambiguously — the exhaustion, re-owned as
+    ``StructuredOutputError`` (instructor's wrap on ``__cause__``), is
+    classified as validation-shaped, not transport."""
     calls = 0
 
     async def fake_acompletion(**_kwargs: object) -> ModelResponse:
@@ -169,7 +170,7 @@ async def test_parse_failure_uses_validation_budget_through_real_loop() -> None:
         quiet_logging(),
         patch("llmkit._litellm.litellm.acompletion", side_effect=fake_acompletion),
         patch("llmkit.retry.asyncio.sleep", AsyncMock()),
-        pytest.raises(InstructorRetryException),
+        pytest.raises(StructuredOutputError),
     ):
         _ = await llm_calls.structured_llm_call(
             "hi", OkSchema, feature="test", retry=policy, provider=_fake_provider()
