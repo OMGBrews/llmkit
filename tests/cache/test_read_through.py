@@ -5,7 +5,8 @@ and counts the requests it received. The cache sits above the fake, so
 "answered from the cache" is a positive observation — the request never
 reached the provider — rather than the absence of an error. A structured call
 runs the real parser, so a paid answer and its cached copy compare equal as
-instances of the schema itself.
+instances of the schema itself: the hit validates the stored answer text with
+the same strict rule.
 """
 
 from __future__ import annotations
@@ -405,7 +406,7 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_aliases_survive_the_round_trip(caplog: pytest.LogCaptureFixture) -> None:
+async def test_an_aliased_answer_is_cached_and_hit(caplog: pytest.LogCaptureFixture) -> None:
     from pydantic import ConfigDict, Field
 
     class _Aliased(BaseModel):

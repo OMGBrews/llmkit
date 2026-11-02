@@ -22,8 +22,9 @@ behaviour in ``test_default_retries.py``:
 
 The call-function tests fake the provider through :mod:`llmkit.testing`, so
 the real limiter, instructor parsing and in-call repair run around each
-attempt. A structured call's failure therefore escapes as instructor's
-``InstructorRetryException`` with the original on ``__cause__``, and malformed
+attempt. A structured call's validation failure therefore escapes as
+``StructuredOutputError`` with instructor's exception on ``__cause__`` (a
+transport or permanent failure keeps ``InstructorRetryException``), and malformed
 JSON costs one in-call repair re-ask (``repair=True``) per attempt, so attempt
 counts are taken over the first asks. The tests that hand-build instructor's
 wrap shapes (the pre-1.15 ``args[0]`` form, ``AsyncValidationError``,
@@ -806,7 +807,9 @@ async def test_v2_wrapped_parse_error_uses_validation_budget(
     the lower validation budget (2) — not just pydantic ``ValidationError`` but
     instructor's own ``ResponseParsingError`` (e.g. a blocked/empty Gemini
     ``Mode.JSON`` generation) and ``AsyncValidationError`` (a failing async field
-    validator). Before ``_SCHEMA_SHAPED_CAUSES`` was aligned with the in-call
+    validator; unreachable on the supported instructor range, where such a
+    schema is refused with ``UnsupportedSchemaError``, and kept as a wrap-shape
+    check). Before ``_SCHEMA_SHAPED_CAUSES`` was aligned with the in-call
     re-ask set, the latter two hit the permanent-cause guard and failed fast
     after a single attempt — a type instructor re-asks in-call being denied its
     cross-call validation retry."""

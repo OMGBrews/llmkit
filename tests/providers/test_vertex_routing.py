@@ -92,7 +92,7 @@ def test_structured_call_pins_json_schema_and_forwards_residency() -> None:
         return fake_client
 
     with patch("llmkit._litellm.instructor.from_litellm", side_effect=_capture_from_litellm):
-        parsed, _cost, _usage = asyncio.run(
+        parsed, _cost, _usage, _text = asyncio.run(
             _litellm.acompletion_structured(
                 "hi", OkSchema, temperature=0.0, model=None, provider=provider
             )

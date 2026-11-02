@@ -22,6 +22,8 @@ from pydantic import BaseModel, ValidationError
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     compose_validation_budget,
+    guard_output_schema,
+    logger,
     parse_tool_calls,
     prepare_call,
     resolve_model_and_provider,
@@ -36,6 +38,7 @@ from llmkit.exceptions import (
     OutputLimitError,
     SchemaEngineError,
     StructuredOutputError,
+    validation_failure_summary,
 )
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
@@ -122,6 +125,11 @@ async def tool_llm_call[T: BaseModel](
     :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
     budget. See :class:`~llmkit.ToolCallResult`.
 
+    Tool arguments, and with ``output_schema`` the final answer, are validated
+    in pydantic's strict JSON mode. An ``output_schema`` that is not a plain
+    pydantic model this lane can validate raises
+    :class:`~llmkit.UnsupportedSchemaError` before any request.
+
     With ``output_schema``, a final answer (a turn that requested no tools)
     that does not validate, or a turn with neither tool calls nor text, raises
     :class:`~llmkit.StructuredOutputError` and is re-asked on the same
@@ -141,6 +149,7 @@ async def tool_llm_call[T: BaseModel](
         label=label,
     )
     if output_schema is not None:
+        guard_output_schema(output_schema)
         if provider is None or not provider.compose_tools_schema:
             name = "the configured provider" if provider is None else provider.name
             raise ComposeUnsupportedError(
@@ -209,7 +218,12 @@ async def tool_llm_call[T: BaseModel](
             elif parsed_calls:
                 result = ToolComposeResult[T](*base, parsed=None)
             else:
-                resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
+                # The routed LiteLLM id, as the structured lane's errors carry.
+                # ``provider`` is set: the compose gate above refused ``None``.
+                routed_model = (
+                    provider.litellm_model(args.model) if provider is not None else args.model
+                )
+                provider_name = provider.name if provider is not None else None
                 if stop_reason == "length":
                     # A final answer cut off by the output-token limit fails
                     # fast like the structured lane's: a re-ask with an
@@ -224,7 +238,7 @@ async def tool_llm_call[T: BaseModel](
                         total_tokens=counts[2],
                     )
                     raise OutputLimitError(
-                        model=resolved_model or "unknown",
+                        model=routed_model or "unknown",
                         max_tokens=args.max_tokens,
                         completion_tokens=counts[1],
                         diagnostics=diagnostics,
@@ -237,25 +251,26 @@ async def tool_llm_call[T: BaseModel](
                         raw_text=None,
                         errors=None,
                         attempt=attempt_offset + attempt_count,
-                        model=resolved_model,
-                        provider=resolved_provider,
+                        model=routed_model,
+                        provider=provider_name,
                     )
                 try:
-                    parsed = output_schema.model_validate_json(text)
+                    # Strict JSON mode: the structured lane's rule.
+                    parsed = output_schema.model_validate_json(text, strict=True)
                 except SchemaEngineError:
                     raise
                 except Exception as exc:
                     raise StructuredOutputError(
                         f"compose response for {output_schema.__name__} failed validation "
-                        + f"({type(exc).__name__}: {exc})",
+                        + f"({validation_failure_summary(exc)})",
                         schema_name=output_schema.__name__,
                         raw_text=text,
                         errors=exc.errors(include_url=False)
                         if isinstance(exc, ValidationError)
                         else None,
                         attempt=attempt_offset + attempt_count,
-                        model=resolved_model,
-                        provider=resolved_provider,
+                        model=routed_model,
+                        provider=provider_name,
                     ) from exc
                 result = ToolComposeResult[T](*base, parsed=parsed)
             return result
@@ -295,7 +310,7 @@ async def tool_llm_call[T: BaseModel](
                         "tools" if output_schema is None else f"tools+{output_schema.__name__}"
                     ),
                     prompt=prompt,
-                    response=result.to_log_dict() if result is not None else None,
+                    response=_dump_for_log(result, feature, label),
                     error=error,
                     approximate_cost=cost,
                     max_tokens=args.max_tokens,
@@ -335,6 +350,29 @@ async def tool_llm_call[T: BaseModel](
         ),
     )
     return completed
+
+
+def _dump_for_log(
+    result: ToolCallResult | None, feature: str, label: str | None
+) -> dict[str, object] | None:
+    """The record's ``response``, or ``None`` when the caller's schema cannot dump.
+
+    A raising serializer on the output schema must not turn a validated final
+    answer into an exception: the dump exists only for the log, as on the
+    structured lane.
+    """
+    if result is None:
+        return None
+    try:
+        return result.to_log_dict()
+    except Exception:
+        logger.warning(
+            "Could not dump the %s/%s compose result for the log; recording response as null",
+            feature,
+            label,
+            exc_info=True,
+        )
+        return None
 
 
 @overload

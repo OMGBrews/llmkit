@@ -46,6 +46,18 @@ def test_every_exported_exception_inherits_the_base() -> None:
     assert all(issubclass(cls, LlmkitError) for cls in exported)
 
 
+def test_every_public_llmkit_exception_is_exported() -> None:
+    """A class the docs name as ``llmkit.<Error>`` must import from there."""
+    public = {
+        cls.__name__
+        for cls in _defined_exception_classes()
+        if issubclass(cls, LlmkitError) and not cls.__name__.startswith("_")
+    }
+    assert "UnsupportedSchemaError" in public, "the scan sees the newest class"
+    assert public <= set(llmkit.__all__)
+    assert all(getattr(llmkit, name) is getattr(exceptions_module, name) for name in public)
+
+
 def test_the_base_is_in_no_catch_set_or_retry_default() -> None:
     for name in dir(exceptions_module):
         if name.startswith("LLM_") and name.endswith("_ERRORS"):

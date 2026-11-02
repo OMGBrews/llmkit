@@ -12,6 +12,7 @@ instead and is not re-asked. Every test answers through the public
 
 from __future__ import annotations
 
+import pickle
 from typing import cast
 
 import pytest
@@ -179,3 +180,80 @@ async def test_a_truncated_turn_that_requested_tools_is_unchanged() -> None:
     assert result.parsed is None
     assert [call.name for call in result.tool_calls] == ["add"]
     assert result.stop_reason == "length"
+
+
+class _Secretive(BaseModel):
+    n: int
+    note: str
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ['{"n": 1, "note": "hunter2', '{"n": "hunter2", "note": "x"}'],
+    ids=["malformed", "wrong-type"],
+)
+async def test_the_message_and_the_record_never_quote_the_answer(answer: str) -> None:
+    """pydantic's own message quotes each failing input; the error's does not."""
+    for call in ("structured", "compose"):
+        with (
+            install(lambda _request: Reply.text(answer)),
+            capture_llm_records() as records,
+            pytest.raises(StructuredOutputError) as caught,
+        ):
+            if call == "structured":
+                _ = await structured_llm_call(
+                    "q", _Secretive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+                )
+            else:
+                _ = await tool_llm_call(
+                    "q",
+                    [],
+                    output_schema=_Secretive,
+                    feature="f",
+                    retry=NO_RETRY,
+                    provider=_PROVIDER,
+                )
+        assert caught.value.raw_text == answer
+        assert caught.value.errors
+        assert "hunter2" not in str(caught.value), call
+        assert all("hunter2" not in (record.error or "") for record in records), call
+
+
+async def test_both_lanes_name_the_same_routed_model() -> None:
+    errors: list[StructuredOutputError] = []
+    with install(lambda _request: Reply.text("{}")):
+        for run in (
+            lambda: structured_llm_call(
+                "q", _Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+            ),
+            lambda: tool_llm_call(
+                "q", [], output_schema=_Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+            ),
+        ):
+            with pytest.raises(StructuredOutputError) as caught:
+                _ = await run()
+            errors.append(caught.value)
+
+    assert errors[0].model == errors[1].model == _PROVIDER.litellm_model(None)
+    assert errors[0].provider == errors[1].provider == _PROVIDER.name
+
+
+async def test_the_error_survives_a_pickle_round_trip() -> None:
+    with (
+        install(lambda _request: Reply.text('{"n": -1}')),
+        pytest.raises(StructuredOutputError) as caught,
+    ):
+        _ = await structured_llm_call(
+            "q", _Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+        )
+    restored = cast("object", pickle.loads(pickle.dumps(caught.value)))
+    assert isinstance(restored, StructuredOutputError)
+
+    assert str(restored) == str(caught.value)
+    for name in ("schema_name", "raw_text", "attempt", "model", "provider"):
+        assert getattr(restored, name) == getattr(caught.value, name), name
+    # ``ctx`` holds the validator's exception object, equal only to itself.
+    assert restored.errors is not None and caught.value.errors is not None
+    assert [(e["type"], e["loc"], e["msg"], e["input"]) for e in restored.errors] == [
+        (e["type"], e["loc"], e["msg"], e["input"]) for e in caught.value.errors
+    ]

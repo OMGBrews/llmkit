@@ -27,7 +27,8 @@ class OpenAIProvider(BaseProvider):
 
     Calls OpenAI (GPT / o-series / GPT-5) directly (``openai/<model>``),
     pinned to OpenAI's native structured-outputs mode (``Mode.JSON_SCHEMA``
-    — a ``strict: true`` ``response_format`` JSON schema). This is the
+    — a ``response_format`` JSON schema, sent without ``strict: true``:
+    only OpenRouter opts into the strict upgrade). This is the
     direct alternative to the indirect ``openrouter/openai/...`` hop, which
     adds a markup and a different structured-output mode.
 

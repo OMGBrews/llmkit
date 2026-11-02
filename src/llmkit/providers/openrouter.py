@@ -35,7 +35,9 @@ class OpenRouterProvider(BaseProvider):
     the schema itself with values nested inside ``properties``. This provider
     therefore sets ``strict_json_schema``, which upgrades the
     ``response_format`` at the LiteLLM call seam to the exact wire shape the
-    original pin was measured on.
+    original pin was measured on. It skips a schema with an open nested object
+    or an object whose ``required`` omits a property: OpenAI-served endpoints
+    answered both with HTTP 400 under strict (measured 2026-11-02).
 
     **Schema-honoring routing (the sharp edge).** OpenRouter advertises
     ``structured_outputs`` as a *model-level* capability, but the strict

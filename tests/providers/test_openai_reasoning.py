@@ -156,7 +156,7 @@ def test_structured_configured_and_per_call_disable_reach_transport(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", complete):
-        parsed, _, _ = asyncio.run(
+        parsed, _, _, _ = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 _Answer,

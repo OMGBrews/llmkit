@@ -78,6 +78,7 @@ from llmkit.exceptions import (
     ServiceUnavailableError,
     StructuredOutputError,
     ToolArgumentError,
+    UnsupportedSchemaError,
 )
 from llmkit.json_schema import model_from_json_schema
 from llmkit.logging import (
@@ -251,6 +252,7 @@ __all__ = [
     "SchemaEngineError",
     "StructuredOutputError",
     "ToolArgumentError",
+    "UnsupportedSchemaError",
     # Package metadata
     "__version__",
 ]

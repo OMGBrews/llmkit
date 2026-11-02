@@ -42,8 +42,8 @@ The recoverable set is split into five subsets the retry layer budgets
   the union) ever re-asks a circuit the breaker already knows is open — unless
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
-  (:class:`OutputLimitError`, raised when a structured or text completion is
-  cut off by the output-token limit). Recoverable in the same catch-set sense as the
+  (:class:`OutputLimitError`, raised when a structured or text completion, or
+  a compose call's final answer, is cut off by the output-token limit). Recoverable in the same catch-set sense as the
   breaker, but **never retried** on either budget by default:
   re-asking with an identical token budget can only truncate again — unless
   a caller explicitly lists the type in ``retry_on``.
@@ -73,6 +73,7 @@ carve-out that a length truncation is never re-asked and surfaces as
 :class:`OutputLimitError` instead).
 """
 
+import functools
 import sys
 from dataclasses import dataclass
 from json import JSONDecodeError
@@ -177,7 +178,8 @@ class LlmkitError(Exception):
     (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
     :class:`ResultValidationError`), and its configuration errors
     (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
-    :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`). It
+    :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`,
+    :class:`UnsupportedSchemaError`). It
     does not catch the third-party errors a call can also raise (``openai``
     and ``httpx`` transport errors, a bare pydantic ``ValidationError``, and
     instructor's ``InstructorRetryException`` wrapping a transport or
@@ -299,12 +301,16 @@ class StructuredOutputError(LlmkitError):
     Raised by :func:`~llmkit.structured_llm_call` when instructor's in-call
     schema repair is exhausted on a genuine parse failure (malformed JSON, a
     field or model validator that rejected the answer, required fields
-    missing), and by :func:`~llmkit.tool_llm_call` with ``output_schema=``
+    missing) or the provider returned no choices, and by
+    :func:`~llmkit.tool_llm_call` with ``output_schema=``
     when the final answer does not validate or the turn carried neither tool
     calls nor text. One llmkit-owned type for the one failure the contract
     names, so a caller can read what failed without knowing instructor's
-    wrapper type. instructor's original exception, when there is one, is on
-    ``__cause__``.
+    wrapper type. The cause is on ``__cause__``: instructor's exception on the
+    structured lane, pydantic's ``ValidationError`` on the compose lane, and
+    nothing when a compose turn carried no text. The message names each
+    failing field and reason (:func:`validation_failure_summary`), never the
+    answer itself.
 
     Only parse-shaped failures are re-owned: a transport or permanent provider
     error that escapes instructor keeps its ``InstructorRetryException`` wrap,
@@ -331,7 +337,8 @@ class StructuredOutputError(LlmkitError):
             for a response with nothing to parse.
         attempt: The call-level attempt number this failure ended (the same
             value the attempt's log record carries), or ``None``.
-        model: The model string the call ran against, or ``None``.
+        model: The routed LiteLLM model id the call ran against (such as
+            ``openai/gpt-4.1-mini``), or ``None``.
         provider: The provider name the call ran against, or ``None``.
     """
 
@@ -353,6 +360,43 @@ class StructuredOutputError(LlmkitError):
         self.attempt: int | None = attempt
         self.model: str | None = model
         self.provider: str | None = provider
+
+    @override
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        # Keyword-only fields: rebuild through a partial so the error pickles
+        # (a process pool or a task queue may carry it across a boundary).
+        return (
+            functools.partial(
+                type(self),
+                self.args[0] if self.args else "",
+                schema_name=self.schema_name,
+                raw_text=self.raw_text,
+                errors=self.errors,
+                attempt=self.attempt,
+                model=self.model,
+                provider=self.provider,
+            ),
+            (),
+        )
+
+
+def validation_failure_summary(exc: BaseException) -> str:
+    """A one-line account of why an answer failed, without the answer itself.
+
+    For :class:`StructuredOutputError`'s message, which lands in the call
+    log's ``error``: pydantic's own message quotes each failing input, so a
+    ``ValidationError`` is summarized from its errors with inputs left out
+    (``"n: Field required [missing]"``). Any other cause keeps its own text.
+    Not exported: an internal formatting helper.
+    """
+    if isinstance(exc, ValidationError):
+        parts = [
+            f"{'.'.join(str(part) for part in error['loc']) or '(answer)'}: "
+            + f"{error['msg']} [{error['type']}]"
+            for error in exc.errors(include_url=False, include_input=False, include_context=False)
+        ]
+        return f"{exc.error_count()} validation error(s): " + "; ".join(parts)
+    return f"{type(exc).__name__}: {exc}"
 
 
 # Schema-validation failures — retried on their own *lower* budget, distinct
@@ -406,7 +450,11 @@ LLM_TOOL_ERRORS: tuple[type[Exception], ...] = (ToolArgumentError,)
 #     error (an exhausted 401/400/403) that must fail fast.
 #   - ``ValidationError``       — pydantic rejected the parse
 #   - ``JSONDecodeError``       — the response wasn't valid JSON
-#   - ``AsyncValidationError``  — an async field validator rejected the parse
+#   - ``AsyncValidationError``  — an async field validator rejected the parse.
+#     Unreachable on the supported instructor range (1.17.x): instructor never
+#     runs async validators, and llmkit refuses a schema that declares one with
+#     :class:`UnsupportedSchemaError` before any request. Kept so this set keeps
+#     mirroring instructor's own parse-error set.
 #   - ``ResponseParsingError``  — instructor couldn't parse the response at all
 #     (e.g. a blocked/empty Gemini ``Mode.JSON`` generation)
 # Deliberately *not* in the exported ``LLM_*_ERRORS`` family: these raw parse
@@ -506,7 +554,7 @@ class OutputLimitDiagnostics:
 
 
 class OutputLimitError(LlmkitError):
-    """A structured or text completion was truncated by the output-token limit.
+    """A structured, text or compose final-answer completion was truncated by the output limit.
 
     Raised by the structured path when the provider stopped generating at the
     token ceiling (``finish_reason='length'`` / Gemini ``MAX_TOKENS``) before a
@@ -514,7 +562,9 @@ class OutputLimitError(LlmkitError):
     paths when the provider explicitly reports ``finish_reason='length'`` — a
     text stream raises it after its last chunk, so the text already yielded
     is the partial answer. A missing finish reason is never read as a
-    truncation. Tool calls report the reason as ``stop_reason`` instead.
+    truncation. A compose call's final answer (:func:`~llmkit.tool_llm_call`
+    with ``output_schema=``) raises it too; every other tool call reports the
+    reason as ``stop_reason`` instead.
     Deliberately **never retried**:
     re-asking with an identical token budget can only truncate again — the
     motivating production failure was a degenerate repetition loop that burned
@@ -606,7 +656,8 @@ def underlying_provider_error(exc: BaseException) -> BaseException:
     can't tell the retry layer which budget the failure belongs to, so this
     returns the wrapped root error for the caller to classify.
 
-    The wrap shape on the pinned instructor 1.15.x: ``args[0]`` is always the
+    The wrap shape on the supported instructor 1.17.x (unchanged since 1.15):
+    ``args[0]`` is always the
     message ``str`` (never the exception), and the root error rides
     ``__cause__`` **raw**. instructor's blanket
     ``except Exception as e: raise InstructorRetryException(...) from e`` catches
@@ -623,7 +674,7 @@ def underlying_provider_error(exc: BaseException) -> BaseException:
     ``instructor<2`` could reintroduce), unwrapped via the public
     ``Future.exception()``. The ``args[0]``-is-an-exception branch is likewise
     retained only as harmless compatibility with instructor's pre-1.15 shape;
-    both are dead on 1.15.x but cheap insurance against the pinned range moving.
+    both are dead on the supported range but cheap insurance against it moving.
 
     Any other exception (a bare ``ValidationError``, a transport error that
     never went through instructor) is returned unchanged, so callers can
@@ -631,7 +682,7 @@ def underlying_provider_error(exc: BaseException) -> BaseException:
     """
     if isinstance(exc, InstructorRetryException):
         # Pre-1.15 compat only: older instructor stored the root exception as
-        # the first positional arg. On 1.15.x ``args[0]`` is the message str,
+        # the first positional arg. Since 1.15 ``args[0]`` is the message str,
         # so this branch never fires there — kept because it is harmless.
         inner = exc.args[0] if exc.args else None
         if isinstance(inner, BaseException):
@@ -645,7 +696,7 @@ def underlying_provider_error(exc: BaseException) -> BaseException:
             if isinstance(recorded, BaseException):
                 return recorded
         elif isinstance(cause, BaseException):
-            # The 1.15.x shape for every current case (``reraise=True``):
+            # The 1.15-and-later shape for every current case (``reraise=True``):
             # instructor wrapped the raw error directly via ``raise ... from e``
             # — whether the in-call predicate declined it (transport/permanent)
             # or an exhausted parse re-ask re-raised it bare.
@@ -696,4 +747,19 @@ class SchemaEngineError(LlmkitError):
     A permanent engine or configuration fault, outside the repairable parse
     and recoverable error sets: another generated answer cannot repair it.
     The original engine exception is available through ``__cause__``.
+    """
+
+
+class UnsupportedSchemaError(LlmkitError, TypeError):
+    """An ``output_schema`` llmkit cannot hold to the structured-output contract.
+
+    Raised before any request (and before the response cache is read) by
+    :func:`~llmkit.structured_llm_call` and by :func:`~llmkit.tool_llm_call`
+    with ``output_schema=``, when the schema is not a pydantic ``BaseModel``
+    subclass, is one of instructor's DSL classes (``IterableModel``,
+    ``Partial``, a simple-type adapter), or declares an instructor async
+    validator (``async_field_validator`` / ``async_model_validator``), which no
+    lane runs. A permanent programming error, outside
+    :data:`LLM_RECOVERABLE_ERRORS`, and a :class:`TypeError` subclass because
+    the schema, not the provider, is wrong.
     """

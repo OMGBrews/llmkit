@@ -10,7 +10,7 @@ its partial transcript instead.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
@@ -19,6 +19,7 @@ from llmkit.calls._shared import (
     prepare_call,
     result_validation_budget,
     run_cached,
+    run_on_result,
     run_with_policy,
 )
 from llmkit.capture import record_call_async
@@ -44,7 +45,7 @@ async def text_llm_call(
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
-    on_result: Callable[[str], object] | None = None,
+    on_result: Callable[[str], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
     """Call the LLM for a plain-text (non-structured) response.
@@ -98,7 +99,9 @@ async def text_llm_call(
             :class:`~llmkit.ResultValidationError` from it to reject a
             structurally-fine-but-wrong answer (e.g. text that fails to parse as
             the JSON you asked for) and re-roll on the validation budget. A
-            cached answer is passed through it too.
+            cached answer is passed through it too. An ``async def`` hook is
+            awaited, and a return value other than ``None`` raises
+            :class:`TypeError`.
         options: Optional :class:`LLMCallOptions` bundle (see
             :func:`structured_llm_call`); explicit keywords here override it,
             it overrides config, and ``None`` leaves the flat path unchanged.
@@ -175,7 +178,7 @@ async def text_llm_call(
             if on_result is not None:
                 # A raise (ResultValidationError) rejects this text and re-rolls
                 # within the validation budget; the attempt is still logged below.
-                _ = on_result(text)
+                await run_on_result(on_result, text)
             return text
         except Exception as exc:
             # A truncation raises after the completion returned, so the
@@ -271,7 +274,7 @@ def text_llm_call_sync(
     provider: LLMProviderInterface | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
-    on_result: Callable[[str], object] | None = None,
+    on_result: Callable[[str], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> str:
     """Synchronous wrapper around :func:`text_llm_call`.
