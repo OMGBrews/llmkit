@@ -111,7 +111,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `tool_llm_call` with `output_schema=` used to treat a final answer cut off
   by the output-token limit (`finish_reason="length"`) as a validation
   failure and re-ask it on the validation budget, where an identical budget
-  can only truncate again. It now raises `OutputLimitError` with the partial
+  can only truncate again, and returned it as `parsed` when the cut-off text
+  happened to validate. It now raises `OutputLimitError` with the partial
   answer on `diagnostics`, never retried by default, and logs
   `partial_text` and `output_limit` as the structured and text lanes do. A
   turn that requested tools still reports the reason as `stop_reason`.
