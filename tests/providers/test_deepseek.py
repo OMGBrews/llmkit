@@ -36,6 +36,8 @@ real round-trip lives in
 
 from __future__ import annotations
 
+from typing import cast
+
 import instructor
 import pytest
 
@@ -120,3 +122,45 @@ def test_build_provider_deepseek_defaults() -> None:
     )
     assert isinstance(provider, DeepSeekProvider)
     assert provider.reasoning_effort is None
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [
+        ("disable", "none"),
+        ("none", "none"),
+        ("low", "low"),
+        ("high", "high"),
+    ],
+)
+@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
+def test_reasoning_kwargs_translate_disable(effort: str, expected: str, model: str) -> None:
+    """``disable`` becomes ``none``: LiteLLM turns thinking on for any other value.
+
+    Measured live on 2026-11-02: ``"disable"`` forwarded unchanged made both
+    models return reasoning content, and ``"none"`` made neither do so.
+    """
+    provider = DeepSeekProvider(api_key="sk-test")
+    assert provider.reasoning_kwargs(effort, model) == {"reasoning_effort": expected}
+
+
+def test_disable_reaches_litellm_as_thinking_disabled() -> None:
+    """The translated kwarg is the one LiteLLM's DeepSeek transform maps to thinking off.
+
+    Imports LiteLLM private API on purpose, as ``test_gemini_thinking_level.py``
+    does: an ``ImportError`` after an upgrade is a rename to follow.
+    """
+    from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
+
+    provider = DeepSeekProvider(api_key="sk-test")
+    # raw-llm: LiteLLM's transform is loosely typed; the boundary is cast once, here.
+    optional_params = cast(
+        "dict[str, object]",
+        DeepSeekChatConfig().map_openai_params(  # pyright: ignore[reportUnknownMemberType]
+            non_default_params=provider.reasoning_kwargs("disable", "deepseek-chat"),
+            optional_params={},
+            model="deepseek-chat",
+            drop_params=False,
+        ),
+    )
+    assert optional_params.get("thinking") == {"type": "disabled"}

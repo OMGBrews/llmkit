@@ -38,9 +38,14 @@ class DeepSeekProvider(BaseProvider):
     ``Mode.JSON``, measured to validate on both ``deepseek-chat`` and
     ``deepseek-reasoner`` (see ``tests/integration/test_live_providers.py``).
 
-    ``reasoning_effort`` is forwarded for ``deepseek-reasoner`` (R1) and is
-    harmless on ``deepseek-chat`` (litellm tolerates it). DeepSeek keeps the
-    reasoner's thinking tokens in a budget separate from ``max_tokens``, and
+    ``reasoning_effort`` switches DeepSeek's thinking mode on both model names.
+    LiteLLM maps ``"none"`` to ``thinking: {"type": "disabled"}`` and every
+    other value to ``{"type": "enabled"}``, so this provider translates
+    ``"disable"`` to ``"none"``; forwarded as-is it would turn thinking *on*.
+    Measured live on 2026-11-02: with ``"disable"`` forwarded unchanged both
+    ``deepseek-chat`` and ``deepseek-reasoner`` returned reasoning content, and
+    with ``"none"`` neither did. Every other value passes through unchanged.
+    DeepSeek keeps thinking tokens in a budget separate from ``max_tokens``, and
     because output is validated through instructor, a too-small ``max_tokens``
     cap surfaces as a loud retry error rather than the silently-empty shape
     seen with other providers' reasoning modes.
@@ -95,6 +100,16 @@ class DeepSeekProvider(BaseProvider):
                 self._base_url, env_vars=self._base_url_env_vars, default=_DEFAULT_BASE_URL
             ),
         }
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate ``"disable"`` to ``"none"``, the value LiteLLM maps to thinking off.
+
+        LiteLLM's DeepSeek transform enables thinking for any effort other than
+        ``"none"``, so the portable ``"disable"`` must not reach it unchanged.
+        """
+        del model
+        return {"reasoning_effort": "none" if effort == "disable" else effort}
 
     @override
     @classmethod

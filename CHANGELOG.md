@@ -294,6 +294,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on its first iteration. The class subclasses `RuntimeError`, so existing
   handlers keep working.
 
+- **`reasoning_effort="disable"` on DeepSeek now turns thinking off.** It used
+  to reach LiteLLM unchanged, and LiteLLM's DeepSeek route turns thinking on
+  for every effort except `"none"`, so a call asking for no reasoning got
+  reasoning. DeepSeek now sends `"none"` for `"disable"`, on `deepseek-chat`
+  and `deepseek-reasoner` alike. Every other value passes through unchanged.
+
 - `model_json_schema` on llmkit's schema-backed models accepts
   `by_alias=None`, matching pydantic 2.14's signature. Guidance now comes from
   the original schema snapshot rather than generated property fields.
