@@ -1261,7 +1261,7 @@ Per-call `model=` overrides the default, so "strong/small/current" model roles a
 
 `reasoning_effort` controls provider "thinking"/reasoning tokens. Leave it `None` (the default) for the provider's own behaviour — the outbound request is byte-identical to omitting it. Set it once (e.g. `"disable"`) and every call inherits it; the call functions also take a `reasoning_effort=` override for a single call. Reasoning can consume the output-token budget. The meaning of `"disable"` depends on the route and model: some disable reasoning, some reduce it to the lowest supported effort, and others reject the request. Do not assume it eliminates reasoning tokens or prevents truncation. On OpenRouter, llmkit sends the setting as OpenRouter's native `reasoning.effort` object. Only `"disable"` is translated: Gemini models after 2.x (Gemini 3 and later) receive `"minimal"` because they require thinking, while other models receive `"none"`. Every other value passes through unchanged. With OpenRouter's default `require_parameters` routing, an effort-carrying request is routed only to endpoints that support reasoning. On Cerebras, `"disable"` becomes `"none"`, except on gpt-oss models, which cannot turn reasoning off and receive their lowest effort, `"low"`; reasoning tokens count against `max_tokens` on both served models. On Anthropic and Bedrock, `"disable"` becomes `"none"`. Models LiteLLM flags as always requiring thinking (such as Sonnet 5.5 and Opus 5.5) raise `ReasoningEffortUnsupportedError` before transport; send `"low"` for their lowest explicit effort. Unknown or unavailable model metadata permits the translation. On OpenAI, `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, llmkit raises `ReasoningEffortUnsupportedError` before transport. It never silently substitutes a lower effort that still reasons. The error names the model and explains the limitation; it suggests a specific alternative only where supported by model-specific evidence. For unknown capabilities, explicitly choose a provider-native effort value or remove the disable requirement. All other OpenAI effort values pass through unchanged without capability lookup.
 
-Register the config with `configure_llm_client(LLMClientConfig(...))`. Calling it again replaces the registration, so a host that changes provider occasionally re-registers. For a single call, pass `provider=` instead; see the next section.
+Register the config with `configure_llm_client(LLMClientConfig(...))`. Calling it again replaces the registration, so a host that changes provider occasionally re-registers. `configure_llm_client(None)` clears the registration, after which a call without `provider=` raises `LLMClientNotConfiguredError`. Every call returns the previous registration (or `None` if there was none), so a test teardown can restore it with `configure_llm_client(previous)`. For a single call, pass `provider=` instead; see the next section.
 
 ### Constructing a provider for a per-call override
 
@@ -1473,8 +1473,10 @@ The hook runs inside the call, on the event loop the call runs on, so keep it qu
 from llmkit import LLMClientConfig, Provider, configure_llm_client
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
 
-# A provider must still be configured; Ollama needs no key.
-configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="test"))
+# A provider must still be configured; Ollama needs no key. The call returns
+# the previous registration; configure_llm_client(previous) restores it, and
+# configure_llm_client(None) clears the registration altogether.
+previous = configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="test"))
 
 def fake(request: TransportRequest) -> Reply:
     if request.feature == "health":
@@ -1488,6 +1490,7 @@ def fake(request: TransportRequest) -> Reply:
 with install(fake) as transport:        # `async with` works too
     run_the_app()
 print(transport.requests)               # every request the fake answered
+configure_llm_client(previous)          # put back whatever was registered before
 ```
 
 The fake is a plain function or a coroutine function. It receives one frozen `TransportRequest` per provider round trip, carrying:

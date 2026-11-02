@@ -424,8 +424,8 @@ _config_source: Callable[[], LLMClientConfig] | None = None
 
 
 def configure_llm_client(
-    config_source: LLMClientConfig | Callable[[], LLMClientConfig],
-) -> None:
+    config_source: LLMClientConfig | Callable[[], LLMClientConfig] | None,
+) -> Callable[[], LLMClientConfig] | None:
     """Register the active :class:`LLMClientConfig`.
 
     Pass the config itself — the usual form::
@@ -439,13 +439,30 @@ def configure_llm_client(
     :func:`build_provider` call, so a change is picked up without
     re-registration. A single call can bypass the registration entirely with
     its ``provider=`` keyword.
+
+    Passing ``None`` clears the registration, so a call without ``provider=``
+    raises :class:`~llmkit.exceptions.LLMClientNotConfiguredError` again.
+
+    Returns the previous source, or ``None`` when nothing was registered. It
+    comes back in its stored callable form: an instance registration returns
+    the constant callable that wrapped it, never the instance itself. Passing
+    it back restores the earlier registration, including "nothing
+    registered", so a test teardown can undo its setup::
+
+        previous = configure_llm_client(LLMClientConfig(provider=Provider.OLLAMA, model="m"))
+        try:
+            ...
+        finally:
+            configure_llm_client(previous)
     """
     global _config_source
+    previous = _config_source
     if isinstance(config_source, LLMClientConfig):
         config = config_source
         _config_source = lambda: config  # noqa: E731 - a constant source
     else:
         _config_source = config_source
+    return previous
 
 
 def active_config() -> LLMClientConfig:

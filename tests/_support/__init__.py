@@ -28,7 +28,6 @@ from llmkit import (
     configure_llm_client,
     configure_llm_logging,
 )
-from llmkit.providers import base as providers_base
 from llmkit.rate_limiting import GlobalRateLimiter
 
 # The usage triple a faked ``acompletion_structured`` / ``acompletion_text``
@@ -104,8 +103,9 @@ def ollama_call_defaults() -> Generator[None]:
     provider config and resets the cache and limiter on exit. A ``conftest.py``
     wraps this in an autouse fixture.
     """
-    previous = providers_base._config_source
-    configure_llm_client(lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model"))
+    previous = configure_llm_client(
+        lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model")
+    )
     configure_llm_cache(None)
     GlobalRateLimiter._reset()
     _litellm.reset_temperature_warnings()
@@ -116,7 +116,7 @@ def ollama_call_defaults() -> Generator[None]:
         GlobalRateLimiter._reset()
         _litellm.reset_temperature_warnings()
         configure_llm_cache(None)
-        providers_base._config_source = previous
+        _ = configure_llm_client(previous)
 
 
 @contextmanager

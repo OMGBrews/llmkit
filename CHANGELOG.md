@@ -12,7 +12,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `LLMClientConfig` directly: `configure_llm_client(LLMClientConfig(...))`.
   Calling it again replaces the registration. The zero-argument callable
   stays supported for a host whose config is resolved late or per context,
-  and is still re-read on every provider construction.
+  and is still re-read on every provider construction. `None` clears the
+  registration, so a test can return llmkit to its unconfigured state, and
+  every call returns the previous source (in its stored callable form, or
+  `None`) for a teardown to pass back with `configure_llm_client(previous)`.
+  Type checkers that report unused call results now flag a bare
+  `configure_llm_client(...)` statement; assign the result to `_`.
 
 - **`LlmkitError`, one base for every exception llmkit defines.**
   `except LlmkitError` catches `ServiceUnavailableError`, `CircuitOpenError`,
