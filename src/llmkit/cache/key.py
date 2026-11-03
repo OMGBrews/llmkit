@@ -27,7 +27,11 @@ from llmkit.providers import LLMProviderInterface
 #: text that would otherwise be replayed as a complete answer. Version 3
 #: retired every structured entry stored as a re-serialized instance, from
 #: before a structured call stored the answer text the provider sent.
-LLM_CACHE_KEY_VERSION: Final = 3
+#: Version 4 retired every entry stored while ``reasoning_effort="disable"``
+#: was silently replaced by a lower effort that still reasons on some routes:
+#: the key holds the portable value, so such an answer would otherwise keep
+#: being served for a request that now turns thinking off or raises.
+LLM_CACHE_KEY_VERSION: Final = 4
 
 # The provider request kwargs that say *where* a request goes, as opposed to
 # who is allowed to send it. An allowlist, so a credential (``api_key``) can

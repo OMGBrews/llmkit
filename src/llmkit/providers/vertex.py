@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers._gemini import direct_reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -119,11 +120,14 @@ class VertexProvider(BaseProvider):
     An unrecognized ``structured_output`` raises ``ValueError`` at construction
     rather than silently falling back.
 
-    ``reasoning_effort`` is forwarded to LiteLLM for Gemini models on Google's Agent Platform that
-    support thinking and is harmless on those that don't. As with Google AI Studio, Gemini 3.1
-    models think by default, spending reasoning tokens against ``max_tokens``; pass
-    ``reasoning_effort="disable"`` to turn it off so a small ``max_tokens`` cap doesn't truncate
-    structured output.
+    ``reasoning_effort`` is translated for Gemini models as on Google AI Studio. Gemini 3.1 models
+    think by default, spending reasoning tokens against ``max_tokens``, and cannot turn thinking
+    off: ``reasoning_effort="disable"`` raises ``ReasoningEffortUnsupportedError`` before transport
+    on Gemini 3 and later and on ``gemini-2.5-pro``, and turns thinking off on other Gemini 2.x
+    models. Pass ``reasoning_effort="lowest"`` for the least reasoning each model supports, so a
+    small ``max_tokens`` cap doesn't truncate structured output. Partner models (Claude, Llama,
+    Mistral and the others LiteLLM dispatches away from its Gemini transform) are not covered by
+    this rule: their values are forwarded to LiteLLM unchanged.
 
     Google's Agent Platform needs the ``google-auth`` library to mint its OAuth token; it ships via
     the ``omg-llmkit[vertex]`` extra rather than the core install, so users of other providers take
@@ -171,6 +175,24 @@ class VertexProvider(BaseProvider):
         rationale behind the choice.
         """
         return self._instructor_mode
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate portable effort for Gemini models; forward partner models unchanged.
+
+        Gemini ids follow the Google AI Studio rule (see
+        :meth:`~llmkit.providers.google.GoogleProvider.reasoning_kwargs`).
+        Partner models, detected with LiteLLM's own
+        ``VertexAIPartnerModels.is_vertex_partner_model``, and Claude ids, which
+        LiteLLM routes to its Anthropic transform, keep the flat
+        ``reasoning_effort`` value: the strict rule does not cover them, and
+        ``"lowest"`` is forwarded as ``"disable"`` there.
+        """
+        from litellm.llms.vertex_ai.vertex_ai_partner_models.main import VertexAIPartnerModels
+
+        if VertexAIPartnerModels.is_vertex_partner_model(model) or "claude" in model.lower():
+            return {"reasoning_effort": "disable" if effort == "lowest" else effort}
+        return direct_reasoning_kwargs(effort, model)
 
     @override
     def completion_kwargs(self) -> dict[str, object]:

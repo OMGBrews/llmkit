@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -61,11 +62,13 @@ class CerebrasProvider(BaseProvider):
 
     Reasoning: both served models reason by default, and reasoning tokens count
     against ``max_tokens`` — a tight cap surfaces as a validation retry, not a
-    silent empty answer. The portable ``disable`` maps to Cerebras's ``none``,
-    except on ``gpt-oss`` models, which reject ``none`` ("Supported values are
-    'low', 'medium', and 'high'", measured 2026-10-22) and so receive their lowest
-    supported effort, ``low``. LiteLLM raises ``UnsupportedParamsError`` for an
-    effort sent to a model it does not mark as reasoning-capable.
+    silent empty answer. The portable ``disable`` maps to Cerebras's ``none``.
+    ``gpt-oss`` models reject ``none`` ("Supported values are 'low', 'medium',
+    and 'high'", measured 2026-10-22), so ``disable`` raises
+    :class:`~llmkit.exceptions.ReasoningEffortUnsupportedError` before transport
+    on them; the portable ``lowest`` sends their lowest supported effort,
+    ``low``, and ``none`` elsewhere. LiteLLM raises ``UnsupportedParamsError``
+    for an effort sent to a model it does not mark as reasoning-capable.
 
     An optional ``base_url`` points the provider at a Cerebras-compatible
     gateway. ``api_base`` is **always** forwarded: it resolves from ``base_url``
@@ -116,11 +119,20 @@ class CerebrasProvider(BaseProvider):
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
         """Translate portable effort into Cerebras's ``reasoning_effort`` values.
 
-        ``disable`` becomes ``none``, or ``low`` on ``gpt-oss`` models, which
-        cannot disable reasoning (see the class docstring). Other values pass
-        through for Cerebras to accept or reject.
+        ``disable`` becomes ``none``, and raises on ``gpt-oss`` models, which
+        cannot disable reasoning (see the class docstring). ``lowest`` becomes
+        ``low`` on ``gpt-oss`` and ``none`` elsewhere. Other values pass through
+        for Cerebras to accept or reject.
         """
         if effort == "disable":
+            if _is_gpt_oss(model):
+                raise ReasoningEffortUnsupportedError(
+                    f"{model!r} cannot turn thinking off (gpt-oss always reasons); "
+                    + 'reasoning_effort="disable" is not available on it. Send "lowest" '
+                    + "for the least reasoning it supports."
+                )
+            return {"reasoning_effort": "none"}
+        if effort == "lowest":
             return {"reasoning_effort": "low" if _is_gpt_oss(model) else "none"}
         return {"reasoning_effort": effort}
 

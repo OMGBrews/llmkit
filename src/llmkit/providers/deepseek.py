@@ -103,13 +103,14 @@ class DeepSeekProvider(BaseProvider):
 
     @override
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
-        """Translate ``"disable"`` to ``"none"``, the value LiteLLM maps to thinking off.
+        """Translate ``"disable"`` and ``"lowest"`` to ``"none"``, LiteLLM's thinking-off value.
 
         LiteLLM's DeepSeek transform enables thinking for any effort other than
-        ``"none"``, so the portable ``"disable"`` must not reach it unchanged.
+        ``"none"``, so neither portable value may reach it unchanged. Both models
+        can turn thinking off, so the least reasoning this route supports is off.
         """
         del model
-        return {"reasoning_effort": "none" if effort == "disable" else effort}
+        return {"reasoning_effort": "none" if effort in ("disable", "lowest") else effort}
 
     @override
     @classmethod

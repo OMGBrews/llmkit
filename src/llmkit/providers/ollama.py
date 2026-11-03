@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
 #: Default local Ollama endpoint — the fallback when no ``base_url`` is
@@ -30,6 +31,23 @@ class OllamaProvider(BaseProvider):
     fixed: it is a global a host must deliberately set inside its own process
     (not ambient environment, and not a stray ``.env``), and llmkit cannot close
     it without reaching into a dependency's globals.
+
+    Reasoning: LiteLLM sends ``think: false`` for ``"disable"`` on every model
+    except gpt-oss, whose ``think`` takes an effort string and cannot be
+    turned off, so ``"disable"`` raises
+    :class:`~llmkit.exceptions.ReasoningEffortUnsupportedError` before transport
+    on gpt-oss (matched by name, as LiteLLM does) and ``"lowest"`` sends
+    ``"low"`` there. On every other model the server is the authority: llmkit
+    sends its explicit off control, and a model that cannot stop thinking may
+    ignore it. Measured 2026-11-02 against Ollama 0.40.11: ``deepseek-r1:8b``
+    returned reasoning with ``think: false``, through llmkit and in a direct
+    ``/api/chat`` request. Measured 2026-11-03 against Ollama 0.40.13 with
+    ``gpt-oss:20b``: ``think: false`` still returned reasoning, ``think: "low"``
+    returned the least, and the literal ``think: "disable"`` LiteLLM would send
+    was rejected as an invalid value. No list of always-thinking local models
+    is kept.
+    ``"lowest"`` therefore sends the off control too: off is the least
+    reasoning this route can ask for.
     """
 
     _provider_name: ClassVar[str] = "Ollama"
@@ -48,6 +66,24 @@ class OllamaProvider(BaseProvider):
     ):
         super().__init__(model, reasoning_effort)
         self._base_url: str = base_url
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Refuse ``"disable"`` on gpt-oss; otherwise send Ollama's explicit off control.
+
+        ``"lowest"`` becomes ``"low"`` on gpt-oss and ``"disable"`` (LiteLLM:
+        ``think: false``) elsewhere. Other values pass through.
+        """
+        gpt_oss = model.startswith("gpt-oss")
+        if effort == "disable" and gpt_oss:
+            raise ReasoningEffortUnsupportedError(
+                f"{model!r} cannot turn thinking off (gpt-oss always reasons); "
+                + 'reasoning_effort="disable" is not available on it. Send "lowest" '
+                + "for the least reasoning it supports."
+            )
+        if effort == "lowest":
+            return {"reasoning_effort": "low" if gpt_oss else "disable"}
+        return {"reasoning_effort": effort}
 
     @override
     def completion_kwargs(self) -> dict[str, object]:

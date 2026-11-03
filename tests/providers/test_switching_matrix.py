@@ -7,8 +7,9 @@ runs once per :class:`~llmkit.Provider` member through the
 the ``provider`` field of the registered :class:`~llmkit.LLMClientConfig`.
 The environment is the same for every row (all six bearer keys set), the
 model is left unset so each route resolves its own default, and
-``reasoning_effort`` is left unset because ``"disable"`` substitutes on four
-routes' default models today and that behaviour is due to change.
+``reasoning_effort`` is left unset because ``"disable"`` raises on four
+routes' default models; per-route reasoning translation is pinned in
+``test_portable_reasoning_every_route.py``.
 
 Each row then asserts that the switch carried the route's own decisions with
 it, against a hard-coded expected table rather than values read back from the

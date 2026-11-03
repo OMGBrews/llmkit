@@ -360,12 +360,15 @@ class LLMClientConfig:
     id is always well-formed — never a dangling ``"anthropic/"``.
 
     ``reasoning_effort`` controls provider "thinking"/reasoning tokens,
-    with portable aliases (``"disable" | "low" | "medium" | "high"``).
+    with portable aliases (``"disable" | "lowest" | "low" | "medium" | "high"``).
     ``None`` (the default) sends no reasoning control, leaving the provider's
-    own default in place — byte-identical to prior behaviour. Set
-    it once here (e.g. ``"disable"``) to have **every** call inherit the
-    setting; Gemini's default-on thinking otherwise spends reasoning tokens
-    against ``max_tokens`` and can truncate small-capped structured output.
+    own default in place — byte-identical to prior behaviour. ``"disable"``
+    turns thinking off or raises ``ReasoningEffortUnsupportedError`` before
+    anything is sent on a model that cannot stop thinking; ``"lowest"`` asks
+    for the least reasoning the route supports (off where possible). Set it
+    once here (e.g. ``"lowest"``) to have **every** call inherit the setting;
+    Gemini's default-on thinking otherwise spends reasoning tokens against
+    ``max_tokens`` and can truncate small-capped structured output.
 
     ``aws_region_name`` carries the AWS region for the Bedrock provider and
     is not accepted by any other provider (which authenticate with ``api_key`` /
@@ -819,12 +822,15 @@ class BaseProvider(ABC):
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
         """Return LiteLLM's portable reasoning kwarg for ``effort``.
 
-        Providers with a native reasoning control override this method.  It is
-        concrete so existing provider subclasses only implementing the two
-        abstract construction hooks remain valid.
+        Every in-tree provider overrides this method; it is the default for
+        third-party providers. It is concrete so existing provider subclasses
+        only implementing the two abstract construction hooks remain valid.
+        ``"lowest"`` is forwarded as ``"disable"``, which LiteLLM understands;
+        ``"disable"`` passes through unchanged, so a third-party route is not
+        made strict: what it does is whatever LiteLLM does with it.
         """
         del model
-        return {"reasoning_effort": effort}
+        return {"reasoning_effort": "disable" if effort == "lowest" else effort}
 
     def litellm_model(self, model: str | None = None) -> str:
         """Return the provider-prefixed LiteLLM model string.

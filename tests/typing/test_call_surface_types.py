@@ -116,7 +116,7 @@ async def _typecheck_reasoning_effort_accepts_values() -> None:
     # deliberately NO negative case for reasoning_effort: ``ReasoningEffort``
     # widens to ``str`` under the checker, so every string is accepted by design
     # (see the ReasoningEffort docstring). A typo like "hihg" is NOT a type error.
-    for effort in ("disable", "low", "medium", "high", "minimal"):
+    for effort in ("disable", "lowest", "low", "medium", "high", "minimal"):
         eff: ReasoningEffort = effort
         _ = await text_llm_call("hi", feature="t", reasoning_effort=eff)
     _ = await text_llm_call("hi", feature="t", reasoning_effort=None)

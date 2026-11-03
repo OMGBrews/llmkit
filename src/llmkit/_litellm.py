@@ -694,7 +694,8 @@ def _reasoning_request_kwargs(
     try:
         translate = provider.reasoning_kwargs
     except AttributeError:
-        return {"reasoning_effort": effort}
+        # LiteLLM does not know the portable "lowest"; send its "disable" value.
+        return {"reasoning_effort": "disable" if effort == "lowest" else effort}
     return translate(effort, model or provider.model)
 
 
@@ -1035,7 +1036,8 @@ async def acompletion_structured[T: BaseModel](
     :func:`_acompletion`, which re-issues the request once without it.
 
     ``reasoning_effort`` controls provider thinking/reasoning tokens (e.g.
-    ``"disable"`` turns Gemini thinking off). When ``None``, the
+    ``"lowest"`` asks for the least thinking the model supports, and
+    ``"disable"`` turns it off or raises before transport). When ``None``, the
     :pyattr:`~llmkit.providers.LLMProviderInterface.reasoning_effort` of the
     provider the call runs on is used (the registered one, or ``provider``);
     an explicit value here overrides it for this call. The kwarg is only
