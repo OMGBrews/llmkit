@@ -105,8 +105,13 @@ async def structured_llm_call[T: BaseModel](
             when one is passed. An explicit value wins for this call.
             ``"disable"`` turns Gemini thinking off so it doesn't consume the
             ``max_tokens`` budget.
-        provider: Optional provider for this call, for example one built
-            with :func:`~llmkit.make_provider`. Unset defers to ``options``,
+        provider: Optional provider for this call: a
+            :class:`~llmkit.Provider` member, built for the call from the
+            provider's environment variables, or an instance built with
+            :func:`~llmkit.make_provider` when the call needs its own key or
+            model. A plain string raises ``TypeError`` naming the member, and
+            a member that cannot be built (a missing key or extra) raises
+            that error, both before the first attempt. Unset defers to ``options``,
             then to the provider registered with
             :func:`~llmkit.configure_llm_client`. Passing one switches this
             call's provider the way ``model=`` switches its model, without

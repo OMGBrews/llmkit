@@ -141,13 +141,16 @@ def make_provider(
 ) -> BaseProvider:
     """Construct a provider directly from raw credentials.
 
-    The one-liner for the per-call ``provider=`` argument: build a provider
-    from a raw key (and optional model) without standing up an
-    :class:`LLMClientConfig` or touching the module-level config source.
-    Passing the result as ``provider=`` switches that call's provider, model, or
-    credential the way ``model=`` switches its model, so one program can send
-    calls to several providers, for example to compare them on the same prompt,
-    with or without a registered config::
+    For a per-call ``provider=`` that needs its own key, model or other knob:
+    build a provider from a raw key (and optional model) without standing up an
+    :class:`LLMClientConfig` or touching the module-level config source. A call
+    that needs only the provider's environment credentials and default model
+    passes the :class:`Provider` member itself (``provider=Provider.ANTHROPIC``),
+    which the call builds with this function. Passing the result as
+    ``provider=`` switches that call's provider, model, or credential the way
+    ``model=`` switches its model, so one program can send calls to several
+    providers, for example to compare them on the same prompt, with or without
+    a registered config::
 
         provider = make_provider(Provider.ANTHROPIC, api_key=key)
         result = structured_llm_call_sync(..., provider=provider)
@@ -211,6 +214,9 @@ def make_provider(
         A constructed provider, ready to pass as a per-call ``provider=``.
 
     Raises:
+        TypeError: If ``provider`` is not a :class:`Provider` member, a plain
+            string included (``make_provider("ollama")``); parse a name with
+            ``Provider(value)``, which ignores case.
         ValueError: If a passed knob is not read by ``provider`` (see above), or
             if a bearer provider has no ``api_key`` and no matching environment
             variable.
