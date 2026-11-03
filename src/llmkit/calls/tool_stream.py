@@ -44,7 +44,7 @@ from llmkit.calls.stream import STREAM_ABANDONED_ERROR
 from llmkit.capture import record_call, record_call_async
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy, with_retries_stream
 from llmkit.run_scope import get_run_id
@@ -76,7 +76,7 @@ async def tool_llm_call_stream(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> AsyncGenerator[TextDeltaEvent | ToolCallResult]:
@@ -201,7 +201,7 @@ def tool_llm_call_stream_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
 ) -> Generator[TextDeltaEvent | ToolCallResult]:

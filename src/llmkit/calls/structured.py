@@ -30,7 +30,7 @@ from llmkit.capture import record_call_async
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy
 from llmkit.run_scope import get_run_id
@@ -49,7 +49,7 @@ async def structured_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,
@@ -382,7 +382,7 @@ def structured_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,

@@ -37,7 +37,7 @@ from llmkit.calls._shared import (
 from llmkit.capture import record_call, record_call_async
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait
 from llmkit.retry import RetryPolicy, with_retries_stream
 from llmkit.sync import iterate_sync
@@ -60,7 +60,7 @@ async def text_llm_call_stream(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -275,7 +275,7 @@ def text_llm_call_stream_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     options: LLMCallOptions | None = None,
