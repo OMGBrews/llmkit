@@ -190,7 +190,9 @@ def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str)
     The variable is read from ``os.environ`` when the provider is built.
     ``import llmkit`` does not import LiteLLM, so a key that lives only in a
     ``.env`` file is not there yet when a provider is built before the first
-    call (with :func:`~llmkit.make_provider`, say). Load the file first.
+    call with :func:`~llmkit.make_provider`. Load the file first in that case.
+    A :class:`Provider` member passed as a call's ``provider=`` is built after
+    that import, so it sees the file's keys on every call.
     """
     if configured:
         return configured
@@ -199,7 +201,8 @@ def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str)
         return from_env
     raise ValueError(
         f"{provider_name} requires an API key and none is configured: set "
-        + f"LLMClientConfig.api_key (or the {env_var} environment variable)."
+        + "LLMClientConfig.api_key, pass make_provider(..., api_key=...) for one "
+        + f"call, or set the {env_var} environment variable."
     )
 
 
@@ -285,7 +288,10 @@ def resolve_base_url(
 class Provider(StrEnum):
     """LLM providers the library can route to.
 
-    Library-owned enum (no dependency on the host's configuration).
+    Library-owned enum (no dependency on the host's configuration). Parse a
+    name read from a settings file with ``Provider(value)``: the lookup ignores
+    case, so ``Provider("Ollama")`` is :attr:`OLLAMA`, and an unknown name
+    raises ``ValueError`` listing every member.
     """
 
     OPENROUTER = "openrouter"
@@ -297,6 +303,22 @@ class Provider(StrEnum):
     BEDROCK = "bedrock"
     VERTEX = "vertex"
     CEREBRAS = "cerebras"
+
+    @classmethod
+    @override
+    def _missing_(cls, value: object) -> Provider:
+        # Called by ``Provider(value)`` when no member's value equals *value*.
+        # Every value is its member's lowercased name, and no two collide under
+        # casefolding (tests/providers/test_provider_parsing.py pins that), so
+        # the casefolded lookup is unambiguous. A ValueError raised here
+        # reaches the caller unchanged.
+        if isinstance(value, str):
+            folded = value.casefold()
+            for member in cls:
+                if member.value == folded:
+                    return member
+        expected = ", ".join(repr(member.value) for member in cls)
+        raise ValueError(f"{value!r} is not a known provider: expected one of {expected}.")
 
 
 @dataclass(frozen=True, repr=False)
@@ -394,6 +416,21 @@ class LLMClientConfig:
     vertex_location: str | None = None
     gemini_structured_output: Literal["schema", "json"] = "schema"
 
+    def __post_init__(self) -> None:
+        # The annotation already makes a type checker refuse a string, but a
+        # value read from a settings file arrives untyped. A lowercase string
+        # used to work only because a StrEnum member equals its value, and any
+        # other spelling failed deep inside ``build_provider`` with an
+        # ``assert_never`` AssertionError; refuse it here instead, naming the
+        # parse that turns the string into a member.
+        if not isinstance(self.provider, Provider):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard at public boundary
+            raise TypeError(
+                "LLMClientConfig.provider must be a Provider member, not "
+                + f"{type(self.provider).__name__} {self.provider!r}: parse a name "
+                + f"with Provider({self.provider!r}), which ignores case, or pass "
+                + "a member such as Provider.OLLAMA."
+            )
+
     @override
     def __repr__(self) -> str:
         # The generated dataclass repr renders ``api_key='sk-...'`` verbatim,
@@ -443,8 +480,9 @@ def configure_llm_client(
     zero-argument callable instead; it is invoked on each
     :func:`build_provider` call, so a change is picked up without
     re-registration. A call can also run on another provider by passing
-    ``provider=`` (for example one built with :func:`~llmkit.make_provider`);
-    the registration is untouched.
+    ``provider=``: a :class:`Provider` member, built from the environment for
+    that call, or an instance from :func:`~llmkit.make_provider` when the call
+    needs its own key or model. The registration is untouched.
 
     Passing ``None`` clears the registration, so a call without ``provider=``
     raises :class:`~llmkit.exceptions.LLMClientNotConfiguredError` again.

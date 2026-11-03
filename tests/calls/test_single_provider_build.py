@@ -4,8 +4,9 @@ Regression guard for the transport/log seam: on the default (no per-call
 ``provider=``) path the transport and the log record share one provider
 instance, so ``build_provider`` is called a single time per call — not once
 to run the call and again only to read ``.model``/``.name`` for the log. A
-per-call ``provider=`` override builds nothing (the passed instance is
-reused throughout). These drive the *real* transport with only the LiteLLM /
+per-call ``provider=`` instance builds nothing (the passed instance is
+reused throughout), and a per-call :class:`~llmkit.Provider` member is built
+exactly once. These drive the *real* transport with only the LiteLLM /
 instructor boundary faked, so the count reflects the production call path.
 """
 
@@ -14,8 +15,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Generator
 from contextlib import AbstractContextManager, contextmanager
+from typing import cast
 from unittest.mock import MagicMock, patch
 
+from llmkit import LLMClientConfig, Provider
 from llmkit import calls as llm_calls
 from tests._support import OkSchema
 
@@ -99,6 +102,26 @@ def test_structured_override_path_builds_nothing() -> None:
         )
     assert result.ok is True
     assert build.call_count == 0
+
+
+def test_structured_member_path_builds_provider_once() -> None:
+    """``make_provider`` builds through ``build_provider``, so the same counter
+    sees the member's build; the registered provider is not built as well."""
+    with _count_builds() as build, _patch_structured_seam():
+        result = asyncio.run(
+            llm_calls.structured_llm_call("hi", OkSchema, feature="x", provider=Provider.OLLAMA)
+        )
+    assert result.ok is True
+    assert build.call_count == 1
+    config = cast("LLMClientConfig", build.call_args.args[0])
+    assert config.provider is Provider.OLLAMA
+
+
+def test_text_member_path_builds_provider_once() -> None:
+    with _count_builds() as build, _patch_text_seam():
+        text = asyncio.run(llm_calls.text_llm_call("hi", feature="x", provider=Provider.OLLAMA))
+    assert text == "ok"
+    assert build.call_count == 1
 
 
 def test_text_default_path_builds_provider_once() -> None:

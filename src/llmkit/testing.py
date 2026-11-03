@@ -38,8 +38,11 @@ call logging. Consequences worth knowing:
 - **A provider is still built.** A call made without ``provider=`` needs a
   registered config, and a key-based provider raises without a key. Either
   pass a provider per call, which needs no registration (a key-based one
-  builds from any placeholder ``api_key``, since no request leaves the
-  process), or register one that needs no key, such as Ollama.
+  built with :func:`~llmkit.make_provider` takes any placeholder ``api_key``,
+  since no request leaves the process; a key-based :class:`~llmkit.Provider`
+  member builds from the environment, so set its variable to a placeholder;
+  ``Provider.OLLAMA`` needs nothing), or register one that needs no key, such
+  as Ollama.
 - **No mid-stream failure.** A fake can fail a streaming call only before its
   first chunk.
 

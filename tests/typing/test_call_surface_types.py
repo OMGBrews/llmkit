@@ -27,6 +27,7 @@ from llmkit import (
     UNSET,
     LLMCallOptions,
     Message,
+    Provider,
     ReasoningEffort,
     TextDeltaEvent,
     ToolCallResult,
@@ -206,6 +207,35 @@ def _typecheck_streaming_tool_lane_rejects_compose() -> None:
     _ = tool_llm_call_stream_sync("hi", tools, feature="t", output_schema=_Out)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
 
 
+async def _typecheck_provider_member_accepted_on_every_lane() -> None:
+    # A ``Provider`` member is a per-call ``provider=`` on every call function
+    # and on ``LLMCallOptions``, built from the environment for that call.
+    tools = [ToolDefinition("lookup", "", {"type": "object"})]
+    for member in Provider:
+        _ = assert_type(await structured_llm_call("hi", _Out, feature="t", provider=member), _Out)
+        _ = assert_type(structured_llm_call_sync("hi", _Out, feature="t", provider=member), _Out)
+        _ = assert_type(await text_llm_call("hi", feature="t", provider=member), str)
+        _ = assert_type(text_llm_call_sync("hi", feature="t", provider=member), str)
+        _ = text_llm_call_stream("hi", feature="t", provider=member)
+        _ = text_llm_call_stream_sync("hi", feature="t", provider=member)
+        _ = await tool_llm_call("hi", tools, feature="t", provider=member)
+        _ = tool_llm_call_sync("hi", tools, feature="t", provider=member)
+        _ = await tool_llm_call("hi", tools, feature="t", output_schema=_Out, provider=member)
+        _ = tool_llm_call_sync("hi", tools, feature="t", output_schema=_Out, provider=member)
+        _ = tool_llm_call_stream("hi", tools, feature="t", provider=member)
+        _ = tool_llm_call_stream_sync("hi", tools, feature="t", provider=member)
+        _ = LLMCallOptions(provider=member)
+    _ = LLMCallOptions(provider=Provider.OPENAI)
+
+
+def _typecheck_provider_string_rejected() -> None:
+    # A provider name as a plain string is refused by the type as well as at
+    # run time (a ``TypeError`` naming the member); each ignore fails the gate
+    # if the parameter is ever widened to accept ``str``.
+    _ = text_llm_call_sync("hi", feature="t", provider="openai")  # pyright: ignore[reportArgumentType]
+    _ = LLMCallOptions(provider="openai")  # pyright: ignore[reportArgumentType]
+
+
 def test_typecheck_helpers_exist() -> None:
     # Reference the type-check-only helpers so they count as accessed. They are
     # analysed by basedpyright but never executed (they would need a configured
@@ -218,6 +248,8 @@ def test_typecheck_helpers_exist() -> None:
         _typecheck_timeout_accepted_on_every_lane,
         _typecheck_prompt_rejects_invalid_shapes,
         _typecheck_streaming_tool_lane_rejects_compose,
+        _typecheck_provider_member_accepted_on_every_lane,
+        _typecheck_provider_string_rejected,
     ):
         assert callable(helper)
 
