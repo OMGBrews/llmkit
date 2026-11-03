@@ -407,6 +407,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A temperature OpenRouter refuses is dropped, as on every other route.**
+  Every OpenRouter request carries `provider.require_parameters`, so on a model
+  none of whose endpoints accepts a temperature (measured 2026-11-03 on
+  `openai/gpt-6-luna`), an explicit `temperature=` failed the call with
+  `litellm.NotFoundError`: "No endpoints found that can handle the requested
+  parameters", routing failed at `Filter by Parameters`. llmkit's one-time
+  re-issue without the temperature matched only a 400, so it never fired. It
+  now also matches that OpenRouter 404 when the request carried a temperature:
+  the call runs at the model's own sampling, the record shows
+  `temperature: null`, and the first drop per model logs a warning. When some
+  other parameter was the one filtered, the re-issue meets the same 404 and the
+  original is raised. OpenRouter's retired-model 404 is never re-issued.
+
 - **The compose form of `tool_llm_call` names a broken provider config
   instead of blaming the provider.** With a registered config that would not
   build (a missing API key, a config field the provider does not read, a

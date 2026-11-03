@@ -2,8 +2,10 @@
 
 Some models take no sampling temperature: LiteLLM refuses ``temperature=0.0``
 client-side on GPT-5 models whose reasoning effort is not ``none`` and on Claude
-5.5-era models, and a provider can refuse it server-side with an HTTP 400 when
-LiteLLM's model map does not know the model. The transport funnel
+5.5-era models, a provider can refuse it server-side with an HTTP 400 when
+LiteLLM's model map does not know the model, and OpenRouter, whose requests
+always carry ``provider.require_parameters``, answers it with a 404 whose
+routing failed at its ``Filter by Parameters`` step. The transport funnel
 (``llmkit._litellm._acompletion``) re-issues such a request exactly once with
 LiteLLM's per-call ``additional_drop_params=["temperature"]``, and every lane's
 call record then shows ``temperature: None`` — what was sent, not what was asked.
@@ -57,6 +59,24 @@ def _server_refusal() -> Exception:
         message="AnthropicException - `temperature` is not supported for this model.",
         model="claude-sonnet-5-5",
         llm_provider="anthropic",
+    )
+
+
+# OpenRouter's answer when ``require_parameters`` filters out every endpoint,
+# as LiteLLM 1.106.6 raised it for ``openai/gpt-6-luna`` with ``temperature=0``
+# on 2026-11-03 (routing funnel trimmed). The body names no parameter.
+_OPENROUTER_REFUSAL = (
+    'OpenrouterException - {"error":{"message":"No endpoints found that can handle the '
+    "requested parameters. To learn more about provider routing, visit: "
+    'https://openrouter.ai/docs/guides/routing/provider-selection","code":404,'
+    '"metadata":{"routing_funnel":[{"step":"Initial Endpoints","endpoint_count":8}],'
+    '"failed_routing_step":"Filter by Parameters"}}}'
+)
+
+
+def _openrouter_refusal() -> Exception:
+    return litellm_errors.NotFoundError(
+        message=_OPENROUTER_REFUSAL, model="openrouter/openai/gpt-6-luna", llm_provider="openrouter"
     )
 
 
@@ -214,7 +234,11 @@ async def _run(
 # --- (a)/(b) the refusal is absorbed on every lane --------------------------
 
 
-@pytest.mark.parametrize("refusal", [_client_refusal, _server_refusal], ids=["client", "server"])
+@pytest.mark.parametrize(
+    "refusal",
+    [_client_refusal, _server_refusal, _openrouter_refusal],
+    ids=["client", "server", "openrouter"],
+)
 @pytest.mark.parametrize(("lane", "stream", "content"), _LANE_PARAMS)
 async def test_refused_temperature_is_dropped_once_and_recorded_as_none(
     lane: _Lane, stream: bool, content: str, refusal: Callable[[], Exception]
@@ -263,6 +287,21 @@ async def test_accepted_temperature_is_recorded_as_sent(
             ),
             id="429",
         ),
+        pytest.param(
+            litellm_errors.NotFoundError(
+                message='OpenrouterException - {"error":{"message":"No endpoints found for '
+                + 'google/gemini-2.0-flash-001.","code":404}}',
+                model="openrouter/google/gemini-2.0-flash-001",
+                llm_provider="openrouter",
+            ),
+            id="openrouter-404-retired-model",
+        ),
+        pytest.param(
+            litellm_errors.NotFoundError(
+                message=_OPENROUTER_REFUSAL, model="m", llm_provider="openai"
+            ),
+            id="404-filter-marker-other-provider",
+        ),
     ],
 )
 async def test_other_errors_are_not_reissued(error: Exception) -> None:
@@ -287,10 +326,16 @@ async def test_a_503_naming_temperature_is_not_reissued_and_is_still_normalised(
     assert len(fake.requests) == 1
 
 
-async def test_a_request_without_temperature_is_not_reissued() -> None:
-    fake = _ScriptedLiteLLM(_client_refusal())
+@pytest.mark.parametrize(
+    "refusal", [_client_refusal, _openrouter_refusal], ids=["client", "openrouter"]
+)
+async def test_a_request_without_temperature_is_not_reissued(
+    refusal: Callable[[], Exception],
+) -> None:
+    error = refusal()
+    fake = _ScriptedLiteLLM(error)
 
-    with pytest.raises(litellm_errors.UnsupportedParamsError):
+    with pytest.raises(type(error)):
         _ = await _run(_text, fake, retry=NO_RETRY)
 
     assert len(fake.requests) == 1
@@ -305,10 +350,16 @@ async def test_a_host_drop_list_is_extended_not_replaced() -> None:
     assert fake.requests[1]["additional_drop_params"] == ["top_p", "temperature"]
 
 
-async def test_a_request_already_dropping_temperature_is_not_reissued() -> None:
-    fake = _ScriptedLiteLLM(_client_refusal())
+@pytest.mark.parametrize(
+    "refusal", [_client_refusal, _openrouter_refusal], ids=["client", "openrouter"]
+)
+async def test_a_request_already_dropping_temperature_is_not_reissued(
+    refusal: Callable[[], Exception],
+) -> None:
+    error = refusal()
+    fake = _ScriptedLiteLLM(error)
 
-    with pytest.raises(litellm_errors.UnsupportedParamsError):
+    with pytest.raises(type(error)):
         _ = await _run(
             _text,
             fake,

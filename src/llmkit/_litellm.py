@@ -70,7 +70,7 @@ from instructor.core.exceptions import (
     ResponseParsingError,
 )
 from litellm import CustomStreamWrapper
-from litellm.exceptions import BadRequestError
+from litellm.exceptions import BadRequestError, NotFoundError
 from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices, Usage
 from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
@@ -130,6 +130,8 @@ _TEMPERATURE = "temperature"
 _DROP_PARAMS = "additional_drop_params"
 # LiteLLM's per-call opt-out of its proxy MCP gateway check; see _acompletion.
 _SKIP_MCP_HANDLER = "_skip_mcp_handler"
+# The routing step OpenRouter names when ``require_parameters`` left no endpoint.
+_OPENROUTER_PARAMETER_FILTER = "Filter by Parameters"
 
 
 def begin_sent_temperature() -> None:
@@ -153,21 +155,36 @@ def sent_temperature(requested: float | None) -> float | None:
 
 
 def _refuses_temperature(exc: Exception, kwargs: dict[str, object]) -> bool:
-    """Whether *exc* is a 400 refusing the ``temperature`` this request carried.
+    """Whether *exc* refuses the ``temperature`` this request carried.
 
-    Covers LiteLLM's client-side ``UnsupportedParamsError`` (a
-    ``BadRequestError`` subclass) and a provider's own 400 alike, so the
-    behaviour does not depend on which LiteLLM model map loaded. A request that
-    already asks LiteLLM to drop ``temperature`` is never re-issued.
+    Two shapes count. A 400 naming ``temperature`` covers LiteLLM's client-side
+    ``UnsupportedParamsError`` (a ``BadRequestError`` subclass) and a
+    provider's own 400 alike, so the behaviour does not depend on which LiteLLM
+    model map loaded. OpenRouter's parameter-filter 404 is the other: every
+    OpenRouter request carries ``provider.require_parameters``, so a model with
+    no endpoint accepting a temperature answers ``No endpoints found that can
+    handle the requested parameters``, with routing failed at its ``Filter by
+    Parameters`` step. That body names no parameter, so when some other
+    parameter was the one filtered, the re-issue meets the same 404 and the
+    original is raised. OpenRouter's retired-model 404 (``No endpoints found for
+    <model>``) carries no such marker and never matches. A request that already
+    asks LiteLLM to drop ``temperature`` is never re-issued.
     """
-    if _TEMPERATURE not in kwargs or not isinstance(exc, BadRequestError):
-        return False
-    if getattr(exc, "status_code", None) != 400:
+    if _TEMPERATURE not in kwargs:
         return False
     already_dropped = kwargs.get(_DROP_PARAMS)
     if isinstance(already_dropped, list) and _TEMPERATURE in cast("list[object]", already_dropped):
         return False
-    return _TEMPERATURE in str(exc).lower()
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, BadRequestError):
+        return status == 400 and _TEMPERATURE in str(exc).lower()
+    if isinstance(exc, NotFoundError):
+        return (
+            status == 404
+            and getattr(exc, "llm_provider", None) == "openrouter"
+            and _OPENROUTER_PARAMETER_FILTER in str(exc)
+        )
+    return False
 
 
 # Models whose refused temperature has already been reported at WARNING. A
@@ -243,7 +260,8 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     hence the catch-all plus ``isinstance`` inside the normalizer.
 
     It is also where a refused ``temperature`` is omitted. When LiteLLM
-    (client-side) or the provider (an HTTP 400) refuses the request's
+    (client-side), the provider (an HTTP 400), or OpenRouter (a 404 from its
+    parameter filter, see :func:`_refuses_temperature`) refuses the request's
     ``temperature`` as unsupported for the model, the same request is re-issued
     exactly once with LiteLLM's per-call ``additional_drop_params`` naming it —
     never the process-global ``litellm.drop_params``. If the re-issue fails too,

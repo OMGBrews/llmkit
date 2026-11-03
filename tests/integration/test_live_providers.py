@@ -1356,8 +1356,12 @@ async def test_live_text_stream_reports_usage(provider: Provider) -> None:
 # The routes on which LiteLLM 1.104 refuses ``temperature=0.0``: a GPT-5 model
 # with reasoning active, either explicitly (``gpt-5.4-mini`` at ``low``) or by
 # the model's own default (``gpt-5-mini`` with no effort passed), and a Claude
-# 5.5-era model, which takes no sampling temperature at all. Hard-coded rather
-# than env-overridable: each id is the refusal it exists to exercise.
+# 5.5-era model, which takes no sampling temperature at all. The OpenRouter
+# route is refused by OpenRouter itself rather than LiteLLM: its request carries
+# ``provider.require_parameters``, and ``openai/gpt-6-luna`` has no endpoint that
+# accepts a temperature, so it answers a 404 from its parameter filter (measured
+# 2026-11-03). Hard-coded rather than env-overridable: each id is the refusal it
+# exists to exercise.
 _TEMPERATURE_REFUSING_ROUTES = [
     pytest.param(Provider.OPENAI, "gpt-5.4-mini", "low", id="openai-gpt-5.4-mini-low"),
     pytest.param(Provider.OPENAI, "gpt-5-mini", None, id="openai-gpt-5-mini-default-effort"),
@@ -1365,6 +1369,7 @@ _TEMPERATURE_REFUSING_ROUTES = [
     pytest.param(
         Provider.BEDROCK, "global.anthropic.claude-sonnet-5-5", None, id="bedrock-sonnet-5-5"
     ),
+    pytest.param(Provider.OPENROUTER, "openai/gpt-6-luna", None, id="openrouter-gpt-6-luna"),
 ]
 
 
