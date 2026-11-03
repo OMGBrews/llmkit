@@ -12,12 +12,15 @@ pydantic-backed and the leaf module deliberately is not.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, override
+from typing import TYPE_CHECKING, Literal, override
 
 from pydantic import BaseModel
 
 from llmkit._types import AssistantToolMessage, ToolResultMessage
-from llmkit.exceptions import ToolArgumentError
+from llmkit.exceptions import ToolArgumentError, ToolChoiceUnsupportedError
+
+if TYPE_CHECKING:
+    from llmkit.providers import LLMProviderInterface
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,28 @@ class ToolName:
 
 
 type ToolChoice = Literal["auto", "none", "required"] | ToolName
+
+
+def guard_tool_choice(provider: LLMProviderInterface, tool_choice: ToolChoice | None) -> None:
+    """Refuse a ``tool_choice`` the provider's route cannot honour, before any attempt.
+
+    ``None`` and ``"auto"`` always pass: ``"auto"`` is what a route without
+    ``tool_choice`` support does anyway (LiteLLM's Ollama chat route drops the
+    field and the model decides), so the request goes out with it unchanged.
+    Every other value on such a route would be dropped silently, so it raises
+    :class:`~llmkit.ToolChoiceUnsupportedError`. A provider that does not
+    declare ``supports_tool_choice`` is treated as supporting it. The one rule
+    the buffered and streamed tool calls and their transports all apply, so the
+    forms cannot drift apart.
+    """
+    if tool_choice is None or tool_choice == "auto":
+        return
+    if getattr(provider, "supports_tool_choice", True):
+        return
+    raise ToolChoiceUnsupportedError(
+        f"{provider.name} does not support tool_choice={tool_choice!r} on this route; "
+        + 'only None or "auto", which the route does anyway, is accepted'
+    )
 
 
 @dataclass(frozen=True)

@@ -55,6 +55,7 @@ from llmkit.tools import (
     ToolCallResult,
     ToolChoice,
     ToolDefinition,
+    guard_tool_choice,
 )
 
 #: The ``schema`` a streamed tool turn records, distinct from the buffered
@@ -139,6 +140,11 @@ async def tool_llm_call_stream(
         feature=feature,
         label=label,
     )
+    # Before the retry loop, so a route that cannot honour the choice refuses
+    # it once, unlogged. With no provider (the registered config would not
+    # build) the transport raises that build error inside the attempt instead.
+    if provider is not None:
+        guard_tool_choice(provider, tool_choice)
     tag = label or feature
     # ``call_id`` and ``attempt_offset`` reach ``_stream_tools_once`` as plain
     # parameters — NEVER a ContextVar, for the reasons ``calls/stream.py``

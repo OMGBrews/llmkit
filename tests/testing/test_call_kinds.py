@@ -201,7 +201,7 @@ async def test_request_carries_identity_inputs_and_settings() -> None:
     assert request.prompt == ({"role": "user", "content": "add 1 and 2"},)
     assert request.messages == ({"role": "user", "content": "add 1 and 2"},)
     assert request.tools == (ADD,)
-    assert request.tool_choice is None  # Ollama routes accept no tool_choice
+    assert request.tool_choice is None  # none passed; Ollama accepts only None or "auto"
     assert request.output_schema is None
     assert request.model == "ollama_chat/fake-model"
     assert request.provider == "Ollama"

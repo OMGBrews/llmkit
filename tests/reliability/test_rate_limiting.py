@@ -32,7 +32,9 @@ import collections
 import contextlib
 import threading
 import time
+import types
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from pathlib import Path
 from typing import override
 from unittest.mock import MagicMock, patch
 
@@ -41,8 +43,9 @@ import openai
 import pytest
 from instructor.core import InstructorRetryException
 
-from llmkit import CircuitOpenError, _litellm
+from llmkit import CircuitOpenError, _litellm, text_llm_call
 from llmkit import calls as llm_calls
+from llmkit.providers import LLMProviderInterface, Provider, make_provider
 from llmkit.rate_limiting import (
     GlobalRateLimiter,
     RateLimitConfig,
@@ -57,6 +60,7 @@ from llmkit.rate_limiting._adaptive import AdaptiveState, SyncAdaptiveGate
 from llmkit.rate_limiting._breaker import CircuitState
 from llmkit.rate_limiting._buckets import RateBucket
 from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
+from llmkit.testing import Reply, install
 from tests._support import quiet_logging
 
 
@@ -86,7 +90,7 @@ async def test_default_on_caps_at_eight_with_zero_config() -> None:
     probe = _ConcurrencyProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(11)]
+    tasks = [asyncio.create_task(probe.run(Provider.OPENAI, hold)) for _ in range(11)]
 
     # Let the scheduler run; exactly 8 should get in, the rest block.
     for _ in range(20):
@@ -138,7 +142,7 @@ async def test_reconfigure_raises_cap_for_new_acquires() -> None:
     probe = _ConcurrencyProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(5)]
+    tasks = [asyncio.create_task(probe.run(Provider.OPENAI, hold)) for _ in range(5)]
     for _ in range(20):
         await asyncio.sleep(0)
     assert probe.current == 5
@@ -155,7 +159,7 @@ async def test_disabled_is_unbounded_no_op() -> None:
     probe = _ConcurrencyProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(7)]
+    tasks = [asyncio.create_task(probe.run(Provider.OPENAI, hold)) for _ in range(7)]
     for _ in range(20):
         await asyncio.sleep(0)
     assert probe.current == 7  # all in flight, unbounded
@@ -336,9 +340,9 @@ class _AsyncFunctionProbe:
         self.peak: int = 0
         self._lock: asyncio.Lock = asyncio.Lock()
 
-    async def run(self, key: str, hold: asyncio.Event) -> None:
+    async def run(self, provider: Provider, hold: asyncio.Event) -> None:
         """Join via the public async function, record peak, hold until set."""
-        async with rate_limit_acquire_async(key):
+        async with rate_limit_acquire_async(provider):
             async with self._lock:
                 self.current += 1
                 self.peak = max(self.peak, self.current)
@@ -354,7 +358,7 @@ async def test_rate_limit_acquire_async_respects_configured_cap() -> None:
     probe = _AsyncFunctionProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(11)]
+    tasks = [asyncio.create_task(probe.run(Provider.OPENAI, hold)) for _ in range(11)]
     for _ in range(20):
         await asyncio.sleep(0)
     assert probe.current == 8  # default per-provider cap
@@ -376,11 +380,11 @@ async def test_rate_limit_acquire_async_acquires_and_releases() -> None:
     release_first = asyncio.Event()
 
     async def first() -> None:
-        async with rate_limit_acquire_async("openai"):
+        async with rate_limit_acquire_async(Provider.OPENAI):
             _ = await release_first.wait()
 
     async def second() -> None:
-        async with rate_limit_acquire_async("openai"):
+        async with rate_limit_acquire_async(Provider.OPENAI):
             entered_second.set()
 
     first_task = asyncio.create_task(first())
@@ -402,7 +406,7 @@ async def test_rate_limit_acquire_async_disabled_bypass() -> None:
     probe = _AsyncFunctionProbe()
     hold = asyncio.Event()
 
-    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(7)]
+    tasks = [asyncio.create_task(probe.run(Provider.OPENAI, hold)) for _ in range(7)]
     for _ in range(20):
         await asyncio.sleep(0)
     assert probe.current == 7  # all in flight, unbounded
@@ -424,12 +428,12 @@ def test_rate_limit_acquire_sync_respects_configured_cap() -> None:
     first_holds = threading.Event()
 
     def first() -> None:
-        with rate_limit_acquire_sync("openai"):
+        with rate_limit_acquire_sync(Provider.OPENAI):
             first_holds.set()
             _ = release_first.wait(timeout=1.0)
 
     def second() -> None:
-        with rate_limit_acquire_sync("openai"):
+        with rate_limit_acquire_sync(Provider.OPENAI):
             entered_second.set()
 
     first_thread = threading.Thread(target=first)
@@ -461,7 +465,7 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
     reached_barrier = threading.Event()
 
     def worker() -> None:
-        with rate_limit_acquire_sync("openai"):
+        with rate_limit_acquire_sync(Provider.OPENAI):
             _ = both_in.wait()  # both threads must be inside at once
             reached_barrier.set()
             _ = release.wait(timeout=1.0)
@@ -508,7 +512,8 @@ def test_sync_acquire_raises_circuit_open_when_breaker_open(
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: stays OPEN
     configure_rate_limit(max_concurrent=8, breaker=True)
-    key = "openai"
+    provider = Provider.OPENAI
+    key = "openai"  # its casefolded display name, the internal registry key
     breaker = GlobalRateLimiter._get_breaker(key)
     for _ in range(BREAKER_MIN_SAMPLES):  # a full window of throttles opens it
         _ = breaker.on_record(throttled=True)
@@ -522,7 +527,7 @@ def test_sync_acquire_raises_circuit_open_when_breaker_open(
     assert gate._in_flight == 0
 
     with pytest.raises(CircuitOpenError) as excinfo:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             raise AssertionError("body must not run while the breaker is OPEN")
 
     assert excinfo.value.provider == key
@@ -540,12 +545,13 @@ def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
     configure_rate_limit(max_concurrent=2)
-    key = "google"
+    provider = Provider.GOOGLE
+    key = "google ai studio"  # its casefolded display name, the internal registry key
     holder_in = threading.Event()
     release_holder = threading.Event()
 
     def holder() -> None:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             holder_in.set()
             _ = release_holder.wait(timeout=2.0)
 
@@ -556,7 +562,7 @@ def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
     # A second sync acquire saturates the gate (in_flight == 2 == limit); its body
     # raises a (wrapped, structured-path) throttle, so the saturation gate fires.
     with pytest.raises(InstructorRetryException):
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             raise _wrapped_throttle(429)
 
     # The SHARED per-provider AIMD limit dropped 2 -> 1 from the sync-side throttle.
@@ -605,12 +611,13 @@ def test_cross_population_saturated_throttle_decreases_shared_limit(
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
     configure_rate_limit(max_concurrent=2)
-    key = "google"
+    provider = Provider.GOOGLE
+    key = "google ai studio"  # its casefolded display name, the internal registry key
     holder_in = threading.Event()
     release_holder = threading.Event()
 
     def holder() -> None:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             holder_in.set()
             _ = release_holder.wait(timeout=2.0)
 
@@ -642,7 +649,8 @@ def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) 
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no refill
     configure_rate_limit(max_concurrent=8, rpm=480)
-    key = "openai"
+    provider = Provider.OPENAI
+    key = "openai"  # its casefolded display name, the internal registry key
     rpm_bucket = GlobalRateLimiter._get_rpm_bucket(key)
     assert rpm_bucket is not None
     full_level = rpm_bucket._level  # capacity min(8, 480) == 8, starts full
@@ -657,7 +665,7 @@ def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(gate, "acquire", _boom)
 
     with pytest.raises(RuntimeError):
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             raise AssertionError("body must not run when the grant fails")
 
     # The token debited before the failed grant was refunded: bucket full again.
@@ -670,11 +678,12 @@ def test_exception_during_sync_body_leaks_no_permit() -> None:
     ``sem.acquire()``-outside-``try`` path.
     """
     configure_rate_limit(max_concurrent=1)
-    key = "openai"
+    provider = Provider.OPENAI
+    key = "openai"  # its casefolded display name, the internal registry key
     gate = GlobalRateLimiter._get_sync_gate(key)
 
     with pytest.raises(RuntimeError):
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             raise RuntimeError("boom in body")
 
     assert gate._in_flight == 0  # slot released despite the exception
@@ -684,7 +693,7 @@ def test_exception_during_sync_body_leaks_no_permit() -> None:
     entered = threading.Event()
 
     def worker() -> None:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             entered.set()
 
     thread = threading.Thread(target=worker)
@@ -713,7 +722,8 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
     so this path — and the spin — was previously untested.
     """
     configure_rate_limit(max_concurrent=2)
-    key = "openai"
+    provider = Provider.OPENAI
+    key = "openai"  # its casefolded display name, the internal registry key
     gate = GlobalRateLimiter._get_sync_gate(key)
 
     release_h0 = threading.Event()
@@ -723,11 +733,11 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
     order_lock = threading.Lock()
 
     def holder(release: threading.Event) -> None:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             _ = release.wait(timeout=5.0)
 
     def waiter(i: int) -> None:
-        with rate_limit_acquire_sync(key):
+        with rate_limit_acquire_sync(provider):
             with order_lock:
                 order.append(i)
             _ = hold_waiters.wait(timeout=5.0)
@@ -1525,28 +1535,31 @@ async def test_call_layer_debits_tpm_from_response_usage(
 
 
 # ---------------------------------------------------------------------------
-# Case-insensitive provider keys: llmkit's own call sites key by the display
-# name ("OpenAI"), while a host following the public-helper docs may pass any
-# casing. Keys are casefolded at the limiter boundary so every casing names
-# ONE budget — a differently-cased host can never silently fork onto a
-# separate budget it believes is shared.
+# One budget per provider, however a host names it. llmkit's own call sites key
+# the limiter by the provider's display name ("OpenAI"), casefolded at the
+# limiter boundary. A host joining by hand names the provider with a Provider
+# member or a provider instance, never a string, so every form lands on the
+# key llmkit's own calls charge and cannot fork onto a separate budget.
 # ---------------------------------------------------------------------------
 
 
-async def test_rpm_budget_shared_across_key_casings(
+def _openai_instance() -> LLMProviderInterface:
+    return make_provider(Provider.OPENAI, api_key="k")
+
+
+async def test_rpm_budget_shared_between_member_and_llmkit_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Public-helper "openai" and internal-path "OpenAI" debit the SAME RPM bucket.
+    """A ``Provider.OPENAI`` join and llmkit's own "OpenAI" key debit one RPM bucket.
 
-    With a frozen clock and rpm=2 (capacity 2), one lowercase acquire via the
-    public helper plus one display-cased acquire via the internal path must
-    drain the single shared bucket to zero — and the registry must hold exactly
-    one (casefolded) entry, not one per casing.
+    With a frozen clock and rpm=2 (capacity 2), one acquire through the public
+    helper plus one through the internal path must drain the single shared
+    bucket to zero, and the registry must hold exactly one (casefolded) entry.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     configure_rate_limit(rpm=2)
 
-    async with rate_limit_acquire_async("openai"):  # host casing, public helper
+    async with rate_limit_acquire_async(Provider.OPENAI):  # host form, public helper
         pass
     async with GlobalRateLimiter.acquire_async("OpenAI"):  # llmkit's display name
         pass
@@ -1554,46 +1567,46 @@ async def test_rpm_budget_shared_across_key_casings(
     assert set(GlobalRateLimiter._rpm_buckets) == {"openai"}  # one bucket, casefolded key
     assert GlobalRateLimiter._rpm_buckets["openai"]._level == 0.0  # 2 - 1 - 1
 
-    # The shared budget is now exhausted: a third acquire under ANY casing
+    # The shared budget is now exhausted: a third acquire under any form
     # would have to wait for refill.
     assert GlobalRateLimiter._rpm_buckets["openai"]._try_acquire(1.0) > 0.0
 
 
-async def test_tpm_budget_shared_across_key_casings(
+async def test_tpm_budget_shared_between_member_and_instance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tokens recorded under "OPENAI" are visible to a "openai" acquirer's bucket."""
+    """Tokens recorded through an instance are visible to a member's bucket."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
     # tpm chosen so the 1s reservoir (tpm/60 = 4000) comfortably holds both
     # debits: the first call must leave the *shared* bucket positive, or the
-    # second casing's TPM gate would (correctly) block waiting for refill — which
-    # under this frozen clock would never come. The sharing/casefold invariant,
-    # not the gate's blocking, is what this test pins.
+    # second join's TPM gate would (correctly) block waiting for refill, which
+    # under this frozen clock would never come. The sharing invariant, not the
+    # gate's blocking, is what this test pins.
     configure_rate_limit(tpm=240_000)
 
-    async with GlobalRateLimiter.acquire_async("OPENAI") as slot:
+    async with rate_limit_acquire_async(_openai_instance()) as slot:
         slot.record_tokens(2_000)
-    async with rate_limit_acquire_async("openai") as slot:
+    async with rate_limit_acquire_async(Provider.OPENAI) as slot:
         slot.record_tokens(1_000)
 
     assert set(GlobalRateLimiter._tpm_buckets) == {"openai"}
-    # Both debits land on the one shared (casefolded) bucket: 4000 reservoir
-    # minus 2000 minus 1000.
+    # Both debits land on the one shared bucket: 4000 reservoir minus 2000
+    # minus 1000.
     assert GlobalRateLimiter._tpm_buckets["openai"]._level == 1_000.0
 
 
-async def test_concurrency_semaphore_shared_across_key_casings() -> None:
-    """A slot held under "OpenAI" blocks a "openai" acquire: one semaphore, cap 1."""
+async def test_concurrency_semaphore_shared_between_instance_and_member() -> None:
+    """A slot held through an instance blocks a member's acquire: one semaphore, cap 1."""
     configure_rate_limit(max_concurrent=1)
     entered_second = asyncio.Event()
     release_first = asyncio.Event()
 
     async def first() -> None:
-        async with GlobalRateLimiter.acquire_async("OpenAI"):  # internal casing
+        async with rate_limit_acquire_async(_openai_instance()):
             _ = await release_first.wait()
 
     async def second() -> None:
-        async with rate_limit_acquire_async("openai"):  # host casing, public helper
+        async with rate_limit_acquire_async(Provider.OPENAI):
             entered_second.set()
 
     first_task = asyncio.create_task(first())
@@ -1601,28 +1614,28 @@ async def test_concurrency_semaphore_shared_across_key_casings() -> None:
 
     for _ in range(20):
         await asyncio.sleep(0)
-    # If the casings forked into two semaphores, second() would be in already.
-    assert not entered_second.is_set(), "differently-cased keys got separate semaphores"
+    # If the two forms forked into two semaphores, second() would be in already.
+    assert not entered_second.is_set(), "member and instance got separate semaphores"
 
     release_first.set()
     _ = await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1.0)
     assert entered_second.is_set()
 
 
-def test_sync_gate_shared_across_key_casings() -> None:
-    """The sync path shares one concurrency gate across key casings too."""
+def test_sync_gate_shared_between_member_and_llmkit_key() -> None:
+    """The sync path shares one concurrency gate between a member and llmkit's key."""
     configure_rate_limit(max_concurrent=1)
     entered_second = threading.Event()
     release_first = threading.Event()
     first_holds = threading.Event()
 
     def first() -> None:
-        with GlobalRateLimiter.acquire_sync("OpenAI"):  # internal casing
+        with GlobalRateLimiter.acquire_sync("OpenAI"):  # llmkit's display name
             first_holds.set()
             _ = release_first.wait(timeout=1.0)
 
     def second() -> None:
-        with rate_limit_acquire_sync("openai"):  # host casing, public helper
+        with rate_limit_acquire_sync(Provider.OPENAI):  # host form, public helper
             entered_second.set()
 
     first_thread = threading.Thread(target=first)
@@ -1631,10 +1644,135 @@ def test_sync_gate_shared_across_key_casings() -> None:
     assert first_holds.wait(timeout=1.0)
 
     second_thread.start()
-    # One shared slot, held under "OpenAI": the "openai" acquire must block.
+    # One shared slot, held under "OpenAI": the member's acquire must block.
     assert not entered_second.wait(timeout=0.1)
 
     release_first.set()
     second_thread.join(timeout=1.0)
     first_thread.join(timeout=1.0)
     assert entered_second.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Every member joins the budget llmkit's own calls on that provider charge.
+# Three members' values differ from their providers' display names
+# (Provider.GOOGLE is "google", but llmkit's calls charge "Google AI Studio"),
+# so a member passed through as its value would fork onto an orphan budget;
+# for those rows these tests fail on that bug. The other rows prove the
+# member form is accepted at all.
+# ---------------------------------------------------------------------------
+
+
+def _instance_for(member: Provider) -> LLMProviderInterface:
+    """Build ``member``'s provider offline, with the least config it accepts."""
+    if member is Provider.OLLAMA:
+        return make_provider(member)
+    if member is Provider.BEDROCK:
+        return make_provider(member, aws_region_name="us-east-1")
+    if member is Provider.VERTEX:
+        return make_provider(member, vertex_project="p", vertex_location="us-central1")
+    return make_provider(member, api_key="k")
+
+
+@pytest.mark.parametrize("member", list(Provider), ids=str)
+async def test_member_join_blocks_llmkit_call_on_that_provider(member: Provider) -> None:
+    """Holding the one slot through a member blocks ``text_llm_call`` on that provider.
+
+    The fake answers inside the limiter slot, so the call cannot finish until
+    the host's slot is released.
+    """
+    configure_rate_limit(max_concurrent=1)
+    instance = _instance_for(member)
+    release = asyncio.Event()
+    holding = asyncio.Event()
+
+    async def host() -> None:
+        async with rate_limit_acquire_async(member):
+            holding.set()
+            _ = await release.wait()
+
+    with install(lambda _request: Reply.text("hi")):
+        host_task = asyncio.create_task(host())
+        _ = await holding.wait()
+        call = asyncio.create_task(
+            text_llm_call("hi", feature="rate-limit-join", provider=instance)
+        )
+        done, _pending = await asyncio.wait({call}, timeout=0.2)
+        assert not done, f"{member!r} join did not block llmkit's call on {instance.name}"
+
+        release.set()
+        assert await asyncio.wait_for(call, timeout=5.0) == "hi"
+        await host_task
+
+
+@pytest.mark.parametrize("member", list(Provider), ids=str)
+def test_member_sync_join_blocks_instance_sync_join(member: Provider) -> None:
+    """A sync slot held through a member blocks a sync join through the instance.
+
+    The sync join counts in-flight slots separately from llmkit's own calls, so
+    its sharing is shown against a second sync join on another thread.
+    """
+    configure_rate_limit(max_concurrent=1)
+    instance = _instance_for(member)
+    release = threading.Event()
+    holding = threading.Event()
+    entered_second = threading.Event()
+
+    def first() -> None:
+        with rate_limit_acquire_sync(member):
+            holding.set()
+            _ = release.wait(timeout=2.0)
+
+    def second() -> None:
+        with rate_limit_acquire_sync(instance):
+            entered_second.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    assert holding.wait(timeout=1.0)
+
+    second_thread.start()
+    assert not entered_second.wait(timeout=0.1), (
+        f"{member!r} and its instance {instance.name!r} got separate sync gates"
+    )
+
+    release.set()
+    second_thread.join(timeout=1.0)
+    first_thread.join(timeout=1.0)
+    assert entered_second.is_set()
+
+
+def test_instance_keys_by_its_name_not_its_member_value() -> None:
+    """A ``VertexProvider`` instance charges "google agent platform", not "vertex"."""
+    configure_rate_limit(rpm=10)
+    instance = _instance_for(Provider.VERTEX)
+    assert instance.name == "Google Agent Platform"
+
+    with rate_limit_acquire_sync(instance):
+        pass
+
+    assert set(GlobalRateLimiter._rpm_buckets) == {"google agent platform"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["openai", "OpenAI", None, types.SimpleNamespace(name="x"), Path("openai")],
+    ids=["lowercase-string", "display-string", "none", "object-with-name", "path"],
+)
+async def test_join_refuses_anything_but_a_member_or_instance(bad: object) -> None:
+    """A string, ``None`` or an unrelated object raises ``TypeError`` untouched.
+
+    The message names both accepted forms, and no registry gains an entry.
+    """
+    configure_rate_limit(rpm=10)
+
+    with pytest.raises(TypeError, match=r"Provider member .* or a provider instance"):
+        with rate_limit_acquire_sync(bad):  # pyright: ignore[reportArgumentType]
+            raise AssertionError("body must not run")
+    with pytest.raises(TypeError, match=r"Provider member .* or a provider instance"):
+        async with rate_limit_acquire_async(bad):  # pyright: ignore[reportArgumentType]
+            raise AssertionError("body must not run")
+
+    assert GlobalRateLimiter._rpm_buckets == {}
+    assert GlobalRateLimiter._sync_gates == {}

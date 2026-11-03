@@ -221,8 +221,10 @@ def build_call_provider(
     the log record share one instance — the default path no longer calls
     :func:`~llmkit.providers.build_provider` twice (once to run the call,
     again only to read ``.model``/``.name`` for the log). A build failure
-    degrades to ``None`` rather than breaking the call: the transport then
-    re-resolves and surfaces the real configuration error, and the log path
+    degrades to ``None`` rather than breaking the call: the compose form of
+    :func:`~llmkit.calls.tool.tool_llm_call` re-resolves at once and raises the
+    real configuration error before any attempt, every other call's transport
+    re-resolves inside its attempt and surfaces it there, and the log path
     degrades to ``(model, None)`` via
     :func:`resolve_model_and_provider` below. Building is config +
     cached SDK checks (no I/O), so resolving it here before the retry loop is

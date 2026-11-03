@@ -102,7 +102,7 @@ from llmkit.exceptions import (
 )
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
-from llmkit.tools import ToolChoice, ToolDefinition, ToolName
+from llmkit.tools import ToolChoice, ToolDefinition, ToolName, guard_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -1379,8 +1379,7 @@ async def acompletion_tools(
 ]:
     """One raw-LiteLLM tool completion, with the usual limiter and TPM debit."""
     provider = provider if provider is not None else build_provider()
-    if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
-        raise ValueError(f"{provider.name} does not support tool_choice on this route")
+    guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     if response_format is not None and provider.strict_json_schema:
@@ -1600,9 +1599,12 @@ async def astream_tools(
     """Stream a tool-enabled turn: text deltas, then one :class:`StreamedToolTurn`.
 
     The streaming sibling of :func:`acompletion_tools`, sharing its
-    ``tool_choice`` guard: a route whose provider declares no ``tool_choice``
-    support raises before any request, so the streaming surface cannot
-    silently accept what the buffered one rejects.
+    ``tool_choice`` guard (:func:`~llmkit.tools.guard_tool_choice`): on a route
+    whose provider declares no ``tool_choice`` support, any value but ``"auto"``
+    raises :class:`~llmkit.ToolChoiceUnsupportedError` before any request, so
+    the streaming surface cannot silently accept what the buffered one rejects.
+    The public call functions apply the same guard before their first attempt;
+    this one is the backstop for direct transport callers.
 
     Like :func:`astream_text` this requests
     ``stream_options={"include_usage": True}``, so the turn's token usage
@@ -1615,8 +1617,7 @@ async def astream_tools(
     exactly the deadlock the limiter exists to avoid.
     """
     provider = provider if provider is not None else build_provider()
-    if tool_choice is not None and not getattr(provider, "supports_tool_choice", True):
-        raise ValueError(f"{provider.name} does not support tool_choice on this route")
+    guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
     choice: object = tool_choice

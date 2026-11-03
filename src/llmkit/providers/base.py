@@ -712,6 +712,16 @@ class BaseProvider(ABC):
         """Provider name."""
         return self._provider_name
 
+    @classmethod
+    def display_name(cls) -> str:
+        """The provider name every instance of this class reports as :attr:`name`.
+
+        The class-level read of the same value, for code that holds a
+        :class:`Provider` member rather than a built instance (the rate
+        limiter's hand-join functions key their budget by it).
+        """
+        return cls._provider_name
+
     @property
     def model(self) -> str:
         """Current default model name (unprefixed)."""

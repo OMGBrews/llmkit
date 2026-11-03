@@ -68,10 +68,15 @@ the call.
 
 Provider keys are matched **case-insensitively**: every key is casefolded at
 the limiter boundary (see :func:`_normalize_key`), so ``"openai"``,
-``"OpenAI"``, and ``"OPENAI"`` all name one budget. A host joining the limit
-by hand via :func:`rate_limit_acquire_async` / :func:`rate_limit_acquire_sync`
-therefore cannot fork itself onto a separate budget by spelling the provider
-name differently from llmkit's own call sites.
+``"OpenAI"``, and ``"OPENAI"`` all name one budget internally. A host joining
+the limit by hand via :func:`rate_limit_acquire_async` /
+:func:`rate_limit_acquire_sync` names the provider with a
+:class:`~llmkit.providers.Provider` member or a provider instance, never a
+string: a member is translated to the provider name llmkit's own calls report
+(``Provider.VERTEX`` charges ``"Google Agent Platform"``, not ``"vertex"``) and
+an instance keys by its ``name``. A host therefore cannot fork itself onto a
+separate budget by spelling the provider name differently from llmkit's own
+call sites, because it never spells the name at all.
 
 **Concurrency** defaults to a cap of **8 concurrent calls per provider**: eight
 favours the common access pattern — fan-out — out of the box, bounding a
@@ -175,6 +180,7 @@ from collections.abc import AsyncGenerator, Generator
 from dataclasses import dataclass
 
 from llmkit.options import UNSET, Unset
+from llmkit.providers import LLMProviderInterface, Provider, provider_display_name
 from llmkit.rate_limiting._buckets import RateLimitSlot
 from llmkit.rate_limiting._limiter import GlobalRateLimiter
 from llmkit.rate_limiting._observability import (
@@ -322,53 +328,90 @@ def get_rate_limit_config() -> RateLimitConfig:
     )
 
 
+def _limiter_key(provider_key: object) -> str:
+    """Resolve a hand-join argument to the key llmkit's own calls charge.
+
+    A :class:`Provider` member is checked first: it is a ``StrEnum``, so any
+    string handling ahead of it would pass the member through as its value,
+    which differs from the provider name for some members. Anything that is
+    neither a member nor a provider instance is refused, strings included.
+    """
+    if isinstance(provider_key, Provider):
+        return provider_display_name(provider_key)
+    if isinstance(provider_key, LLMProviderInterface):
+        return provider_key.name
+    raise TypeError(
+        "rate_limit_acquire_async/rate_limit_acquire_sync take a Provider member "
+        + "(e.g. Provider.OPENAI) or a provider instance, not "
+        + f"{type(provider_key).__name__} {provider_key!r}"
+    )
+
+
 @contextlib.asynccontextmanager
-async def rate_limit_acquire_async(provider_key: str) -> AsyncGenerator[RateLimitSlot]:
+async def rate_limit_acquire_async(
+    provider_key: Provider | LLMProviderInterface,
+) -> AsyncGenerator[RateLimitSlot]:
     """Hold an async slot on the global per-provider limit for the block.
 
     The public way to join the process-global, per-provider limit by hand — for
     a host that issues provider calls outside llmkit's own call functions (e.g.
     a LangChain chat-model wrapper) and still wants them bounded by the same
-    concurrency / RPM / TPM budgets. ``provider_key`` is the provider name
-    (``provider.name``, e.g. ``"OpenAI"``, ``"AWS Bedrock"``), matched
-    **case-insensitively** — ``"openai"`` and ``"OpenAI"`` share one budget, so
-    any casing joins the same budget llmkit's own calls debit. Each provider
-    has an independent budget. Yields a :class:`RateLimitSlot`; call its
+    concurrency / RPM / TPM budgets. ``provider_key`` is a
+    :class:`~llmkit.providers.Provider` member (e.g. ``Provider.OPENAI``) or a
+    provider instance (a host's own provider class joins by passing its
+    instance); either joins the same budget llmkit's own calls on that provider
+    debit. Each provider has an independent budget. Yields a :class:`RateLimitSlot`; call its
     :meth:`~RateLimitSlot.record_tokens` once you know the call's token usage to
     debit the TPM budget (a no-op when TPM is off). A no-op when limiting is
     disabled.
 
     Usage::
 
-        async with rate_limit_acquire_async("OpenAI") as slot:
+        async with rate_limit_acquire_async(Provider.OPENAI) as slot:
             response = ...  # one slot held against OpenAI's budget
             slot.record_tokens(response.usage.total_tokens)
 
     Behaviour is identical to the throttle llmkit's own async call path uses.
+
+    Raises:
+        TypeError: if ``provider_key`` is neither a ``Provider`` member nor a
+            provider instance; a plain string such as ``"openai"`` is refused,
+            before the limiter is touched.
     """
-    async with GlobalRateLimiter.acquire_async(provider_key) as slot:
+    key = _limiter_key(provider_key)
+    async with GlobalRateLimiter.acquire_async(key) as slot:
         yield slot
 
 
 @contextlib.contextmanager
-def rate_limit_acquire_sync(provider_key: str) -> Generator[RateLimitSlot]:
+def rate_limit_acquire_sync(
+    provider_key: Provider | LLMProviderInterface,
+) -> Generator[RateLimitSlot]:
     """Hold a sync slot on the global per-provider limit for the block.
 
     The synchronous counterpart to :func:`rate_limit_acquire_async`, for a host
     joining the global per-provider limit from a sync code path (e.g. a
     synchronous LangChain ``_generate``/``_stream`` wrapper). ``provider_key``
-    is the provider name (``provider.name``, e.g. ``"OpenAI"``), matched
-    **case-insensitively** — any casing joins the same budget llmkit's own
-    calls debit. Each provider has an independent budget across all three
+    is a :class:`~llmkit.providers.Provider` member or a provider instance,
+    as for the async form; either joins the same budget llmkit's own calls on
+    that provider debit. The sync join counts its in-flight slots separately
+    from llmkit's own calls (see the module docstring's caveat), but shares
+    their adaptive limit, circuit breaker and RPM/TPM buckets. Each provider has an independent budget across all three
     dimensions. Yields a :class:`RateLimitSlot` whose
     :meth:`~RateLimitSlot.record_tokens` debits the TPM budget. A no-op when
     limiting is disabled.
 
     Usage::
 
-        with rate_limit_acquire_sync("OpenAI") as slot:
+        with rate_limit_acquire_sync(Provider.OPENAI) as slot:
             response = ...  # one slot held against OpenAI's budget
             slot.record_tokens(response.usage.total_tokens)
+
+    Raises:
+        TypeError: if ``provider_key`` is neither a ``Provider`` member nor a
+            provider instance; a plain string such as ``"openai"`` is refused,
+            before the limiter is touched.
     """
-    with GlobalRateLimiter.acquire_sync(provider_key) as slot:
+    key = _limiter_key(provider_key)
+    with GlobalRateLimiter.acquire_sync(key) as slot:
         yield slot

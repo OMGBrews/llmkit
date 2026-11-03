@@ -21,19 +21,22 @@ from pydantic import BaseModel
 from llmkit import (
     NO_RETRY,
     ComposeUnsupportedError,
+    LLMClientConfig,
     Provider,
     ToolArgumentError,
     ToolCallResult,
+    ToolChoiceUnsupportedError,
     ToolComposeResult,
     ToolDefinition,
     ToolName,
+    configure_llm_client,
     make_provider,
     tool_llm_call,
     tool_result_message,
 )
 from llmkit.providers import LLMProviderInterface
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
-from llmkit.tools import TokenUsage
+from llmkit.tools import TokenUsage, ToolChoice
 from tests._support import capturing_sink, provider_mock
 
 
@@ -283,3 +286,82 @@ async def test_compose_refuses_unsupported_provider_before_transport() -> None:
                 output_schema=_Forecast,
             )
     assert installed.requests == []
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (LLMClientConfig(provider=Provider.ANTHROPIC, model="m"), "requires an API key"),
+        (
+            LLMClientConfig(
+                provider=Provider.ANTHROPIC, model="m", api_key="k", aws_region_name="us-east-1"
+            ),
+            r"does not read the config field\(s\)",
+        ),
+    ],
+    ids=["missing-key", "rejected-field"],
+)
+async def test_compose_raises_the_build_error_of_an_unbuildable_config(
+    monkeypatch: pytest.MonkeyPatch, config: LLMClientConfig, expected: str
+) -> None:
+    """A registered config that will not build raises its own error, not a compose refusal.
+
+    Anthropic composes, so the only thing wrong is the config; the error names
+    that, before any request and without a log record.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _ = configure_llm_client(config)
+    with install(lambda _request: Reply.text("unreachable")) as installed:
+        with capturing_sink() as records:
+            with pytest.raises(ValueError, match=expected) as excinfo:
+                _ = await tool_llm_call(
+                    "weather?",
+                    [ToolDefinition("weather", "", {"type": "object"})],
+                    feature="assistant",
+                    output_schema=_Forecast,
+                )
+    assert not isinstance(excinfo.value, ComposeUnsupportedError)
+    assert installed.requests == []
+    assert records == []
+
+
+def _add() -> ToolDefinition:
+    return ToolDefinition("add", "Add two numbers", {"type": "object"})
+
+
+async def test_tool_call_runs_auto_on_ollama() -> None:
+    """On a real ``OllamaProvider``, ``"auto"`` runs, and the request records it."""
+    with install(lambda _request: Reply.text("hi")) as installed, capturing_sink() as records:
+        result = await tool_llm_call(
+            "hi",
+            [_add()],
+            feature="assistant",
+            provider=make_provider(Provider.OLLAMA),
+            tool_choice="auto",
+        )
+    assert isinstance(result, ToolCallResult)
+    assert [request.tool_choice for request in installed.requests] == ["auto"]
+    assert len(records) == 1
+    assert records[0].error is None
+
+
+@pytest.mark.parametrize(
+    "tool_choice", ["none", "required", ToolName("add")], ids=["none", "required", "named"]
+)
+async def test_tool_call_refuses_unsupported_tool_choice_on_ollama_before_any_attempt(
+    tool_choice: ToolChoice,
+) -> None:
+    """On a real ``OllamaProvider`` the refusal precedes the first attempt: no
+    request, no log record, and so no retry."""
+    with install(lambda _request: Reply.text("unreachable")) as installed:
+        with capturing_sink() as records:
+            with pytest.raises(ToolChoiceUnsupportedError, match="does not support tool_choice"):
+                _ = await tool_llm_call(
+                    "hi",
+                    [_add()],
+                    feature="assistant",
+                    provider=make_provider(Provider.OLLAMA),
+                    tool_choice=tool_choice,
+                )
+    assert installed.requests == []
+    assert records == []
