@@ -35,9 +35,11 @@ call logging. Consequences worth knowing:
   previous fake.
 - **The cache sits above the fake.** A cache hit, and an identical request
   that joins one already in flight, never reach it.
-- **A configured provider is still required.** The transport resolves the
-  provider before the round trip, and a key-based provider raises without a
-  key. Configure one that needs none, such as Ollama.
+- **A provider is still built.** A call made without ``provider=`` needs a
+  registered config, and a key-based provider raises without a key. Either
+  pass a provider per call, which needs no registration (a key-based one
+  builds from any placeholder ``api_key``, since no request leaves the
+  process), or register one that needs no key, such as Ollama.
 - **No mid-stream failure.** A fake can fail a streaming call only before its
   first chunk.
 

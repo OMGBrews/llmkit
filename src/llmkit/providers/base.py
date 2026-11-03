@@ -186,6 +186,11 @@ def resolve_api_key(configured: str | None, *, env_var: str, provider_name: str)
     empty key wandering into the transport to fail (or silently succeed) at call
     time. An empty string is treated as unset, matching the falsy-``model``
     convention on :class:`LLMClientConfig`.
+
+    The variable is read from ``os.environ`` when the provider is built.
+    ``import llmkit`` does not import LiteLLM, so a key that lives only in a
+    ``.env`` file is not there yet when a provider is built before the first
+    call (with :func:`~llmkit.make_provider`, say). Load the file first.
     """
     if configured:
         return configured
@@ -313,18 +318,18 @@ class LLMClientConfig:
     Bedrock or Google's Agent Platform (ambient AWS/Google chains). The credential is masked in
     this config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray ``print`` or
     traceback never leaks it. ``base_url`` sets the endpoint for the key-authenticated providers
-    and Ollama: it resolves from this value, else the provider's own documented endpoint
-    variable(s) (``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE`` and friends —
-    still honoured, now read explicitly by llmkit in a tested order), else that provider's own
-    measured default endpoint. The endpoint is therefore llmkit's decision, readable from
-    ``completion_kwargs()`` rather than inferred from LiteLLM's own chain, and it is resolved per
-    call so it reflects the environment the call goes out in (see :func:`resolve_base_url`). Google
-    AI Studio is the one provider with no default — its base carries an API version LiteLLM picks
-    from the model — so with neither this field nor ``GEMINI_API_BASE`` set it sends no
-    ``api_base`` and lets LiteLLM choose. It is not accepted by Bedrock or Google's Agent Platform,
-    whose endpoints derive from ``aws_region_name`` / ``vertex_location`` instead. Per-call
-    ``model`` overrides (e.g. the strong/small roles the host resolves) are passed at call time and
-    are not part of this config — this carries only the provider's *default* model.
+    and Ollama, and llmkit, not LiteLLM's own chain, decides it (readable from
+    ``completion_kwargs()``). Anthropic, OpenAI, DeepSeek, Cerebras and Google AI Studio resolve
+    it per call from this value, else the provider's own endpoint variable(s)
+    (``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE``, ``GEMINI_API_BASE`` and
+    friends), else a measured default (see :func:`resolve_base_url`). Google AI Studio has no
+    default: with neither this value nor ``GEMINI_API_BASE`` set it sends no ``api_base`` and lets
+    LiteLLM pick the API version from the model. OpenRouter and Ollama read no endpoint variable:
+    this value, else llmkit's default, fixed when the provider is built. It is not accepted by
+    Bedrock or Google's Agent Platform, whose endpoints derive from ``aws_region_name`` /
+    ``vertex_location`` instead. Per-call ``model`` overrides (e.g. the strong/small roles the
+    host resolves) are passed at call time and are not part of this config — this carries only
+    the provider's *default* model.
 
     ``model`` is optional: leave it ``None`` (or empty) to inherit the
     selected provider's own default model rather than naming one here. A
@@ -363,7 +368,7 @@ class LLMClientConfig:
     residency guarantee. That pin is overridable from outside the config — see
     :class:`~llmkit.providers.vertex.VertexProvider`. Leave either ``None`` to let it resolve from
     the environment (``VERTEXAI_PROJECT`` / ``VERTEXAI_LOCATION``), with the location otherwise
-    falling back to Google's default region.
+    falling back to LiteLLM's default, ``us-central1``, which does not serve the default model.
 
     ``gemini_structured_output`` selects the structured-output *strategy* for the two Gemini
     providers (Google's Agent Platform, Google AI Studio); a non-default value is not accepted by
@@ -437,8 +442,9 @@ def configure_llm_client(
     (settings reloaded at runtime, a tenant chosen per request) passes a
     zero-argument callable instead; it is invoked on each
     :func:`build_provider` call, so a change is picked up without
-    re-registration. A single call can bypass the registration entirely with
-    its ``provider=`` keyword.
+    re-registration. A call can also run on another provider by passing
+    ``provider=`` (for example one built with :func:`~llmkit.make_provider`);
+    the registration is untouched.
 
     Passing ``None`` clears the registration, so a call without ``provider=``
     raises :class:`~llmkit.exceptions.LLMClientNotConfiguredError` again.

@@ -102,7 +102,8 @@ class Message(TypedDict):
 #: providers accept values outside this set (e.g. OpenAI's ``"minimal"``), and
 #: llmkit forwards the value without validating it, translating only where a
 #: provider needs a native request control (OpenRouter, OpenAI, Anthropic, Bedrock,
-#: Cerebras). Anthropic and Bedrock map disable to "none" and raise
+#: Cerebras, DeepSeek). DeepSeek maps disable to "none", the one value LiteLLM
+#: turns into thinking off there. Anthropic and Bedrock map disable to "none" and raise
 #: ReasoningEffortUnsupportedError on models LiteLLM flags as always-on;
 #: unknown metadata permits the translation. Use "low" for lowest explicit
 #: effort on always-on Claude. OpenAI omits the parameter for known non-reasoning

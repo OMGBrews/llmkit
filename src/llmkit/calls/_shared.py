@@ -216,8 +216,8 @@ def build_call_provider(
 ) -> LLMProviderInterface | None:
     """Resolve the provider for a call exactly once, best-effort.
 
-    A per-call ``provider`` override is returned unchanged; otherwise the
-    globally-configured provider is built a single time so the transport and
+    A ``provider`` passed for the call is returned unchanged; otherwise the
+    registered provider is built a single time so the transport and
     the log record share one instance — the default path no longer calls
     :func:`~llmkit.providers.build_provider` twice (once to run the call,
     again only to read ``.model``/``.name`` for the log). A build failure
@@ -562,9 +562,9 @@ def resolve_model_and_provider(
     When the caller passes ``model=None`` the provider's configured
     default is what actually ran — record that instead of ``null`` so
     cost attribution is a ``grep | sort | uniq -c`` over the logs, not a
-    code trace. An explicit ``provider`` (the per-call override) is used
+    code trace. An explicit ``provider`` (passed for the call) is used
     as-is so the log names the provider that *actually* ran, not the
-    globally-configured one. Best-effort: any failure resolving the
+    registered one. Best-effort: any failure resolving the
     provider degrades to ``(model, None)`` rather than breaking the log
     write — logging must never break the LLM call.
     """
@@ -628,8 +628,8 @@ def build_text_record(
     streaming surface instead passes the partial transcript). ``model``
     is resolved to
     the effective model (provider default substituted when the caller
-    passed ``None``); ``provider`` is the per-call override (``None`` uses
-    the globally-configured one) and names the provider the log records.
+    passed ``None``); ``provider`` is the one passed for the call (``None``
+    uses the registered one) and names the provider the log records.
     ``max_tokens``/``reasoning_effort`` are recorded as on the structured
     path, so the cap and thinking setting appear in the log for these calls
     too (both default ``None`` — absent from the request and unset on the

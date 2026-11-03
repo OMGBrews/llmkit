@@ -946,9 +946,45 @@ async def test_openai_reasoning_disable_live(model: str) -> None:
 async def test_deepseek_live() -> None:
     # Mode.JSON (not JSON_SCHEMA, which DeepSeek's API rejects) validates on
     # both deepseek-chat and deepseek-reasoner; the default smoke model is
-    # deepseek-chat (V3). reasoning_effort is omitted: it's only meaningful for
-    # deepseek-reasoner, and the provider forwards it when configured.
+    # deepseek-chat. reasoning_effort is omitted here; the disable translation
+    # is covered by test_deepseek_reasoning_disable_live.
     await _override_roundtrip(Provider.DEEPSEEK, _DEEPSEEK_MODEL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["deepseek-chat", "deepseek-reasoner"])
+async def test_deepseek_reasoning_disable_live(model: str) -> None:
+    """``"disable"`` turns DeepSeek thinking off on both model names.
+
+    LiteLLM's DeepSeek route enables thinking for every effort except
+    ``"none"``, so the provider translates ``"disable"`` to ``"none"``. Before
+    that translation, ``"disable"`` returned reasoning content on both models
+    (measured 2026-11-02). The responses are read at the transport, so this
+    checks the reasoning itself, not only that a valid answer came back.
+    """
+    real_acompletion = cast("Callable[..., Awaitable[object]]", litellm.acompletion)
+    responses: list[object] = []
+
+    async def _keep_response(**kwargs: object) -> object:
+        response = await real_acompletion(**kwargs)
+        responses.append(response)
+        return response
+
+    provider = make_provider(Provider.DEEPSEEK, model=model, **_live_credentials(Provider.DEEPSEEK))
+    with patch("llmkit._litellm.litellm.acompletion", _keep_response):
+        await _assert_structured_roundtrip(provider, reasoning_effort="disable")
+    assert responses, "no request reached litellm.acompletion"
+    for response in responses:
+        assert isinstance(response, litellm.ModelResponse), response
+        choice = response.choices[0]
+        assert isinstance(choice, litellm.Choices), choice
+        # LiteLLM deletes ``reasoning_content`` from the message when the
+        # provider returned none, so read it with a default.
+        reasoning: object = getattr(choice.message, "reasoning_content", None)
+        assert not reasoning, reasoning
+        usage: object = getattr(response, "usage", None)
+        details: object = getattr(usage, "completion_tokens_details", None)
+        assert not getattr(details, "reasoning_tokens", None), usage
 
 
 @pytest.mark.asyncio

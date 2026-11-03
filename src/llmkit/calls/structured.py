@@ -87,10 +87,9 @@ async def structured_llm_call[T: BaseModel](
             Claude 5.5-era models, Google's upcoming Gemini models), the
             request is re-issued once without it and the call record shows
             ``None``.
-        model: Optional model override (provider default when it resolves to
-            ``None``). *Dual-homed* — also settable on
-            :class:`~llmkit.LLMClientConfig`; this per-call value overrides
-            the config (with ``options`` sitting between, see ``options``).
+        model: Optional model override. Unset defers to ``options``, then
+            to the default model of the provider the call runs on (the
+            registered one, or ``provider=``), as does an explicit ``None``.
         timeout: Seconds for one provider round trip; unset or ``None`` sends
             no timeout keyword and leaves LiteLLM's default in effect.
         max_tokens: Optional cap on the completion length, forwarded to the
@@ -99,19 +98,21 @@ async def structured_llm_call[T: BaseModel](
             :func:`text_llm_call`.
         reasoning_effort: Optional per-call override of the provider's
             reasoning/thinking effort (``"disable" | "low" | "medium" |
-            "high"``; provider-native values are also accepted). Unset defers to ``options``, then to the value
-            configured on :class:`~llmkit.LLMClientConfig`; an explicit
-            value wins for this call. ``"disable"`` turns Gemini thinking
-            off so it doesn't consume the ``max_tokens`` budget.
-            *Dual-homed* like ``model``: per-call overrides ``options``
-            overrides config.
-        provider: Optional provider override for THIS call only. Unset (the
-            default) uses the globally-configured provider — so every
-            existing caller is unchanged. Pass an explicit provider (e.g. an
-            :class:`~llmkit.OpenRouterProvider` built from credentials) to
-            route a single call through a different provider family without
-            touching the app-wide :func:`~llmkit.configure_llm_client`
-            registration. The log records the provider that actually ran.
+            "high"``; provider-native values are also accepted). Unset defers
+            to ``options``, then to the ``reasoning_effort`` of the provider
+            the call runs on: the one built from
+            :class:`~llmkit.LLMClientConfig`, or the ``provider=`` instance
+            when one is passed. An explicit value wins for this call.
+            ``"disable"`` turns Gemini thinking off so it doesn't consume the
+            ``max_tokens`` budget.
+        provider: Optional provider for this call, for example one built
+            with :func:`~llmkit.make_provider`. Unset defers to ``options``,
+            then to the provider registered with
+            :func:`~llmkit.configure_llm_client`. Passing one switches this
+            call's provider the way ``model=`` switches its model, without
+            touching the registration, so one program can send calls to
+            several providers. The log records the provider that actually
+            ran.
         retry: Transient-error retry budget applied to this call. Resolves
             to :data:`~llmkit.DEFAULT_RETRY_POLICY` (retry the curated
             ``LLM_RECOVERABLE_ERRORS`` with full-jitter backoff) when
@@ -399,16 +400,16 @@ def structured_llm_call_sync[T: BaseModel](
     bounds sync fan-out across threads, with no separate calling-thread
     semaphore. ``max_tokens`` caps the completion length when set (parity with
     :func:`text_llm_call`); unset leaves it uncapped. ``reasoning_effort`` is
-    forwarded identically (unset defers to the configured
-    :class:`~llmkit.LLMClientConfig` value). ``retry`` is the transient-error
-    budget, inherited from the async path (default-on; pass
-    :data:`~llmkit.NO_RETRY` to opt out). ``cache`` is the same response-cache
-    opt-out (``False`` bypasses lookup and store). ``on_result`` is the same
-    semantic-validation re-roll hook the async call takes (raise
-    :class:`~llmkit.ResultValidationError` to reject a result and re-roll on the
-    validation budget). ``options`` is the same opt-in :class:`LLMCallOptions`
-    bundle the async call takes, with the same **config < options < explicit
-    keyword** precedence; every argument is forwarded untouched.
+    forwarded identically (unset defers to ``options``, then to the provider
+    the call runs on). ``retry`` is the transient-error budget, inherited from
+    the async path (default-on; pass :data:`~llmkit.NO_RETRY` to opt out).
+    ``cache`` is the same response-cache opt-out (``False`` bypasses lookup
+    and store). ``on_result`` is the same semantic-validation re-roll hook the
+    async call takes (raise :class:`~llmkit.ResultValidationError` to reject a
+    result and re-roll on the validation budget). ``options`` is the same
+    opt-in :class:`LLMCallOptions` bundle the async call takes, with the same
+    **config < options < explicit keyword** precedence; every argument is
+    forwarded untouched.
 
     ``timeout`` is seconds for one provider round trip; unset or ``None`` sends
     no timeout keyword. The sync bridge adds no whole-call ceiling: as on the

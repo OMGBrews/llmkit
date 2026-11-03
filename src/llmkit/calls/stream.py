@@ -85,7 +85,7 @@ async def text_llm_call_stream(
     ``reasoning_effort`` controls provider thinking tokens — parity with
     :func:`text_llm_call` and :func:`structured_llm_call`. Each is forwarded
     to the provider only when it resolves to a value (``reasoning_effort``
-    resolved against the configured :class:`~llmkit.LLMClientConfig` value
+    resolved against the ``reasoning_effort`` of the provider the call runs on
     when ``None``) and is recorded on the call's
     :class:`~llmkit.logging.LLMCallRecord`. ``temperature`` follows the same
     rule: unset resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``),
