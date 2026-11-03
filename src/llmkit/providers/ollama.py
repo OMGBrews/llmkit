@@ -41,7 +41,11 @@ class OllamaProvider(BaseProvider):
     sends its explicit off control, and a model that cannot stop thinking may
     ignore it. Measured 2026-11-02 against Ollama 0.40.11: ``deepseek-r1:8b``
     returned reasoning with ``think: false``, through llmkit and in a direct
-    ``/api/chat`` request. No list of always-thinking local models is kept.
+    ``/api/chat`` request. Measured 2026-11-03 against Ollama 0.40.13 with
+    ``gpt-oss:20b``: ``think: false`` still returned reasoning, ``think: "low"``
+    returned the least, and the literal ``think: "disable"`` LiteLLM would send
+    was rejected as an invalid value. No list of always-thinking local models
+    is kept.
     ``"lowest"`` therefore sends the off control too: off is the least
     reasoning this route can ask for.
     """

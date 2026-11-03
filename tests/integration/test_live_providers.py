@@ -424,15 +424,16 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
     assert_never(provider)
 
 
-# Gemini 2.5 (AI Studio *and* Google's Agent Platform) thinks by default; disable it so the smoke
-# call doesn't burn reasoning tokens on a trivial extraction. Claude routes also
-# exercise the portable disable translation. Other providers send nothing because
-# some models reject the knob outright.
+# Gemini (AI Studio *and* Google's Agent Platform) thinks by default, and the Gemini 3.1
+# defaults cannot turn it off, so "disable" raises there: send the portable "lowest" so the
+# smoke call doesn't burn reasoning tokens on a trivial extraction. Claude routes exercise
+# the portable disable translation, honoured on their defaults. Other providers send nothing
+# because some models reject the knob outright.
 _REASONING_EFFORT: dict[Provider, str] = {
     Provider.ANTHROPIC: "disable",
     Provider.BEDROCK: "disable",
-    Provider.GOOGLE: "disable",
-    Provider.VERTEX: "disable",
+    Provider.GOOGLE: "lowest",
+    Provider.VERTEX: "lowest",
 }
 
 
@@ -897,20 +898,41 @@ async def test_openrouter_live() -> None:
 
 @pytest.mark.asyncio
 async def test_openrouter_reasoning_effort_live() -> None:
-    """OpenRouter accepts native translated disable controls on Gemini.
+    """OpenRouter accepts the native controls the portable values translate to on Gemini.
 
-    The ids are deliberately hard-coded: Gemini 3.1 Flash-Lite exercises the
-    current default's mandatory-thinking ``minimal`` branch, while Gemini 2.5
-    Flash-Lite exercises OpenRouter's true ``none`` branch. The offline routing
-    tests capture the corresponding outgoing native bodies; this smoke proves
-    each reaches the gateway and returns visible structured output under the
-    small shared cap.
+    The ids are deliberately hard-coded: Gemini 3.1 Flash-Lite cannot turn
+    thinking off, so it runs ``"lowest"`` (OpenRouter ``minimal``), while Gemini
+    2.5 Flash-Lite runs ``"disable"`` (OpenRouter's true ``none``). The offline
+    routing tests capture the corresponding outgoing native bodies; this smoke
+    proves each reaches the gateway and returns visible structured output under
+    the small shared cap.
     """
-    for model in ("google/gemini-3.1-flash-lite", "google/gemini-2.5-flash-lite"):
+    for model, effort in (
+        ("google/gemini-3.1-flash-lite", "lowest"),
+        ("google/gemini-2.5-flash-lite", "disable"),
+    ):
         provider = make_provider(
             Provider.OPENROUTER, model=model, **_live_credentials(Provider.OPENROUTER)
         )
-        await _assert_structured_roundtrip(provider, reasoning_effort="disable")
+        await _assert_structured_roundtrip(provider, reasoning_effort=effort)
+
+
+@pytest.mark.asyncio
+async def test_gemini_2_disable_live() -> None:
+    """``"disable"`` is honoured on a Gemini 2.x id.
+
+    The default-model rows send ``"lowest"`` because Gemini 3.1 cannot turn
+    thinking off; this pins the path where ``"disable"`` reaches LiteLLM and
+    becomes ``thinkingBudget: 0``, measured rather than inferred. Google AI
+    Studio only: Vertex shares the same translation and LiteLLM transform
+    (pinned offline in ``test_gemini_thinking_level.py``), and its configured
+    residency location may serve no Gemini 2.x model (the ``us`` multi-region
+    did not, 2026-11-03).
+    """
+    built = make_provider(
+        Provider.GOOGLE, model="gemini-2.5-flash-lite", **_live_credentials(Provider.GOOGLE)
+    )
+    await _assert_structured_roundtrip(built, reasoning_effort="disable")
 
 
 @pytest.mark.asyncio

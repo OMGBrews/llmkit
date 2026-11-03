@@ -6,6 +6,13 @@ reasons. ``gemini-2.5-pro`` cannot either (Google documents it, and LiteLLM's
 model map does not flag it), so ``thinkingBudget: 0`` fails at the provider.
 The portable ``"disable"`` therefore raises before transport on those models,
 and ``"lowest"`` carries the least reasoning each one supports.
+
+Measured 2026-11-03: OpenRouter answered ``reasoning.effort: "none"`` on
+``google/gemini-2.5-pro`` with 400 "Reasoning is mandatory for this endpoint
+and cannot be disabled", and served ``"minimal"``. Google AI Studio no longer
+offers ``gemini-2.5-pro`` to new users, and the measuring Vertex location did
+not serve it, so the direct-route refusal rests on Google's documented model
+property.
 """
 
 import re

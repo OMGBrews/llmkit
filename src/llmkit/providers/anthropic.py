@@ -108,7 +108,7 @@ class AnthropicProvider(BaseProvider):
 
     @override
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
-        """Translate disable to none, rejecting models known to require thinking."""
+        """Translate disable and lowest, rejecting disable on models known to require thinking."""
         return reasoning_kwargs(effort, model, route="anthropic")
 
     @override

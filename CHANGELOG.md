@@ -86,6 +86,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: `reasoning_effort="disable"` turns thinking off or raises, on
+  every route; the new `"lowest"` replaces the old substitution.** On some
+  routes `"disable"` used to become a lower effort that still reasons, so
+  switching vendors could silently change how much a call reasoned and what
+  it cost. Now it either sends the route's off control or raises
+  `ReasoningEffortUnsupportedError` before transport, the cache and retries,
+  naming the model. **If you relied on the substitution, send `"lowest"`**:
+  the least reasoning the route supports, off where the model can turn
+  thinking off and its lowest effort otherwise, which is the old `"disable"`
+  translation under an honest name. `"disable"` now raises on:
+  - Google AI Studio and Vertex: Gemini 3 and later, including the default
+    `gemini-3.1-flash-lite`, and `gemini-2.5-pro` (previously LiteLLM's
+    lowest thinking level, silently). Vertex partner models are not covered
+    and forward the value unchanged.
+  - OpenRouter: Gemini 3 and later, including the default
+    `google/gemini-3.1-flash-lite`, and `google/gemini-2.5-pro` (previously
+    `"minimal"`).
+  - Cerebras: gpt-oss models, including the default `gpt-oss-120b`
+    (previously `"low"`).
+  - Ollama: gpt-oss models, whose literal `think: "disable"` the server
+    rejects. On other Ollama models llmkit sends the server's off control,
+    which a model that cannot stop thinking may ignore.
+
+  Anthropic, Bedrock and OpenAI already raised where they could not turn
+  thinking off; their errors now suggest `"lowest"` where it would work.
+  DeepSeek is unchanged. Third-party providers that do not override
+  `reasoning_kwargs` keep their behaviour, and receive `"lowest"` as
+  `"disable"`. `LLM_CACHE_KEY_VERSION` is now 4, so an answer cached while
+  `"disable"` was substituted is not replayed for a request that now turns
+  thinking off or raises.
+
 - **Breaking: `rate_limit_acquire_async` and `rate_limit_acquire_sync` take a
   `Provider` member or a provider instance, not a string.** A member joins
   the budget llmkit's own calls on that provider charge, and an instance joins
@@ -177,8 +208,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer and schemas that could not round-trip are cached too. A host
   provider whose mode answers outside the message content (such as
   `Mode.TOOLS`) has no answer text, so its answers are not cached. A stored entry that fails to decode is a miss with a
-  warning. `LLM_CACHE_KEY_VERSION` is 3, so entries stored by earlier
-  releases miss once. This corrects the 0.13.0 notes, which said a paid
+  warning. `LLM_CACHE_KEY_VERSION` is 4 (this release also moves it for the
+  `reasoning_effort` change above), so entries stored by earlier releases
+  miss once. This corrects the 0.13.0 notes, which said a paid
   answer equals its cache hit and that such a schema is never cached; neither
   held for every schema.
 

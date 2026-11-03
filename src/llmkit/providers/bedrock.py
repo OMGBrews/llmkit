@@ -80,8 +80,8 @@ class BedrockProvider(BaseProvider):
 
     ``reasoning_effort="disable"`` translates to LiteLLM's ``"none"``.
     Models LiteLLM flags as requiring thinking raise
-    :class:`~llmkit.ReasoningEffortUnsupportedError`; use ``"low"`` for their
-    lowest explicit effort. Unknown metadata permits the translation.
+    :class:`~llmkit.ReasoningEffortUnsupportedError`; ``"lowest"`` sends their
+    lowest effort, ``"low"``. Unknown metadata permits the translation.
     Other effort values are forwarded unchanged, with support decided by LiteLLM
     and the selected Bedrock model.
 
@@ -138,7 +138,7 @@ class BedrockProvider(BaseProvider):
 
     @override
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
-        """Translate disable to none, rejecting models known to require thinking."""
+        """Translate disable and lowest, rejecting disable on models known to require thinking."""
         return reasoning_kwargs(effort, model, route="bedrock")
 
     @override
