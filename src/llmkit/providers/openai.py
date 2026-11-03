@@ -84,10 +84,15 @@ class OpenAIProvider(BaseProvider):
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
         """Disable thinking only when the effective model's capabilities establish how.
 
-        Missing metadata is not evidence of non-reasoning. Native effort values
-        remain an explicit escape hatch and pass through without lookup.
+        ``"disable"`` sends ``"none"`` where supported, omits the parameter for
+        known non-reasoning models, and raises otherwise. ``"lowest"`` follows
+        the same branches; where off is unsupported it sends ``"minimal"`` or
+        ``"low"`` when the metadata flags one, and raises wherever ``"disable"``
+        would raise for any other reason. Missing metadata is not evidence of
+        non-reasoning, so nothing is sent blind. Native effort values remain an
+        explicit escape hatch and pass through without lookup.
         """
-        if effort != "disable":
+        if effort not in ("disable", "lowest"):
             return {"reasoning_effort": effort}
 
         import litellm
@@ -95,7 +100,7 @@ class OpenAIProvider(BaseProvider):
         unknown = ReasoningEffortUnsupportedError(
             f"{model!r}: cannot establish how to turn thinking off; model capabilities "
             + "are unknown or inconsistent. Choose a supported native reasoning_effort "
-            + 'explicitly, or remove the "disable" requirement.'
+            + f'explicitly, or remove the "{effort}" requirement.'
         )
         try:
             info = litellm.get_model_info(model, custom_llm_provider="openai")
@@ -140,10 +145,18 @@ class OpenAIProvider(BaseProvider):
             raise unknown from None
 
         if none is False or always_on is True:
+            native = "minimal" if minimal is True else "low" if low is True else None
+            if effort == "lowest" and native is not None:
+                return {"reasoning_effort": native}
             alternative = ' Choose a different model or remove the "disable" requirement.'
-            if minimal is True or low is True:
-                native = "minimal" if minimal is True else "low"
-                alternative = f' Send "{native}" explicitly for lower effort; it still reasons.'
+            if native is not None:
+                alternative = ' Send "lowest" for the least reasoning it supports.'
+            if effort == "lowest":
+                raise ReasoningEffortUnsupportedError(
+                    f"{model!r} cannot turn thinking off and flags no lowest effort; "
+                    + 'reasoning_effort="lowest" is not available on it. Choose a '
+                    + "supported native reasoning_effort explicitly."
+                )
             raise ReasoningEffortUnsupportedError(
                 f'{model!r} cannot turn thinking off; reasoning_effort="disable" is not '
                 + "available on it."

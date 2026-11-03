@@ -37,6 +37,7 @@ import pytest
 from pydantic import BaseModel
 
 from llmkit import _litellm
+from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers import (
     LLMClientConfig,
     LLMProviderInterface,
@@ -44,8 +45,8 @@ from llmkit.providers import (
     OpenRouterProvider,
     Provider,
     build_provider,
-    openrouter,
 )
+from llmkit.providers._gemini import is_gemini_3_or_newer_openrouter
 
 _ROUTING_PREF = {"provider": {"require_parameters": True}}
 
@@ -71,20 +72,44 @@ def test_config_build_keeps_require_parameters_on() -> None:
     assert provider.completion_kwargs()["extra_body"] == _ROUTING_PREF
 
 
-def test_reasoning_kwargs_use_openrouter_native_effort() -> None:
-    """Portable ``disable`` maps to each model family's lowest native control."""
+@pytest.mark.parametrize(
+    "model",
+    [
+        "google/gemini-3.5-flash",
+        "google/gemini-4-flash",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-pro-preview-06-05",
+    ],
+)
+def test_disable_raises_on_gemini_that_always_thinks(model: str) -> None:
+    """Gemini 3+ and 2.5 Pro cannot stop thinking: ``disable`` refuses before transport."""
     provider = OpenRouterProvider(api_key="k")
-    assert provider.reasoning_kwargs("disable", "google/gemini-3.5-flash") == {
-        "extra_body": {"reasoning": {"effort": "minimal"}}
-    }
-    assert provider.reasoning_kwargs("disable", "google/gemini-4-flash") == {
-        "extra_body": {"reasoning": {"effort": "minimal"}}
-    }
-    assert provider.reasoning_kwargs("disable", "google/gemini-2.5-flash-lite") == {
-        "extra_body": {"reasoning": {"effort": "none"}}
-    }
-    assert provider.reasoning_kwargs("xhigh", "google/gemini-2.5-flash-lite") == {
-        "extra_body": {"reasoning": {"effort": "xhigh"}}
+    with pytest.raises(
+        ReasoningEffortUnsupportedError, match=r'cannot turn thinking off.*"lowest"'
+    ):
+        _ = provider.reasoning_kwargs("disable", model)
+
+
+@pytest.mark.parametrize(
+    ("effort", "model", "native"),
+    [
+        ("disable", "google/gemini-2.5-flash-lite", "none"),
+        ("disable", "anthropic/claude-sonnet-4", "none"),
+        ("lowest", "google/gemini-3.5-flash", "minimal"),
+        ("lowest", "google/gemini-4-flash", "minimal"),
+        ("lowest", "google/gemini-2.5-pro", "minimal"),
+        ("lowest", "google/gemini-2.5-flash-lite", "none"),
+        ("lowest", "anthropic/claude-sonnet-4", "none"),
+        ("xhigh", "google/gemini-2.5-flash-lite", "xhigh"),
+    ],
+)
+def test_reasoning_kwargs_use_openrouter_native_effort(
+    effort: str, model: str, native: str
+) -> None:
+    """``disable`` sends ``none``; ``lowest`` the family's lowest native control."""
+    provider = OpenRouterProvider(api_key="k")
+    assert provider.reasoning_kwargs(effort, model) == {
+        "extra_body": {"reasoning": {"effort": native}}
     }
 
 
@@ -109,7 +134,7 @@ def test_reasoning_kwargs_use_openrouter_native_effort() -> None:
 def test_gemini_generation_check_mirrors_litellm(model: str, expected: bool) -> None:
     """The local predicate excludes only pre-Gemini-3 names, as LiteLLM does,
     so a later generation counts without a code change."""
-    assert openrouter._is_gemini_3_or_newer(model) is expected
+    assert is_gemini_3_or_newer_openrouter(model) is expected
 
 
 def test_routing_preference_threads_into_litellm_call() -> None:
@@ -192,20 +217,18 @@ def _assert_native_reasoning(captured: dict[str, object], effort: str) -> None:
 def test_structured_reasoning_uses_native_body_for_config_and_override() -> None:
     """Both resolution sources reach the structured wire in native form."""
     configured = OpenRouterProvider(
-        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="disable"
+        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="lowest"
     )
     _assert_native_reasoning(_drive_structured_call(configured), "minimal")
 
     override = OpenRouterProvider(api_key="k", model="google/gemini-3.5-flash")
-    _assert_native_reasoning(
-        _drive_structured_call(override, reasoning_effort="disable"), "minimal"
-    )
+    _assert_native_reasoning(_drive_structured_call(override, reasoning_effort="lowest"), "minimal")
 
 
 def test_text_and_stream_reasoning_use_native_body() -> None:
     """Both resolution sources reach the text and stream transports natively."""
     configured = OpenRouterProvider(
-        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="disable"
+        api_key="k", model="google/gemini-3.5-flash", reasoning_effort="lowest"
     )
     override = OpenRouterProvider(api_key="k", model="google/gemini-3.5-flash")
     captured: list[dict[str, object]] = []
@@ -225,7 +248,7 @@ def test_text_and_stream_reasoning_use_native_body() -> None:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))])
 
     async def _drive() -> None:
-        for provider, effort in ((configured, None), (override, "disable")):
+        for provider, effort in ((configured, None), (override, "lowest")):
             text, _cost, _usage = await _litellm.acompletion_text(
                 "hi", temperature=0.0, model=None, reasoning_effort=effort, provider=provider
             )

@@ -128,6 +128,7 @@ def test_build_provider_deepseek_defaults() -> None:
     ("effort", "expected"),
     [
         ("disable", "none"),
+        ("lowest", "none"),
         ("none", "none"),
         ("low", "low"),
         ("high", "high"),

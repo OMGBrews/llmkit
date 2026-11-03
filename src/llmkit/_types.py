@@ -97,20 +97,39 @@ class Message(TypedDict):
 
 
 #: The reasoning/thinking effort levels, mirroring LiteLLM's ``reasoning_effort``
-#: parameter: ``"disable"`` turns provider thinking off; ``"low"`` / ``"medium"``
-#: / ``"high"`` scale it. The trailing ``| str`` is a deliberate escape hatch —
-#: providers accept values outside this set (e.g. OpenAI's ``"minimal"``), and
-#: llmkit forwards the value without validating it, translating only where a
-#: provider needs a native request control (OpenRouter, OpenAI, Anthropic, Bedrock,
-#: Cerebras, DeepSeek). DeepSeek maps disable to "none", the one value LiteLLM
-#: turns into thinking off there. Anthropic and Bedrock map disable to "none" and raise
-#: ReasoningEffortUnsupportedError on models LiteLLM flags as always-on;
-#: unknown metadata permits the translation. Use "low" for lowest explicit
-#: effort on always-on Claude. OpenAI omits the parameter for known non-reasoning
-#: models and maps "disable" to "none" where model capabilities establish support.
-#: It raises ReasoningEffortUnsupportedError before transport if reasoning cannot
-#: be disabled or capabilities are unknown; it never substitutes a lower effort.
-#: Other OpenAI effort values pass through unchanged, without capability lookup.
+#: parameter, plus two portable values llmkit translates per route:
+#:
+#: - ``"disable"`` turns thinking off, or raises ReasoningEffortUnsupportedError
+#:   before transport on a model that cannot stop thinking. It never substitutes
+#:   a lower effort that still reasons.
+#: - ``"lowest"`` asks for the least reasoning the route supports: off where the
+#:   model can turn thinking off, else its lowest effort.
+#:
+#: ``"low"`` / ``"medium"`` / ``"high"`` scale thinking. Per route:
+#:
+#: - Google AI Studio and Vertex Gemini: ``disable`` raises on Gemini 3 and later
+#:   and on gemini-2.5-pro, else thinkingBudget 0; ``lowest`` sends LiteLLM's
+#:   ``disable`` (lowest thinking level, no thought summaries), or ``minimal``
+#:   on gemini-2.5-pro. Vertex partner models forward the value unchanged.
+#: - OpenRouter: ``disable`` raises on the same Gemini models, else ``none``;
+#:   ``lowest`` sends ``minimal`` there, else ``none``.
+#: - Anthropic and Bedrock: ``disable`` sends ``none`` and raises on models LiteLLM
+#:   flags as always-on (unknown metadata permits it); ``lowest`` sends ``low``
+#:   there, else ``none``.
+#: - OpenAI: ``disable`` sends ``none`` where capabilities establish support,
+#:   omits the parameter for known non-reasoning models, and raises otherwise;
+#:   ``lowest`` follows the same branches but sends ``minimal`` or ``low`` where
+#:   the metadata flags one and off is unsupported.
+#: - Cerebras: ``disable`` raises on gpt-oss, else ``none``; ``lowest`` sends
+#:   ``low`` on gpt-oss, else ``none``.
+#: - DeepSeek: both send ``none``, the one value LiteLLM turns into thinking off.
+#: - Ollama: ``disable`` raises on gpt-oss, else sends the server's off control,
+#:   which a model that cannot stop thinking may ignore; ``lowest`` sends ``low``
+#:   on gpt-oss, else the off control.
+#:
+#: The trailing ``| str`` is a deliberate escape hatch — providers accept values
+#: outside this set (e.g. OpenAI's ``"minimal"``), and llmkit forwards them
+#: without validating.
 #:
 #: This alias is **advisory, not enforcing**: under the type checker
 #: ``Literal[...] | str`` widens to ``str``, so it names and documents the
@@ -119,7 +138,7 @@ class Message(TypedDict):
 #: also reject the provider-specific values the non-validating design
 #: intentionally permits — so the open tail is the right trade for a thin,
 #: non-validating wrapper.
-type ReasoningEffort = Literal["disable", "low", "medium", "high"] | str
+type ReasoningEffort = Literal["disable", "lowest", "low", "medium", "high"] | str
 
 # ``Message`` deliberately stays closed for existing callers. Tool loops use
 # this union, which retains ordinary messages and adds the OpenAI-normalized

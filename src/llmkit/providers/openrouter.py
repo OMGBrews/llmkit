@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import re
 from typing import ClassVar, override
 
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers._gemini import (
+    cannot_disable_error,
+    is_always_thinking_gemini,
+    is_gemini_3_or_newer_openrouter,
+)
 from llmkit.providers.base import BaseProvider, LLMClientConfig, resolve_api_key
 
 #: OpenRouter's public API endpoint — the fallback when no ``base_url`` is
@@ -101,20 +105,23 @@ class OpenRouterProvider(BaseProvider):
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
         """Translate portable effort into OpenRouter's native ``reasoning`` body.
 
-        Gemini 3 and later require thinking, so their portable ``disable``
-        intent maps to OpenRouter's lowest supported effort, ``minimal`` (see
-        :func:`_is_gemini_3_or_newer`). Other OpenRouter models can receive
-        the explicit ``none`` control. Values outside the
-        portable aliases pass through: OpenRouter accepts additional native
-        levels and should reject an unsupported value itself.
+        ``"disable"`` sends OpenRouter's explicit ``none`` control, except on
+        Gemini 3 and later and on ``google/gemini-2.5-pro``, which cannot turn
+        thinking off: there it raises :class:`ReasoningEffortUnsupportedError`
+        before transport. ``"lowest"`` sends ``minimal`` on those models and
+        ``none`` elsewhere. Values outside the portable aliases pass through:
+        OpenRouter accepts additional native levels and should reject an
+        unsupported value itself.
         """
-        native_effort = (
-            "minimal"
-            if effort == "disable" and _is_gemini_3_or_newer(model)
-            else "none"
-            if effort == "disable"
-            else effort
-        )
+        always_thinks = is_gemini_3_or_newer_openrouter(model) or is_always_thinking_gemini(model)
+        if effort == "disable":
+            if always_thinks:
+                raise cannot_disable_error(model, why="this Gemini model always thinks")
+            native_effort = "none"
+        elif effort == "lowest":
+            native_effort = "minimal" if always_thinks else "none"
+        else:
+            native_effort = effort
         return {"extra_body": {"reasoning": {"effort": native_effort}}}
 
     @override
@@ -134,27 +141,3 @@ class OpenRouterProvider(BaseProvider):
             base_url=config.base_url or _DEFAULT_BASE_URL,
             reasoning_effort=config.reasoning_effort,
         )
-
-
-#: Gemini ids that predate Gemini 3: 1.x, 2.x, ``exp``, and the legacy bare
-#: ``pro``/``flash`` names (``gemini-pro-latest`` and ``gemini-flash-latest``
-#: are aliases that now resolve to Gemini 3+, so they are not excluded).
-#: Copied verbatim from LiteLLM 1.104.0's
-#: ``VertexGeminiConfig._is_gemini_3_or_newer``.
-_PRE_GEMINI_3_RE = re.compile(
-    r"^gemini-(?:[12](?:\.\d+)?|exp|(?:pro|flash)(?!-(?:lite-)?latest$))(?:-|$)"
-)
-
-
-def _is_gemini_3_or_newer(model: str) -> bool:
-    """Whether an OpenRouter model id names Gemini 3 or any later generation.
-
-    Reproduces LiteLLM 1.104.0's ``VertexGeminiConfig._is_gemini_3_or_newer`` rule — exclude only
-    the known pre-Gemini-3 names, so a future ``google/gemini-4-*`` counts without a code change —
-    rather than calling that private method, keeping this route independent of LiteLLM's Gemini
-    config. The id after the last ``/`` must start with ``gemini-`` (so ``google/gemma-*`` and
-    non-Google models never match). LiteLLM's fine-tuned-id clause is dropped: Gemini Enterprise
-    Agent Platform (formerly Vertex AI) numeric ids cannot occur here.
-    """
-    name = model.rsplit("/", 1)[-1].lower()
-    return name.startswith("gemini-") and _PRE_GEMINI_3_RE.match(name) is None

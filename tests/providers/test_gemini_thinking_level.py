@@ -37,8 +37,9 @@ from litellm.llms.vertex_ai.gemini import transformation as gemini_transformatio
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
-from llmkit import Provider, make_provider
+from llmkit import Provider, ReasoningEffortUnsupportedError, make_provider
 from llmkit._types import ReasoningEffort
+from llmkit.exceptions import LLM_RECOVERABLE_ERRORS
 from llmkit.providers import LLMProviderInterface
 
 #: raw-llm: the shared Gemini request-body builder, typed at the boundary: its
@@ -104,7 +105,7 @@ def _thinking_config(
 
 
 _ROUTES = [Provider.GOOGLE, Provider.VERTEX]
-_EFFORTS: list[ReasoningEffort] = ["low", "disable"]
+_EFFORTS: list[ReasoningEffort] = ["low", "lowest"]
 
 
 @pytest.mark.parametrize("effort", _EFFORTS)
@@ -118,7 +119,7 @@ def test_gemini_3_and_later_get_thinking_level(
     assert "thinkingBudget" not in thinking, thinking
 
 
-@pytest.mark.parametrize("effort", _EFFORTS)
+@pytest.mark.parametrize("effort", [*_EFFORTS, "disable"])
 @pytest.mark.parametrize("provider_enum", _ROUTES)
 def test_gemini_2_control_still_gets_thinking_budget(
     provider_enum: Provider, effort: ReasoningEffort
@@ -128,3 +129,73 @@ def test_gemini_2_control_still_gets_thinking_budget(
     thinking = _thinking_config(provider_enum, "gemini-2.5-flash", effort)
     assert "thinkingBudget" in thinking, thinking
     assert "thinkingLevel" not in thinking, thinking
+
+
+# --- Portable ``disable`` and ``lowest`` on the direct Gemini routes ---------------
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-pro",
+        "gemini-4-flash",
+        "gemini-flash-latest",
+        "learnlm-2.0-flash-experimental",
+        "gemini-2.5-pro",
+        "gemini-2.5-pro-preview-06-05",
+    ],
+)
+@pytest.mark.parametrize("provider_enum", _ROUTES)
+def test_disable_raises_where_gemini_always_thinks(provider_enum: Provider, model: str) -> None:
+    """``disable`` refuses before transport wherever LiteLLM would substitute a level.
+
+    ``learnlm-*`` counts because LiteLLM's own Gemini-3 test counts it, and the
+    transform that would run is LiteLLM's. ``gemini-2.5-pro`` cannot take a zero
+    budget.
+    """
+    provider = _build(provider_enum, model)
+    with pytest.raises(
+        ReasoningEffortUnsupportedError, match=r'cannot turn thinking off.*"lowest"'
+    ):
+        _ = provider.reasoning_kwargs("disable", model)
+    assert not isinstance(ReasoningEffortUnsupportedError(), LLM_RECOVERABLE_ERRORS)
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "expected"),
+    [
+        # Off where the model can stop thinking.
+        ("gemini-2.5-flash", "disable", {"thinkingBudget": 0, "includeThoughts": False}),
+        ("gemini-2.5-flash", "lowest", {"thinkingBudget": 0, "includeThoughts": False}),
+        ("gemini-2.0-flash-001", "lowest", {"thinkingBudget": 0, "includeThoughts": False}),
+        # Gemini 3+: the lowest level, with thought summaries off (not ``minimal``,
+        # which would turn them on).
+        (
+            "gemini-3.1-flash-lite",
+            "lowest",
+            {"thinkingLevel": "minimal", "includeThoughts": False},
+        ),
+        ("gemini-3.1-pro", "lowest", {"thinkingLevel": "low", "includeThoughts": False}),
+        ("gemini-4-flash", "lowest", {"thinkingLevel": "minimal", "includeThoughts": False}),
+        # gemini-2.5-pro: its minimum budget.
+        ("gemini-2.5-pro", "lowest", {"thinkingBudget": 128, "includeThoughts": True}),
+    ],
+)
+@pytest.mark.parametrize("provider_enum", _ROUTES)
+def test_portable_values_reach_the_gemini_wire(
+    provider_enum: Provider, model: str, effort: ReasoningEffort, expected: dict[str, object]
+) -> None:
+    assert _thinking_config(provider_enum, model, effort) == expected
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["claude-sonnet-4-6@20250929", "meta/llama-4-maverick-17b-128e-instruct-maas", "mistral-large"],
+)
+def test_vertex_partner_models_forward_the_flat_value(model: str) -> None:
+    """Partner models leave LiteLLM's Gemini transform, so the Gemini rule does not cover them."""
+    provider = _build(Provider.VERTEX, model)
+    assert provider.reasoning_kwargs("disable", model) == {"reasoning_effort": "disable"}
+    assert provider.reasoning_kwargs("lowest", model) == {"reasoning_effort": "disable"}
+    assert provider.reasoning_kwargs("high", model) == {"reasoning_effort": "high"}

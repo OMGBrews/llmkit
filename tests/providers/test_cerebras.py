@@ -23,6 +23,7 @@ from llmkit import (
     Provider,
     build_provider,
 )
+from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers import CerebrasProvider
 
 
@@ -131,13 +132,25 @@ def test_build_provider_rejects_unread_knobs(config: LLMClientConfig) -> None:
     ("effort", "model", "expected"),
     [
         ("disable", "qwen-3.8-27b", "none"),
-        ("disable", "gpt-oss-120b", "low"),
+        ("lowest", "qwen-3.8-27b", "none"),
+        ("lowest", "gpt-oss-120b", "low"),
+        ("lowest", "cerebras/gpt-oss-120b", "low"),
         ("low", "gpt-oss-120b", "low"),
         ("high", "qwen-3.8-27b", "high"),
         ("medium", "gpt-oss-120b", "medium"),
     ],
 )
-def test_reasoning_kwargs_translate_disable(effort: str, model: str, expected: str) -> None:
-    """``disable`` → ``none``, or ``low`` on gpt-oss, which rejects ``none`` (measured)."""
+def test_reasoning_kwargs_translate_portable_values(effort: str, model: str, expected: str) -> None:
+    """``disable`` and ``lowest`` → ``none``; ``lowest`` → ``low`` on gpt-oss, which rejects ``none``."""
     provider = CerebrasProvider(api_key="csk-test")
     assert provider.reasoning_kwargs(effort, model) == {"reasoning_effort": expected}
+
+
+@pytest.mark.parametrize("model", ["gpt-oss-120b", "cerebras/gpt-oss-120b"])
+def test_disable_raises_on_gpt_oss(model: str) -> None:
+    """gpt-oss cannot turn reasoning off, so ``disable`` refuses before transport."""
+    provider = CerebrasProvider(api_key="csk-test")
+    with pytest.raises(
+        ReasoningEffortUnsupportedError, match=r'cannot turn thinking off.*"lowest"'
+    ):
+        _ = provider.reasoning_kwargs("disable", model)

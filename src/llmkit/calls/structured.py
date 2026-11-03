@@ -97,14 +97,15 @@ async def structured_llm_call[T: BaseModel](
             byte-identical to the prior request). Parity with
             :func:`text_llm_call`.
         reasoning_effort: Optional per-call override of the provider's
-            reasoning/thinking effort (``"disable" | "low" | "medium" |
-            "high"``; provider-native values are also accepted). Unset defers
+            reasoning/thinking effort (``"disable" | "lowest" | "low" |
+            "medium" | "high"``; provider-native values are also accepted). Unset defers
             to ``options``, then to the ``reasoning_effort`` of the provider
             the call runs on: the one built from
             :class:`~llmkit.LLMClientConfig`, or the ``provider=`` instance
             when one is passed. An explicit value wins for this call.
-            ``"disable"`` turns Gemini thinking off so it doesn't consume the
-            ``max_tokens`` budget.
+            ``"lowest"`` keeps Gemini thinking to its minimum so it doesn't
+            consume the ``max_tokens`` budget; ``"disable"`` turns thinking off
+            or raises before transport on a model that cannot stop thinking.
         provider: Optional provider for this call, for example one built
             with :func:`~llmkit.make_provider`. Unset defers to ``options``,
             then to the provider registered with

@@ -226,3 +226,88 @@ def test_native_per_call_effort_overrides_configured_disable() -> None:
     assert captured["reasoning_effort"] == "future-value"
     assert captured["model"] == "openai/gateway-alias"
     lookup.assert_not_called()
+
+
+# --- Portable ``lowest``: the same capability branches as ``disable`` -------------
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-4.1-mini", {}),
+        ("gpt-5.1", {"reasoning_effort": "none"}),
+        ("gpt-5", {"reasoning_effort": "minimal"}),
+    ],
+)
+def test_lowest_follows_bundled_capabilities(model: str, expected: dict[str, str]) -> None:
+    provider = OpenAIProvider(api_key="test")
+    assert provider.reasoning_kwargs("lowest", model) == expected
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"supports_reasoning": False}, {}),
+        ({"supports_none_reasoning_effort": True}, {"reasoning_effort": "none"}),
+        (
+            {
+                "supports_reasoning": True,
+                "supports_none_reasoning_effort": False,
+                "supports_minimal_reasoning_effort": True,
+            },
+            {"reasoning_effort": "minimal"},
+        ),
+        (
+            {
+                "supports_reasoning": True,
+                "supports_none_reasoning_effort": False,
+                "supports_low_reasoning_effort": True,
+            },
+            {"reasoning_effort": "low"},
+        ),
+        (
+            {
+                "supports_reasoning": True,
+                "thinking_always_on": True,
+                "supports_low_reasoning_effort": True,
+            },
+            {"reasoning_effort": "low"},
+        ),
+    ],
+)
+def test_lowest_explicit_capabilities(
+    metadata: dict[str, object], expected: dict[str, str]
+) -> None:
+    provider = OpenAIProvider(api_key="test")
+    with patch("litellm.get_model_info", return_value=metadata):
+        assert provider.reasoning_kwargs("lowest", "test-model") == expected
+
+
+def test_disable_on_a_model_with_a_lower_effort_suggests_lowest() -> None:
+    provider = OpenAIProvider(api_key="test")
+    with pytest.raises(ReasoningEffortUnsupportedError, match=r'Send "lowest"'):
+        _ = provider.reasoning_kwargs("disable", "gpt-5")
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"supports_reasoning": True},
+        {"supports_reasoning": True, "supports_none_reasoning_effort": False},
+        {"supports_reasoning": False, "supports_minimal_reasoning_effort": True},
+        {"supports_none_reasoning_effort": True, "thinking_always_on": True},
+    ],
+)
+def test_lowest_raises_wherever_disable_raises_without_a_flagged_lower_effort(
+    metadata: dict[str, object],
+) -> None:
+    """Nothing is sent blind: an unknown or effort-less model refuses ``lowest`` too."""
+    provider = OpenAIProvider(api_key="test")
+    with (
+        patch("litellm.get_model_info", return_value=metadata),
+        patch("litellm.get_supported_openai_params", return_value=["temperature"]),
+    ):
+        for effort in ("disable", "lowest"):
+            with pytest.raises(ReasoningEffortUnsupportedError, match="test-model"):
+                _ = provider.reasoning_kwargs(effort, "test-model")

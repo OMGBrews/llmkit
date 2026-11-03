@@ -7,6 +7,7 @@ from typing import ClassVar, override
 import instructor
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers._gemini import direct_reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
     LLMClientConfig,
@@ -131,6 +132,20 @@ class GoogleProvider(BaseProvider):
         rationale behind the choice.
         """
         return self._instructor_mode
+
+    @override
+    def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
+        """Translate portable effort for LiteLLM's Gemini transform.
+
+        ``"disable"`` turns thinking off (``thinkingBudget: 0``) where the model
+        can, and raises :class:`~llmkit.exceptions.ReasoningEffortUnsupportedError`
+        before transport on Gemini 3 and later and on ``gemini-2.5-pro``, which
+        always think. ``"lowest"`` sends the least reasoning the model supports:
+        off where possible, else its lowest thinking level with thought
+        summaries off (``gemini-2.5-pro``: its minimum budget). Every model on
+        this route reaches the Gemini transform, so the rule covers every id.
+        """
+        return direct_reasoning_kwargs(effort, model)
 
     @override
     def completion_kwargs(self) -> dict[str, object]:

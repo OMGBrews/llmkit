@@ -24,6 +24,7 @@ def provider(request: pytest.FixtureRequest) -> LLMProviderInterface:
 
 def test_translate_and_pass_through(provider: LLMProviderInterface) -> None:
     assert provider.reasoning_kwargs("disable", provider.model) == {"reasoning_effort": "none"}
+    assert provider.reasoning_kwargs("lowest", provider.model) == {"reasoning_effort": "none"}
     for effort in ("low", "max", "future-value"):
         with patch("litellm.get_model_info") as lookup:
             assert provider.reasoning_kwargs(effort, provider.model) == {"reasoning_effort": effort}
@@ -37,8 +38,11 @@ def _always_on(provider: LLMProviderInterface) -> str:
 
 
 def test_always_on_bundled_model_map(provider: LLMProviderInterface) -> None:
-    with pytest.raises(ReasoningEffortUnsupportedError, match=r'cannot turn thinking off.*"low"'):
+    with pytest.raises(
+        ReasoningEffortUnsupportedError, match=r'cannot turn thinking off.*"lowest"'
+    ):
         _ = provider.reasoning_kwargs("disable", _always_on(provider))
+    assert provider.reasoning_kwargs("lowest", _always_on(provider)) == {"reasoning_effort": "low"}
     assert not isinstance(ReasoningEffortUnsupportedError(), LLM_RECOVERABLE_ERRORS)
 
 
@@ -52,6 +56,7 @@ def test_unknown_metadata_is_permissive(
     with patch("litellm.get_model_info", return_value=metadata) as lookup:
         assert provider.reasoning_kwargs("disable", "future-model") == {"reasoning_effort": "none"}
         lookup.assert_called_once_with("future-model", custom_llm_provider=route)
+        assert provider.reasoning_kwargs("lowest", "future-model") == {"reasoning_effort": "none"}
 
 
 def test_lookup_failure_is_permissive(provider: LLMProviderInterface) -> None:

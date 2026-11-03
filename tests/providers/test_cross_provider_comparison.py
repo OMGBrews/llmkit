@@ -25,8 +25,7 @@ router, and they translate ``"disable"`` differently. DeepSeek adds a route with
 different mode pin, so the mode assertion is not the same value five times.
 
 The Gemini pair is driven with ``"low"`` rather than ``"disable"``: ``"disable"``
-on Gemini 3 is substituted today and is slated to refuse instead, and this test
-must not pin either behaviour.
+raises before transport on Gemini 3, so it cannot drive a comparison there.
 """
 
 from __future__ import annotations
