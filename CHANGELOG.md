@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`describe_llm` describes a per-call provider and reports the route's
+  decisions.** `describe_llm(provider=...)` takes what a call's `provider=`
+  takes: a `Provider` member, built the way a call builds it (from its
+  environment variables and default model, after importing LiteLLM so a key in
+  `.env` is found), or an instance of one of llmkit's provider classes,
+  described as built. A plain string raises the `TypeError` a call raises, as
+  does an instance of any other class, a subclass of a shipped class included,
+  and passing both `config` and `provider`. `describe_llm()` and
+  `describe_llm(config)` are unchanged. `LLMInfo` gains `instructor_mode`,
+  `strict_json_schema`, `single_tool_call_per_schema` and
+  `supports_tool_choice`, read from the built instance, so Google or Gemini
+  Enterprise Agent Platform with `gemini_structured_output="json"` reports
+  `Mode.JSON`. The new fields default to `None` ("not reported"), so an
+  `LLMInfo` built with only its first five fields still constructs;
+  `describe_llm` fills every field.
+
 - **`provider=` takes a `Provider` member.** Every call function, its sync
   form and `LLMCallOptions.provider` accept `provider=Provider.ANTHROPIC`,
   which builds that provider for the call with `make_provider` from its

@@ -370,7 +370,7 @@ else:
     raise RuntimeError("Tool loop did not finish within five turns")
 ```
 
-Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally, in pydantic's strict JSON mode, and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. When that budget is spent it raises `StructuredOutputError`, the same type the structured lane raises. A final answer cut off by the output-token limit raises `OutputLimitError` and is not retried; a turn that requested tools keeps reporting its reason as `stop_reason`. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
+Use `describe_llm(config).compose_tools_schema`, or `describe_llm(provider=...).compose_tools_schema` for a per-call provider (both from `llmkit.providers`), to choose the optimization without using exceptions. Compose calls preserve the tool lane's retry, rate-limit, usage, and log behavior — including re-asking a round in which every requested call is malformed — and their log schema is `tools+<ModelName>`. The compose lane validates the final text locally, in pydantic's strict JSON mode, and retries a malformed final answer within `validation_max_attempts`; unlike the instructor-backed structured lane it has no repair prompt, so the complete tool history is re-sent on a retry. When that budget is spent it raises `StructuredOutputError`, the same type the structured lane raises. A final answer cut off by the output-token limit raises `OutputLimitError` and is not retried; a turn that requested tools keeps reporting its reason as `stop_reason`. Gemini's compose feature remains preview-only, so llmkit deliberately keeps it on the portable path; its `gemini_structured_output="json"` escape hatch is an instructor-mode setting and does not apply here.
 
 ### Choosing which tool the model calls
 
@@ -1450,8 +1450,36 @@ limiter's `rpm`, `tpm` and `max_concurrent` settings, though, are one setting fo
 all providers, so they stay as you tuned them for the old account. To
 confirm a switch before the first call, run `describe_llm(config)` (from
 `llmkit.providers`). It builds the provider, so a missing key, a missing extra,
-or a rejected field raises there, and it reports the provider and model the
-calls will use.
+or a rejected field raises there. It reports the provider and model the calls
+will use, and the decisions that travel with the switch: the structured-output
+mode (`instructor_mode`), whether the schema is sent strictly
+(`strict_json_schema`), whether a structured answer must arrive in one tool call
+(`single_tool_call_per_schema`), whether the route accepts `tool_choice`
+(`supports_tool_choice`), and whether it composes tools with a schema
+(`compose_tools_schema`):
+
+```python
+from llmkit.providers import LLMClientConfig, Provider, describe_llm
+
+info = describe_llm(LLMClientConfig(provider=Provider.DEEPSEEK))  # key from DEEPSEEK_API_KEY
+print(info.provider_name, info.model, info.instructor_mode)  # DeepSeek deepseek-chat Mode.JSON
+```
+
+A per-call provider is described the same way, by passing what the call passes
+as `provider=`: `describe_llm(provider=Provider.ANTHROPIC)` builds the provider
+a call with `provider=Provider.ANTHROPIC` uses, from its environment variables
+and default model, and `describe_llm(provider=make_provider(...))` describes
+that instance as built. It accepts only llmkit's own provider classes; a
+provider you define yourself, a subclass included, raises `TypeError`, and its
+decisions are its own `instructor_mode`, `strict_json_schema`,
+`single_tool_call_per_schema` and `supports_tool_choice` properties.
+
+The snapshot does not check everything a call will do. It does not resolve the
+routed model id, so a doubled prefix such as `"anthropic/claude-sonnet-4-6"` on
+`ANTHROPIC` is reported unchanged. It reports decisions made per route, not per
+model: Anthropic can still refuse a compose call for a model it cannot compose
+with, and the translation of `reasoning_effort="disable"` and `"lowest"` depends
+on the model.
 
 ### Switching provider per call
 
@@ -1571,7 +1599,8 @@ The accessor verbs are split by intent:
 
 - `build_provider(config)` / `make_provider(...)` **construct** a provider —
   from a config, or from raw credentials.
-- `describe_llm(config)` (importable from `llmkit.providers`) and
+- `describe_llm(config)` or `describe_llm(provider=...)` (importable from
+  `llmkit.providers`) and
   `get_rate_limit_config()` **read** effective state — a snapshot for
   display/telemetry; they construct nothing you keep.
 

@@ -129,7 +129,7 @@ def test_litellm_503_classifies_as_transport_once_litellm_imported() -> None:
 _MEMBER_ORDERING_CHILD = """
 import sys
 import llmkit
-import llmkit.calls._shared as shared
+import llmkit.providers as providers
 from llmkit import Provider, text_llm_call_sync
 
 seen = []
@@ -141,7 +141,7 @@ def spy(member, **_kwargs):
     seen.append("litellm" in sys.modules)
     raise Stop
 
-shared.make_provider = spy
+providers.make_provider = spy
 assert "litellm" not in sys.modules
 try:
     text_llm_call_sync("hi", feature="x", provider=Provider.OLLAMA)

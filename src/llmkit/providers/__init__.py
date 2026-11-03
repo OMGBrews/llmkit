@@ -18,6 +18,7 @@ never silently fall back to another provider.
 
 from __future__ import annotations
 
+import importlib
 from typing import Literal, assert_never
 
 from llmkit._types import ReasoningEffort
@@ -75,6 +76,13 @@ def _provider_class(provider: Provider) -> type[BaseProvider]:
     # a type error if a newly-added Provider member is missing its case, and it
     # raises loudly at runtime for any unwired value — never a silent fallback.
     assert_never(provider)
+
+
+# The inverse of :func:`_provider_class`, for :func:`describe_llm`: a built
+# instance does not record its member, so the member is recovered from the
+# instance's exact class. The exhaustiveness test guarantees the nine classes
+# are distinct, so the inverse is unambiguous.
+_MEMBER_BY_CLASS: dict[type[BaseProvider], Provider] = {_provider_class(m): m for m in Provider}
 
 
 def provider_display_name(provider: Provider) -> str:
@@ -242,27 +250,154 @@ def make_provider(
     return build_provider(config)
 
 
-def describe_llm(config: LLMClientConfig | None = None) -> LLMInfo:
-    """Read descriptive metadata for the active (or given) configuration.
+def coerce_call_provider(
+    value: LLMProviderInterface | Provider | None,
+) -> LLMProviderInterface | None:
+    """Turn a call's ``provider=`` into the instance it runs on, or refuse it.
+
+    Shared by every call and by :func:`describe_llm`, so ``describe_llm(provider=x)``
+    describes exactly the provider a call passing ``provider=x`` runs on.
+
+    A :class:`~llmkit.Provider` member is built with
+    :func:`~llmkit.make_provider` from environment credentials, after importing
+    LiteLLM: that import loads a ``.env`` file, so the first call of a process
+    sees a key kept there as every later call does. The build's own error (a
+    missing key, a missing extra) propagates, so a member that cannot be built
+    fails before any attempt rather than degrading to the registered provider
+    the way a call's global path does (``llmkit.calls._shared.build_call_provider``).
+
+    A plain string raises :class:`TypeError`: a call site is code that can
+    import the enum, so the string is refused rather than parsed. The member
+    test comes first because a ``StrEnum`` member is also a ``str``. Anything
+    else (an instance, or ``None``) is returned unchanged.
+    """
+    if isinstance(value, Provider):
+        # Importing the transport imports LiteLLM, which loads ``.env``; by
+        # name rather than ``import llmkit._litellm``, which would bind the
+        # package and close an import cycle through ``llmkit/__init__``.
+        _ = importlib.import_module("llmkit._litellm")
+        return make_provider(value)
+    if isinstance(value, str):
+        raise TypeError(_bare_provider_string_message(value))
+    return value
+
+
+def _bare_provider_string_message(value: str) -> str:
+    """The fix-naming message for a provider name passed as a plain string."""
+    head = f"provider= takes a Provider member or a built provider, not the string {value!r}: "
+    try:
+        member = Provider(value)
+    except ValueError:
+        expected = ", ".join(f"Provider.{m.name}" for m in Provider)
+        return (
+            head
+            + "pass a Provider member (one of "
+            + expected
+            + "), or make_provider(Provider.X, api_key=...) for a call that needs its own key."
+        )
+    return (
+        head
+        + f"pass Provider.{member.name}, or make_provider(Provider.{member.name}, api_key=...) "
+        + "for a call that needs its own key."
+    )
+
+
+def _member_for(instance: LLMProviderInterface | None) -> tuple[Provider, BaseProvider]:
+    """Recover the :class:`Provider` member of a shipped provider instance.
+
+    The match is on the exact class: a host's own provider, including a
+    subclass of a shipped class, is a route llmkit has not measured, so it has
+    no member and raises :class:`TypeError` naming the accepted inputs.
+    """
+    if isinstance(instance, BaseProvider):
+        member = _MEMBER_BY_CLASS.get(type(instance))
+        if member is not None:
+            return member, instance
+    shipped = ", ".join(cls.__name__ for cls in _MEMBER_BY_CLASS)
+    raise TypeError(
+        "describe_llm describes an LLMClientConfig passed as config, or a Provider "
+        + "member or an instance of a shipped provider class passed as provider= "
+        + f"(one of {shipped}); got an instance of {type(instance).__qualname__}, "
+        + "which llmkit has not measured. Read its decisions from the instance's own "
+        + "instructor_mode, strict_json_schema, single_tool_call_per_schema and "
+        + "supports_tool_choice properties."
+    )
+
+
+def _snapshot(member: Provider, instance: BaseProvider) -> LLMInfo:
+    """Fill every :class:`LLMInfo` field from a built shipped provider."""
+    return LLMInfo(
+        provider=member,
+        provider_name=instance.name,
+        model=instance.model,
+        is_local=instance.is_local,
+        compose_tools_schema=instance.compose_tools_schema,
+        instructor_mode=instance.instructor_mode,
+        strict_json_schema=instance.strict_json_schema,
+        single_tool_call_per_schema=instance.single_tool_call_per_schema,
+        supports_tool_choice=instance.supports_tool_choice,
+    )
+
+
+def describe_llm(
+    config: LLMClientConfig | None = None,
+    *,
+    provider: Provider | LLMProviderInterface | None = None,
+) -> LLMInfo:
+    """Describe the provider a call would use, and the decisions it makes.
 
     A *read* accessor (``get_*``/``describe_*`` semantics), distinct from the
-    ``build_*`` / ``make_*`` constructors: it builds a provider only to read
-    back the resolved provider + model for display/telemetry.
+    ``build_*`` / ``make_*`` constructors: it reads back the resolved provider
+    and model, plus the route's correctness decisions (how a structured answer
+    is requested and checked), without making a call.
+
+    Three inputs, matching what a call can run on:
+
+    - No argument: the config registered with :func:`configure_llm_client`.
+    - ``config``: that config, built with :func:`build_provider`, so a missing
+      key, a missing extra or a rejected field raises here, before any call.
+    - ``provider=``: the same values a call's ``provider=`` takes. A
+      :class:`Provider` member is built the way a call builds it, with
+      :func:`make_provider` from environment credentials after importing
+      LiteLLM (which loads ``.env``), so it reports that provider's default
+      model, not the registered config's. An instance of a shipped provider
+      class is described as built. A plain string raises the
+      :class:`TypeError` a call raises.
+
+    The snapshot does not resolve the routed model id, and it does not report
+    decisions made per model rather than per route, such as Anthropic's
+    compose guard or how ``reasoning_effort="disable"`` and ``"lowest"`` are
+    translated.
+
+    Args:
+        config: Explicit config to describe. When ``None`` and ``provider`` is
+            not given, the registered config is described.
+        provider: A :class:`Provider` member or a built instance of a shipped
+            provider class to describe instead of a config.
 
     Returns:
-        :class:`LLMInfo` snapshot of the resolved provider + model.
+        :class:`LLMInfo` with every field filled.
+
+    Raises:
+        TypeError: If both ``config`` and ``provider`` are given, if
+            ``provider`` is a plain string, or if it is an instance of a class
+            llmkit does not ship (a host subclass of a shipped class included).
+        ValueError: If the provider cannot be built, such as a bearer provider
+            with no key configured.
     """
+    if provider is not None:
+        if config is not None:
+            raise TypeError(
+                "describe_llm takes a config or a provider=, not both: pass the "
+                + "config to describe the program-wide setting, or provider= to "
+                + "describe what a call with that provider= uses."
+            )
+        member, shipped = _member_for(coerce_call_provider(provider))
+        return _snapshot(member, shipped)
+
     if config is None:
         config = active_config()
-    provider = build_provider(config)
-
-    return LLMInfo(
-        provider=config.provider,
-        provider_name=provider.name,
-        model=provider.model,
-        is_local=provider.is_local,
-        compose_tools_schema=provider.compose_tools_schema,
-    )
+    return _snapshot(config.provider, build_provider(config))
 
 
 __all__ = [

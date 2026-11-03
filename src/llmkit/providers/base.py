@@ -911,11 +911,33 @@ class BaseProvider(ABC):
 
 @dataclass
 class LLMInfo:
-    """Descriptive metadata about the active LLM configuration.
+    """Descriptive metadata about a provider and its route decisions.
 
-    A read-only snapshot for display/telemetry (provider name, model,
-    locality) — distinct from :class:`LLMClientConfig`, which carries the
-    credentials used to *construct* a provider.
+    A read-only snapshot for display/telemetry, returned by
+    :func:`~llmkit.providers.describe_llm` for a config, a :class:`Provider`
+    member or a built shipped provider — distinct from :class:`LLMClientConfig`,
+    which carries the credentials used to *construct* a provider.
+
+    Beyond the provider, display name, model and locality, it reports the
+    route's correctness decisions, the ones that travel with a switch of
+    provider, read from the built instance (so Google or Gemini Enterprise
+    Agent Platform with ``gemini_structured_output="json"`` reports
+    ``Mode.JSON``):
+
+    - ``compose_tools_schema``: whether the route has a measured, stable
+      combined tools + schema request.
+    - ``instructor_mode``: the instructor mode that pins how a structured
+      answer is requested and parsed.
+    - ``strict_json_schema``: whether structured requests upgrade
+      ``response_format`` to strict enforcement.
+    - ``single_tool_call_per_schema``: whether structured requests forbid
+      splitting the schema across tool calls (``parallel_tool_calls=False``).
+    - ``supports_tool_choice``: whether the route accepts LiteLLM's
+      ``tool_choice`` control.
+
+    The four decision fields after ``compose_tools_schema`` default to
+    ``None``, meaning "not reported", so an ``LLMInfo`` built with only the
+    first five fields still constructs. ``describe_llm`` fills every field.
     """
 
     provider: Provider
@@ -923,3 +945,7 @@ class LLMInfo:
     model: str
     is_local: bool
     compose_tools_schema: bool
+    instructor_mode: instructor.Mode | None = None
+    strict_json_schema: bool | None = None
+    single_tool_call_per_schema: bool | None = None
+    supports_tool_choice: bool | None = None
