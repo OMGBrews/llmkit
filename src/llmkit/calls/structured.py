@@ -30,7 +30,7 @@ from llmkit.capture import record_call_async
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy
 from llmkit.run_scope import get_run_id
@@ -49,7 +49,7 @@ async def structured_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,
@@ -106,8 +106,13 @@ async def structured_llm_call[T: BaseModel](
             ``"lowest"`` keeps Gemini thinking to its minimum so it doesn't
             consume the ``max_tokens`` budget; ``"disable"`` turns thinking off
             or raises before transport on a model that cannot stop thinking.
-        provider: Optional provider for this call, for example one built
-            with :func:`~llmkit.make_provider`. Unset defers to ``options``,
+        provider: Optional provider for this call: a
+            :class:`~llmkit.Provider` member, built for the call from the
+            provider's environment variables, or an instance built with
+            :func:`~llmkit.make_provider` when the call needs its own key or
+            model. A plain string raises ``TypeError`` naming the member, and
+            a member that cannot be built (a missing key or extra) raises
+            that error, both before the first attempt. Unset defers to ``options``,
             then to the provider registered with
             :func:`~llmkit.configure_llm_client`. Passing one switches this
             call's provider the way ``model=`` switches its model, without
@@ -383,7 +388,7 @@ def structured_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
-    provider: LLMProviderInterface | None | Unset = UNSET,
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,

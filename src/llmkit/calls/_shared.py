@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import importlib
 import inspect
 import json
 import logging
@@ -59,7 +60,7 @@ from llmkit.exceptions import (
 )
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider, make_provider
 from llmkit.providers.base import active_config, client_configured
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
@@ -211,12 +212,62 @@ def compose_validation_budget(retry: RetryPolicy) -> tuple[type[BaseException], 
     return (*tool_validation_budget(retry), StructuredOutputError)
 
 
+def coerce_call_provider(
+    value: LLMProviderInterface | Provider | None,
+) -> LLMProviderInterface | None:
+    """Turn a call's ``provider=`` into the instance it runs on, or refuse it.
+
+    A :class:`~llmkit.Provider` member is built with
+    :func:`~llmkit.make_provider` from environment credentials, after importing
+    LiteLLM: that import loads a ``.env`` file, so the first call of a process
+    sees a key kept there as every later call does. The build's own error (a
+    missing key, a missing extra) propagates, so a member that cannot be built
+    fails before any attempt rather than degrading to the registered provider
+    the way the global path does in :func:`build_call_provider`.
+
+    A plain string raises :class:`TypeError`: a call site is code that can
+    import the enum, so the string is refused rather than parsed. The member
+    test comes first because a ``StrEnum`` member is also a ``str``. Anything
+    else (an instance, or ``None``) is returned unchanged.
+    """
+    if isinstance(value, Provider):
+        # Importing the transport imports LiteLLM, which loads ``.env``; by
+        # name rather than ``import llmkit._litellm``, which would bind the
+        # package and close an import cycle through ``llmkit/__init__``.
+        _ = importlib.import_module("llmkit._litellm")
+        return make_provider(value)
+    if isinstance(value, str):
+        raise TypeError(_bare_provider_string_message(value))
+    return value
+
+
+def _bare_provider_string_message(value: str) -> str:
+    """The fix-naming message for a provider name passed as a plain string."""
+    head = f"provider= takes a Provider member or a built provider, not the string {value!r}: "
+    try:
+        member = Provider(value)
+    except ValueError:
+        expected = ", ".join(f"Provider.{m.name}" for m in Provider)
+        return (
+            head
+            + "pass a Provider member (one of "
+            + expected
+            + "), or make_provider(Provider.X, api_key=...) for a call that needs its own key."
+        )
+    return (
+        head
+        + f"pass Provider.{member.name}, or make_provider(Provider.{member.name}, api_key=...) "
+        + "for a call that needs its own key."
+    )
+
+
 def build_call_provider(
     provider: LLMProviderInterface | None,
 ) -> LLMProviderInterface | None:
     """Resolve the provider for a call exactly once, best-effort.
 
-    A ``provider`` passed for the call is returned unchanged; otherwise the
+    A ``provider`` passed for the call arrives here already an instance (see
+    :func:`coerce_call_provider`) and is returned unchanged; otherwise the
     registered provider is built a single time so the transport and
     the log record share one instance — the default path no longer calls
     :func:`~llmkit.providers.build_provider` twice (once to run the call,
@@ -249,7 +300,11 @@ class PreparedCall(NamedTuple):
     Attributes:
         args: the merged per-call arguments (config < options < keyword).
         provider: the provider instance this call runs on, built exactly once
-            so the transport and every attempt's log record share it.
+            so the transport and every attempt's log record share it: a
+            per-call instance as given, one built from a per-call
+            :class:`~llmkit.Provider` member, the registered provider, or
+            ``None`` when the registered build failed (the transport then
+            surfaces that error).
         call_id: one ``uuid4`` hex per *logical* call. Every retry attempt
             shares it and numbers itself, so the N records a retried call
             produces join on ``call_id`` rather than on feature + timestamp
@@ -276,7 +331,7 @@ def prepare_call(
     max_tokens: int | None | Unset,
     reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
-    provider: LLMProviderInterface | None | Unset,
+    provider: LLMProviderInterface | Provider | None | Unset,
     feature: str,
     label: str | None,
     cache: bool | Unset = UNSET,
@@ -299,6 +354,11 @@ def prepare_call(
     first ``__anext__``, in the consumer's task — a read of the loop's scope,
     never a write.
 
+    A per-call ``provider`` is coerced here by :func:`coerce_call_provider`,
+    before the not-configured check and before the call is claimed from an
+    enclosing retry loop, so a refused string or a member that cannot be built
+    raises before any attempt is made, logged or counted.
+
     *cache* is passed by the families that read the response cache — the two
     buffered ones and the streamed text family; the tool families leave it
     unset.
@@ -314,13 +374,16 @@ def prepare_call(
         provider=provider,
         cache=cache,
     )
-    if args.provider is None and not client_configured():
+    # Before the claim: inside an outer with_retries a claim counts an attempt,
+    # so an error raised after it would count a phantom one.
+    call_provider = coerce_call_provider(args.provider)
+    if call_provider is None and not client_configured():
         # The one piece of setup a call needs, missing: fail before any attempt
         # is made or logged, naming it. Other provider build failures keep the
         # best-effort path below.
         _ = active_config()
     call_id, attempt_offset = claim_logical_call(feature, label)
-    return PreparedCall(args, build_call_provider(args.provider), call_id, attempt_offset)
+    return PreparedCall(args, build_call_provider(call_provider), call_id, attempt_offset)
 
 
 async def run_with_policy[T](

@@ -160,7 +160,7 @@ default — see [Where the logs go](#where-the-logs-go).
 
 > **Two defaults worth knowing up front.**
 > - **llmkit sends no `temperature` unless you set one.** A call that sets none anywhere hands LiteLLM **no `temperature` field at all**, so the provider's own default sampling applies; pass a number (e.g. `temperature=0.0`) to choose one, and it is forwarded. Some models take no temperature (GPT-5 models with reasoning active, Claude 5.5-era models, and Google's upcoming Gemini models): when LiteLLM or the provider refuses yours as unsupported, llmkit re-issues the request once without it, logs a warning the first time each model refuses, and the call record shows `temperature: null`, so no host needs LiteLLM's global `drop_params`. LiteLLM itself still adds a temperature on Gemini 3 routes — see [Provider-default sampling](#provider-default-sampling-temperaturenone).
-> - **Any call switches provider with one argument, as it switches model.** `provider=make_provider(Provider.ANTHROPIC)` sends that call to Anthropic and leaves the registration above alone, so one program can compare several vendors on the same prompt. See [Switching provider per call](#switching-provider-per-call).
+> - **Any call switches provider with one argument, as it switches model.** `provider=Provider.ANTHROPIC` sends that call to Anthropic and leaves the registration above alone, so one program can compare several vendors on the same prompt. See [Switching provider per call](#switching-provider-per-call).
 
 Switching this whole program to Ollama, or to a provider whose key is already
 in its own environment variable, is one field: change `provider=`. The new
@@ -507,11 +507,11 @@ Both halves are pinned by tests: `tests/providers/test_gemini_tool_schema_transp
 The call functions (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) take a block of per-call keyword arguments. When a feature module makes many calls with the same settings, repeating that block at every site is noise. Build an `LLMCallOptions` once and pass it as `options=`:
 
 ```python
-from llmkit import LLMCallOptions, Provider, make_provider, structured_llm_call
+from llmkit import LLMCallOptions, Provider, structured_llm_call
 
 # Built once per feature module.
 RISK_OPTS = LLMCallOptions(
-    provider=make_provider(Provider.GOOGLE),
+    provider=Provider.GOOGLE,
     temperature=0.0,
     model="gemini-2.5-flash",
     reasoning_effort="high",
@@ -526,7 +526,7 @@ async def extract(prompt: str) -> RiskRegister:
 
 `LLMCallOptions` is **frozen** and carries any subset of `temperature` / `model` / `max_tokens` / `reasoning_effort` / `retry` / `provider` / `timeout` / `cache` (the last read by the buffered families and both forms of the text stream; see [Response cache](#response-cache)). The tool calls never read the response cache, so they ignore an options bundle's `cache` field; that is what lets one bundle serve every call a feature module makes. Every field is optional and *unset* by default — an unset field defers to the call's keyword (and through it to the provider the call runs on), so a partially-filled `LLMCallOptions` only supplies the fields you set. Like the call keywords, `temperature` accepts `None` (`LLMCallOptions(temperature=None)`), which requests the provider's default sampling — the same as leaving it unset.
 
-The bundle sets `provider` beside `model` because a model id is spelled for one route (`gemini-2.5-flash` is the Google AI Studio and Google's Agent Platform spelling), so the route and its id travel together. `make_provider` reads `GEMINI_API_KEY` when the module is imported, so a key kept only in `.env` must be loaded before then; see [Switching provider per call](#switching-provider-per-call).
+The bundle sets `provider` beside `model` because a model id is spelled for one route (`gemini-2.5-flash` is the Google AI Studio and Google's Agent Platform spelling), so the route and its id travel together. A member is built for each call from `GEMINI_API_KEY`, read then, so a key kept in `.env` is found; see [Switching provider per call](#switching-provider-per-call).
 
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
@@ -538,7 +538,7 @@ The flat-keyword path is unchanged — pass no `options` and nothing about exist
 
 **config < `options` < explicit per-call keyword**
 
-A call that passes `provider=` takes the lowest layer from that provider instead: its own `model` and `reasoning_effort` (as given to `make_provider` or `build_provider`), not the registered config's.
+A call that passes `provider=` takes the lowest layer from that provider instead: its own `model` and `reasoning_effort` (as given to `make_provider` or `build_provider`, or the provider's defaults for a `Provider` member), not the registered config's.
 
 So a value passed directly as a keyword wins — *any* passed value, including `None` or one equal to the documented default. The call functions' mergeable keywords default to the `UNSET` sentinel rather than to real values, so "was it passed" is a structural fact, never inferred by comparing values: `structured_llm_call(..., temperature=0.2, options=LLMCallOptions(temperature=0.9))` runs at `0.2`, and an explicit `model=None` forces the provider/config default even when `options` carries a model. The same holds for `temperature=None`: it overrides a numeric `options` value (`structured_llm_call(..., temperature=None, options=LLMCallOptions(temperature=0.9))` sends no `temperature` field), and a numeric `LLMCallOptions(temperature=0.9)` is used when the keyword is unset. An `LLMCallOptions` field sits between the keyword and the config; when neither the keyword nor `options` supplies a value, the true default applies (`DEFAULT_TEMPERATURE`, `DEFAULT_RETRY_POLICY`, or, for `model`/`reasoning_effort`, the provider the call runs on: the registered config's, or a per-call `provider=`'s own). The same precedence applies to `timeout`: `timeout=5.0` overrides `LLMCallOptions(timeout=30.0)`, while explicit `timeout=None` overrides the options value and sends no timeout. An *unset* `LLMCallOptions` field never overrides config — only a field you explicitly set on the options participates.
 
@@ -1135,7 +1135,7 @@ configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
+    provider: Provider               # a member: OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
     base_url: str | None = None      # endpoint: config, else the provider's env var if it reads one, else its default if it has one (sent as api_base; see below); not accepted by Bedrock or Google's Agent Platform
@@ -1170,6 +1170,16 @@ and location; each comes from the config or, when unset, from the environment.
 See [their setup and endpoint caveats](#bedrock-and-vertex-do-not-own-their-endpoints).
 To run the same model on another route, see
 [Switching provider for a whole program](#switching-provider-for-a-whole-program).
+
+**`provider` takes a member, and a name read from settings is parsed first.**
+`Provider(value)` ignores case, so `Provider("Ollama")` is `Provider.OLLAMA`,
+and an unknown name raises `ValueError` listing every member. A string passed
+to `LLMClientConfig` (or `make_provider`) unparsed raises `TypeError` at
+construction, naming `Provider(value)`:
+
+```python
+config = LLMClientConfig(provider=Provider(settings["llm_provider"]))
+```
 
 **Populating a knob the selected provider does not read is rejected, not
 ignored.** Each provider declares which provider-shaped fields it honours, and
@@ -1446,20 +1456,28 @@ calls will use.
 ### Switching provider per call
 
 A call takes `provider=` the way it takes `model=`: one argument sends that call
-to another provider, model, or credential and leaves the registered config
-alone. `make_provider` builds the provider straight from raw credentials, with
-no `LLMClientConfig` and no module-level config source:
+to another provider and leaves the registered config alone. A `Provider` member
+is built for that call from the provider's environment variables and its own
+default model:
 
 ```python
-from llmkit import make_provider, structured_llm_call_sync, Provider
+from llmkit import Provider, structured_llm_call_sync
 
 result = structured_llm_call_sync(
     prompt,
     output_schema=MyModel,
     feature="summarize",
-    provider=make_provider(Provider.ANTHROPIC),  # key from ANTHROPIC_API_KEY
+    provider=Provider.ANTHROPIC,  # key from ANTHROPIC_API_KEY
 )
 ```
+
+When the call needs its own key, model or other knob, build the provider with
+`make_provider` and pass the instance instead, with no `LLMClientConfig` and no
+module-level config source: `provider=make_provider(Provider.ANTHROPIC,
+api_key=key)`. A provider name as a plain string
+(`provider="anthropic"`) raises `TypeError` naming the member to pass. A member
+whose key or extra is missing raises that error before the first attempt; the
+call never falls back to the registered provider.
 
 **Comparing vendors side by side.** Because each call names its own provider,
 one program can send the same prompt to several vendors and keep every answer.
@@ -1468,13 +1486,13 @@ No `configure_llm_client(...)` is needed when every call passes `provider=`:
 ```python
 import asyncio
 
-from llmkit import Provider, make_provider, structured_llm_call
+from llmkit import LLMProviderInterface, Provider, make_provider, structured_llm_call
 
 # Each key comes from its provider's own environment variable.
-contenders = {
-    "anthropic": make_provider(Provider.ANTHROPIC),
-    "openai": make_provider(Provider.OPENAI),
-    "gemini": make_provider(Provider.GOOGLE),
+contenders: dict[str, Provider | LLMProviderInterface] = {
+    "anthropic": Provider.ANTHROPIC,
+    "openai": Provider.OPENAI,
+    "gemini": Provider.GOOGLE,
     "claude-via-openrouter": make_provider(
         Provider.OPENROUTER, model="anthropic/claude-sonnet-4.6"
     ),
@@ -1498,10 +1516,12 @@ also share cached answers, because the cache key leaves credentials out, so pass
 `cache=False` when comparing accounts or run-to-run variation.
 
 These providers do not inherit the registered config's `reasoning_effort`; pass
-it to `make_provider` or on the call. `make_provider` reads each key when it
-runs, and llmkit sees a `.env` file only once its first call imports LiteLLM, so
-a host whose keys live in `.env` loads it first (for example with
-python-dotenv's `load_dotenv()`).
+it to `make_provider` or on the call. A member passed per call is built after
+llmkit imports LiteLLM, which loads a `.env` file, so it finds a key kept there
+on every call. `make_provider` reads each key when it runs, and llmkit sees a
+`.env` file only once its first call imports LiteLLM, so a host that builds
+providers with `make_provider` before its first call and keeps its keys in
+`.env` loads the file first (for example with python-dotenv's `load_dotenv()`).
 
 `make_provider` takes the same knobs as `LLMClientConfig`, and — like
 `build_provider` — **rejects** any that the selected provider does not read
@@ -1752,7 +1772,7 @@ Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait 
 ### What the fake does not see
 
 - **Cache hits and shared in-flight requests.** The [response cache](#response-cache) sits above the fake. A hit never reaches it, and an identical buffered request that joins one already in flight shares that one round trip. Configure no cache, or pass `cache=False`, when a test counts requests.
-- **Calls with no configured provider.** The provider is resolved before the round trip, and a key-based provider raises without its key. Configure one that needs none, such as Ollama, or give the provider a placeholder key.
+- **Calls with no configured provider.** The provider is resolved before the round trip, and a key-based provider raises without its key. Configure one that needs none, such as Ollama, or give the provider a placeholder key. A `Provider` member passed as `provider=` is built from the environment, so a key-based member needs its variable set under test (`monkeypatch.setenv("OPENAI_API_KEY", "placeholder")`); `provider=Provider.OLLAMA` needs nothing.
 - **Timeout enforcement.** A fake answers before LiteLLM is reached, so `timeout` never fires under it. A `Reply(delay=...)` longer than the request timeout still returns normally.
 - **Mid-stream failures.** A fake can fail a streaming call before its first chunk, not partway through.
 

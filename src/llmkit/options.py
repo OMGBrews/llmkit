@@ -26,7 +26,7 @@ from enum import Enum
 from typing import override
 
 from llmkit._types import ReasoningEffort
-from llmkit.providers import LLMProviderInterface
+from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
 
@@ -116,9 +116,12 @@ class LLMCallOptions:
             provider the call runs on (the registered one, or ``provider``).
         retry: Transient-error retry budget. Unset defers to the per-call
             ``retry`` keyword (:data:`~llmkit.DEFAULT_RETRY_POLICY`).
-        provider: Provider for the call, for example one built with
-            :func:`~llmkit.make_provider`. Unset defers to the per-call
-            ``provider`` keyword, then to the registered provider.
+        provider: Provider for the call: a :class:`~llmkit.Provider` member,
+            built from environment credentials for the call, or an instance
+            from :func:`~llmkit.make_provider` when the call needs its own key
+            or model. A plain string such as ``"openai"`` raises
+            ``TypeError``. Unset defers to the per-call ``provider`` keyword,
+            then to the registered provider.
         cache: Whether the call reads and writes the configured response
             cache (:func:`~llmkit.configure_llm_cache`). Unset defers to the
             per-call ``cache`` keyword, then to ``True``; ``False`` bypasses
@@ -135,7 +138,7 @@ class LLMCallOptions:
     max_tokens: int | None | Unset = UNSET
     reasoning_effort: ReasoningEffort | None | Unset = UNSET
     retry: RetryPolicy | Unset = UNSET
-    provider: LLMProviderInterface | None | Unset = UNSET
+    provider: LLMProviderInterface | Provider | None | Unset = UNSET
     cache: bool | Unset = UNSET
     timeout: float | None | Unset = UNSET
 
@@ -169,7 +172,7 @@ class ResolvedCallArgs:
     max_tokens: int | None
     reasoning_effort: ReasoningEffort | None
     retry: RetryPolicy
-    provider: LLMProviderInterface | None
+    provider: LLMProviderInterface | Provider | None
     cache: bool
     timeout: float | None
 
@@ -182,7 +185,7 @@ def resolve_call_args(
     max_tokens: int | None | Unset,
     reasoning_effort: ReasoningEffort | None | Unset,
     retry: RetryPolicy | Unset,
-    provider: LLMProviderInterface | None | Unset,
+    provider: LLMProviderInterface | Provider | None | Unset,
     cache: bool | Unset,
     timeout: float | None | Unset,
 ) -> ResolvedCallArgs:

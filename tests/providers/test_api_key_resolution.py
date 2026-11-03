@@ -47,6 +47,24 @@ def test_build_without_key_or_env_raises_naming_env_var(
         _ = build_provider(LLMClientConfig(provider=provider))
 
 
+@pytest.mark.parametrize(("provider", "env_var", "name"), _BEARER_PROVIDERS)
+def test_missing_key_error_names_every_remedy(
+    provider: Provider, env_var: str, name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The error names the config field, the per-call ``make_provider`` key and
+    the environment variable, so a caller switching one call's provider sees how
+    to give that call its own key."""
+    monkeypatch.delenv(env_var, raising=False)
+    with pytest.raises(ValueError) as caught:
+        _ = build_provider(LLMClientConfig(provider=provider))
+
+    message = str(caught.value)
+    assert message.startswith(f"{name} requires an API key and none is configured")
+    assert "LLMClientConfig.api_key" in message
+    assert "make_provider(..., api_key=...)" in message
+    assert env_var in message
+
+
 @pytest.mark.parametrize(("provider", "env_var"), _BEARER_PROVIDER_ENVS)
 def test_build_falls_back_to_env_when_config_key_absent(
     provider: Provider, env_var: str, monkeypatch: pytest.MonkeyPatch

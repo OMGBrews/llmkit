@@ -121,3 +121,82 @@ def test_litellm_503_classifies_as_transport_once_litellm_imported() -> None:
             """
         )
     )
+
+
+# The child script for the per-call member ordering test. The spy stands in for
+# the ``make_provider`` that ``coerce_call_provider`` calls, records whether
+# LiteLLM (whose import loads ``.env``) is already imported, then stops the call.
+_MEMBER_ORDERING_CHILD = """
+import sys
+import llmkit
+import llmkit.calls._shared as shared
+from llmkit import Provider, text_llm_call_sync
+
+seen = []
+
+class Stop(Exception):
+    pass
+
+def spy(member, **_kwargs):
+    seen.append("litellm" in sys.modules)
+    raise Stop
+
+shared.make_provider = spy
+assert "litellm" not in sys.modules
+try:
+    text_llm_call_sync("hi", feature="x", provider=Provider.OLLAMA)
+except Stop:
+    pass
+else:
+    raise AssertionError("the spy was not reached")
+assert seen == [True], seen
+"""
+
+
+def test_a_per_call_member_imports_litellm_before_it_is_built() -> None:
+    """A member passed as ``provider=`` is built after LiteLLM's import.
+
+    That import runs ``load_dotenv()``, so building first would miss a key kept
+    only in a ``.env`` file on the first call of a process and find it on the
+    second. A fresh interpreter, because this test session imported LiteLLM
+    long ago.
+    """
+    _run_python(_MEMBER_ORDERING_CHILD)
+
+
+def test_a_refused_provider_string_leaves_litellm_unimported() -> None:
+    """The bare-string refusal happens before anything imports LiteLLM."""
+    _run_python(
+        textwrap.dedent(
+            """
+            import sys
+            from llmkit import text_llm_call_sync
+            try:
+                text_llm_call_sync("hi", feature="x", provider="openai")
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("the string was accepted")
+            assert 'litellm' not in sys.modules
+            """
+        )
+    )
+
+
+def test_an_unconfigured_call_leaves_litellm_unimported() -> None:
+    """The not-configured error, too, comes before LiteLLM's import."""
+    _run_python(
+        textwrap.dedent(
+            """
+            import sys
+            from llmkit import LLMClientNotConfiguredError, text_llm_call_sync
+            try:
+                text_llm_call_sync("hi", feature="x")
+            except LLMClientNotConfiguredError:
+                pass
+            else:
+                raise AssertionError("the call ran unconfigured")
+            assert 'litellm' not in sys.modules
+            """
+        )
+    )

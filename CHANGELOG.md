@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`provider=` takes a `Provider` member.** Every call function, its sync
+  form and `LLMCallOptions.provider` accept `provider=Provider.ANTHROPIC`,
+  which builds that provider for the call with `make_provider` from its
+  environment variables and default model, once per call. LiteLLM, whose
+  import loads a `.env` file, is imported first, so the first call of a
+  process finds a key kept there as later calls do. A built instance is still
+  used unchanged; pass one from `make_provider` when the call needs its own
+  key or model.
+
+- **`Provider(value)` ignores case.** `Provider("Ollama")` and
+  `Provider("OLLAMA")` are `Provider.OLLAMA`, so a provider name read from a
+  settings file parses in one step.
+
 - **Sync forms of the two streams: `text_llm_call_stream_sync` and
   `tool_llm_call_stream_sync`.** Each takes exactly the parameters of its
   async form and returns a plain generator of the same items, fetched one per
@@ -116,6 +129,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `"disable"`. `LLM_CACHE_KEY_VERSION` is now 4, so an answer cached while
   `"disable"` was substituted is not replayed for a request that now turns
   thinking off or raises.
+
+- **Each wrong way of naming a provider fails before transport, naming the
+  fix.** A plain string as a call's `provider=` (`provider="openai"`), which
+  used to fail inside the first attempt with an `AttributeError`, raises
+  `TypeError` naming the member it parses to (`Provider.OPENAI`) and
+  `make_provider`, before any attempt is made or logged. `LLMClientConfig`
+  given a non-member raises `TypeError` at construction naming
+  `Provider(value)`, and so does `make_provider`; a lowercase string used to
+  work by accident and any other spelling failed in `build_provider` with an
+  `AssertionError`. An unknown name given to `Provider(...)` raises
+  `ValueError` listing every member. A per-call member whose key or extra is
+  missing raises that error before the first attempt and never runs on the
+  registered provider. **Migration:** `LLMClientConfig(provider="ollama")`
+  becomes `LLMClientConfig(provider=Provider("ollama"))`.
+
+- **The missing-key error names the per-call remedy.** It now reads "set
+  `LLMClientConfig.api_key`, pass `make_provider(..., api_key=...)` for one
+  call, or set the `ANTHROPIC_API_KEY` environment variable" (with the
+  provider's own variable); its prefix "requires an API key and none is
+  configured" is unchanged.
 
 - **Breaking: `rate_limit_acquire_async` and `rate_limit_acquire_sync` take a
   `Provider` member or a provider instance, not a string.** A member joins
