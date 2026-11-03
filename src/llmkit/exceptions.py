@@ -178,6 +178,7 @@ class LlmkitError(Exception):
     (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
     :class:`ResultValidationError`), and its configuration errors
     (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
+    :class:`ToolChoiceUnsupportedError`,
     :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`,
     :class:`UnsupportedSchemaError`). It
     does not catch the third-party errors a call can also raise (``openai``
@@ -730,6 +731,19 @@ class ComposeUnsupportedError(LlmkitError):
     :data:`LLM_RECOVERABLE_ERRORS`: retrying cannot make a provider support the
     combined request.  Use the portable two-step pattern (tool loop followed by
     ``structured_llm_call``) instead.
+    """
+
+
+class ToolChoiceUnsupportedError(LlmkitError, ValueError):
+    """Raised before transport when a route cannot honour the requested ``tool_choice``.
+
+    A route without ``tool_choice`` support (Ollama) accepts only ``"auto"``,
+    which is what it does anyway; ``"none"``, ``"required"`` and a
+    :class:`~llmkit.ToolName` would be dropped on the way to the wire and the
+    model could still call a tool or skip one, so llmkit refuses them before the
+    first attempt. A permanent configuration error, outside
+    :data:`LLM_RECOVERABLE_ERRORS`. It subclasses ``ValueError``, the type this
+    refusal raised before, so an existing ``except ValueError`` keeps catching it.
     """
 
 

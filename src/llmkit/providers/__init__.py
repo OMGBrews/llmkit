@@ -77,6 +77,17 @@ def _provider_class(provider: Provider) -> type[BaseProvider]:
     assert_never(provider)
 
 
+def provider_display_name(provider: Provider) -> str:
+    """Return the provider name llmkit's own calls report for ``provider``.
+
+    The name differs from the member's value for some members
+    (``Provider.VERTEX`` is ``"vertex"`` but reports ``"Google Agent
+    Platform"``), so code that keys state by the provider name, such as the rate
+    limiter, translates a member through this rather than using its value.
+    """
+    return _provider_class(provider).display_name()
+
+
 def build_provider(config: LLMClientConfig | None = None) -> BaseProvider:
     """Construct an LLM provider instance from a config.
 

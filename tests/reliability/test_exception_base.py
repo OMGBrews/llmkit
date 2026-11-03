@@ -64,3 +64,17 @@ def test_the_base_is_in_no_catch_set_or_retry_default() -> None:
             members = cast("tuple[type[BaseException], ...]", getattr(exceptions_module, name))
             assert LlmkitError not in members, name
     assert LlmkitError not in llmkit.DEFAULT_RETRY_POLICY.retry_on
+
+
+def test_tool_choice_refusal_is_a_configuration_error_that_stays_a_value_error() -> None:
+    """``ToolChoiceUnsupportedError`` replaced a bare ``ValueError``, so it keeps
+    that base for existing handlers, and is never retried or caught as recoverable."""
+    error = llmkit.ToolChoiceUnsupportedError
+    assert "ToolChoiceUnsupportedError" in llmkit.__all__
+    assert issubclass(error, LlmkitError)
+    assert issubclass(error, ValueError)
+    for name in dir(exceptions_module):
+        if name.startswith("LLM_") and name.endswith("_ERRORS"):
+            members = cast("tuple[type[BaseException], ...]", getattr(exceptions_module, name))
+            assert not any(issubclass(error, member) for member in members), name
+    assert not any(issubclass(error, member) for member in llmkit.DEFAULT_RETRY_POLICY.retry_on)

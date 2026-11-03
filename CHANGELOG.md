@@ -38,7 +38,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OutputLimitError`, `ToolArgumentError`, `ResultValidationError`,
   `ComposeUnsupportedError`, `ReasoningEffortUnsupportedError`,
   `SchemaEngineError`, the new `LLMClientNotConfiguredError`, and the new
-  `StructuredOutputError` and `UnsupportedSchemaError`. It does not catch third-party transport errors, a
+  `StructuredOutputError`, `UnsupportedSchemaError` and
+  `ToolChoiceUnsupportedError`. It does not catch third-party transport errors, a
   bare pydantic `ValidationError`, or instructor's `InstructorRetryException`
   around a transport or permanent provider error; the `LLM_*_ERRORS` tuples
   remain the sets for retry-shaped handling. Do not list the base in
@@ -84,6 +85,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **Breaking: `rate_limit_acquire_async` and `rate_limit_acquire_sync` take a
+  `Provider` member or a provider instance, not a string.** A member joins
+  the budget llmkit's own calls on that provider charge, and an instance joins
+  the budget of its `name`, so a host can no longer land on a separate budget
+  by spelling the provider name differently. A string, or any other type,
+  raises `TypeError` before the limiter is touched. A host that already
+  passed `Provider.GOOGLE`, `Provider.BEDROCK` or `Provider.VERTEX` was
+  charged an orphan budget under the member's value (`"google"`, `"bedrock"`,
+  `"vertex"`) instead of the provider name llmkit's calls charge (`"Google AI
+  Studio"`, `"AWS Bedrock"`, `"Google Agent Platform"`); it now shares that
+  provider's one budget, circuit breaker and adaptive limit with llmkit's own
+  calls. **Migration:** `rate_limit_acquire_sync("openai")` becomes
+  `rate_limit_acquire_sync(Provider.OPENAI)`; a host-defined provider passes
+  its instance.
+
+- **`tool_choice="auto"` now runs on Ollama, and the other values are refused
+  before the first attempt with `ToolChoiceUnsupportedError`.** Ollama's
+  route does not support `tool_choice`: LiteLLM drops the field and the model
+  decides, which is what `"auto"` asks for, so `"auto"` is now sent (and
+  recorded) unchanged. `"none"`, `"required"` and `ToolName(...)` would be
+  dropped silently, so `tool_llm_call`, `tool_llm_call_stream` and their sync
+  forms raise the new `ToolChoiceUnsupportedError` for them before the first
+  attempt: no request, no retry, no call record. It used to be a bare
+  `ValueError` raised inside the attempt, for every value including `"auto"`,
+  and logged as a failed attempt. The new class subclasses `LlmkitError` and
+  `ValueError`, so an existing `except ValueError` keeps catching it, and it is
+  outside `LLM_RECOVERABLE_ERRORS`.
 
 - **The documentation treats switching provider per call as a normal use.**
   The README's "Switching provider per call" section (formerly "Constructing
@@ -296,6 +325,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `completion_kwargs`.
 
 ### Fixed
+
+- **The compose form of `tool_llm_call` names a broken provider config
+  instead of blaming the provider.** With a registered config that would not
+  build (a missing API key, a config field the provider does not read, a
+  missing optional extra), `tool_llm_call(..., output_schema=...)` raised
+  `ComposeUnsupportedError`, saying "the configured provider does not support
+  combining tools with an output schema". It now raises the build's own error
+  before any request and without a call record. A key kept only in a `.env`
+  file used to hit this, because nothing had loaded the file yet; the call now
+  reports the missing key. A provider that builds but cannot compose still
+  raises `ComposeUnsupportedError`.
 
 - **A call made before `configure_llm_client` now fails before its first
   attempt, and says so.** It used to run the retry loop, log a failed attempt,

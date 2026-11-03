@@ -37,17 +37,20 @@ from pydantic import BaseModel
 
 from llmkit import (
     NO_RETRY,
+    Provider,
     TextDeltaEvent,
     ToolArgumentError,
     ToolCallResult,
+    ToolChoiceUnsupportedError,
     ToolDefinition,
     ToolName,
+    make_provider,
     tool_llm_call_stream,
 )
 from llmkit._litellm import StreamedToolTurn
 from llmkit.calls import STREAM_ABANDONED_ERROR
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
-from llmkit.tools import TokenUsage
+from llmkit.tools import TokenUsage, ToolChoice
 from tests._support import capturing_sink, provider_mock, quiet_logging
 
 
@@ -406,8 +409,13 @@ async def test_transport_reads_usage_from_the_final_choiceless_frame() -> None:
     assert turn.usage == (11, 22, 33)
 
 
-async def test_transport_rejects_tool_choice_on_a_route_without_support() -> None:
-    """The guard duplicated from ``acompletion_tools``.
+@pytest.mark.parametrize(
+    "tool_choice", ["none", "required", ToolName("add")], ids=["none", "required", "named"]
+)
+async def test_transport_rejects_tool_choice_on_a_route_without_support(
+    tool_choice: ToolChoice,
+) -> None:
+    """The transport backstop shares the public calls' guard.
 
     Without it the streaming surface would silently accept what the buffered
     one rejects before any request.
@@ -417,18 +425,98 @@ async def test_transport_rejects_tool_choice_on_a_route_without_support() -> Non
     provider = _stream_provider()
     provider.supports_tool_choice = False
 
-    with pytest.raises(ValueError, match="does not support tool_choice"):
-        _ = [
+    with patch("llmkit._litellm.litellm.acompletion") as acompletion:
+        with pytest.raises(ToolChoiceUnsupportedError, match="does not support tool_choice"):
+            _ = [
+                item
+                async for item in _litellm.astream_tools(
+                    "hi",
+                    [_add_tool()],
+                    tool_choice=tool_choice,
+                    temperature=None,
+                    model=None,
+                    provider=provider,
+                )
+            ]
+    acompletion.assert_not_called()
+
+
+async def test_transport_sends_auto_on_a_route_without_support() -> None:
+    """``"auto"`` is what such a route does anyway, so it goes out unchanged."""
+    from llmkit import _litellm
+
+    provider = _stream_provider()
+    provider.supports_tool_choice = False
+    seen: dict[str, object] = {}
+
+    @final
+    class _FakeStream:
+        def __aiter__(self) -> AsyncIterator[_FakeChunk]:
+            async def _gen() -> AsyncIterator[_FakeChunk]:
+                yield _FakeChunk(content="hi")
+
+            return _gen()
+
+    async def _fake_acompletion(**request: object) -> _FakeStream:
+        seen.update(request)
+        return _FakeStream()
+
+    with patch("llmkit._litellm.litellm.acompletion", side_effect=_fake_acompletion):
+        items = [
             item
             async for item in _litellm.astream_tools(
                 "hi",
                 [_add_tool()],
-                tool_choice=ToolName("add"),
+                tool_choice="auto",
                 temperature=None,
                 model=None,
                 provider=provider,
             )
         ]
+    assert items[0] == "hi"
+    assert seen["tool_choice"] == "auto"
+
+
+async def test_stream_runs_auto_on_ollama() -> None:
+    """On a real ``OllamaProvider``, ``"auto"`` streams, and the request records it."""
+    with install(lambda _request: Reply.text("hi")) as installed, capturing_sink() as records:
+        events = [
+            event
+            async for event in tool_llm_call_stream(
+                "hi",
+                [_add_tool()],
+                feature="tool-stream",
+                provider=make_provider(Provider.OLLAMA),
+                tool_choice="auto",
+            )
+        ]
+    assert isinstance(events[-1], ToolCallResult)
+    assert [request.tool_choice for request in installed.requests] == ["auto"]
+    assert len(records) == 1
+    assert records[0].error is None
+
+
+@pytest.mark.parametrize(
+    "tool_choice", ["none", "required", ToolName("add")], ids=["none", "required", "named"]
+)
+async def test_stream_refuses_unsupported_tool_choice_on_ollama_before_any_attempt(
+    tool_choice: ToolChoice,
+) -> None:
+    """On a real ``OllamaProvider`` the refusal precedes the first attempt: no
+    request, no log record, and so no retry."""
+    with install(lambda _request: Reply.text("unreachable")) as installed:
+        with capturing_sink() as records:
+            with pytest.raises(ToolChoiceUnsupportedError, match="does not support tool_choice"):
+                async for _event in tool_llm_call_stream(
+                    "hi",
+                    [_add_tool()],
+                    feature="tool-stream",
+                    provider=make_provider(Provider.OLLAMA),
+                    tool_choice=tool_choice,
+                ):
+                    pass
+    assert installed.requests == []
+    assert records == []
 
 
 async def test_transport_ignores_choiceless_keepalive_frames() -> None:

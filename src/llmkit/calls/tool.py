@@ -53,6 +53,7 @@ from llmkit.tools import (
     ToolChoice,
     ToolComposeResult,
     ToolDefinition,
+    guard_tool_choice,
 )
 
 
@@ -150,13 +151,27 @@ async def tool_llm_call[T: BaseModel](
     )
     if output_schema is not None:
         guard_output_schema(output_schema)
-        if provider is None or not provider.compose_tools_schema:
-            name = "the configured provider" if provider is None else provider.name
+        if provider is None:
+            # ``prepare_call`` raised already if nothing is registered, so ``None``
+            # here is a registered config that would not build. Build it again so
+            # its own error (a missing key, a rejected field, a missing extra)
+            # surfaces before any attempt, instead of a compose refusal that
+            # blames the provider. Function-local import: tests patch
+            # ``llmkit.providers.build_provider`` by module attribute.
+            from llmkit.providers import build_provider
+
+            provider = build_provider()
+        if not provider.compose_tools_schema:
             raise ComposeUnsupportedError(
-                f"{name} does not support combining tools with an output schema; use the "
-                + "portable two-step pattern (tool loop, then structured_llm_call)."
+                f"{provider.name} does not support combining tools with an output schema; "
+                + "use the portable two-step pattern (tool loop, then structured_llm_call)."
             )
         provider.guard_compose_tools_schema(args.model)
+    # After the compose block, so a provider it just built is guarded too. With
+    # no provider (plain path, unbuildable config) the transport raises that
+    # build error inside the attempt instead.
+    if provider is not None:
+        guard_tool_choice(provider, tool_choice)
     definitions = {definition.name: definition for definition in tools}
     attempt_count = 0
 

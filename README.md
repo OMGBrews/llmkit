@@ -328,7 +328,7 @@ The error is never retried by default and never cached; see [Retries](#automatic
 
 The portable pattern is still **two steps**: run a tool loop with `tool_llm_call`, then make one `structured_llm_call` for the final answer. That works across every provider, including Gemini.
 
-For a measured compose-capable route, pass `output_schema=` to the tool call instead. Each turn is either a normal `ToolComposeResult` with `tool_calls` and `parsed is None`, or a final answer with `parsed` set to your validated Pydantic instance. Anthropic and OpenAI support the combined request; unsupported providers and unsafe legacy Claude models raise `ComposeUnsupportedError` *before any request* with a steer to the portable pattern.
+For a measured compose-capable route, pass `output_schema=` to the tool call instead. Each turn is either a normal `ToolComposeResult` with `tool_calls` and `parsed is None`, or a final answer with `parsed` set to your validated Pydantic instance. Anthropic and OpenAI support the combined request; unsupported providers and unsafe legacy Claude models raise `ComposeUnsupportedError` *before any request* with a steer to the portable pattern. A registered config that cannot be built (no API key, a field the provider does not read) raises that build error instead, also before any request.
 
 ```python
 from pydantic import BaseModel
@@ -378,8 +378,11 @@ Use `describe_llm(config).compose_tools_schema` (from `llmkit.providers`) to cho
 `tool_llm_call_stream_sync` take a `tool_choice=` keyword. Leave it `None` (the default) for the provider's own
 behaviour, or pass `"auto"`, `"none"`, `"required"`, or `ToolName("weather")` to
 force one named tool (`ToolName` is exported; `ToolChoice` is the union type). A
-route whose provider does not support `tool_choice` — Ollama — raises
-`ValueError` before any request rather than silently ignoring the setting.
+route whose provider does not support `tool_choice` — Ollama — accepts `"auto"`,
+which is what it does anyway, and raises `ToolChoiceUnsupportedError` (an
+`LlmkitError` and a `ValueError`) for `"none"`, `"required"` and `ToolName(...)`
+before the first attempt, so no request is sent and no call record is written,
+rather than silently ignoring the setting.
 
 ### Streaming a tool turn
 
@@ -783,24 +786,32 @@ can join the same per-provider budget by hand with the module-level acquire
 functions:
 
 ```python
+from llmkit import Provider
 from llmkit.rate_limiting import (
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
 
 # Async path (e.g. an async _agenerate):
-async with rate_limit_acquire_async("openai") as slot:
-    response = ...  # one slot held against openai's budget
+async with rate_limit_acquire_async(Provider.OPENAI) as slot:
+    response = ...  # one slot held against OpenAI's budget
     slot.record_tokens(response.usage.total_tokens)  # debits TPM (no-op when off)
 
 # Sync path (e.g. a synchronous _generate / _stream):
-with rate_limit_acquire_sync("openai") as slot:
-    response = ...  # one slot held against openai's budget
+with rate_limit_acquire_sync(Provider.OPENAI) as slot:
+    response = ...  # one slot held against OpenAI's budget
     slot.record_tokens(response.usage.total_tokens)
 ```
 
-The argument is the **provider name** (`provider.name`, e.g. `"openai"`,
-`"ollama"`); each provider has an independent budget on every dimension. Each
+The argument is a **`Provider` member** or a **provider instance**: the member
+joins the budget llmkit's own calls on that provider charge, and an instance,
+including one of your own provider classes, joins the budget of its `name`. A
+plain string such as `"openai"` raises `TypeError`, so a misspelt or outdated
+name cannot quietly start a separate budget. Each provider has an independent
+budget on every dimension. A slot held through `rate_limit_acquire_sync` counts
+against the same RPM/TPM buckets, adaptive limit and circuit breaker as llmkit's
+own calls, but its in-flight slots are counted separately from theirs, like a
+second event loop's (see the concurrency caveat above). Each
 context manager yields a `RateLimitSlot`; call its `record_tokens(...)` once you
 know the call's token usage to debit the TPM budget (a no-op when TPM is off).
 Both are no-ops when rate limiting is disabled, and they share the exact
