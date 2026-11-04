@@ -293,6 +293,43 @@ def _serving(*streams: _ScriptedStream) -> Callable[..., object]:
     return _acompletion
 
 
+@pytest.mark.parametrize("lane", ["text_stream", "tool_stream"])
+async def test_a_stream_whose_opening_request_never_answers_is_cut_off(lane: str) -> None:
+    opened: list[object] = []
+
+    async def _hang(**kwargs: object) -> object:
+        opened.append(kwargs.get("stream"))
+        await asyncio.sleep(_STALL)
+        return _ScriptedStream([])
+
+    provider = OpenAIProvider(api_key="k", model="gpt-4.1-mini")
+    started = time.monotonic()
+    with (
+        patch("llmkit._litellm.litellm.acompletion", _hang),
+        capture_llm_records() as records,
+        pytest.raises(TimeoutError),
+    ):
+        if lane == "text_stream":
+            async for _chunk in calls.text_llm_call_stream(
+                "hi", feature="deadline", provider=provider, timeout=_DEADLINE, retry=NO_RETRY
+            ):
+                pass
+        else:
+            async for _event in calls.tool_llm_call_stream(
+                "hi",
+                _TOOLS,
+                feature="deadline",
+                provider=provider,
+                timeout=_DEADLINE,
+                retry=NO_RETRY,
+            ):
+                pass
+    assert time.monotonic() - started < _STALL / 2
+    assert opened == [True]
+    assert [_cut(record) for record in records] == [True]
+    assert records[0].first_chunk_ms is None
+
+
 async def test_a_stall_after_the_first_chunk_ends_the_stream_unretried() -> None:
     stalled = _ScriptedStream([(0.0, _frame("first")), (_STALL, _frame(" late"))])
     spare = _ScriptedStream([(0.0, _frame("never", finish="stop"))])
