@@ -56,7 +56,8 @@ import asyncio
 import functools
 import logging
 import threading
-from collections.abc import AsyncGenerator, Callable, Coroutine, Sequence
+import time
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -234,6 +235,77 @@ def _without_temperature(kwargs: dict[str, object]) -> dict[str, object]:
     return {**kwargs, _DROP_PARAMS: [*drop, _TEMPERATURE]}
 
 
+def _deadline(kwargs: dict[str, object]) -> float | None:
+    """The request's effective ``timeout`` in seconds, or ``None`` for no deadline.
+
+    Read from the request as LiteLLM receives it, not from the call's own
+    option, because a provider's ``completion_kwargs`` can carry a timeout the
+    call did not set, and that is the value the request is sent with. A value
+    that is not a number (an ``httpx.Timeout``, say) is LiteLLM's alone to
+    apply; llmkit enforces only seconds.
+    """
+    value = kwargs.get("timeout")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+async def _within[T](timeout: float | None, awaitable: Awaitable[T]) -> T:
+    """Await *awaitable*, cut off after *timeout* seconds with a ``TimeoutError``.
+
+    The per-round-trip deadline llmkit enforces itself. LiteLLM's own timeout
+    is an HTTP read timeout that a provider keeping the connection alive
+    without answering never trips, and on the OpenAI-compatible routes the SDK
+    retries a timed-out request inside one call, so it cannot bound an
+    attempt. This scope can: whatever the request is waiting on is cancelled at
+    the deadline. ``0.0`` is accepted and fires at the first suspension.
+
+    The ``TimeoutError`` ``asyncio.timeout`` raises carries no message, which
+    would log as ``"TimeoutError: "``; this one names the deadline. A
+    ``TimeoutError`` the awaited code raised itself, before the deadline,
+    passes through unchanged. The scope never spans a ``yield``: a sync
+    stream runs each step in its own task, and a scope entered in one task
+    cannot be exited in another.
+    """
+    if timeout is None:
+        return await awaitable
+    scope = asyncio.timeout(timeout)
+    try:
+        async with scope:
+            return await awaitable
+    except TimeoutError:
+        if scope.expired():
+            raise TimeoutError(f"no provider response within {timeout:g}s") from None
+        raise
+
+
+class _Exhausted:
+    """Sentinel type: a bounded frame source has run out."""
+
+
+_EXHAUSTED = _Exhausted()
+
+
+async def _bounded_frames[T](source: AsyncIterator[T], timeout: float | None) -> AsyncGenerator[T]:
+    """Each item of *source*, every wait for the next one bounded by *timeout*.
+
+    One deadline per frame, entered and left before the frame is yielded, so
+    no scope is held across the consumer's suspension. *source* is closed on
+    the way out, however that happens: a stream cut at its deadline would
+    otherwise keep the stalled response open until garbage collection.
+    """
+    try:
+        while True:
+            item = await _within(timeout, anext(source, _EXHAUSTED))
+            if isinstance(item, _Exhausted):
+                return
+            yield item
+    finally:
+        aclose = cast("Callable[[], Awaitable[object]] | None", getattr(source, "aclose", None))
+        if aclose is not None:
+            _ = await aclose()
+
+
 async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     """Typed boundary over ``litellm.acompletion``.
 
@@ -288,7 +360,15 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     re-issue carries it too. Why llmkit does this rather than cap LiteLLM or
     require the ``mcp`` extra is recorded on the ``litellm`` requirement in
     ``pyproject.toml``.
+
+    It is also where the request's ``timeout`` becomes a deadline llmkit
+    enforces (see :func:`_within`). Each send gets its own: the
+    refused-temperature re-issue is a second round trip with a fresh budget,
+    as is instructor's schema-repair re-ask, which reaches here as a second
+    call. For a stream the deadline bounds opening it; :func:`_stream` bounds
+    each frame after that.
     """
+    timeout = _deadline(kwargs)
     acompletion = cast(
         "Callable[..., Coroutine[object, object, ModelResponse | CustomStreamWrapper]]",
         litellm.acompletion,
@@ -297,12 +377,12 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
         _ = kwargs.setdefault(_SKIP_MCP_HANDLER, True)
     try:
         try:
-            result = await acompletion(**kwargs)
+            result = await _within(timeout, acompletion(**kwargs))
         except Exception as refused:
             if not _refuses_temperature(refused, kwargs):
                 raise
             try:
-                result = await acompletion(**_without_temperature(kwargs))
+                result = await _within(timeout, acompletion(**_without_temperature(kwargs)))
             except Exception:
                 # Raised inside this handler, so the second error rides on
                 # ``__context__`` while the caller sees the refusal it caused.
@@ -327,12 +407,13 @@ async def _send(request: WireRequest) -> WireResponse:
     rate-limiter slot. A double installed through :mod:`llmkit.testing`
     answers here in place of the provider; otherwise the LiteLLM adapter does:
     :func:`_acompletion`, whose duties (503 re-ownership, the temperature
-    re-issue and stamp, the MCP-handler opt-out) this only wraps with a
-    conversion.
+    re-issue and stamp, the MCP-handler opt-out, the deadline) this only wraps
+    with a conversion. The double answers under the same deadline, so a
+    ``Reply(delay=...)`` longer than the request's ``timeout`` times out.
     """
     double = active_double()
     if double is not None and request.call is not None:
-        return await double.respond(request.call)
+        return await _within(_deadline(request.kwargs), double.respond(request.call))
     return _wire_response(await _acompletion(**request.kwargs))
 
 
@@ -343,22 +424,33 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
     after :func:`_acompletion` has returned. It is re-owned exactly as the
     call-time boundary does, so the stream path keeps the
     ``except LLM_RECOVERABLE_ERRORS`` contract too.
+
+    The request's ``timeout`` bounds opening the stream (in
+    :func:`_acompletion`) and then each wait for the next wire frame, the
+    first one included, but never the stream's whole duration and never the
+    consumer's time between frames. A breach raises ``TimeoutError``. Whether
+    that is retried is the retry loop's decision, made on whether its
+    consumer has received anything yet. The double streams under the same
+    deadlines.
     """
+    timeout = _deadline(request.kwargs)
     double = active_double()
     if double is not None and request.call is not None:
-        async for item in double.stream(request.call):
-            yield item
+        async with aclosing(_bounded_frames(aiter(double.stream(request.call)), timeout)) as frames:
+            async for item in frames:
+                yield item
         return
     # stream=True makes acompletion return a CustomStreamWrapper, whose async
     # iteration yields typed ModelResponseStream chunks.
     stream = cast("CustomStreamWrapper", await _acompletion(**request.kwargs))
     usage: object = None
     try:
-        async for chunk in stream:
-            frame_usage: object = getattr(chunk, "usage", None)
-            if frame_usage is not None:
-                usage = frame_usage
-            yield _wire_chunk(chunk)
+        async with aclosing(_bounded_frames(aiter(stream), timeout)) as chunks:
+            async for chunk in chunks:
+                frame_usage: object = getattr(chunk, "usage", None)
+                if frame_usage is not None:
+                    usage = frame_usage
+                yield _wire_chunk(chunk)
     except Exception as e:
         normalized = normalize_service_unavailable(e)
         if normalized is not e:
@@ -1615,6 +1707,7 @@ async def astream_tools(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    on_first_frame: Callable[[float], None] | None = None,
 ) -> AsyncGenerator[str | StreamedToolTurn]:
     """Stream a tool-enabled turn: text deltas, then one :class:`StreamedToolTurn`.
 
@@ -1635,6 +1728,12 @@ async def astream_tools(
     parked on the assembled result (the idiomatic stopping point) is running
     its own tools, and holding a per-provider concurrency slot across that is
     exactly the deadlock the limiter exists to avoid.
+
+    *on_first_frame*, when given, is called once with the
+    :func:`time.monotonic` instant the first wire frame of any kind arrived:
+    a role-only, reasoning, usage or tool-fragment frame counts, so the
+    instant is the provider's, not the first text's. It is not called for a
+    stream that received no frame.
     """
     provider = provider if provider is not None else build_provider()
     guard_tool_choice(provider, tool_choice)
@@ -1683,6 +1782,7 @@ async def astream_tools(
     cost: float | None = None
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         async with aclosing(_stream(request)) as stream:
+            first = True
             async for item in stream:
                 if isinstance(item, WireStreamEnd):
                     # Usage on a frame wins; the stream's own accumulation is
@@ -1692,6 +1792,10 @@ async def astream_tools(
                     if cost is None:
                         cost = item.cost
                     continue
+                if first:
+                    first = False
+                    if on_first_frame is not None:
+                        on_first_frame(time.monotonic())
                 _absorb_tool_fragments(item.tool_fragments, fragments)
                 if item.finish_reason is not None:
                     stop_reason = item.finish_reason
@@ -1726,6 +1830,7 @@ async def astream_text(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    on_first_frame: Callable[[float], None] | None = None,
 ) -> AsyncGenerator[str | StreamedTextEnd]:
     """Stream plain-text deltas via LiteLLM, then one :class:`StreamedTextEnd`.
 
@@ -1752,6 +1857,9 @@ async def astream_text(
     :class:`~llmkit.exceptions.OutputLimitError` carrying the yielded
     transcript as its partial text. A missing or any other finish reason ends
     the stream normally.
+
+    *on_first_frame* is as on :func:`astream_tools`: called once with the
+    monotonic instant the first wire frame of any kind arrived.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1802,6 +1910,7 @@ async def astream_text(
         GlobalRateLimiter.acquire_async(provider.name) as slot,
         aclosing(_stream(request)) as stream,
     ):
+        first = True
         async for item in stream:
             if isinstance(item, WireStreamEnd):
                 # Usage on a frame wins; the stream's own accumulation is the
@@ -1811,6 +1920,10 @@ async def astream_text(
                 if cost is None:
                     cost = item.cost
                 continue
+            if first:
+                first = False
+                if on_first_frame is not None:
+                    on_first_frame(time.monotonic())
             # The stop reason can ride a frame with text, or a frame of its own.
             if item.finish_reason is not None:
                 stop_reason = item.finish_reason

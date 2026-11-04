@@ -105,6 +105,7 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
         "cache_hit",
         "duration_ms",
         "queue_wait_ms",
+        "first_chunk_ms",
         "approximate_cost",
         "error",
     }

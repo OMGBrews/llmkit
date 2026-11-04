@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     build_text_record,
+    error_text,
     prepare_call,
     result_validation_budget,
     run_cached,
@@ -75,8 +76,13 @@ async def text_llm_call(
         model: Optional model override. Unset defers to ``options``, then
             to the default model of the provider the call runs on (see
             :func:`structured_llm_call`).
-        timeout: Seconds for one provider round trip; unset or ``None`` sends
-            no timeout keyword and leaves LiteLLM's default in effect.
+        timeout: Seconds for one provider round trip, a deadline llmkit
+            enforces: a round trip still waiting at it is cut off with a
+            ``TimeoutError``, which the default retry policy retries with a
+            fresh deadline. The value is forwarded to LiteLLM too. ``0.0`` is
+            accepted and fires at the first wait. Unset or ``None`` sets no
+            deadline and sends no timeout keyword, leaving LiteLLM's default
+            in effect.
         max_tokens: Optional cap on the completion length, forwarded to
             the provider when set. A completion the provider cuts off at the
             cap (or at its own ceiling) raises :class:`~llmkit.OutputLimitError`
@@ -185,11 +191,22 @@ async def text_llm_call(
             # A truncation raises after the completion returned, so the
             # funnel already stamped what it sent.
             sent_temperature = _litellm.sent_temperature(sent_temperature)
-            error = f"{type(exc).__name__}: {exc}"
+            error = error_text(exc)
             if isinstance(exc, OutputLimitError):
                 # ``response`` stays None: the cut-off text is not an answer,
                 # and is logged as ``partial_text`` instead.
                 diagnostics = exc.diagnostics
+            raise
+        except BaseException as exc:
+            # A cancellation (a host's ``asyncio.timeout`` around the call, a
+            # cancelled task) is a ``BaseException`` and bypasses the clause
+            # above, so without this one the ``finally`` would record
+            # ``error=None, response=None``: a success that returned nothing.
+            # It is recorded as cancelled instead, and re-raised untouched.
+            # The record still lands, for the reason ``calls/tool.py`` gives:
+            # the single delivered cancellation is consumed by the time the
+            # ``finally`` awaits.
+            error = error_text(exc)
             raise
         finally:
             _ = await record_call_async(
@@ -287,9 +304,10 @@ def text_llm_call_sync(
     persistent loop, with no separate calling-thread semaphore (see
     :func:`structured_llm_call_sync`).
 
-    ``timeout`` is seconds for one provider round trip; unset or ``None`` sends
-    no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
-    async form, the per-request timeout and the retry budget bound the call.
+    ``timeout`` is seconds for one provider round trip, enforced by llmkit as
+    on the async form; unset or ``None`` sets no deadline. The sync bridge adds
+    no whole-call ceiling: as on the async form, the per-request timeout and
+    the retry budget bound the call.
     """
     return run_sync(
         text_llm_call(

@@ -58,6 +58,15 @@ class LLMCallRecord:
     ``duration_ms - queue_wait_ms``. All four default ``None`` for
     directly-constructed records.
 
+    ``first_chunk_ms`` is, for a streamed attempt, the time from the
+    attempt's start to the first wire frame of any kind the provider sent (a
+    role-only, reasoning or usage frame counts, not just text). Like
+    ``duration_ms`` it is measured from the attempt's start, so it includes
+    ``queue_wait_ms``, and ``first_chunk_ms - queue_wait_ms`` is the
+    provider's own time to first chunk. It is ``None`` on every buffered
+    record, on a cache hit, and on a streamed attempt that received no frame,
+    which is how a stream cut off before its first chunk reads.
+
     ``cache_hit`` is ``True`` when the response cache
     (:func:`~llmkit.configure_llm_cache`) answered the call instead of a
     provider, and it is the field that disambiguates every other one on such
@@ -102,8 +111,10 @@ class LLMCallRecord:
     failed attempt, or the bare type name where the exception carries no
     message; ``None`` for a clean one — a streamed call abandoned by its
     consumer records :data:`~llmkit.STREAM_ABANDONED_ERROR` here rather than
-    ``None``, and a tool round cancelled mid-flight records ``"CancelledError"``
-    rather than reading as a successful round that requested nothing), and
+    ``None``; a buffered attempt — structured, text or tool — cancelled
+    mid-flight records ``"CancelledError"`` rather than reading as a success
+    that returned nothing, and an attempt cut off by its ``timeout`` records
+    ``"TimeoutError: no provider response within <n>s"``), and
     ``max_tokens`` / ``reasoning_effort`` (the request-shaping knobs as resolved
     for this call, ``None`` when not sent).
 
@@ -168,3 +179,4 @@ class LLMCallRecord:
     partial_text: str | None = None
     cache_hit: bool = False
     source_call_id: str | None = None
+    first_chunk_ms: float | None = None

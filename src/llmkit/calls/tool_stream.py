@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    error_text,
     parse_tool_calls,
     prepare_call,
     resolve_model_and_provider,
@@ -82,9 +83,15 @@ async def tool_llm_call_stream(
 ) -> AsyncGenerator[TextDeltaEvent | ToolCallResult]:
     """Stream one tool-enabled turn: text deltas, then the completed result.
 
-    ``timeout`` is seconds for one provider round trip (each wait for the
-    next chunk when streaming). Unset or ``None`` sends no timeout keyword
-    and leaves LiteLLM's default in effect.
+    ``timeout`` is seconds for one provider round trip, a deadline llmkit
+    enforces. For a stream it bounds opening the request, the wait for the
+    first chunk and each later wait for the next chunk, never the stream's
+    whole duration or your time between chunks. A breach raises
+    ``TimeoutError``: before anything reached you it is retried as a fresh
+    attempt, after that it ends the stream unretried. The value is forwarded
+    to LiteLLM too; ``0.0`` is accepted and fires at the first wait. Unset or
+    ``None`` sets no deadline and sends no timeout keyword, leaving LiteLLM's
+    default in effect.
 
     Yields a :class:`~llmkit.TextDeltaEvent` per chunk of assistant prose as it
     arrives, and finally exactly one :class:`~llmkit.ToolCallResult` — the same
@@ -289,6 +296,14 @@ async def _stream_tools_once(
     # :func:`llmkit._litellm.sent_temperature`).
     sent_temperature = temperature
     captured = False
+    # When the provider's first wire frame of any kind arrived, reported by the
+    # transport: a tool-only round yields nothing here until it is assembled.
+    first_chunk_at: float | None = None
+
+    def _first_frame(at: float) -> None:
+        nonlocal first_chunk_at
+        first_chunk_at = at
+
     _litellm.begin_sent_temperature()
     try:
         async with aclosing(
@@ -306,6 +321,7 @@ async def _stream_tools_once(
                 label=label,
                 call_id=call_id,
                 attempt=attempt,
+                on_first_frame=_first_frame,
             )
         ) as transport:
             async for item in transport:
@@ -346,7 +362,7 @@ async def _stream_tools_once(
             error = STREAM_ABANDONED_ERROR
         raise
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error = error_text(exc)
         raise
     finally:
         if not captured:
@@ -384,6 +400,9 @@ async def _stream_tools_once(
             if result is not None
             else None,
             usage=usage_log_dict(result.usage if result is not None else None),
+            first_chunk_ms=(
+                (first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None
+            ),
         )
         if error == STREAM_ABANDONED_ERROR:
             # Abandonment unwinds via GeneratorExit / a re-deliverable

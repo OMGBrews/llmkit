@@ -1398,7 +1398,12 @@ async def test_refused_temperature_zero_is_dropped_live(
 
 @pytest.mark.asyncio
 async def test_live_tiny_request_timeout() -> None:
-    """An explicit timeout reaches a real provider with transport retries disabled."""
+    """An explicit timeout cuts a real provider request with transport retries disabled.
+
+    llmkit's own deadline usually fires first, as a builtin ``TimeoutError``;
+    LiteLLM's HTTP timeout, which the value also reaches, raises
+    ``APITimeoutError`` when it wins the race. Either is the timeout working.
+    """
     from openai import APITimeoutError
 
     from llmkit.exceptions import LLM_TRANSPORT_ERRORS
@@ -1413,7 +1418,7 @@ async def test_live_tiny_request_timeout() -> None:
             retry=NO_RETRY,
             cache=False,
         )
-    assert isinstance(caught.value, APITimeoutError), repr(caught.value)
+    assert isinstance(caught.value, (APITimeoutError, TimeoutError)), repr(caught.value)
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,8 @@ lives here so the next family added does not become another copy:
 * :func:`build_text_record` and :func:`resolve_model_and_provider` — record
   construction shared by the text and streaming surfaces, and the effective
   model/provider resolution every family records;
+* :func:`error_text` — the ``error`` string every family records for a failed
+  attempt;
 * :func:`parse_tool_calls` — narrowing a round's raw provider tool calls,
   shared by the buffered and streaming tool surfaces so the salvage contract
   (well-formed calls survive a partly malformed round) is written once.
@@ -595,6 +597,16 @@ def resolve_model_and_provider(
         return (model, None)
 
 
+def error_text(exc: BaseException) -> str:
+    """The record's ``error`` for *exc*: ``"<Type>: <message>"``, or the bare type.
+
+    One formatter for every family, so a failure reads the same on each lane.
+    The message is dropped when empty, so a bare ``asyncio.CancelledError``
+    records ``"CancelledError"`` rather than ``"CancelledError: "``.
+    """
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
 def usage_log_dict(usage: TokenUsage | None) -> dict[str, int | None] | None:
     """The log record's ``usage`` mapping, ``None`` when no usage was received.
 
@@ -632,6 +644,7 @@ def build_text_record(
     cache_hit: bool = False,
     source_call_id: str | None = None,
     output_limit: OutputLimitDiagnostics | None = None,
+    first_chunk_at: float | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -658,6 +671,9 @@ def build_text_record(
     :class:`~llmkit.OutputLimitDiagnostics`: it fills the record's
     ``output_limit`` and ``partial_text`` fields, and its token counts become
     ``usage`` when the caller passes none, as on the structured path.
+    ``first_chunk_at`` is the :func:`time.monotonic` instant a streamed
+    attempt's first wire frame arrived, recorded as ``first_chunk_ms`` from
+    ``start_t``; ``None`` (every buffered call, every hit) records ``None``.
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
@@ -696,4 +712,5 @@ def build_text_record(
         source_call_id=source_call_id,
         output_limit=output_limit.to_log_dict() if output_limit is not None else None,
         partial_text=output_limit.partial_text if output_limit is not None else None,
+        first_chunk_ms=(first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None,
     )

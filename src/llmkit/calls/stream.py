@@ -31,6 +31,7 @@ from llmkit.cache.read_through import cached_entry, store_entry
 from llmkit.calls._shared import (
     build_text_record,
     cache_and_key,
+    error_text,
     prepare_call,
     resolve_model_and_provider,
 )
@@ -67,9 +68,15 @@ async def text_llm_call_stream(
 ) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
-    ``timeout`` is seconds for one provider round trip (each wait for the
-    next chunk when streaming). Unset or ``None`` sends no timeout keyword
-    and leaves LiteLLM's default in effect.
+    ``timeout`` is seconds for one provider round trip, a deadline llmkit
+    enforces. For a stream it bounds opening the request, the wait for the
+    first chunk and each later wait for the next chunk, never the stream's
+    whole duration or your time between chunks. A breach raises
+    ``TimeoutError``: before anything reached you it is retried as a fresh
+    attempt, after that it ends the stream unretried. The value is forwarded
+    to LiteLLM too; ``0.0`` is accepted and fires at the first wait. Unset or
+    ``None`` sets no deadline and sends no timeout keyword, leaving LiteLLM's
+    default in effect.
 
     Yields each chunk's textual content as it arrives. Callers parse the
     accumulated text themselves — typically as in-progress JSON, when the
@@ -172,7 +179,7 @@ async def text_llm_call_stream(
                 error = STREAM_ABANDONED_ERROR
                 raise
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                error = error_text(exc)
                 raise
             finally:
                 record = build_text_record(
@@ -362,6 +369,14 @@ async def _stream_once(
     # :func:`llmkit._litellm.sent_temperature`).
     sent_temperature = temperature
     captured = False
+    # When the provider's first wire frame of any kind arrived; the transport
+    # reports it, because this loop sees only text and the terminal item.
+    first_chunk_at: float | None = None
+
+    def _first_frame(at: float) -> None:
+        nonlocal first_chunk_at
+        first_chunk_at = at
+
     _litellm.begin_sent_temperature()
     try:
         async for chunk in _litellm.astream_text(
@@ -376,6 +391,7 @@ async def _stream_once(
             label=label,
             call_id=call_id,
             attempt=attempt,
+            on_first_frame=_first_frame,
         ):
             if not captured:
                 sent_temperature = _litellm.sent_temperature(temperature)
@@ -400,7 +416,7 @@ async def _stream_once(
         error = STREAM_ABANDONED_ERROR
         raise
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error = error_text(exc)
         if isinstance(exc, OutputLimitError):
             # Unlike the buffered lane, ``response`` keeps the transcript the
             # consumer already received; ``partial_text`` repeats it.
@@ -429,6 +445,7 @@ async def _stream_once(
             attempt=attempt,
             usage=usage,
             output_limit=diagnostics,
+            first_chunk_at=first_chunk_at,
         )
         if error == STREAM_ABANDONED_ERROR:
             # Abandonment unwinds via GeneratorExit / a re-deliverable

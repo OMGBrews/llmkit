@@ -14,7 +14,7 @@ import pytest
 from llmkit import UNSET, LLMCallOptions, ToolDefinition, Unset, calls
 from llmkit.options import resolve_call_args
 from llmkit.providers import OpenAIProvider
-from llmkit.testing import Reply, install
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import OkSchema
 
 _TOOLS = [ToolDefinition("lookup", "", {"type": "object"})]
@@ -188,7 +188,13 @@ def test_options_timeout_reaches_sync_fake_request(lane: str) -> None:
     assert [request.timeout for request in installed.requests] == [2.5]
 
 
-def test_fake_delay_does_not_enforce_provider_timeout() -> None:
-    with install(lambda _request: Reply.text("ok", delay=0.01)) as installed:
-        assert calls.text_llm_call_sync("hi", feature="test", timeout=0.001) == "ok"
-    assert [request.timeout for request in installed.requests] == [0.001]
+def test_fake_delay_past_the_timeout_times_out_and_is_retried() -> None:
+    """The fake answers under llmkit's deadline: a late reply is cut off."""
+
+    def _late_once(request: TransportRequest) -> Reply:
+        return Reply.text("ok", delay=1.0 if request.attempt == 1 else 0.0)
+
+    with install(_late_once) as installed:
+        assert calls.text_llm_call_sync("hi", feature="test", timeout=0.01) == "ok"
+    assert [request.timeout for request in installed.requests] == [0.01, 0.01]
+    assert [request.attempt for request in installed.requests] == [1, 2]

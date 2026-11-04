@@ -306,6 +306,9 @@ class LocalYamlLogSink:
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
                 ),
+                "first_chunk_ms": (
+                    round(record.first_chunk_ms, 1) if record.first_chunk_ms is not None else None
+                ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
                 "partial_text": record.partial_text,
@@ -453,7 +456,7 @@ class LocalYamlLogSink:
         POSIX, so concurrent calls don't interleave lines.
 
         The line carries only the cross-call triage fields, ``cache_hit``
-        among them; request-shaping knobs (temperature, max_tokens,
+        and a stream's ``first_chunk_ms`` among them; request-shaping knobs (temperature, max_tokens,
         reasoning_effort) and ``source_call_id`` are deliberately omitted to
         keep the index compact — they live in the per-call YAML.
         """
@@ -473,6 +476,9 @@ class LocalYamlLogSink:
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
+                ),
+                "first_chunk_ms": (
+                    round(record.first_chunk_ms, 1) if record.first_chunk_ms is not None else None
                 ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,

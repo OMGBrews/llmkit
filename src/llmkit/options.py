@@ -129,8 +129,11 @@ class LLMCallOptions:
             (:func:`structured_llm_call`, :func:`text_llm_call` and their sync
             wrappers) and :func:`text_llm_call_stream` with its sync form; the
             tool families ignore it.
-        timeout: Seconds for one provider round trip. Unset or ``None`` sends
-            no timeout keyword; LiteLLM supplies its default.
+        timeout: Seconds for one provider round trip, a deadline llmkit
+            enforces (for a stream, on opening it and on each wait for the
+            next chunk) and also forwards to LiteLLM. Unset or ``None`` sets
+            no deadline and sends no timeout keyword; LiteLLM supplies its
+            default.
     """
 
     temperature: float | None | Unset = UNSET

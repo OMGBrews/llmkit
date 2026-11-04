@@ -308,7 +308,8 @@ def test_yaml_and_index_agree_on_run_id(tmp_path: Path) -> None:
 
 def test_unscoped_record_keeps_the_pre_run_id_shape(tmp_path: Path) -> None:
     """With no scope set, the only changes to the index line are an explicit
-    ``run_id: null`` and the later ``cache_hit: false`` — every pre-existing key
+    ``run_id: null`` and the later ``cache_hit: false`` and
+    ``first_chunk_ms: null`` — every pre-existing key
     survives, in its original order, so a current consumer parses it
     unchanged."""
     assert LocalYamlLogSink(tmp_path).write_returning_path(_record()) is not None
@@ -316,7 +317,8 @@ def test_unscoped_record_keeps_the_pre_run_id_shape(tmp_path: Path) -> None:
 
     assert line["run_id"] is None
     assert line["cache_hit"] is False
-    added_since_legacy = {"run_id", "cache_hit"}
+    assert line["first_chunk_ms"] is None
+    added_since_legacy = {"run_id", "cache_hit", "first_chunk_ms"}
     assert [key for key in line if key not in added_since_legacy] == _LEGACY_INDEX_KEYS
 
 
