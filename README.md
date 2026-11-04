@@ -568,24 +568,48 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 
 Every call function, including the sync wrappers, accepts `timeout` in
 seconds, directly or through
-`LLMCallOptions(timeout=30.0)`. A number is forwarded to LiteLLM; unset or
-`None` sends no `timeout` keyword, leaving LiteLLM's request timeout in force
-(600 seconds by default, or its `REQUEST_TIMEOUT` environment setting).
-An explicit call value overrides a provider subclass's `completion_kwargs()`
-timeout too.
+`LLMCallOptions(timeout=30.0)`. It is a deadline llmkit enforces itself: a
+provider round trip still waiting when it expires is cut off and raised as a
+builtin `TimeoutError` reading `no provider response within 30s`. The number
+is also forwarded to LiteLLM. Unset or `None` sets no deadline and sends no
+`timeout` keyword, leaving LiteLLM's own request timeout in force
+(`litellm.request_timeout`, 6000 seconds on LiteLLM 1.108.0 unless its
+`REQUEST_TIMEOUT` environment setting says otherwise). An explicit call value
+overrides a provider subclass's `completion_kwargs()` timeout too, and a
+timeout that only `completion_kwargs()` supplies is enforced the same way.
+`0.0` is accepted and fires at the first wait.
+
+llmkit enforces it because LiteLLM's timeout cannot bound an attempt on its
+own. It is an HTTP read timeout, so a provider that keeps the connection open
+without sending anything never trips it. On the OpenAI-compatible routes the
+SDK also retries a timed-out request inside one call, by default twice.
 
 The value bounds one provider round trip: each transport retry, instructor
 schema-repair re-ask and refused-temperature re-issue gets its own timeout.
-For a stream, it bounds connection and each wait for the next chunk, rather
-than the stream's total duration. It does not include waiting for a
-rate-limiter slot or retry backoff sleeps. Timeout errors are transport errors
-and are retried with a fresh timeout per attempt; pass `retry=NO_RETRY` to
-turn those retries off.
+For a stream, it bounds opening the request, the wait for the first chunk,
+and each later wait for the next chunk, rather than the stream's total
+duration; the time your code spends between chunks never counts. A breach
+before anything reached your code is retried as a fresh attempt. A breach
+after a chunk reached you ends the stream with the `TimeoutError`,
+unretried, like any mid-stream error. Nothing else cuts a stream between
+chunks. The timeout does not include waiting for a rate-limiter slot or retry
+backoff sleeps. Timeout errors are transport errors and are retried with a
+fresh timeout per attempt; pass `retry=NO_RETRY` to turn those retries off.
+A cut attempt counts as a timeout for the rate limiter, which treats timeouts
+as neutral: they neither shrink adaptive concurrency nor count toward opening
+the circuit breaker, though a half-open breaker's probe that times out
+re-opens it, as any failed probe does. On `structured_llm_call` the `TimeoutError`, like every transport
+error, reaches you inside instructor's `InstructorRetryException`, with the
+timeout as its `__cause__`.
+
+The attempt's [log record](#logging-agent-readable-by-default) says what happened. A cut attempt
+records the `TimeoutError` as its `error`, not the abandoned-stream marker,
+and a streamed attempt records `first_chunk_ms`, the time to its first chunk.
 
 The sync wrappers behave the same way: the sync bridge adds no whole-call
 ceiling of its own, and a sync stream adds no limit to each wait for its next
-item. This setting is not a whole-call deadline on either form;
-the retry budget and each request's timeout are what bound a call.
+item beyond this one. This setting is not a whole-call deadline on either
+form; the retry budget and each request's timeout are what bound a call.
 
 ### Contracts as JSON-schema dicts
 
@@ -842,7 +866,7 @@ you do not want stored. See [Security: scope](SECURITY.md#scope).
 `LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
 1. **One YAML file per call, laid out verdict-first.** The file opens with a one-line `#` header — `ok`/`ERROR`, feature/label, resolved model, schema, duration, approximate cost — so `head -1 *.yaml` triages a whole run (the second header line carries the timestamp plus `call=<id> attempt=<n>`, so retries of one logical call — including passes of your own `with_retries` loop — are joinable from the file heads alone, and ends `cache=hit` when the [response cache](#response-cache) answered the call). Small metadata is next; the large `partial_text`, `response` and `prompt` blobs are last, so the *head* of the file is the whole story for most reads.
-2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, cache_hit, duration, queue wait, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
+2. **A compact append-only `index.jsonl`** — one JSON line per call (file, timestamp, feature, label, model, provider, schema, run_id, call_id, attempt, cache_hit, duration, queue wait, time to first chunk, cost, error). Cross-call questions — "which calls errored / were slowest / most expensive / the last call for feature X" — are a single small scan instead of globbing and parsing every YAML.
 
 ```yaml
 # ok | reports/exec_summary | google/gemini-3.1-flash-lite | Summary | 1840ms | $0.0007
@@ -871,6 +895,7 @@ usage:
 output_limit: null
 duration_ms: 1840.2
 queue_wait_ms: 0.4
+first_chunk_ms: null
 approximate_cost: 0.0007
 error: null
 partial_text: null
@@ -878,7 +903,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured, text or compose final-answer attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call, or a compose call's final answer, was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error, except on a compose call's final answer (`tool_llm_call` with `output_schema=`). `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt and `null` for a clean one; a **cancelled** tool round records `CancelledError` there rather than the `null` that would make it indistinguishable from a round that succeeded and requested nothing.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `first_chunk_ms` is, for a streamed attempt, the time from the attempt's start to the first frame of any kind the provider sent, a role-only or reasoning frame included. It is measured like `duration_ms`, so it includes `queue_wait_ms`, and `first_chunk_ms - queue_wait_ms` is the provider's own time to first chunk. A stream that waited 100 seconds and then streamed for 2 reads `first_chunk_ms` near 100000 against a `duration_ms` near 102000. It is `null` on every buffered call, on a cache hit, and on a streamed attempt that received nothing, which is how a stream cut off before its first chunk reads. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured, text or compose final-answer attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call, or a compose call's final answer, was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error, except on a compose call's final answer (`tool_llm_call` with `output_schema=`). `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt (the bare type name when the exception has no message) and `null` for a clean one. A **cancelled** structured, text or tool attempt records `CancelledError` there, for instance when your own `asyncio.timeout` cancels the call, rather than the `null` that would make it indistinguishable from an attempt that succeeded and returned nothing. An attempt cut off by its [`timeout`](#per-request-timeout) records `TimeoutError: no provider response within <n>s` (a structured attempt records the same message inside `InstructorRetryException`), and a stream cut that way records the same rather than the abandoned-stream marker, which stays reserved for a stream your own code stopped consuming.
 
 ### Grouping calls by run
 
@@ -1800,13 +1825,12 @@ The failure helpers build the exceptions providers really raise, so llmkit's ret
 | `server_error()` | `openai.InternalServerError` (500) | yes | no |
 | `timeout_error()` | `openai.APITimeoutError` | yes | no |
 
-Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait is spent inside the rate-limiter slot, as a slow provider's would be. Fault scripts compose from the request: refuse the first N attempts of one feature with `request.attempt`, or keep refusing one feature until its retry budget is spent. Tell a readiness probe from real work by its `feature` or `label`.
+Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait is spent inside the rate-limiter slot, as a slow provider's would be. The call's [`timeout`](#per-request-timeout) applies to the fake as to a provider: a delay longer than it is cut off with a `TimeoutError` and retried like a stalled request, so a host's timeout handling can be tested offline. On a stream the delay comes before the first chunk. Fault scripts compose from the request: refuse the first N attempts of one feature with `request.attempt`, or keep refusing one feature until its retry budget is spent. Tell a readiness probe from real work by its `feature` or `label`.
 
 ### What the fake does not see
 
 - **Cache hits and shared in-flight requests.** The [response cache](#response-cache) sits above the fake. A hit never reaches it, and an identical buffered request that joins one already in flight shares that one round trip. Configure no cache, or pass `cache=False`, when a test counts requests.
 - **Calls with no configured provider.** The provider is resolved before the round trip, and a key-based provider raises without its key. Configure one that needs none, such as Ollama, or give the provider a placeholder key. A `Provider` member passed as `provider=` is built from the environment, so a key-based member needs its variable set under test (`monkeypatch.setenv("OPENAI_API_KEY", "placeholder")`); `provider=Provider.OLLAMA` needs nothing.
-- **Timeout enforcement.** A fake answers before LiteLLM is reached, so `timeout` never fires under it. A `Reply(delay=...)` longer than the request timeout still returns normally.
 - **Mid-stream failures.** A fake can fail a streaming call before its first chunk, not partway through.
 
 Patching llmkit's private modules (`llmkit._litellm` and its functions) is unsupported: those are internal test seams and change without notice. `llmkit.testing` is the supported way.

@@ -80,11 +80,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preserving cached-token discounts. Unknown prices remain `null`; local
   Ollama streams may record zero. Pricing errors never fail a stream.
 
-- **Per-request `timeout` on every call function and `LLMCallOptions`.** Pass
-  seconds to bound each provider round trip; unset or `None` sends no timeout
-  keyword and preserves LiteLLM's default. Transport retries each get a fresh
-  timeout. Streams bound connection and each chunk wait. The fake transport
-  exposes the resolved value without enforcing it.
+- **Per-request `timeout` on every call function and `LLMCallOptions`, enforced
+  by llmkit.** Pass seconds to bound each provider round trip. llmkit enforces
+  the deadline itself: a round trip still waiting when it expires is cut off
+  and raised as a builtin `TimeoutError` reading `no provider response within
+  <n>s`, which the default retry policy retries with a fresh deadline. The value
+  is also forwarded to LiteLLM, whose own timeout cannot bound an attempt
+  alone: it is an HTTP read timeout that a provider keeping the connection
+  open without answering never trips, and the OpenAI SDK retries a timed-out
+  request inside one call. A timeout that only a provider's
+  `completion_kwargs()` supplies is enforced the same way. Unset or `None` sets
+  no deadline, sends no timeout keyword, and preserves LiteLLM's default.
+  Transport retries, schema-repair re-asks and refused-temperature re-issues
+  each get a fresh timeout. A stream's one `timeout` bounds opening the
+  request, the wait for the first chunk (a breach there is retried as a fresh
+  attempt) and each later chunk wait (a breach there ends the stream,
+  unretried); nothing else cuts a stream between chunks, and the consumer's own
+  time never counts. A cut attempt counts as a timeout for the rate limiter,
+  which treats timeouts as neutral. The fake transport answers under the same
+  deadline, so a `Reply(delay=...)` past it raises `TimeoutError` and a host's
+  timeout handling can be tested offline. On `structured_llm_call` the timeout
+  reaches the caller inside `InstructorRetryException`, as every transport
+  error does. A host that bounds attempts with its own `asyncio.timeout` around
+  each attempt of an app-owned retry loop can pass `timeout=` instead and let
+  llmkit's default retries run.
+
+- **`first_chunk_ms`: time to first chunk on every streamed record.**
+  `LLMCallRecord.first_chunk_ms`, the YAML body and the `index.jsonl` line carry
+  the time from a streamed attempt's start to the first frame of any kind the
+  provider sent, so a stream that waited 100 s and then streamed for 2 s is no
+  longer indistinguishable from one that streamed slowly throughout. Like
+  `duration_ms` it includes `queue_wait_ms`. It is `null` on buffered records,
+  cache hits, and a streamed attempt that received nothing, which is how a
+  stream cut off before its first chunk reads. The field is last on
+  `LLMCallRecord`, so positional construction is unchanged; a parser that
+  pins the index line's key set sees one new key, after `queue_wait_ms`.
 
 - **A dropped `temperature` is now logged.** When a model refuses the
   `temperature` you passed and llmkit re-issues the request without it, the
@@ -406,6 +436,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `completion_kwargs`.
 
 ### Fixed
+
+- **A cancelled structured or text attempt is recorded as cancelled.** An
+  `asyncio.CancelledError` reaching a buffered structured or text attempt (a
+  host's `asyncio.timeout` around the call, a cancelled task) bypassed the
+  error handler, so the attempt was recorded with `error=None, response=None`,
+  the shape of a success that returned nothing. It now records
+  `"CancelledError"`, as the tool lane already did, and the YAML verdict reads
+  `# ERROR`. Every family now formats `error` the same way: the bare type name
+  when the exception has no message, never `"<Type>: "`.
+
+- **A host-driven stream retry keeps one `call_id`.** A host that re-ran a
+  stream function from an attempt factory under `llmkit.retry.with_retries_stream`
+  got a fresh `call_id` and `attempt: 1` on every attempt, and a response-cache
+  lookup each time. The stream loop now carries the same call ledger as
+  `with_retries`, so those attempts share one `call_id` with a rising `attempt`,
+  and only the first reads the cache. llmkit's own stream retries already did.
+
+- **A stream cut off at its deadline releases the provider response.** A stream
+  attempt that ended early left LiteLLM's stream wrapper unclosed until garbage
+  collection; llmkit now closes it on every exit.
 
 - **A temperature OpenRouter refuses is dropped, as on every other route.**
   Every OpenRouter request carries `provider.require_parameters`, so on a model

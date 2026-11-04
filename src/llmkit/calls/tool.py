@@ -22,6 +22,7 @@ from pydantic import BaseModel, ValidationError
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     compose_validation_budget,
+    error_text,
     guard_output_schema,
     logger,
     parse_tool_calls,
@@ -116,9 +117,12 @@ async def tool_llm_call[T: BaseModel](
 ) -> ToolCallResult | ToolComposeResult[T]:
     """Run one tool-enabled turn, optionally accepting a schema-validated final answer.
 
-    ``timeout`` is seconds for one provider round trip (each wait for the
-    next chunk when streaming). Unset or ``None`` sends no timeout keyword
-    and leaves LiteLLM's default in effect.
+    ``timeout`` is seconds for one provider round trip, a deadline llmkit
+    enforces: a round trip still waiting at it is cut off with a
+    ``TimeoutError``, which the default retry policy retries with a fresh
+    deadline. The value is forwarded to LiteLLM too; ``0.0`` is accepted and
+    fires at the first wait. Unset or ``None`` sets no deadline and sends no
+    timeout keyword, leaving LiteLLM's default in effect.
 
     A round in which only *some* requested calls are malformed keeps the
     well-formed ones on ``tool_calls`` and reports the rest on
@@ -308,7 +312,7 @@ async def tool_llm_call[T: BaseModel](
             #
             # ``str(exc)`` is empty for a bare ``CancelledError``, so the
             # message is dropped rather than logged as ``"CancelledError: "``.
-            error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            error = error_text(exc)
             raise
         finally:
             resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
@@ -453,9 +457,10 @@ def tool_llm_call_sync[T: BaseModel](
     :func:`run_sync`: same arguments, same retries, logging, rate limits and
     result. Every argument is forwarded untouched.
 
-    ``timeout`` is seconds for one provider round trip; unset or ``None``
-    sends no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
-    async form, the per-request timeout and the retry budget bound the call.
+    ``timeout`` is seconds for one provider round trip, enforced by llmkit as
+    on the async form; unset or ``None`` sets no deadline. The sync bridge adds
+    no whole-call ceiling: as on the async form, the per-request timeout and
+    the retry budget bound the call.
     """
     return run_sync(
         tool_llm_call(

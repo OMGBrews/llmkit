@@ -16,6 +16,7 @@ from pydantic import BaseModel, JsonValue
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    error_text,
     guard_output_schema,
     logger,
     prepare_call,
@@ -90,8 +91,13 @@ async def structured_llm_call[T: BaseModel](
         model: Optional model override. Unset defers to ``options``, then
             to the default model of the provider the call runs on (the
             registered one, or ``provider=``), as does an explicit ``None``.
-        timeout: Seconds for one provider round trip; unset or ``None`` sends
-            no timeout keyword and leaves LiteLLM's default in effect.
+        timeout: Seconds for one provider round trip, a deadline llmkit
+            enforces: a round trip still waiting at it is cut off with a
+            ``TimeoutError``, which the default retry policy retries with a
+            fresh deadline. The value is forwarded to LiteLLM too. ``0.0`` is
+            accepted and fires at the first wait. Unset or ``None`` sets no
+            deadline and sends no timeout keyword, leaving LiteLLM's default
+            in effect.
         max_tokens: Optional cap on the completion length, forwarded to the
             provider when set (no cap when it resolves to ``None`` —
             byte-identical to the prior request). Parity with
@@ -252,7 +258,7 @@ async def structured_llm_call[T: BaseModel](
             # instructor can raise after a completion returned (a truncation),
             # in which case the funnel already stamped what it sent.
             sent_temperature = _litellm.sent_temperature(sent_temperature)
-            error = f"{type(exc).__name__}: {exc}"
+            error = error_text(exc)
             if isinstance(exc, OutputLimitError):
                 # ``None`` for a directly constructed error: no fields logged.
                 diagnostics = exc.diagnostics
@@ -264,6 +270,17 @@ async def structured_llm_call[T: BaseModel](
                         diagnostics.completion_tokens,
                         diagnostics.total_tokens,
                     )
+            raise
+        except BaseException as exc:
+            # A cancellation (a host's ``asyncio.timeout`` around the call, a
+            # cancelled task) is a ``BaseException`` and bypasses the clause
+            # above, so without this one the ``finally`` would record
+            # ``error=None, response=None``: a success that returned nothing.
+            # It is recorded as cancelled instead, and re-raised untouched.
+            # The record still lands, for the reason ``calls/tool.py`` gives:
+            # the single delivered cancellation is consumed by the time the
+            # ``finally`` awaits.
+            error = error_text(exc)
             raise
         finally:
             duration_ms = (time.monotonic() - start_t) * 1000
@@ -417,9 +434,10 @@ def structured_llm_call_sync[T: BaseModel](
     **config < options < explicit keyword** precedence; every argument is
     forwarded untouched.
 
-    ``timeout`` is seconds for one provider round trip; unset or ``None`` sends
-    no timeout keyword. The sync bridge adds no whole-call ceiling: as on the
-    async form, the per-request timeout and the retry budget bound the call.
+    ``timeout`` is seconds for one provider round trip, enforced by llmkit as
+    on the async form; unset or ``None`` sets no deadline. The sync bridge adds
+    no whole-call ceiling: as on the async form, the per-request timeout and
+    the retry budget bound the call.
     """
     return run_sync(
         structured_llm_call(

@@ -123,7 +123,9 @@ class TransportRequest:
         model: The resolved, provider-routed model id.
         provider: The provider's name.
         temperature: The temperature the call requested, or ``None``.
-        timeout: Per-request timeout in seconds, or ``None``; never fires under a fake.
+        timeout: The call's per-request timeout in seconds, or ``None``. The
+            fake answers under it, as a provider does: a :class:`Reply`
+            whose ``delay`` outlasts it raises ``TimeoutError``.
         max_tokens: The output-token cap, or ``None``.
         reasoning_effort: The effective reasoning effort, or ``None``.
     """
@@ -181,7 +183,8 @@ class Reply:
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
         cost: Approximate cost to report, or ``None``.
-        delay: Seconds to wait before answering, inside the rate-limiter slot.
+        delay: Seconds to wait before answering, inside the rate-limiter slot
+            and under the request's ``timeout``, which cuts a longer wait off.
         chunks: Explicit text deltas for a streaming call. When omitted,
             ``content`` is split into word-sized deltas. Buffered calls answer
             with their concatenation.

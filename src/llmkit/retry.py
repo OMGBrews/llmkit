@@ -16,8 +16,8 @@ as either composes with itself.
 Audit logging and timing remain the caller's concern: each attempt is its
 own LLM call (and its own log record), because the retry loop wraps the
 logging call functions rather than living inside them. The loop does own one
-piece of logging identity: a call function re-run by :func:`with_retries` joins
-the loop's logical call, so its records share one ``call_id`` and number their
+piece of logging identity: a call function re-run by either loop joins the
+loop's logical call, so its records share one ``call_id`` and number their
 ``attempt`` across passes (see :class:`_CallLedger`).
 
 Two budgets, kept separate: *transport* failures (rate limits, transient
@@ -329,13 +329,16 @@ NO_RETRY = RetryPolicy(max_attempts=1, validation_max_attempts=1)
 
 @final
 class _CallLedger:
-    """The logical calls one :func:`with_retries` loop re-runs, across passes.
+    """The logical calls one retry loop re-runs, across passes.
 
     ``LLMCallRecord`` promises one ``call_id`` per *logical* call and a 1-based
     ``attempt`` within it. A call function opted out of its own retries and
-    re-run by an outer :func:`with_retries` is invoked afresh on every pass, so
-    left alone it would mint a new id each time; the ledger is what lets it
-    rejoin the logical call it belongs to instead.
+    re-run by an outer :func:`with_retries` — or a stream function a host's
+    attempt factory calls afresh under :func:`with_retries_stream` — is invoked
+    afresh on every pass, so left alone it would mint a new id each time; the
+    ledger is what lets it rejoin the logical call it belongs to instead. A
+    rejoined call also gets a nonzero attempt offset, which is how only the
+    first attempt reads the response cache.
 
     A call is identified by its ``(feature, label)`` and the occurrence index of
     that pair within the current pass — not by raw position, so a conditional
@@ -343,9 +346,12 @@ class _CallLedger:
     wrong id. ``attempt`` counts tries *of that logical call*: one first reached
     on pass 2 records attempt 1.
 
-    Only the non-nested path of :func:`with_retries` installs one. The stream
-    loop's scopes carry none, because a stream's own attempts already share an
-    id by parameter and no call is prepared under them.
+    The non-nested paths of both loops install one. The stream loop carries
+    its one ledger across every scope it re-arms around a ``yield``, so every
+    call an attempt prepares is counted by the same ledger, before its first
+    chunk or after. llmkit's own stream functions
+    prepare their call before entering the loop and pass the id to each
+    attempt as a parameter, so for them the ledger changes nothing.
     """
 
     __slots__ = ("_entries", "_seen")
@@ -387,8 +393,9 @@ class _RetryScope:
     collapsing: it runs in its own task, so it keeps its own retry budget.
 
     The same ownership test decides which calls join the loop's logical calls:
-    *ledger* is the :class:`_CallLedger` a non-nested :func:`with_retries`
-    installs, read through :func:`claim_logical_call`; ``None`` everywhere else.
+    *ledger* is the :class:`_CallLedger` a non-nested :func:`with_retries` or
+    :func:`with_retries_stream` installs, read through
+    :func:`claim_logical_call`; ``None`` everywhere else.
     """
 
     __slots__ = ("ledger", "task")
@@ -423,7 +430,8 @@ def _in_active_retry_scope() -> bool:
 def claim_logical_call(feature: str, label: str | None) -> tuple[str, int]:
     """The ``call_id`` and attempt offset for a call about to be prepared.
 
-    Inside a :func:`with_retries` loop owned by the current task, the call joins
+    Inside a :func:`with_retries` or :func:`with_retries_stream` loop owned by
+    the current task, the call joins
     the loop's logical call through its :class:`_CallLedger`: the same id as the
     matching call on earlier passes, and an offset of the attempts already made
     under it. Anywhere else — no loop, or a loop owned by another task, which is
@@ -562,7 +570,11 @@ async def with_retries_stream[T](
 
     *attempt_factory* is called with the 1-based attempt number and returns one
     attempt's async generator; each attempt is a distinct call (and, for the
-    call functions, its own log record, sharing the stream's ``call_id``).
+    call functions, its own log record, sharing the stream's ``call_id``). A
+    factory that calls a stream function afresh on each attempt joins one
+    logical call through the loop's :class:`_CallLedger`, as under
+    :func:`with_retries`: one ``call_id``, a rising ``attempt``, and a response
+    cache read on the first attempt only.
     *surface* names the caller in the double-wrap warning, and *label* is the
     tag used for the warning and the exhaustion log line — the same
     ``"%s: all %d attempts failed: %s"`` message :func:`with_retries` emits,
@@ -577,7 +589,8 @@ async def with_retries_stream[T](
       a suspension would leak it into the consumer's own llmkit calls between
       chunks — and, on an early ``break``, leave it set in their context for
       good. Each re-arm installs a fresh :class:`_RetryScope`, because a
-      generator may resume in a *different* task than the one it suspended in.
+      generator may resume in a *different* task than the one it suspended in,
+      carrying the loop's one :class:`_CallLedger`.
     * **Each attempt is wrapped in ``aclosing``.** An abandoning consumer's
       close must reach the attempt generator while this frame is still live, so
       the attempt's own ``finally`` runs deterministically rather than whenever
@@ -638,9 +651,11 @@ async def with_retries_stream[T](
                 )
             raise
 
-    token = _retry_scope.set(_RetryScope())
+    ledger = _CallLedger()
+    token = _retry_scope.set(_RetryScope(ledger))
     try:
         for attempt in range(1, policy.max_attempts + 1):
+            ledger.begin_pass()
             yielded_any = False
             try:
                 async with aclosing(attempt_factory(attempt)) as attempt_stream:
@@ -650,7 +665,9 @@ async def with_retries_stream[T](
                         try:
                             yield chunk
                         finally:
-                            token = _retry_scope.set(_RetryScope())
+                            # The loop's one ledger, so a call the attempt
+                            # prepares after this chunk is counted by it too.
+                            token = _retry_scope.set(_RetryScope(ledger))
                 return
             except Exception as exc:
                 if (

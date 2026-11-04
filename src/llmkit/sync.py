@@ -713,8 +713,9 @@ def iterate_sync[T](agen: AsyncGenerator[T]) -> Generator[T]:
     context entered after this call (a :func:`~llmkit.capture_llm_records`
     block, a run scope) does not reach the stream.
 
-    No step has a wait ceiling; the async stream's own per-request timeout
-    bounds each item. Closing the returned generator — explicitly, by
+    No step has a wait ceiling of its own; the async stream's per-request
+    timeout, which llmkit enforces on each wait for the next wire frame inside
+    the step, bounds each item. Closing the returned generator — explicitly, by
     ``break`` out of a ``for`` loop that holds its only reference, or by
     dropping it — closes the async generator on the loop, so the stream
     records its abandonment. :func:`shutdown` cancels a step in flight, which
