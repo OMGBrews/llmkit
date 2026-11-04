@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Buffered tool calls now attach the latest rejected tool-call turn and one
+  validation-error result per call when re-asking an all-malformed round,
+  followed by a user instruction to issue a corrected tool call.
+  Invalid or non-object JSON is safely replayed as `{}` with the raw arguments
+  in the error result; missing ids or names retain the original blind re-ask.
+  Strict argument validation and retry budgets are unchanged. Streamed tool
+  calls still raise without re-asking. Whole-round `ToolArgumentError` exposes
+  all rejections in `round_errors`; individual salvaged errors leave it empty.
+  Repair-attempt logs include the added history, while testing fakes keep the
+  original `prompt`, expose the sent `messages`, and mark `repair=True`.
+
 ### Added
 
 - **`describe_llm` describes a per-call provider and reports the route's

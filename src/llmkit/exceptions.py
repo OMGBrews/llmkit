@@ -424,15 +424,27 @@ LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
 
 
 class ToolArgumentError(LlmkitError):
-    """A model requested an unknown tool or supplied invalid arguments."""
+    """A model requested an unknown tool or supplied invalid arguments.
+
+    ``round_errors`` carries every rejection in an all-malformed round, for
+    buffered repair re-asks. Individual salvaged-round errors leave it empty.
+    The streaming lane also exposes the round but does not re-ask it.
+    """
 
     def __init__(
-        self, tool_name: str | None, call_id: str | None, arguments_raw: str | None, reason: str
+        self,
+        tool_name: str | None,
+        call_id: str | None,
+        arguments_raw: str | None,
+        reason: str,
+        *,
+        round_errors: tuple["ToolArgumentError", ...] = (),
     ):
         super().__init__(reason)
         self.tool_name: str | None = tool_name
         self.call_id: str | None = call_id
         self.arguments_raw: str | None = arguments_raw
+        self.round_errors: tuple[ToolArgumentError, ...] = round_errors
 
 
 LLM_TOOL_ERRORS: tuple[type[Exception], ...] = (ToolArgumentError,)

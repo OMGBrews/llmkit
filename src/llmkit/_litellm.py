@@ -1073,6 +1073,7 @@ def _call_context(
     label: str | None,
     call_id: str | None,
     attempt: int | None,
+    repair: bool = False,
     output_schema: type[BaseModel] | None = None,
     tools: Sequence[ToolDefinition] = (),
     tool_choice: ToolChoice | None = None,
@@ -1080,6 +1081,7 @@ def _call_context(
     """The :class:`CallContext` a transport attaches to its wire request."""
     return CallContext(
         kind=kind,
+        repair=repair,
         prompt=prompt,
         messages=messages,
         model=model,
@@ -1473,6 +1475,7 @@ async def acompletion_tools(
     prompt: str | Sequence[ChatMessage],
     tools: Sequence[ToolDefinition],
     *,
+    repair: Sequence[ChatMessage] = (),
     tool_choice: ToolChoice | None,
     temperature: float | None,
     model: str | None,
@@ -1500,7 +1503,7 @@ async def acompletion_tools(
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
     litellm_model = provider.litellm_model(model)
-    messages = wire_messages(prompt)
+    messages = [*wire_messages(prompt), *wire_messages(repair)]
     call = _call_context(
         "tool",
         prompt,
@@ -1515,6 +1518,7 @@ async def acompletion_tools(
         label=label,
         call_id=call_id,
         attempt=attempt,
+        repair=bool(repair),
         output_schema=output_schema,
         tools=tools,
         tool_choice=tool_choice,

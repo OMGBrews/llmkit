@@ -65,6 +65,7 @@ from llmkit import (
     tool_llm_call,
     tool_llm_call_sync,
 )
+from llmkit._types import AssistantToolMessage, ChatMessage, ToolResultMessage
 from llmkit.providers import OllamaProvider
 from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
 
@@ -205,6 +206,112 @@ async def test_tool_arguments_raise_when_every_call_is_lax_only() -> None:
     assert caught.value.call_id == "bad"
     # Re-asked on the validation budget, like a schema failure.
     assert len(fake.requests) == 2
+
+
+@pytest.mark.parametrize("as_messages", [False, True])
+async def test_tool_reask_repairs_strict_arguments(as_messages: bool) -> None:
+    tool = ToolDefinition.from_model("count", _N, "Count")
+    answers = iter(
+        [
+            Reply(tool_calls=[FakeToolCall("count", '{"n": "1"}', id="bad")]),
+            Reply(tool_calls=[FakeToolCall("count", '{"n": 1}', id="good")]),
+        ]
+    )
+    prompt: str | list[ChatMessage] = [{"role": "user", "content": "q"}] if as_messages else "q"
+    with install(lambda _request: next(answers)) as fake, capture_llm_records() as records:
+        result = await tool_llm_call(
+            prompt, [tool], feature="f", provider=_PROVIDER, retry=_NO_BACKOFF
+        )
+    assert result.tool_calls[0].validated == _N(n=1)
+    first, second = fake.requests
+    assert second.prompt == first.prompt
+    assert second.repair is True
+    user, assistant, error, reminder = second.messages
+    assert user == {"role": "user", "content": "q"}
+    assert assistant == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "bad",
+                "type": "function",
+                "function": {"name": "count", "arguments": '{"n": "1"}'},
+            }
+        ],
+    }
+    assert error["role"] == "tool"
+    assert error["tool_call_id"] == "bad"
+    assert error["content"].startswith("ERROR: ")
+    assert all(part in error["content"] for part in ("count", "bad", "int_type"))
+    assert records[0].prompt == prompt
+    assert reminder["role"] == "user"
+    assert isinstance(reminder["content"], str)
+    assert "Retry the rejected tool request" in reminder["content"]
+    assert records[1].prompt == [
+        user,
+        assistant,
+        {
+            "role": "tool",
+            "tool_call_id": "bad",
+            "content": error["content"].removeprefix("ERROR: "),
+            "is_error": True,
+        },
+        reminder,
+    ]
+    assert prompt == ([{"role": "user", "content": "q"}] if as_messages else "q")
+
+
+@pytest.mark.parametrize("arguments", ["{not json", "[]", "null"])
+async def test_tool_reask_normalizes_unreplayable_arguments(arguments: str) -> None:
+    answers = iter(
+        [
+            Reply(tool_calls=[FakeToolCall("count", arguments, id="bad")]),
+            Reply(tool_calls=[FakeToolCall("count", '{"n": 1}', id="good")]),
+        ]
+    )
+    with install(lambda _request: next(answers)) as fake:
+        _ = await tool_llm_call(
+            "q",
+            [ToolDefinition.from_model("count", _N, "Count")],
+            feature="f",
+            provider=_PROVIDER,
+            retry=_NO_BACKOFF,
+        )
+    _, assistant, error, _ = fake.requests[1].messages
+    assistant = cast("AssistantToolMessage", assistant)
+    assert cast("dict[str, object]", assistant["tool_calls"][0]["function"])["arguments"] == "{}"
+    assert arguments in cast("ToolResultMessage", error)["content"]
+
+
+async def test_tool_reask_carries_every_rejected_call() -> None:
+    replies = iter(
+        [
+            Reply(
+                tool_calls=[
+                    FakeToolCall("count", '{"n": "1"}', id="one"),
+                    FakeToolCall("unknown", "{}", id="two"),
+                ]
+            ),
+            Reply(tool_calls=[FakeToolCall("count", '{"n": 1}', id="good")]),
+        ]
+    )
+    with install(lambda _request: next(replies)) as fake:
+        _ = await tool_llm_call(
+            "q",
+            [ToolDefinition.from_model("count", _N, "Count")],
+            feature="f",
+            provider=_PROVIDER,
+            retry=_NO_BACKOFF,
+        )
+    _, assistant, one, two, _ = fake.requests[1].messages
+    assistant = cast("AssistantToolMessage", assistant)
+    assert [call["id"] for call in assistant["tool_calls"]] == ["one", "two"]
+    one = cast("ToolResultMessage", one)
+    two = cast("ToolResultMessage", two)
+    assert one["tool_call_id"] == "one"
+    assert two["tool_call_id"] == "two"
+    assert "int_type" in one["content"]
+    assert all(part in two["content"] for part in ("unknown", "not offered", "count"))
 
 
 async def test_a_cache_hit_whose_stored_text_is_lax_only_is_a_warned_miss(
@@ -869,3 +976,101 @@ async def test_no_choice_is_an_empty_result_on_the_tool_lane() -> None:
     assert result.tool_calls == []
     assert result.invalid_calls == []
     assert len(fake.requests) == 1
+
+
+@pytest.mark.parametrize("missing", ["id", "name", "arguments"])
+async def test_tool_reask_handles_missing_provider_fields(
+    missing: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import llmkit.testing as testing
+    from llmkit._transport import WireFunction, WireToolCall
+
+    original = testing._reply_tool_calls
+    calls = 0
+
+    def malformed_first(reply: Reply) -> tuple[WireToolCall, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                WireToolCall(
+                    None if missing == "id" else "bad",
+                    WireFunction(
+                        None if missing == "name" else "count",
+                        None if missing == "arguments" else '{"n": "1"}',
+                    ),
+                ),
+            )
+        return original(reply)
+
+    monkeypatch.setattr(testing, "_reply_tool_calls", malformed_first)
+    with install(lambda _request: Reply(tool_calls=[FakeToolCall("count", '{"n": 1}')])) as fake:
+        _ = await tool_llm_call(
+            "q",
+            [ToolDefinition.from_model("count", _N, "Count")],
+            feature="f",
+            provider=_PROVIDER,
+            retry=_NO_BACKOFF,
+        )
+    first, second = fake.requests
+    if missing in ("id", "name"):
+        assert second.messages == first.messages
+        assert not second.repair
+    else:
+        assert second.repair
+        _, assistant, error, _ = second.messages
+        assistant = cast("AssistantToolMessage", assistant)
+        assert (
+            cast("dict[str, object]", assistant["tool_calls"][0]["function"])["arguments"] == "{}"
+        )
+        assert "No arguments arrived" in cast("ToolResultMessage", error)["content"]
+
+
+async def test_tool_repair_tracks_latest_round_and_survives_transport_failure() -> None:
+    replies = iter(
+        [
+            Reply(tool_calls=[FakeToolCall("count", '{"n": "1"}', id="first")]),
+            TimeoutError("no response"),
+            Reply(tool_calls=[FakeToolCall("count", '{"n": "2"}', id="latest")]),
+            Reply.text('{"n": "3"}'),
+            Reply.text('{"n": 4}'),
+        ]
+    )
+
+    def answer(_request: TransportRequest) -> Reply:
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    with install(answer) as fake, capture_llm_records() as records:
+        result = await tool_llm_call(
+            "q",
+            [ToolDefinition.from_model("count", _N, "Count")],
+            output_schema=_N,
+            feature="f",
+            provider=_PROVIDER,
+            retry=RetryPolicy(validation_max_attempts=4, backoff_base_seconds=0.0),
+        )
+    assert result.parsed == _N(n=4)
+    assert [request.repair for request in fake.requests] == [False, True, True, True, False]
+    assert fake.requests[1].messages == fake.requests[2].messages
+    assert len(fake.requests[3].messages) == 4
+    latest = fake.requests[3].messages[1]
+    latest = cast("AssistantToolMessage", latest)
+    assert latest["tool_calls"][0]["id"] == "latest"
+    assert fake.requests[4].messages == fake.requests[0].messages
+    assert [record.prompt for record in records][1] == records[2].prompt
+
+
+def test_whole_round_error_carries_distinct_individual_errors() -> None:
+    from llmkit._transport import WireFunction, WireToolCall
+    from llmkit.calls._shared import parse_tool_calls
+
+    calls = [WireToolCall(name, WireFunction("count", '{"n": "1"}')) for name in ("a", "b")]
+    with pytest.raises(ToolArgumentError) as caught:
+        _ = parse_tool_calls(list[object](calls), {"count": ToolDefinition.from_model("count", _N)})
+    error = caught.value
+    assert [item.call_id for item in error.round_errors] == ["a", "b"]
+    assert all(item is not error and item.round_errors == () for item in error.round_errors)

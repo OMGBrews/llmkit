@@ -48,7 +48,7 @@ from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 
 from pydantic import BaseModel
 
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import AssistantToolMessage, ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import CacheDecodeError, cache_key_or_none, read_through
 from llmkit.exceptions import (
@@ -66,7 +66,7 @@ from llmkit.providers.base import active_config, client_configured
 from llmkit.rate_limiting import current_queue_wait_ms
 from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
 from llmkit.run_scope import get_run_id
-from llmkit.tools import TokenUsage, ToolCall, ToolDefinition
+from llmkit.tools import TokenUsage, ToolCall, ToolDefinition, tool_result_message
 
 # One logger for the whole call surface, named explicitly rather than via
 # ``__name__`` so every family module shares a single greppable name.
@@ -540,8 +540,9 @@ def parse_tool_calls(
     The one case that still raises is a round in which **every** call failed:
     the turn produced nothing actionable, so it stays a whole-round
     :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
-    budget exactly as before. A round with no calls at all is not a failure —
-    a text-only or compose answer takes that path.
+    budget with the rejected calls and their errors attached when replayable.
+    A round with no calls at all is not a failure — a text-only or compose
+    answer takes that path.
 
     Public-named inside a private module, the repo's convention for a seam two
     families share: :func:`~llmkit.tool_llm_call` and
@@ -560,7 +561,14 @@ def parse_tool_calls(
         except ToolArgumentError as exc:
             invalid.append(exc)
     if invalid and not parsed:
-        raise invalid[0]
+        first = invalid[0]
+        raise ToolArgumentError(
+            first.tool_name,
+            first.call_id,
+            first.arguments_raw,
+            str(first),
+            round_errors=tuple(invalid),
+        ) from first
     if invalid:
         logger.warning(
             "Dropped %d malformed tool call(s) from a round of %d: %s",
@@ -714,3 +722,62 @@ def build_text_record(
         partial_text=output_limit.partial_text if output_limit is not None else None,
         first_chunk_ms=(first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None,
     )
+
+
+def tool_repair_messages(
+    errors: Sequence[ToolArgumentError], offered: Sequence[str]
+) -> list[ChatMessage]:
+    """Render one rejected round without replaying non-object JSON arguments.
+
+    Missing ids or names make the entire round unpairable, so it stays blind.
+    A final user turn requests another tool call rather than a prose answer.
+    Unknown names are preserved; whether Anthropic or Gemini accept history
+    naming an undeclared tool has not been measured.
+    """
+    assistant: AssistantToolMessage = {"role": "assistant", "content": None, "tool_calls": []}
+    results: list[ChatMessage] = []
+    for error in errors:
+        if error.call_id is None or error.tool_name is None:
+            return []
+        arguments = error.arguments_raw
+        try:
+            replayable = arguments is not None and isinstance(json.loads(arguments), dict)
+        except json.JSONDecodeError:
+            replayable = False
+        assistant["tool_calls"].append(
+            {
+                "id": error.call_id,
+                "type": "function",
+                "function": {
+                    "name": error.tool_name,
+                    "arguments": arguments if replayable and arguments is not None else "{}",
+                },
+            }
+        )
+        text = (
+            f"Tool {error.tool_name!r}, call {error.call_id!r}: {error}. "
+            "The tool did not execute. Request the tool again with corrected arguments."
+        )
+        if not replayable:
+            text += (
+                f". Raw arguments: {arguments!r}"
+                if arguments is not None
+                else ". No arguments arrived"
+            )
+        if error.tool_name not in offered:
+            text += f". Tool was not offered. Offered tools: {', '.join(offered)}"
+        results.append(tool_result_message(error.call_id, text, is_error=True))
+    if not results:
+        return []
+    # A tool result normally invites a final answer. Small models can describe
+    # corrected arguments in prose unless a new user turn requests another call.
+    reminder: ChatMessage = {
+        "role": "user",
+        "content": (
+            "Retry the rejected tool request now using the tool interface. "
+            "Correct the arguments according to the errors above. "
+            "Respect the declared JSON types: an integer must be a JSON number "
+            "without quotes. Send a tool call rather than prose or a code block."
+        ),
+    }
+    return [assistant, *results, reminder]

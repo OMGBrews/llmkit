@@ -29,6 +29,7 @@ from llmkit.calls._shared import (
     prepare_call,
     resolve_model_and_provider,
     run_with_policy,
+    tool_repair_messages,
     tool_validation_budget,
     usage_log_dict,
 )
@@ -39,6 +40,7 @@ from llmkit.exceptions import (
     OutputLimitError,
     SchemaEngineError,
     StructuredOutputError,
+    ToolArgumentError,
     validation_failure_summary,
 )
 from llmkit.logging import LLMCallRecord
@@ -128,7 +130,8 @@ async def tool_llm_call[T: BaseModel](
     well-formed ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``; a round in which every call is malformed still raises
     :class:`~llmkit.ToolArgumentError` and is re-asked on the validation
-    budget. See :class:`~llmkit.ToolCallResult`.
+    budget with the rejected calls and validation errors attached when replayable.
+    See :class:`~llmkit.ToolCallResult`.
 
     Tool arguments, and with ``output_schema`` the final answer, are validated
     in pydantic's strict JSON mode. An ``output_schema`` that is not a plain
@@ -178,13 +181,20 @@ async def tool_llm_call[T: BaseModel](
         guard_tool_choice(provider, tool_choice)
     definitions = {definition.name: definition for definition in tools}
     attempt_count = 0
+    repair: list[ChatMessage] = []
 
     async def _attempt() -> ToolCallResult | ToolComposeResult[T]:
         # Function-local + module-bound; see :mod:`llmkit._litellm`.
         import llmkit._litellm as _litellm
 
-        nonlocal attempt_count
+        nonlocal attempt_count, repair
         attempt_count += 1
+        attempt_prompt: str | Sequence[ChatMessage] = prompt
+        if repair:
+            original: list[ChatMessage] = (
+                [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+            )
+            attempt_prompt = [*original, *repair]
         begin_queue_wait()
         started_at, start_t = datetime.now(UTC), time.monotonic()
         result: ToolCallResult | ToolComposeResult[T] | None = None
@@ -199,6 +209,7 @@ async def tool_llm_call[T: BaseModel](
             text, raw_calls, stop_reason, counts, cost = await _litellm.acompletion_tools(
                 prompt,
                 tools,
+                repair=repair,
                 tool_choice=tool_choice,
                 temperature=args.temperature,
                 model=args.model,
@@ -224,7 +235,14 @@ async def tool_llm_call[T: BaseModel](
                 attempt=attempt_offset + attempt_count,
             )
             sent_temperature = _litellm.sent_temperature(args.temperature)
-            parsed_calls, invalid_calls = parse_tool_calls(raw_calls, definitions)
+            # Only a received all-malformed round replaces repair. Transport
+            # failures above retain it; all other received outcomes clear it.
+            repair = []
+            try:
+                parsed_calls, invalid_calls = parse_tool_calls(raw_calls, definitions)
+            except ToolArgumentError as exc:
+                repair = tool_repair_messages(exc.round_errors, list(definitions))
+                raise
             base = (
                 text,
                 parsed_calls,
@@ -328,7 +346,7 @@ async def tool_llm_call[T: BaseModel](
                     schema=(
                         "tools" if output_schema is None else f"tools+{output_schema.__name__}"
                     ),
-                    prompt=prompt,
+                    prompt=attempt_prompt,
                     response=_dump_for_log(result, feature, label),
                     error=error,
                     approximate_cost=cost,

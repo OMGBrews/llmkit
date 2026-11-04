@@ -1503,3 +1503,25 @@ async def _assert_schema_backed_constraints(
         max_tokens=1024,
     )
     assert result.root == {"code": "123", "status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_live_ollama_buffered_integer_tool() -> None:
+    """The shipped default model can request strictly typed integer arguments.
+
+    Uses the default retry policy, including its one validation repair re-ask.
+    The streamed cost check intentionally measures a different, text-only tool.
+    """
+    built = make_provider(Provider.OLLAMA, model=None, **_live_credentials(Provider.OLLAMA))
+    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    result = await tool_llm_call(
+        "Use the add tool to calculate 2 plus 3.",
+        [add],
+        feature="integration-ollama-buffered-integer-tool",
+        provider=built,
+        max_tokens=512,
+    )
+    assert len(result.tool_calls) == 1, result
+    assert result.tool_calls[0].name == "add"
+    assert result.tool_calls[0].validated == _AdditionArgs(left=2, right=3)
+    assert not result.invalid_calls
