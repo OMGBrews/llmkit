@@ -1419,15 +1419,26 @@ async def test_live_tiny_request_timeout() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", _TEXT_STREAM_USAGE_PROVIDERS)
 async def test_live_tool_stream_reports_cost(provider: Provider) -> None:
-    """A streamed tool turn records a price from provider usage on every route."""
+    """A streamed tool turn records a price from provider usage on every route.
+
+    The tool takes a text argument on purpose. Tool arguments are validated
+    strictly, so a number written as text is rejected for an ``int`` field (the
+    structured-output contract audit's item 15, shipped as a breaking change).
+    Ollama's default model wrote the integer ``add`` tool's arguments as text in
+    6 of 10 direct calls (measured 2026-11-03), and the streamed lane cannot
+    re-ask, so an integer tool made this test fail intermittently on Ollama.
+    The test measures price recording and never reads the arguments, so do not
+    reintroduce an integer tool here. ``tool_choice`` stays unset because the
+    Ollama route cannot force a tool.
+    """
     built = make_provider(provider, model=None, **_live_credentials(provider))
-    add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
+    lookup = ToolDefinition.from_model("lookup", _LookupArgs, "Look up a stored value by its key.")
     with capture_llm_records() as records:
         events = [
             event
             async for event in tool_llm_call_stream(
-                "Use the add tool to calculate 2 plus 3.",
-                [add],
+                "Use the lookup tool to fetch the stored value for key 'answer'.",
+                [lookup],
                 feature="integration-tool-stream-cost",
                 provider=built,
                 max_tokens=512,
