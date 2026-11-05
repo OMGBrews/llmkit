@@ -20,17 +20,11 @@ piece of logging identity: a call function re-run by either loop joins the
 loop's logical call, so its records share one ``call_id`` and number their
 ``attempt`` across passes (see :class:`_CallLedger`).
 
-Two budgets, kept separate: *transport* failures (rate limits, transient
-5xx, network/timeout) get the full :attr:`RetryPolicy.max_attempts` budget;
-*schema-validation* failures get the lower
-:attr:`RetryPolicy.validation_max_attempts` budget, so a deterministic schema
-failure can't burn the full transport budget on doomed re-asks. A third class
-gets **zero budget** under every configuration — including ``retry_on=None``:
-an open circuit (:class:`~llmkit.exceptions.CircuitOpenError`) must never be
-re-asked, because the breaker already knows the provider is down, and an
-output-limit truncation (:class:`~llmkit.exceptions.OutputLimitError`) re-asked
-with an identical token budget can only truncate again; only a ``retry_on``
-that explicitly lists the type opts back in.
+One overall outer-attempt ceiling, with a smaller validation-retry allowance
+inside it: every pass counts against :attr:`RetryPolicy.max_attempts`, and a
+validation failure can cause at most ``validation_max_attempts - 1`` retries.
+Switching error categories never resets either count. Output-limit truncation
+and an open circuit fail immediately unless explicitly included in ``retry_on``.
 
 Composing :func:`with_retries` around a call function that *already* retries
 (every call function does, by default) would otherwise multiply the budgets
@@ -186,8 +180,8 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
 _SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = REPAIRABLE_PARSE_ERRORS
 
 
-# Zero-budget fail-fast signals: retried on neither budget under every
-# configuration, including retry_on=None. Backpressure (an open circuit must
+# Zero-budget fail-fast signals: never retried under the default policy.
+# Backpressure (an open circuit must
 # never be re-asked) and output-limit truncation (an identical token budget
 # can only truncate again). An explicit retry_on listing the type opts back in.
 _ZERO_BUDGET_ERRORS: tuple[type[Exception], ...] = (
@@ -208,27 +202,21 @@ class RetryPolicy:
     errors with bounded full-jitter backoff, without the caller wrapping
     every call.
 
-    **Two separate budgets.** Transport failures (rate limits, transient
-    5xx, network/timeout — :data:`~llmkit.exceptions.LLM_TRANSPORT_ERRORS`)
-    get ``max_attempts`` tries, since a retry on a fresh connection
-    routinely succeeds. Schema-validation failures (llmkit's
-    :class:`~llmkit.exceptions.StructuredOutputError`, pydantic
-    ``ValidationError``, instructor ``InstructorRetryException`` —
-    :data:`~llmkit.exceptions.LLM_SCHEMA_ERRORS`) get the lower
-    ``validation_max_attempts``, so a deterministically-wrong schema can't
-    burn the full transport budget on doomed re-asks while a
-    transiently-malformed JSON response still earns one cross-call retry.
-    The budgets are counted independently: each failure is charged to
-    whichever budget matches its class, and the call stops when *that*
-    budget is spent.
+    **One ceiling with a validation sublimit.** ``max_attempts`` bounds every
+    outer attempt, including the first, regardless of failure category.
+    ``validation_max_attempts - 1`` limits how many retries validation failures
+    can cause within that ceiling. The default is three outer attempts with
+    at most one validation-caused retry. No count resets after another error
+    class intervenes. A pass may issue more than one provider request because
+    schema repair and temperature reissues happen inside it; this is not a
+    provider-request, spending, or elapsed-time cap.
 
     **Two classes get zero budget.** An output-limit truncation
     (:class:`~llmkit.exceptions.OutputLimitError`, ``finish_reason='length'``)
     and an open-circuit backpressure signal
     (:class:`~llmkit.exceptions.CircuitOpenError`) are retried on *neither*
-    budget and propagate immediately, under every configuration including
-    ``retry_on=None``: a re-ask with an identical token budget can only
-    truncate again, and the breaker already knows the provider is down, so
+    budget and propagate immediately under the default policy: a re-ask with
+    an identical token budget can only truncate again, and the breaker already knows the provider is down, so
     neither a fresh connection nor a schema repair can help. Listing the type
     explicitly in ``retry_on`` opts back in.
 
@@ -249,19 +237,19 @@ class RetryPolicy:
     wraps *transport* failures in the same exception, the loop first unwraps it
     (:func:`~llmkit.exceptions.underlying_provider_error`) and routes a wrapped
     transport cause to ``max_attempts`` — so a 429/5xx/network blip inside a
-    structured call gets the full transport budget, exactly like the text path.
+    structured call can use the overall ceiling, exactly like the text path.
     A wrapped cause that is neither transport- nor schema-shaped — a *permanent*
     error such as an exhausted 401/400/403 — is not retried on either budget:
     it propagates immediately, matching the fail-fast contract the bare-4xx
     text path already honours.
 
     Attributes:
-        max_attempts: Total *transport* attempts, including the first
-            (``1`` = no retry). The default permits two retries after the
-            first try.
-        validation_max_attempts: Total *schema-validation* attempts,
-            including the first (``1`` = no retry). Defaults to ``2`` (one
-            retry) — lower than ``max_attempts`` on purpose.
+        max_attempts: Total outer attempts across all error classes, including
+            the first (``1`` = no retry). Defaults to ``3``.
+        validation_max_attempts: A value of N permits at most N-1 retries caused
+            by validation failures, within ``max_attempts``. ``1`` permits none;
+            the default ``2`` permits one. A larger value cannot raise the total
+            ceiling.
         backoff_base_seconds: Full-jitter backoff base; the sleep before
             retry *n* is a random delay in
             ``[0, min(base * 2**(n-1), max_backoff_seconds)]``. Must be >= 0
@@ -316,11 +304,11 @@ class RetryPolicy:
 
 
 #: The budget applied when a call function's ``retry`` argument is left at
-#: its default — three transport attempts (and two validation attempts) with
+#: its default — three outer attempts, at most one validation-caused retry, with
 #: full-jitter backoff over the curated transient-error sets.
 DEFAULT_RETRY_POLICY = RetryPolicy()
 
-#: A policy that disables retries (a single attempt) for *both* budgets. Pass
+#: A policy that disables retries (a single outer attempt). Pass
 #: ``retry=NO_RETRY`` to opt a latency-sensitive call out of automatic
 #: transient recovery, or to opt the inner layer out when wrapping a call
 #: function in :func:`with_retries`.
@@ -451,9 +439,8 @@ class RetryProgressCallback(Protocol):
     does not call back — callers learn about exhaustion by catching the
     re-raised exception. Implementations must not raise.
 
-    The ``max_attempts`` keyword carries the *total attempts* for the budget
-    the failing error is charged against (transport or validation), matching
-    the name used across the rest of the retry surface.
+    ``attempt`` is the monotonic outer-pass number and ``max_attempts`` is
+    its total ceiling. The validation allowance may stop retries earlier.
     """
 
     def __call__(
@@ -507,9 +494,8 @@ async def handle_retry_failure(
     identically. The final failure is *not* routed here: callers learn about
     exhaustion from the re-raised exception.
 
-    ``max_attempts`` is the budget the failing class is charged against
-    (transport or validation), so the logged ``attempt/max_attempts`` pair
-    reflects the actual ceiling for this error.
+    ``attempt`` and ``max_attempts`` report the monotonic outer-pass number
+    and total ceiling. The validation allowance may stop retries earlier.
 
     **The sleep honours ``Retry-After`` first.** If ``error`` carries a
     provider ``Retry-After`` (:func:`_retry_after_seconds`), the sleep is that
@@ -566,7 +552,7 @@ async def with_retries_stream[T](
     Awaitable[T]]`` that can simply be re-awaited: a partially-consumed stream
     cannot be transparently restarted, so once any chunk has reached the
     consumer a mid-stream error propagates unretried. Everything before the
-    first chunk is retried on ``policy``'s transport budget.
+    first chunk follows ``policy``'s total ceiling and validation sublimit.
 
     *attempt_factory* is called with the 1-based attempt number and returns one
     attempt's async generator; each attempt is a distinct call (and, for the
@@ -577,7 +563,7 @@ async def with_retries_stream[T](
     cache read on the first attempt only.
     *surface* names the caller in the double-wrap warning, and *label* is the
     tag used for the warning and the exhaustion log line — the same
-    ``"%s: all %d attempts failed: %s"`` message :func:`with_retries` emits,
+    ``"%s: stopped after %d attempts: %s"`` message :func:`with_retries` emits,
     from the same logger, so an operator greps the streaming and non-streaming
     surfaces identically.
 
@@ -610,10 +596,9 @@ async def with_retries_stream[T](
     per-call-site de-duplication onto that one line, so a host with two distinct
     double-wrap sites is told about only the first.
 
-    Budgeting is transport-only: a stream carries no schema parsing, so there
-    is no separate validation budget. ``validation_retry_on`` is still matched
-    when classifying a failure, so a stray validation error pre-first-chunk is
-    treated as transient rather than escaping unretried.
+    A pre-yield validation failure consumes the same persistent validation
+    allowance as a buffered call. Once anything has been yielded, no error is
+    replayed, even if its type is explicitly configured as retryable.
     """
     tag = label
     # Nested-retry guard, mirroring :func:`with_retries`: when an outer llmkit
@@ -634,10 +619,12 @@ async def with_retries_stream[T](
             # Stricter than ``with_retries``'s policy-shaped test on purpose:
             # the inner layer only "would have retried" if the failure was
             # actually retryable *and* arrived pre-first-chunk.
+            retry_class = _retry_class(exc, policy)
             would_have_retried = (
                 policy.max_attempts > 1
                 and not yielded_any
-                and isinstance(exc, (*policy.retry_on, *policy.validation_retry_on))
+                and retry_class is not None
+                and (not retry_class or policy.validation_max_attempts > 1)
             )
             if would_have_retried:
                 warnings.warn(
@@ -651,6 +638,7 @@ async def with_retries_stream[T](
                 )
             raise
 
+    validation_failures = 0
     ledger = _CallLedger()
     token = _retry_scope.set(_RetryScope(ledger))
     try:
@@ -670,13 +658,15 @@ async def with_retries_stream[T](
                             token = _retry_scope.set(_RetryScope(ledger))
                 return
             except Exception as exc:
-                if (
-                    not isinstance(exc, (*policy.retry_on, *policy.validation_retry_on))
-                    or yielded_any
-                ):
+                is_validation = _retry_class(exc, policy)
+                if yielded_any or is_validation is None:
                     raise
-                if attempt == policy.max_attempts:
-                    logger.error("%s: all %d attempts failed: %s", tag, policy.max_attempts, exc)
+                if is_validation:
+                    validation_failures += 1
+                if attempt >= policy.max_attempts or (
+                    is_validation and validation_failures >= policy.validation_max_attempts
+                ):
+                    logger.error("%s: stopped after %d attempts: %s", tag, attempt, exc)
                     raise
                 await handle_retry_failure(
                     tag=tag,
@@ -691,135 +681,76 @@ async def with_retries_stream[T](
         _retry_scope.reset(token)
 
 
+def _retry_class(error: BaseException, policy: RetryPolicy) -> bool | None:
+    """True for validation, False for transport, None for an ineligible error.
+
+    Instructor wraps transport and permanent errors as well as parse failures.
+    Classify its cause first so the wrapper cannot turn a permanent error into
+    a validation retry. Explicit transport-type overrides retain precedence
+    over fail-fast exclusions, as on the buffered call path.
+    """
+    cause = underlying_provider_error(error)
+    explicit = isinstance(error, policy.retry_on)
+    if isinstance(cause, _ZERO_BUDGET_ERRORS) and not explicit:
+        return None
+    is_transport = isinstance(cause, policy.retry_on)
+    if (
+        cause is not error
+        and not is_transport
+        and not isinstance(cause, _SCHEMA_SHAPED_CAUSES)
+        and not explicit
+    ):
+        return None
+    if not is_transport and isinstance(error, policy.validation_retry_on):
+        return True
+    if explicit or is_transport:
+        return False
+    return None
+
+
 async def with_retries[T](
     fn: Callable[[], Awaitable[T]],
     *,
-    max_attempts: int | None = None,
+    policy: RetryPolicy = DEFAULT_RETRY_POLICY,
     label: str | None = None,
-    backoff_base_seconds: float = 0.0,
-    max_backoff_seconds: float = 30.0,
-    retry_after_cap: float = _DEFAULT_RETRY_AFTER_CAP,
-    retry_on: tuple[type[BaseException], ...] | None = None,
-    validation_max_attempts: int | None = None,
-    validation_retry_on: tuple[type[BaseException], ...] | None = None,
 ) -> T:
-    """Retry an async callable up to *max_attempts* times.
+    """Retry an async callable under the same policy as ordinary calls.
 
-    .. warning::
+    ``policy.max_attempts`` is the total outer-pass ceiling, including the
+    first pass. At most ``validation_max_attempts - 1`` retries may be caused
+    by validation failures, within that ceiling. Switching failure categories
+    never resets either count or the exponential backoff. Defaults permit
+    three passes, with at most one validation-caused retry. Use ``NO_RETRY``
+    for a single pass, or a custom ``RetryPolicy`` to set budgets and types.
+    Permanent and programming errors fail immediately under the default policy.
 
-        The call functions (:func:`~llmkit.structured_llm_call`,
-        :func:`~llmkit.text_llm_call`, :func:`~llmkit.text_llm_call_stream`,
-        :func:`~llmkit.tool_llm_call`, :func:`~llmkit.tool_llm_call_stream`,
-        and the sync wrappers) **already retry internally** by default. Wrapping
-        one of them in :func:`with_retries` would otherwise multiply the two
-        budgets (the ``3 x 3 = 9`` trap). To prevent that, :func:`with_retries`
-        detects (via a context variable) when it is running *inside* an
-        already-active llmkit retry loop and collapses that **inner** layer to
-        a **single pass** — the outer loop owns the retries — so the net effect
-        is one shared budget, not the product. An *accidental* double-wrap (an
-        inner layer that would itself have retried) also emits a
-        ``RuntimeWarning`` (de-duplicated by Python's default warning filter).
-        Either way, a call function re-run by the outer loop joins its logical
-        call: every pass's record carries the same ``call_id`` and a rising
-        ``attempt``, as an internally retried call's records do.
-        This guard only fires when there *is* an active llmkit retry loop in
-        scope: wrapping a plain (non-llmkit) awaitable retries normally. To drive
-        retries entirely from your wrapper, opt the inner call out with
-        ``retry=NO_RETRY`` — the clean, warning-free path.
+    The ceiling counts executions of ``fn``, not provider requests, spending,
+    or elapsed time: a call may perform an in-call schema repair or temperature
+    reissue. Provider ``Retry-After`` still takes precedence over computed
+    backoff, within the policy's cap.
+
+    The call functions already retry internally. A retry loop nested in this
+    loop's task collapses to one pass, so budgets do not multiply. An accidental
+    double-wrap warns; set the inner call's ``retry=NO_RETRY`` to make the outer
+    policy its sole owner. A separate task retains its own budget. Calls re-run
+    by the outer loop share a logical ``call_id`` and number their attempts.
 
     Args:
         fn: Zero-argument async callable to execute.
-        max_attempts: Total number of *transport* attempts (1 = no retry).
-            Defaults to ``1`` when not given.
-        label: Optional identifier for log messages (e.g. an op_id).
-        backoff_base_seconds: When > 0, sleep before each retry using
-            exponential "full jitter" backoff — a random delay in
-            ``[0, min(backoff_base_seconds * 2**(attempt-1), max_backoff_seconds)]``.
-            Defaults to 0.0 (retry immediately), which preserves prior
-            behaviour for callers that don't opt in. Jitter spreads
-            concurrent retries so a transient provider-saturation window
-            (the dominant failure mode for the eval fan-out) isn't re-hit
-            by every caller at once.
-        max_backoff_seconds: Ceiling on any single backoff sleep (default
-            30s), capping the exponential term so a large ``max_attempts``
-            can't grow the worst-case sleep unboundedly.
-        retry_after_cap: Ceiling on a *server-supplied* ``Retry-After`` wait
-            (default 60s). When a retried error carries ``Retry-After``, the
-            backoff honours it (capped here, plus jitter) instead of the
-            computed exponential — see :func:`handle_retry_failure`.
-        retry_on: When set, only exceptions matching this tuple are retried
-            against ``max_attempts``; anything else propagates immediately
-            on the first raise (so programming errors are never retried).
-            ``None`` (the default) retries on any :class:`Exception`,
-            preserving prior behaviour for direct callers. Budget *routing*
-            still distinguishes the two classes when a validation budget is
-            configured: with ``retry_on=None`` the unwrapped cause is
-            classified against
-            :data:`~llmkit.exceptions.LLM_TRANSPORT_ERRORS`, so an
-            ``InstructorRetryException`` wrapping a 429/5xx/network blip is
-            charged the full ``max_attempts``, and only genuine validation
-            failures are charged the lower validation budget. A wrapped cause
-            that is neither transport- nor schema-shaped (a permanent
-            401/400/403) propagates immediately under every configuration,
-            unless ``retry_on`` explicitly lists the wrapper type. An
-            output-limit truncation
-            (:class:`~llmkit.exceptions.OutputLimitError`) likewise propagates
-            immediately even with ``retry_on=None`` — an identical token
-            budget can only truncate again — unless ``retry_on`` explicitly
-            lists the type. A bare
-            :class:`~llmkit.exceptions.CircuitOpenError` fails fast the same
-            way under every configuration — the breaker already knows the
-            provider is down, so re-asking an open circuit is pointless —
-            unless ``retry_on`` explicitly lists the type.
-        validation_max_attempts: Total number of *schema-validation*
-            attempts (1 = no retry). When set together with
-            ``validation_retry_on``, failures matching that tuple are charged
-            against this separate, typically-lower budget instead of
-            ``max_attempts``. ``None`` (the default) means no separate
-            validation budget — every retryable error shares ``max_attempts``.
-        validation_retry_on: The exception types charged against
-            ``validation_max_attempts``. Only meaningful when
-            ``validation_max_attempts`` is set.
+        policy: Retry classification, total ceiling, validation allowance and
+            backoff settings. Defaults to ``DEFAULT_RETRY_POLICY``.
+        label: Optional identifier for log messages.
 
     Returns:
         The result of the first successful call.
 
     Raises:
-        The exception from the last failed attempt if all retries
-        are exhausted, or any non-matching exception immediately when
-        ``retry_on`` is set.
+        The last failure when either applicable limit is exhausted, or an
+        ineligible error immediately.
     """
-    if max_attempts is None:
-        max_attempts = 1
-
     tag = label or "retry"
-
-    # Nested-retry guard: if an llmkit retry loop is already active in this
-    # task (the classic case: a host wrapped a call function that already
-    # retries internally, awaited inline in the same task), this inner layer
-    # collapses to a single pass so the two budgets don't multiply (the
-    # 3 x 3 = 9 trap). The outer, already-running loop owns the retries. The
-    # scope is keyed on the owning task, so a *distinct* call that only
-    # inherited the context across a task boundary (create_task / the sync
-    # bridge, each copying the context into a NEW task) is NOT collapsed — it
-    # keeps its own retry budget. Accepted, documented edges of the
-    # task-identity check: a distinct call *directly awaited in the same task*
-    # inside ``fn`` still collapses (its exception genuinely propagates to this
-    # outer loop, so un-collapsing would recreate real multiplication — the
-    # RuntimeWarning signals it and NO_RETRY is the escape); an
-    # ``asyncio.current_task()`` of None in an exotic harness reproduces today's
-    # collapse; and a same-task ``copy_context().run(...)`` still collapses. The
-    # accidental double-wrap warns (deduped by the default warning filter); an
-    # explicit NO_RETRY inner does not.
     if _in_active_retry_scope():
-        # Only the *accidental* double-wrap is worth warning about: an inner
-        # layer that would itself have retried (budget > 1). When the inner is
-        # already a single pass — e.g. retry=NO_RETRY, the documented way to
-        # drive retries from an outer wrapper — there is nothing to multiply, so
-        # stay quiet. Either way the inner runs exactly one pass; the outer loop
-        # owns the retries.
-        inner_would_retry = max_attempts > 1 or (validation_max_attempts or 1) > 1
-        if inner_would_retry:
+        if policy.max_attempts > 1:
             warnings.warn(
                 f"with_retries({tag!r}) is nested inside an already-retrying llmkit "
                 + "retry loop; this inner layer will run a single pass to avoid "
@@ -831,107 +762,35 @@ async def with_retries[T](
             )
         return await fn()
 
-    # Separate budgets: validation failures (when a validation budget is
-    # configured) are charged against ``validation_max_attempts``; everything
-    # else retryable against ``max_attempts``. Each failure increments only
-    # its own counter, and the call stops when that counter hits its ceiling.
-    use_validation_budget = validation_max_attempts is not None and validation_retry_on is not None
-    transport_attempt = 0
-    validation_attempt = 0
-
+    attempt = 0
+    validation_failures = 0
     ledger = _CallLedger()
     token = _retry_scope.set(_RetryScope(ledger))
     try:
         while True:
+            attempt += 1
             ledger.begin_pass()
             try:
                 return await fn()
-            except Exception as e:
-                # instructor re-raises *any* exhausted attempt — transport
-                # failures included — as InstructorRetryException, which is in
-                # the schema set. Unwrap to the underlying provider error so a
-                # wrapped transport failure (429/5xx/network) claims the
-                # transport budget first, matching the plain-text path; a
-                # wrapped schema failure (or an inner error in neither set)
-                # still falls through to the validation budget below.
-                cause = underlying_provider_error(e)
-                # Zero-budget fail-fast signals are permanent under every
-                # configuration, including retry_on=None ("retry on any
-                # Exception"): an open circuit
-                # (:class:`~llmkit.exceptions.CircuitOpenError`) must never be
-                # re-asked — the breaker already knows the provider is down —
-                # and an output-limit truncation retried with an identical
-                # token budget can only truncate again. Without this guard the
-                # bare CircuitOpenError / OutputLimitError would fall into the
-                # retry-anything branch below and burn the full transport
-                # budget on doomed re-asks. Checked on the unwrapped cause for
-                # defense in depth (the transport raises them bare today; a
-                # wrapped form would also fail fast via wraps_permanent_cause
-                # below — the wrapped CircuitOpenError is already caught there).
-                # A retry_on that explicitly lists the type still wins, matching
-                # the wraps_permanent_cause escape.
-                if isinstance(cause, _ZERO_BUDGET_ERRORS) and (
-                    retry_on is None or not isinstance(e, retry_on)
-                ):
+            except Exception as error:
+                is_validation = _retry_class(error, policy)
+                if is_validation is None:
                     raise
-                # With retry_on=None ("retry on any Exception") the routing
-                # still needs a transport set to classify the unwrapped cause
-                # against — otherwise a wrapped 429/network blip would match
-                # ``validation_retry_on`` below and be charged the *lower*
-                # validation budget, the exact misclassification the unwrap
-                # exists to prevent. Fall back to the curated transport set.
-                transport_types = retry_on if retry_on is not None else LLM_TRANSPORT_ERRORS
-                is_transport_cause = isinstance(cause, transport_types)
-                # Wrapped *permanent* errors fail fast: instructor wraps an
-                # exhausted 401/400/403 (any non-transient provider error) in
-                # the same InstructorRetryException as genuine schema failures,
-                # so without this guard the wrapper would match
-                # ``validation_retry_on`` below and burn a validation retry on
-                # a request that can never succeed — violating the documented
-                # fail-fast contract the bare-4xx text path already honours.
-                # When the unwrapped cause differs from the wrapper and is
-                # neither transport- nor schema-shaped, propagate immediately.
-                # An explicit ``retry_on`` that lists the wrapper type still
-                # wins: the caller asked for exactly that retry.
-                wraps_permanent_cause = (
-                    cause is not e
-                    and not is_transport_cause
-                    and not isinstance(cause, _SCHEMA_SHAPED_CAUSES)
-                )
-                if wraps_permanent_cause and (retry_on is None or not isinstance(e, retry_on)):
-                    raise
-                is_validation = (
-                    use_validation_budget
-                    and not is_transport_cause
-                    and isinstance(
-                        e,
-                        validation_retry_on,  # pyright: ignore[reportArgumentType]  # None excluded by use_validation_budget
-                    )
-                )
                 if is_validation:
-                    validation_attempt += 1
-                    attempt = validation_attempt
-                    budget = validation_max_attempts
-                    assert budget is not None  # guaranteed by use_validation_budget
-                elif retry_on is None or isinstance(e, retry_on) or is_transport_cause:
-                    transport_attempt += 1
-                    attempt = transport_attempt
-                    budget = max_attempts
-                else:
-                    # Not retryable on either budget — propagate immediately.
+                    validation_failures += 1
+                if attempt >= policy.max_attempts or (
+                    is_validation and validation_failures >= policy.validation_max_attempts
+                ):
+                    logger.error("%s: stopped after %d attempts: %s", tag, attempt, error)
                     raise
-                if attempt < budget:
-                    await handle_retry_failure(
-                        tag=tag,
-                        attempt=attempt,
-                        max_attempts=budget,
-                        error=e,
-                        backoff_base_seconds=backoff_base_seconds,
-                        max_backoff_seconds=max_backoff_seconds,
-                        retry_after_cap=retry_after_cap,
-                    )
-                else:
-                    logger.error("%s: all %d attempts failed: %s", tag, budget, e)
-                    raise
+                await handle_retry_failure(
+                    tag=tag,
+                    attempt=attempt,
+                    max_attempts=policy.max_attempts,
+                    error=error,
+                    backoff_base_seconds=policy.backoff_base_seconds,
+                    max_backoff_seconds=policy.max_backoff_seconds,
+                    retry_after_cap=policy.retry_after_cap,
+                )
     finally:
         _retry_scope.reset(token)

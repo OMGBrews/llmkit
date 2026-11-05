@@ -129,9 +129,12 @@ async def tool_llm_call_stream(
     retried. One consequence is worth stating plainly — a round in which
     *every* requested tool call is malformed raises
     :class:`~llmkit.ToolArgumentError` (the same whole-round contract the
-    buffered lane keeps), but here that raise reaches the caller **unretried**:
-    :func:`~llmkit.retry.with_retries_stream` is a transport-only budget with
-    no validation re-ask. A round in which only *some* calls are malformed
+    buffered lane keeps), but here it reaches the caller **unretried by
+    default**: the default stream policy does not include ``ToolArgumentError``
+    in its validation set. A custom ``validation_retry_on`` can include it; the
+    validation allowance then applies within the total outer-attempt ceiling,
+    and a retry is still possible only before any item has been yielded. A
+    round in which only *some* calls are malformed
     keeps the good ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``, exactly as the buffered lane does.
     """

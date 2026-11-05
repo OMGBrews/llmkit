@@ -7,27 +7,27 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into five subsets the retry layer budgets
-**separately** (see :mod:`llmkit.retry`):
+The recoverable set is split into five subsets the retry layer classifies
+within one overall attempt ceiling (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
-  limits, transient 5xx, network/timeout). These get the full transport
-  retry budget, since a retry on a fresh connection routinely succeeds.
+  limits, transient 5xx, network/timeout). These may retry up to the overall
+  attempt ceiling, since a retry on a fresh connection routinely succeeds.
 * :data:`LLM_SCHEMA_ERRORS` — *schema-validation* failures (llmkit's
   :class:`StructuredOutputError`, raised when a structured answer fails
   validation after instructor's in-call repair, or when a compose lane's final
   answer fails validation; pydantic ``ValidationError``; instructor's
   ``InstructorRetryException`` for an exhausted attempt that was not a parse
-  failure). These get a **lower** budget: a transiently-malformed JSON
-  response still earns one cross-call retry, but a deterministically-wrong
-  schema can't burn the full transport budget on doomed re-asks.
+  failure). These get a **lower** retry allowance inside that ceiling: a
+  transiently-malformed JSON response still earns one cross-call retry, but a deterministically-wrong
+  schema can't burn the full attempt ceiling on doomed re-asks.
 
   Caveat — ``InstructorRetryException`` is a *wrapper*: instructor re-raises
   **every** exhausted attempt this way, including transport failures (a 429
   or network blip caught inside its create call). llmkit re-owns the
   parse-shaped ones as :class:`StructuredOutputError`; the rest keep the
   wrapper, and the retry layer unwraps it via :func:`underlying_provider_error`
-  and charges a wrapped transport cause to the transport budget — so
+  and gives a wrapped transport cause no validation charge — so
   membership here is the default-but-not-final classification, not a promise
   the failure is genuinely schema-shaped.
 * :data:`LLM_BACKPRESSURE_ERRORS` — llmkit's *own* fail-fast backpressure
@@ -37,7 +37,7 @@ The recoverable set is split into five subsets the retry layer budgets
   fallback) instead of crashing on a new uncaught type — but it is deliberately
   **not** retried by default: it lives outside the transport set,
   and ``with_retries`` additionally carves it out as a zero-budget fail-fast
-  signal, so neither ``with_retries`` (even on its ``retry_on=None`` default)
+  signal, so neither ``with_retries`` with its default policy
   nor the streaming loop (which keys off the transport/schema subsets, never
   the union) ever re-asks a circuit the breaker already knows is open — unless
   a caller explicitly lists the type in ``retry_on``.
@@ -49,8 +49,8 @@ The recoverable set is split into five subsets the retry layer budgets
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_TOOL_ERRORS` — a tool round the model got wrong
   (:class:`ToolArgumentError`: an unknown tool, or arguments that are not
-  valid JSON or fail the tool's model). The tool lanes charge it to the
-  **validation** budget, so a round whose every call is malformed is re-asked
+  valid JSON or fail the tool's model). The buffered tool lanes charge it to the
+  **validation** allowance, so a round whose every call is malformed is re-asked
   like a malformed schema response.
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
@@ -400,10 +400,10 @@ def validation_failure_summary(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-# Schema-validation failures — retried on their own *lower* budget, distinct
-# from the transport set, so a deterministic schema failure can't consume the
-# full transport budget on doomed re-asks while a transiently-malformed JSON
-# response still earns one cross-call retry.
+# Schema-validation failures — a lower retry allowance within the overall
+# attempt ceiling, distinct from the transport set, so a deterministic schema
+# failure cannot consume the full ceiling on doomed re-asks while a
+# transiently-malformed JSON response still earns one cross-call retry.
 #   - ``StructuredOutputError``     — llmkit's own type for a structured answer
 #     that failed validation, on either the structured or the compose lane.
 #     The structured lane re-raises an exhausted parse-cause
@@ -414,8 +414,8 @@ def validation_failure_summary(exc: BaseException) -> str:
 #     escaping that loop this way — transport and permanent errors included,
 #     which llmkit's parse-only predicate declines after a single attempt (no
 #     re-ask). The retry layer unwraps it (``underlying_provider_error``) so a
-#     wrapped transport cause is charged the transport budget rather than this
-#     lower one, and a wrapped permanent error fails fast on neither.
+#     wrapped transport cause does not consume this allowance, and a wrapped
+#     permanent error fails fast. Every pass still counts toward max_attempts.
 LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     StructuredOutputError,
     ValidationError,
@@ -487,7 +487,7 @@ class CircuitOpenError(LlmkitError):
 
     The breaker (opt-in via ``configure_rate_limit(breaker=True)``) is the
     aggregate guard that stops doomed work when a provider is *down*: once its
-    throttle rate over a rolling window crosses the trip threshold it opens, and
+    outage rate over a rolling window crosses the trip threshold it opens, and
     the limiter then raises this **immediately** — before any concurrency slot is
     held or RPM token deducted — instead of admitting a call that would only burn
     its retry budget into the storm. It is raised whenever the breaker won't admit
@@ -503,9 +503,8 @@ class CircuitOpenError(LlmkitError):
     :data:`LLM_TRANSPORT_ERRORS` (and so out of the default ``retry_on``):
     retrying a circuit the breaker already knows is open would defeat its
     purpose. :func:`~llmkit.retry.with_retries` treats it as a zero-budget
-    fail-fast signal, so it is never re-asked under *any* configuration —
-    including the ``retry_on=None`` ("retry on any Exception") default of a
-    direct caller — unless that caller explicitly lists the type in ``retry_on``
+    fail-fast signal: it is not re-asked unless a caller explicitly lists
+    the type in ``RetryPolicy.retry_on``
     (an explicit opt-in wins, matching :class:`OutputLimitError`). It *is* a
     member of :data:`LLM_BACKPRESSURE_ERRORS` and therefore of
     :data:`LLM_RECOVERABLE_ERRORS`, so a host that already writes
@@ -649,8 +648,8 @@ LLM_OUTPUT_LIMIT_ERRORS: tuple[type[Exception], ...] = (OutputLimitError,)
 # The full recoverable set is the union of the five subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
 # exactly what they did before even though the retry layer now budgets the
-# subsets separately (and, unless a caller opts in through ``retry_on``, never
-# retries the backpressure/output-limit subsets).
+# subsets within one ceiling (and, unless a caller opts in through
+# ``retry_on``, never retries the backpressure/output-limit subsets).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
@@ -725,12 +724,14 @@ class ResultValidationError(LlmkitError):
     callback raises this (a result that *parsed* but is *semantically* wrong —
     an empty risk register, a citation that doesn't resolve, a total that
     doesn't reconcile), the call re-rolls **within the same validation budget**
-    that governs schema-validation retries (``RetryPolicy.validation_max_attempts``),
-    so a deterministically-bad result can't burn the full transport budget.
+    that governs schema-validation retries (at most
+    ``RetryPolicy.validation_max_attempts - 1`` retries within the overall
+    ``max_attempts`` ceiling), so a deterministically-bad result cannot spend
+    the full ceiling on validation re-asks.
 
     It is in spirit a *schema-validation* failure (the content is wrong, not the
-    transport), so it is charged against the validation budget rather than the
-    transport one. On budget exhaustion the last ``ResultValidationError``
+    transport), so it consumes the validation allowance as well as the
+    overall attempt count. On budget exhaustion the last ``ResultValidationError``
     propagates to the caller, carrying the rejecting message (and, if the host
     raised it ``from`` another error, that ``__cause__``).
     """

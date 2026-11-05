@@ -29,7 +29,7 @@ from llmkit import (
 )
 from llmkit import calls as llm_calls
 from llmkit.logging import INDEX_FILENAME
-from llmkit.retry import with_retries
+from llmkit.retry import RetryPolicy, with_retries
 from tests._support import OkSchema
 
 
@@ -176,7 +176,12 @@ async def test_opted_in_retry_logs_each_attempts_own_diagnostics(log_dir: Path) 
         patch("llmkit.retry.asyncio.sleep", sleep_mock),
         pytest.raises(OutputLimitError),
     ):
-        _ = await with_retries(call, max_attempts=2, retry_on=(OutputLimitError,))
+        _ = await with_retries(
+            call,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(OutputLimitError,), backoff_base_seconds=0.0
+            ),
+        )
 
     first, second = _read_logs(log_dir)
     assert first["call_id"] == second["call_id"]

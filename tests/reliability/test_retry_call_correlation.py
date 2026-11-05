@@ -37,7 +37,7 @@ from pydantic import BaseModel
 from llmkit import NO_RETRY, LLMCallRecord, ToolDefinition, capture_llm_records
 from llmkit import calls as llm_calls
 from llmkit._litellm import StreamedToolTurn
-from llmkit.retry import with_retries
+from llmkit.retry import RetryPolicy, with_retries
 from llmkit.sync import run_sync
 from llmkit.testing import Fake, Reply, TransportRequest, install, timeout_error
 from tests._support import OkSchema, provider_mock, quiet_logging
@@ -95,10 +95,15 @@ async def test_outer_with_retries_joins_passes_under_one_call_id(
     reply: Reply, fn: Callable[[], Awaitable[object]]
 ) -> None:
     """Two transport failures, then a success, under an outer
-    ``with_retries(max_attempts=3)``: three records, one ``call_id``,
+    ``with_retries(policy=RetryPolicy(max_attempts=3))``: three records, one ``call_id``,
     attempts 1, 2, 3."""
     with install(_failing_twice(reply)), capture_llm_records() as records:
-        _ = await with_retries(fn, max_attempts=3, retry_on=(openai.APITimeoutError,))
+        _ = await with_retries(
+            fn,
+            policy=RetryPolicy(
+                max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+            ),
+        )
 
     assert len(records) == 3
     _assert_one_logical_call(records, 3)
@@ -112,7 +117,14 @@ def test_outer_with_retries_joins_passes_through_the_sync_bridge() -> None:
         install(_failing_twice(Reply.json(OkSchema(ok=True)))),
         capture_llm_records() as records,
     ):
-        _ = run_sync(with_retries(_structured, max_attempts=3, retry_on=(openai.APITimeoutError,)))
+        _ = run_sync(
+            with_retries(
+                _structured,
+                policy=RetryPolicy(
+                    max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+                ),
+            )
+        )
 
     _assert_one_logical_call(records, 3)
 
@@ -147,7 +159,10 @@ async def test_text_stream_joins_passes_when_failing_after_the_first_chunk() -> 
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        chunks = await with_retries(_fn, max_attempts=3, retry_on=(TimeoutError,))
+        chunks = await with_retries(
+            _fn,
+            policy=RetryPolicy(max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     assert chunks == ["he", "llo"]
     _assert_one_logical_call(records, 3)
@@ -186,7 +201,10 @@ async def test_tool_stream_joins_passes_when_failing_after_the_first_event() -> 
         patch("llmkit.providers.build_provider", return_value=provider_mock()),
         capture_llm_records() as records,
     ):
-        _ = await with_retries(_fn, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(
+            _fn,
+            policy=RetryPolicy(max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     _assert_one_logical_call(records, 3)
 
@@ -214,7 +232,10 @@ async def test_call_from_another_task_keeps_its_own_call_id() -> None:
         install(lambda _request: Reply.json(OkSchema(ok=True))),
         capture_llm_records() as records,
     ):
-        _ = await with_retries(_fn, max_attempts=2, retry_on=(TimeoutError,))
+        _ = await with_retries(
+            _fn,
+            policy=RetryPolicy(max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     children = [r for r in records if r.label == "child"]
     owned = [r for r in records if r.label != "child"]
@@ -241,7 +262,12 @@ async def test_two_calls_per_pass_stay_two_logical_calls() -> None:
         _ = await llm_calls.text_llm_call("second", feature="test", retry=NO_RETRY)
 
     with install(fake), capture_llm_records() as records:
-        await with_retries(_fn, max_attempts=2, retry_on=(openai.APITimeoutError,))
+        await with_retries(
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+            ),
+        )
 
     # Pass 1: first, second (failed). Pass 2: first, second.
     assert len(records) == 4
@@ -268,7 +294,10 @@ async def test_call_first_reached_on_a_later_pass_starts_at_attempt_one() -> Non
         )
 
     with install(lambda _request: Reply.text("ok")), capture_llm_records() as records:
-        await with_retries(_fn, max_attempts=2, retry_on=(TimeoutError,))
+        await with_retries(
+            _fn,
+            policy=RetryPolicy(max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     drafts = [r for r in records if r.label == "draft"]
     reviews = [r for r in records if r.label == "review"]

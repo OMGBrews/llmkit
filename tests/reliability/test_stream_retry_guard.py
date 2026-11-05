@@ -78,7 +78,7 @@ def _times_out_then(reply: Reply) -> Fake:
 
 async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
     """Wrapping stream consumption (which already retries 3x pre-first-chunk)
-    in ``with_retries(max_attempts=3)`` must NOT yield 3x3=9 provider calls.
+    in ``with_retries(policy=RetryPolicy(max_attempts=3))`` must NOT yield 3x3=9 provider calls.
     The stream loop collapses to a single pass per outer attempt, and the
     accidental double-wrap warns."""
 
@@ -90,7 +90,12 @@ async def test_outer_with_retries_collapses_stream_to_single_pass() -> None:
         pytest.warns(RuntimeWarning, match="nested inside an already-retrying"),
         pytest.raises(openai.APITimeoutError),
     ):
-        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
+        _ = await with_retries(
+            _wrapped,
+            policy=RetryPolicy(
+                max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+            ),
+        )
 
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
     # NOT 9 (3 x 3). The guard prevented the multiplication.
@@ -133,7 +138,14 @@ async def test_double_wrap_warning_blames_the_caller_not_llmkit() -> None:
             warnings.simplefilter("default")
             for site in (_site_one, _site_two):
                 with contextlib.suppress(openai.APITimeoutError):
-                    _ = await with_retries(site, max_attempts=2, retry_on=(openai.APITimeoutError,))
+                    _ = await with_retries(
+                        site,
+                        policy=RetryPolicy(
+                            max_attempts=2,
+                            retry_on=(openai.APITimeoutError,),
+                            backoff_base_seconds=0.0,
+                        ),
+                    )
             caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
 
     # Two distinct caller sites -> two warnings. One would mean the origin
@@ -159,7 +171,12 @@ async def test_no_retry_inner_under_outer_wrapper_stays_silent() -> None:
             install(_always_times_out) as installed,
             pytest.raises(openai.APITimeoutError),
         ):
-            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
+            _ = await with_retries(
+                _wrapped,
+                policy=RetryPolicy(
+                    max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+                ),
+            )
 
     assert len(installed.requests) == 3
 
@@ -186,7 +203,12 @@ async def test_mid_stream_failure_under_outer_wrapper_does_not_warn() -> None:
             patch("llmkit._litellm.astream_text", _transport),
             pytest.raises(TimeoutError, match="mid-stream"),
         ):
-            _ = await with_retries(_wrapped, max_attempts=2, retry_on=(TimeoutError,))
+            _ = await with_retries(
+                _wrapped,
+                policy=RetryPolicy(
+                    max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=0.0
+                ),
+            )
 
     # One provider call per outer attempt — the inner loop never re-dialed.
     assert calls[0] == 2
@@ -290,7 +312,14 @@ async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() ->
             warnings.simplefilter("default")
             for site in (_site_one, _site_two):
                 with contextlib.suppress(openai.APITimeoutError):
-                    _ = await with_retries(site, max_attempts=2, retry_on=(openai.APITimeoutError,))
+                    _ = await with_retries(
+                        site,
+                        policy=RetryPolicy(
+                            max_attempts=2,
+                            retry_on=(openai.APITimeoutError,),
+                            backoff_base_seconds=0.0,
+                        ),
+                    )
             caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
 
     assert len(caught) == 2, [f"{w.filename}:{w.lineno}" for w in caught]
@@ -301,7 +330,7 @@ async def test_tool_stream_double_wrap_warning_blames_the_caller_not_llmkit() ->
 
 
 async def test_tool_stream_retries_before_the_first_event() -> None:
-    """The transport-only budget, on the lane whose terminal item is a result:
+    """The total ceiling, on the lane whose terminal item is a result:
     pre-first-event failures exhaust the budget."""
     with install(_always_times_out) as installed, pytest.raises(openai.APITimeoutError):
         _ = [

@@ -37,7 +37,7 @@ from llmkit import (
 )
 from llmkit.calls import STREAM_ABANDONED_ERROR
 from llmkit.rate_limiting import GlobalRateLimiter
-from llmkit.retry import with_retries, with_retries_stream
+from llmkit.retry import RetryPolicy, with_retries, with_retries_stream
 from llmkit.testing import Reply, TransportRequest, install
 from tests.cache.conftest import cache_provider
 
@@ -368,7 +368,12 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     with install(transport) as installed:
         _ = await _chunks(provider=provider)  # stores "one two"
         accepted = await with_retries(
-            _draft, max_attempts=3, validation_retry_on=(ResultValidationError,)
+            _draft,
+            policy=RetryPolicy(
+                max_attempts=3,
+                validation_retry_on=(ResultValidationError,),
+                backoff_base_seconds=0.0,
+            ),
         )
         after = await _chunks(provider=provider)
 

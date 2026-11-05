@@ -14,6 +14,7 @@ deadlock, and contention-dependently at that.
 import asyncio
 import contextlib
 import logging
+import math
 import threading
 from collections.abc import AsyncGenerator, Generator
 
@@ -25,7 +26,7 @@ from llmkit.rate_limiting._breaker import Admit, CircuitBreaker
 from llmkit.rate_limiting._buckets import RateBucket, RateLimitSlot
 from llmkit.rate_limiting._observability import emit_backpressure, stamp_queue_wait
 from llmkit.rate_limiting._outcomes import record_gate_outcome
-from llmkit.rate_limiting._tuning import TPM_BURST_SECONDS
+from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN, TPM_BURST_SECONDS
 
 # Named explicitly rather than via ``__name__`` so every module in this package
 # keeps emitting under the one logger name operators already filter on.
@@ -129,6 +130,7 @@ class GlobalRateLimiter:
     _enabled: bool = True
     _adaptive: bool = True
     _breaker: bool = False
+    _breaker_cooldown: float = BREAKER_COOLDOWN
 
     @classmethod
     def configure(
@@ -139,6 +141,7 @@ class GlobalRateLimiter:
         tpm: int | None | Unset = UNSET,
         adaptive: bool | Unset = UNSET,
         breaker: bool | Unset = UNSET,
+        breaker_cooldown: float | Unset = UNSET,
     ) -> None:
         """Configure the global per-provider rate limit.
 
@@ -171,13 +174,16 @@ class GlobalRateLimiter:
                 identical to a fixed cap. When ``False``, the limit is pinned at
                 ``max_concurrent`` (the pre-feature behaviour).
             breaker: Whether the per-provider **circuit breaker** is armed — off
-                by default. When ``True``, once a provider's throttle rate over a
+                by default. When ``True``, once a provider's outage rate over a
                 rolling window crosses the trip threshold the limiter fast-fails
                 that provider's calls with
                 :class:`~llmkit.exceptions.CircuitOpenError` for a cooldown (one
                 HALF_OPEN probe then tests recovery), reading the *same* unwrapped
-                outcome stream AIMD uses. Off by default because it flips
+                outcomes, but counting connection and transient server errors too.
+                Off by default because it flips
                 "eventually succeeds" → "fails fast"; the host opts in.
+            breaker_cooldown: Seconds to fail fast before admitting a recovery
+                probe; finite and positive, 30 until set.
 
         Raises:
             ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` /
@@ -191,6 +197,12 @@ class GlobalRateLimiter:
             raise ValueError(f"rpm must be a positive integer or None, got {rpm!r}")
         if not isinstance(tpm, Unset) and tpm is not None and tpm <= 0:
             raise ValueError(f"tpm must be a positive integer or None, got {tpm!r}")
+        if not isinstance(breaker_cooldown, Unset) and (
+            not math.isfinite(breaker_cooldown) or breaker_cooldown <= 0
+        ):
+            raise ValueError(
+                f"breaker_cooldown must be finite and positive, got {breaker_cooldown!r}"
+            )
         with cls._lock:
             if not isinstance(max_concurrent, Unset):
                 cls._max_concurrent = max_concurrent
@@ -204,12 +216,15 @@ class GlobalRateLimiter:
                 cls._adaptive = adaptive
             if not isinstance(breaker, Unset):
                 cls._breaker = breaker
+            if not isinstance(breaker_cooldown, Unset):
+                cls._breaker_cooldown = breaker_cooldown
             max_concurrent = cls._max_concurrent
             enabled = cls._enabled
             rpm = cls._rpm
             tpm = cls._tpm
             adaptive = cls._adaptive
             breaker = cls._breaker
+            breaker_cooldown = cls._breaker_cooldown
             cls._async_gates = {}
             cls._adaptive_states = {}
             cls._breaker_states = {}
@@ -218,13 +233,14 @@ class GlobalRateLimiter:
             cls._tpm_buckets = {}
         logger.info(
             "Configured LLM rate limit: max_concurrent=%d, rpm=%s, tpm=%s, enabled=%s, "
-            + "adaptive=%s, breaker=%s",
+            + "adaptive=%s, breaker=%s, breaker_cooldown=%s",
             max_concurrent,
             rpm,
             tpm,
             enabled,
             adaptive,
             breaker,
+            breaker_cooldown,
         )
 
     @classmethod
@@ -236,7 +252,13 @@ class GlobalRateLimiter:
         around each test.
         """
         cls.configure(
-            max_concurrent=8, enabled=True, rpm=None, tpm=None, adaptive=True, breaker=False
+            max_concurrent=8,
+            enabled=True,
+            rpm=None,
+            tpm=None,
+            adaptive=True,
+            breaker=False,
+            breaker_cooldown=BREAKER_COOLDOWN,
         )
 
     @classmethod
@@ -273,6 +295,11 @@ class GlobalRateLimiter:
         return cls._breaker
 
     @classmethod
+    def breaker_cooldown(cls) -> float:
+        """Seconds the breaker rejects calls before admitting a recovery probe."""
+        return cls._breaker_cooldown
+
+    @classmethod
     def _get_breaker(cls, key: str) -> CircuitBreaker:
         # One breaker per provider name, shared across loops/threads (the breaker
         # has no loop affinity — only a lock-guarded outcome window). Created at
@@ -281,7 +308,9 @@ class GlobalRateLimiter:
         with cls._lock:
             breaker = cls._breaker_states.get(key)
             if breaker is None:
-                breaker = CircuitBreaker(provider=key, ceiling=cls._max_concurrent)
+                breaker = CircuitBreaker(
+                    provider=key, ceiling=cls._max_concurrent, cooldown=cls._breaker_cooldown
+                )
                 cls._breaker_states[key] = breaker
             return breaker
 
@@ -406,12 +435,11 @@ class GlobalRateLimiter:
         a provider overload signal (429/503/529, **unwrapped** so a structured
         call's wrapped error is seen) received while saturated lowers the
         provider's limit; a success recovers it over time toward the ceiling. The
-        breaker, when armed, reads the *same* unwrapped outcome: a throttle or
+        breaker, when armed, reads the *same* unwrapped outcome: an outage or
         success feeds its rolling window, and a HALF_OPEN probe's outcome decides
         whether it closes or re-opens. Cancellation while acquiring the
         rate/concurrency gates — before the slot is held — refunds the deducted
-        RPM token (and releases a HALF_OPEN probe claim, re-opening the breaker so
-        it never wedges).
+        RPM token and releases a HALF_OPEN probe claim for another caller.
         """
         # Unsynchronized read of _enabled is intentional: a concurrent
         # configure() flip only changes whether *this* call is bounded, and an
@@ -436,16 +464,21 @@ class GlobalRateLimiter:
         is_probe = False
         if breaker is not None:
             decision, transition = breaker.admit()
-            emit_backpressure(transition)
+            is_probe = decision is Admit.PROBE
+            try:
+                emit_backpressure(transition)
+            except BaseException:
+                if is_probe:
+                    breaker.on_probe_neutral()
+                raise
             if decision is Admit.REJECT:
                 raise CircuitOpenError(provider_key)
-            is_probe = decision is Admit.PROBE
         # Acquire phase — RPM gate, then TPM gate, then the concurrency gate. If
         # cancelled here (after the RPM token is deducted but before a slot is
         # held), refund the token so a systematically-cancelled workload doesn't
         # silently shrink its own effective RPM — compounding the backpressure
         # that caused the cancellation. A probe cancelled here never ran, so it
-        # is a probe failure: release the claim and re-open (no wedged breaker).
+        # has no provider outcome: release the claim for another caller.
         rpm_debited = False
         wait_start = _tuning.now()
         try:
@@ -459,7 +492,7 @@ class GlobalRateLimiter:
             if rpm_debited and rpm_bucket is not None:
                 rpm_bucket.refund(1.0)
             if is_probe and breaker is not None:
-                emit_backpressure(breaker.on_probe_failure())
+                breaker.on_probe_neutral()
             raise
         # Slot acquired: stamp how long this caller queued behind the RPM /
         # TPM / concurrency gates, for the call layer's log record.
@@ -517,8 +550,8 @@ class GlobalRateLimiter:
         population), so this is same-semantics-per-population, not one merged cap.
         On any :class:`BaseException` while acquiring the rate/concurrency gates —
         before the slot is held — the deducted RPM token is refunded and a
-        HALF_OPEN probe claim is resolved (re-opening the breaker so it never
-        wedges); the slot release lives in ``finally``. Catching
+        HALF_OPEN probe claim is released for another caller; the slot release
+        lives in ``finally``. Catching
         :class:`BaseException` (``KeyboardInterrupt`` is not an ``Exception``) is
         the permit-leak fix over the old fixed-semaphore path.
         """
@@ -539,10 +572,15 @@ class GlobalRateLimiter:
         is_probe = False
         if breaker is not None:
             decision, transition = breaker.admit()
-            emit_backpressure(transition)
+            is_probe = decision is Admit.PROBE
+            try:
+                emit_backpressure(transition)
+            except BaseException:
+                if is_probe:
+                    breaker.on_probe_neutral()
+                raise
             if decision is Admit.REJECT:
                 raise CircuitOpenError(provider_key)
-            is_probe = decision is Admit.PROBE
         # Acquire phase — RPM gate, then TPM gate, then the concurrency gate. On
         # ANY BaseException here (after the RPM token is deducted but before a slot
         # is held), refund the token so a systematically-interrupted workload
@@ -562,7 +600,7 @@ class GlobalRateLimiter:
             if rpm_debited and rpm_bucket is not None:
                 rpm_bucket.refund(1.0)
             if is_probe and breaker is not None:
-                emit_backpressure(breaker.on_probe_failure())
+                breaker.on_probe_neutral()
             raise
         # Slot held: classify the outcome for AIMD and the breaker through the
         # single shared helper (identical to ``acquire_async``), then always

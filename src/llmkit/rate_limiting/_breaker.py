@@ -46,11 +46,11 @@ class CircuitState(enum.Enum):
 
 
 class CircuitBreaker:
-    """Per-provider circuit breaker over the shared throttle/success stream.
+    """Per-provider circuit breaker over provider outage and success outcomes.
 
     The aggregate guard that complements AIMD: AIMD drives the per-provider limit
     *toward* 1 under sustained pushback; the breaker is the "limit is effectively
-    0 for a cooldown" case — once a provider's throttle rate over a rolling window
+    0 for a cooldown" case — once a provider's outage rate over a rolling window
     crosses the trip threshold it **opens**, and while open the limiter fast-fails
     every call with :class:`~llmkit.exceptions.CircuitOpenError` instead of letting
     each one burn its retry budget into the storm.
@@ -60,19 +60,19 @@ class CircuitBreaker:
     thread. State is a ``CLOSED / OPEN / HALF_OPEN`` machine plus a count-based
     ring of the last :data:`BREAKER_WINDOW` real outcomes:
 
-    * **CLOSED** — admit normally; each real outcome (a throttle or a success;
+    * **CLOSED** — admit normally; each real outcome (an outage or a success;
       an ambiguous neutral error, like AIMD, records nothing) is appended to the
-      ring. Once the ring is full and its throttled fraction reaches
+      ring. Once the ring is full and its outage fraction reaches
       :data:`BREAKER_THRESHOLD`, **open** (clearing the ring) and arm the
       cooldown.
-    * **OPEN** — reject every admission for :data:`BREAKER_COOLDOWN` seconds.
+    * **OPEN** — reject every admission for the configured cooldown.
       The fast rejections feed nothing back (no real call ran).
     * **HALF_OPEN** — the first admission after the cooldown becomes a single,
       process-wide, lock-guarded **probe**; everyone else is rejected until it
       resolves. The probe's outcome alone decides: a clean success **closes** the
-      breaker (and clears the ring); any failure — a throttle, a neutral error,
-      or cancellation before/while it ran — **re-opens** it and re-arms the
-      cooldown, so a probe can never wedge the breaker HALF_OPEN.
+      breaker (and clears the ring); an outage **re-opens** it and re-arms the
+      cooldown. A neutral error or cancellation releases the claim without
+      claiming recovery or an outage, allowing the next call to probe.
 
     State is guarded by a plain :class:`threading.Lock` (shared safely across
     loops and threads, exactly like :class:`RateBucket` / :class:`AdaptiveState`),
@@ -82,11 +82,12 @@ class CircuitBreaker:
     :func:`_tuning.now`, so cooldown is deterministic under a monkeypatched clock.
     """
 
-    def __init__(self, provider: str, ceiling: int) -> None:
+    def __init__(self, provider: str, ceiling: int, cooldown: float = BREAKER_COOLDOWN) -> None:
         self._provider: str = provider
         # The breaker's own effective ceiling, reported on transitions so an
         # event reads ceiling → 0 (open) → 1 (one probe) → ceiling (closed).
         self._ceiling: int = ceiling
+        self._cooldown: float = cooldown
         self._state: CircuitState = CircuitState.CLOSED
         self._window: collections.deque[bool] = collections.deque(maxlen=BREAKER_WINDOW)
         # When the breaker last opened, for the cooldown comparison. ``-inf`` is
@@ -105,7 +106,7 @@ class CircuitBreaker:
             if self._state is CircuitState.CLOSED:
                 return Admit.NORMAL, None
             if self._state is CircuitState.OPEN:
-                if _tuning.now() - self._opened_at < BREAKER_COOLDOWN:
+                if _tuning.now() - self._opened_at < self._cooldown:
                     return Admit.REJECT, None
                 # Cooldown elapsed: admit exactly one probe and announce HALF_OPEN.
                 self._state = CircuitState.HALF_OPEN
@@ -118,7 +119,7 @@ class CircuitBreaker:
             self._probe_in_flight = True
             return Admit.PROBE, None
 
-    def on_record(self, *, throttled: bool) -> BackpressureEvent | None:
+    def on_record(self, *, outage: bool) -> BackpressureEvent | None:
         """Account one *normal* (non-probe) call outcome; open if the ring trips.
 
         Only the CLOSED path accumulates the ring: a normal call that was admitted
@@ -128,11 +129,11 @@ class CircuitBreaker:
         with self._lock:
             if self._state is not CircuitState.CLOSED:
                 return None
-            self._window.append(throttled)
+            self._window.append(outage)
             if len(self._window) < BREAKER_MIN_SAMPLES:
                 return None
-            throttled_fraction = sum(self._window) / len(self._window)
-            if throttled_fraction < BREAKER_THRESHOLD:
+            outage_fraction = sum(self._window) / len(self._window)
+            if outage_fraction < BREAKER_THRESHOLD:
                 return None
             return self._open_locked()
 
@@ -147,8 +148,7 @@ class CircuitBreaker:
             return BackpressureEvent(self._provider, 1, self._ceiling, "breaker_closed")
 
     def on_probe_failure(self) -> BackpressureEvent | None:
-        """Resolve the HALF_OPEN probe with *any* failure (throttle, neutral error,
-        or cancellation before it ran): re-open and re-arm the cooldown.
+        """Resolve the HALF_OPEN probe with an outage: re-open and re-arm the cooldown.
 
         Always releases the probe claim, so the breaker can never wedge HALF_OPEN.
         """
@@ -157,6 +157,15 @@ class CircuitBreaker:
             if self._state is not CircuitState.HALF_OPEN:
                 return None
             return self._open_locked()
+
+    def on_probe_neutral(self) -> None:
+        """Release a probe without evidence of either outage or recovery.
+
+        HALF_OPEN remains in force; the next caller may claim the single probe.
+        Cancellation before a provider request runs is neutral too.
+        """
+        with self._lock:
+            self._probe_in_flight = False
 
     def _open_locked(self) -> BackpressureEvent:
         # Caller holds ``self._lock``. Transition to OPEN, arm the cooldown, and

@@ -64,7 +64,7 @@ def record_call(record: LLMCallRecord) -> Path | None:
 
 
 async def record_call_async(record: LLMCallRecord) -> Path | None:
-    """:func:`record_call`, offloaded so sink I/O never blocks the event loop.
+    """:func:`record_call`, normally offloaded to keep sink I/O off the event loop.
 
     The default sink's write is real blocking work — ``mkdir``, a
     full-payload ``yaml.dump``, two file writes, retention housekeeping —
@@ -73,12 +73,14 @@ async def record_call_async(record: LLMCallRecord) -> Path | None:
     the capture ContextVars hold shared list objects, so capture appends made
     in the worker are visible to the caller exactly as on the sync path; the
     thread completes even if the awaiting task is cancelled mid-write, so
-    the record (and its captured path) still lands.
+    the write can complete and append capture entries after cancellation. A
+    blocked worker is not terminated by cancelling the await, and executor
+    shutdown may wait for it. There is no write deadline.
 
     Falls back to the synchronous seam when the offload itself is impossible
     (``RuntimeError``: no running loop, or the loop's default executor was
-    already shut down by a late teardown write) — logging must never break
-    the call, and a blocking write in a dying process beats a lost record.
+    already shut down by a late teardown write). This fallback writes inline
+    and can block the calling thread; it preserves the existing delivery path.
 
     Deliberately additive: the sync :func:`record_call` stays, both because
     it is an importable seam and because the abandoned-stream path *must*

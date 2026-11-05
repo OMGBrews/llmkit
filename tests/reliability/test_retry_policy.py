@@ -38,6 +38,7 @@ canonical non-recoverable one is an ``openai`` auth/4xx status error.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
 import warnings
@@ -446,7 +447,7 @@ def test_recoverable_set_union_invariant_still_holds() -> None:
 
 @pytest.mark.asyncio
 async def test_with_retries_max_attempts_runs_exactly_n_attempts() -> None:
-    """``with_retries(max_attempts=3)`` makes exactly three attempts before
+    """``with_retries(policy=RetryPolicy(max_attempts=3))`` makes exactly three attempts before
     re-raising — the canonical name, total attempts including the first."""
     calls = [0]
 
@@ -455,7 +456,10 @@ async def test_with_retries_max_attempts_runs_exactly_n_attempts() -> None:
         raise TimeoutError("always")
 
     with pytest.raises(TimeoutError, match="always"):
-        _ = await with_retries(_fn, max_attempts=3, retry_on=(TimeoutError,))
+        _ = await with_retries(
+            _fn,
+            policy=RetryPolicy(max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     assert calls[0] == 3
 
@@ -474,7 +478,7 @@ async def test_with_retries_max_retries_kwarg_raises_type_error() -> None:
         # Deliberately passing the hard-cut ``max_retries`` alias: it is no longer
         # a parameter, so the type checker rightly flags it; the test pins the
         # runtime ``TypeError``.
-        await with_retries(_fn, max_retries=3, retry_on=(TimeoutError,))  # pyright: ignore[reportCallIssue]
+        await with_retries(_fn, max_retries=3)  # pyright: ignore[reportCallIssue]
 
     # The callable was never invoked: the bad kwarg is rejected at the call.
     assert calls[0] == 0
@@ -485,8 +489,9 @@ def test_retry_policy_and_with_retries_agree_on_max_attempts() -> None:
     semantics — ``max_attempts=3`` means three total attempts."""
     policy = RetryPolicy(max_attempts=3)
     assert policy.max_attempts == 3
-    # ``with_retries`` accepts ``max_attempts`` directly (no alias needed).
-    assert "max_attempts" in (with_retries.__doc__ or "")
+    parameters = inspect.signature(with_retries).parameters
+    assert set(parameters) == {"fn", "policy", "label"}
+    assert "max_attempts" not in parameters
 
 
 # --- nested-retry guard: no budget multiplication -------------------------
@@ -494,7 +499,7 @@ def test_retry_policy_and_with_retries_agree_on_max_attempts() -> None:
 
 async def test_nested_with_retries_around_call_function_does_not_multiply() -> None:
     """Wrapping a call function (which already retries 3x) in
-    ``with_retries(max_attempts=3)`` must NOT yield 3x3=9 attempts. The inner
+    ``with_retries(policy=RetryPolicy(max_attempts=3))`` must NOT yield 3x3=9 attempts. The inner
     layer collapses to a single pass, so the outer loop owns the retries —
     a persistent transient error costs the *outer* budget, not the product."""
 
@@ -508,7 +513,12 @@ async def test_nested_with_retries_around_call_function_does_not_multiply() -> N
         pytest.warns(RuntimeWarning, match="nested"),
         pytest.raises(InstructorRetryException) as excinfo,
     ):
-        _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
+        _ = await with_retries(
+            _wrapped,
+            policy=RetryPolicy(
+                max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+            ),
+        )
 
     assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
     # Outer budget of 3, inner collapsed to a single pass each -> 3 total,
@@ -533,7 +543,12 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
             install(_always_raises(timeout_error())) as installed,
             pytest.raises(InstructorRetryException) as excinfo,
         ):
-            _ = await with_retries(_wrapped, max_attempts=3, retry_on=(openai.APITimeoutError,))
+            _ = await with_retries(
+                _wrapped,
+                policy=RetryPolicy(
+                    max_attempts=3, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+                ),
+            )
 
     assert isinstance(excinfo.value.__cause__, openai.APITimeoutError)
     assert len(installed.requests) == 3
@@ -541,7 +556,7 @@ async def test_no_retry_inner_drives_retries_from_outer_wrapper_without_warning(
 
 async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> None:
     """The nested guard preserves the one-log-per-attempt contract: an outer
-    ``with_retries(max_attempts=2)`` around a transient-then-success call
+    ``with_retries(policy=RetryPolicy(max_attempts=2))`` around a transient-then-success call
     function writes one log per real attempt (here: 2). The accidental
     double-wrap still joins the loop's logical call: both records share one
     ``call_id`` and number their attempts 1, 2."""
@@ -560,7 +575,10 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
             pytest.warns(RuntimeWarning, match="nested"),
         ):
             result = await with_retries(
-                _wrapped, max_attempts=2, retry_on=(openai.APITimeoutError,)
+                _wrapped,
+                policy=RetryPolicy(
+                    max_attempts=2, retry_on=(openai.APITimeoutError,), backoff_base_seconds=0.0
+                ),
             )
     finally:
         configure_llm_logging(LocalYamlLogSink())
@@ -588,7 +606,10 @@ async def test_with_retries_around_bare_awaitable_still_retries() -> None:
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning here would fail the test
-        result = await with_retries(_bare, max_attempts=3, retry_on=(TimeoutError,))
+        result = await with_retries(
+            _bare,
+            policy=RetryPolicy(max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     assert result == "ok"
     assert calls[0] == 3
@@ -617,13 +638,23 @@ async def test_task_spawned_inside_attempt_keeps_its_own_retries() -> None:
 
     async def _outer() -> str:
         outer_calls[0] += 1
-        task = asyncio.create_task(with_retries(_inner, max_attempts=3, retry_on=(TimeoutError,)))
+        task = asyncio.create_task(
+            with_retries(
+                _inner,
+                policy=RetryPolicy(
+                    max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0
+                ),
+            )
+        )
         return await task
 
     with warnings.catch_warnings():
         # A spurious nested-guard RuntimeWarning on this path would fail the test.
         warnings.simplefilter("error", RuntimeWarning)
-        result = await with_retries(_outer, max_attempts=2, retry_on=(TimeoutError,))
+        result = await with_retries(
+            _outer,
+            policy=RetryPolicy(max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     assert result == "ok"
     assert inner_calls[0] == 3  # inner kept its own budget, not collapsed to 1
@@ -693,13 +724,19 @@ async def test_directly_awaited_nested_with_retries_still_collapses_same_task() 
     async def _outer() -> str:
         outer_calls[0] += 1
         # Directly awaited in the same task: the guard collapses it to one pass.
-        return await with_retries(_inner, max_attempts=3, retry_on=(TimeoutError,))
+        return await with_retries(
+            _inner,
+            policy=RetryPolicy(max_attempts=3, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     with (
         pytest.warns(RuntimeWarning, match="nested"),
         pytest.raises(TimeoutError, match="always"),
     ):
-        _ = await with_retries(_outer, max_attempts=2, retry_on=(TimeoutError,))
+        _ = await with_retries(
+            _outer,
+            policy=RetryPolicy(max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=0.0),
+        )
 
     # Inner collapsed to one pass per outer attempt; outer budget 2 -> 2 total,
     # NOT 6 (2 x 3). The same-task collapse is preserved.
@@ -890,17 +927,11 @@ async def test_instructor_wrapped_permanent_4xx_fails_fast(
         pytest.param(_litellm_503, id="litellm-503"),
     ],
 )
-async def test_retry_on_none_wrapped_transport_cause_uses_transport_budget(
+async def test_default_helper_wrapped_transport_cause_uses_total_ceiling(
     make_transport_cause: Callable[[], Exception],
 ) -> None:
-    """``retry_on=None`` ("retry on any Exception") must not break the budget
-    *routing*: an ``InstructorRetryException`` wrapping a transport cause
-    (429, litellm 503) is classified against ``LLM_TRANSPORT_ERRORS`` after
-    unwrapping and charged the full transport budget (4), not the lower
-    validation budget (2). Regression test: the cause check used to require
-    an explicit ``retry_on``, so direct ``with_retries`` callers using the
-    documented ``None`` default got the exact misclassification the unwrap
-    exists to prevent."""
+    """A wrapped transport error uses the total ceiling, not the validation
+    sublimit. The helper's default policy unwraps instructor like ordinary calls."""
     from instructor.core import InstructorRetryException
 
     calls = [0]
@@ -912,20 +943,20 @@ async def test_retry_on_none_wrapped_transport_cause_uses_transport_budget(
     with pytest.raises(InstructorRetryException):
         _ = await with_retries(
             _fn,
-            max_attempts=4,
-            retry_on=None,
-            validation_max_attempts=2,
-            validation_retry_on=LLM_SCHEMA_ERRORS,
+            policy=RetryPolicy(
+                max_attempts=4,
+                validation_max_attempts=2,
+                validation_retry_on=LLM_SCHEMA_ERRORS,
+                backoff_base_seconds=0.0,
+            ),
         )
 
     assert calls[0] == 4
 
 
 @pytest.mark.asyncio
-async def test_retry_on_none_wrapped_validation_cause_uses_validation_budget() -> None:
-    """Under the same ``retry_on=None`` setup, an ``InstructorRetryException``
-    wrapping a genuine ``ValidationError`` still lands on the lower validation
-    budget (2) — the transport fallback must not swallow real schema failures."""
+async def test_default_helper_wrapped_validation_cause_uses_validation_allowance() -> None:
+    """A wrapped parse failure uses the smaller validation allowance."""
     from instructor.core import InstructorRetryException
 
     calls = [0]
@@ -937,22 +968,20 @@ async def test_retry_on_none_wrapped_validation_cause_uses_validation_budget() -
     with pytest.raises(InstructorRetryException):
         _ = await with_retries(
             _fn,
-            max_attempts=4,
-            retry_on=None,
-            validation_max_attempts=2,
-            validation_retry_on=LLM_SCHEMA_ERRORS,
+            policy=RetryPolicy(
+                max_attempts=4,
+                validation_max_attempts=2,
+                validation_retry_on=LLM_SCHEMA_ERRORS,
+                backoff_base_seconds=0.0,
+            ),
         )
 
     assert calls[0] == 2
 
 
 @pytest.mark.asyncio
-async def test_retry_on_none_wrapped_permanent_4xx_fails_fast() -> None:
-    """Even under ``retry_on=None`` ("retry on any Exception"), an
-    ``InstructorRetryException`` wrapping a permanent 401 propagates after a
-    single attempt: the unwrapped cause is neither transport- nor
-    schema-shaped, so the fail-fast contract overrides the blanket retry for
-    the wrapper, exactly as under the curated default sets."""
+async def test_default_helper_wrapped_permanent_4xx_fails_fast() -> None:
+    """The helper's default policy propagates wrapped permanent failures."""
     from instructor.core import InstructorRetryException
 
     calls = [0]
@@ -966,10 +995,12 @@ async def test_retry_on_none_wrapped_permanent_4xx_fails_fast() -> None:
     with pytest.raises(InstructorRetryException):
         _ = await with_retries(
             _fn,
-            max_attempts=4,
-            retry_on=None,
-            validation_max_attempts=2,
-            validation_retry_on=LLM_SCHEMA_ERRORS,
+            policy=RetryPolicy(
+                max_attempts=4,
+                validation_max_attempts=2,
+                validation_retry_on=LLM_SCHEMA_ERRORS,
+                backoff_base_seconds=0.0,
+            ),
         )
 
     assert calls[0] == 1

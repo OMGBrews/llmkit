@@ -31,7 +31,7 @@ from llmkit import (
     text_llm_call,
     text_llm_call_sync,
 )
-from llmkit.retry import with_retries
+from llmkit.retry import RetryPolicy, with_retries
 from llmkit.testing import Reply, TransportRequest, install
 from tests.cache.conftest import CALL_MODE, cache_provider
 
@@ -394,7 +394,12 @@ async def test_outer_retry_reroll_skips_the_lookup() -> None:
     with install(_InTurn()) as installed:
         _ = await text_llm_call("q", feature="draft", provider=provider)  # stores "first"
         accepted = await with_retries(
-            _draft, max_attempts=3, validation_retry_on=(ResultValidationError,)
+            _draft,
+            policy=RetryPolicy(
+                max_attempts=3,
+                validation_retry_on=(ResultValidationError,),
+                backoff_base_seconds=0.0,
+            ),
         )
         after = await text_llm_call("q", feature="draft", provider=provider)
 

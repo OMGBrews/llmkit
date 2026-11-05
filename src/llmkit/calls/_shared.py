@@ -355,14 +355,8 @@ async def run_with_policy[T](
     """
     return await with_retries(
         attempt,
-        max_attempts=policy.max_attempts,
+        policy=dataclasses.replace(policy, validation_retry_on=validation_retry_on),
         label=tag,
-        backoff_base_seconds=policy.backoff_base_seconds,
-        max_backoff_seconds=policy.max_backoff_seconds,
-        retry_after_cap=policy.retry_after_cap,
-        retry_on=policy.retry_on,
-        validation_max_attempts=policy.validation_max_attempts,
-        validation_retry_on=validation_retry_on,
     )
 
 

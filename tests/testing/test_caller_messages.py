@@ -62,7 +62,7 @@ async def _own_retry(prompt: list[ChatMessage]) -> Verdict:
 async def _outer_with_retries(prompt: list[ChatMessage]) -> Verdict:
     return await with_retries(
         lambda: structured_llm_call(prompt, Verdict, feature="caller-messages", retry=NO_RETRY),
-        max_attempts=3,
+        policy=RetryPolicy(max_attempts=3, backoff_base_seconds=0.0),
     )
 
 

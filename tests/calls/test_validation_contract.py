@@ -1051,7 +1051,8 @@ async def test_tool_repair_tracks_latest_round_and_survives_transport_failure() 
             output_schema=_N,
             feature="f",
             provider=_PROVIDER,
-            retry=RetryPolicy(validation_max_attempts=4, backoff_base_seconds=0.0),
+            # Three validation failures plus a transport failure need five total passes.
+            retry=RetryPolicy(max_attempts=5, validation_max_attempts=4, backoff_base_seconds=0.0),
         )
     assert result.parsed == _N(n=4)
     assert [request.repair for request in fake.requests] == [False, True, True, True, False]

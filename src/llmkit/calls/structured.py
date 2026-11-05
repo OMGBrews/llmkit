@@ -127,7 +127,7 @@ async def structured_llm_call[T: BaseModel](
             ran.
         retry: Transient-error retry budget applied to this call. Resolves
             to :data:`~llmkit.DEFAULT_RETRY_POLICY` (retry the curated
-            ``LLM_RECOVERABLE_ERRORS`` with full-jitter backoff) when
+            transport and validation subsets with full-jitter backoff) when
             neither this keyword nor ``options`` supplies one. Pass
             :data:`~llmkit.NO_RETRY` to opt out, or a custom
             :class:`~llmkit.RetryPolicy` to tune the budget. Each attempt is
@@ -145,9 +145,9 @@ async def structured_llm_call[T: BaseModel](
             result that parsed cleanly but is semantically wrong (an empty
             register, an unresolved citation, a total that doesn't reconcile)
             and re-roll the call. The re-roll is charged against the *validation*
-            budget (``retry.validation_max_attempts``), exactly like a schema
-            failure, so a deterministically-bad result can't burn the full
-            transport budget; on exhaustion the last
+            allowance (at most ``retry.validation_max_attempts - 1`` retries),
+            exactly like a schema failure, within the overall ``max_attempts``
+            ceiling; on exhaustion the last
             :class:`~llmkit.ResultValidationError` propagates. ``None`` (the
             default) leaves the call unchanged. Folds an
             LLM-then-validate-then-re-roll loop the caller would otherwise

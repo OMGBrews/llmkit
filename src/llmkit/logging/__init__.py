@@ -7,9 +7,11 @@ per call to a directory resolved lazily at first write (see
 the enclosing project root, else a per-user state directory), preserving
 the historical log shape so existing analysis tooling keeps working.
 
-Logging is unconditional and best-effort — a sink that raises is swallowed
-so the LLM call itself never breaks because logging did. The host
-application points the sink at its chosen directory once at startup via
+Logging is best-effort: ordinary sink exceptions are caught, but writes have
+no deadline. The call awaits an offloaded write; the synchronous fallback and
+abandoned-stream paths write inline. A blocked sink can delay calls and
+shutdown. The host application points the sink at its chosen directory once
+at startup via
 :func:`configure_llm_logging`, mirroring the ``configure_rate_limit``
 module-level pattern.
 Module layout

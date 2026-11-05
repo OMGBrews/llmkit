@@ -2,8 +2,9 @@
 
 Every call builds an :class:`~llmkit.LLMCallRecord` (prompt, schema, response,
 duration, resolved model/provider, approximate cost, any provider error) and
-hands it to the configured log sink. Logging is unconditional — a sink failure
-is swallowed so the LLM call itself never breaks because logging did.
+hands it to the configured log sink. Ordinary sink exceptions are caught;
+write completion is awaited without a deadline, so a blocked sink can delay
+the call. See :mod:`llmkit.capture` for offload and cancellation behavior.
 
 The provider transport lives in :mod:`llmkit._litellm` (LiteLLM, with
 ``instructor`` for structured output); these functions own the logging,

@@ -12,8 +12,8 @@ re-ask. These tests pin the whole contract:
   partial text and usage on ``diagnostics``, read from every completion
   shape without ever raising);
 * the outer retry layer (:func:`~llmkit.retry.with_retries`) propagates it
-  immediately under the default policy *and* under ``retry_on=None`` ("retry
-  anything") — only an explicit ``retry_on`` listing the type opts back in;
+  immediately under the default policy — only an explicit ``retry_on`` listing
+  the type opts back in;
 * the taxonomy holds: catchable via ``LLM_RECOVERABLE_ERRORS``, outside both
   retry-budget sets;
 * no collateral damage: the one schema-repair re-ask (and the
@@ -53,7 +53,7 @@ from llmkit import (
 from llmkit import (
     calls as llm_calls,
 )
-from llmkit.retry import with_retries
+from llmkit.retry import RetryPolicy, with_retries
 from tests._support import OkSchema, quiet_logging
 
 
@@ -269,10 +269,8 @@ async def test_public_call_default_policy_adds_no_attempts_or_backoff() -> None:
     assert sleep_mock.await_count == 0
 
 
-async def test_with_retries_retry_on_none_fails_fast() -> None:
-    """The regression test for the bare-exception hole: ``retry_on=None``
-    ("retry on any Exception") must still propagate an ``OutputLimitError``
-    immediately instead of charging it to the transport budget."""
+async def test_with_retries_default_policy_fails_fast() -> None:
+    """The default helper policy propagates output-limit failures immediately."""
     attempts = 0
 
     async def boom() -> None:
@@ -281,7 +279,7 @@ async def test_with_retries_retry_on_none_fails_fast() -> None:
         raise OutputLimitError(model="fake/model", max_tokens=None, completion_tokens=None)
 
     with pytest.raises(OutputLimitError):
-        await with_retries(boom, max_attempts=3)
+        await with_retries(boom, policy=RetryPolicy(max_attempts=3, backoff_base_seconds=0.0))
     assert attempts == 1
 
 
@@ -296,7 +294,12 @@ async def test_with_retries_explicit_opt_in_still_retries() -> None:
         raise OutputLimitError(model="fake/model", max_tokens=8, completion_tokens=8)
 
     with pytest.raises(OutputLimitError):
-        await with_retries(boom, max_attempts=2, retry_on=(OutputLimitError,))
+        await with_retries(
+            boom,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(OutputLimitError,), backoff_base_seconds=0.0
+            ),
+        )
     assert attempts == 2
 
 
