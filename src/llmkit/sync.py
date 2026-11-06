@@ -74,6 +74,7 @@ import contextlib
 import contextvars
 import logging
 import threading
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Generator
 from types import TracebackType
 from typing import cast, final, overload, override
@@ -647,8 +648,8 @@ class _SyncGenerator[T](Generator[T, None, None]):
         """Close the async generator on the loop and wait until it has closed.
 
         This is the deterministic abandonment path: the stream's ``finally``
-        blocks run, and its abandoned-stream record is written, before
-        ``close`` returns. A no-op once the stream has finished, when it was
+        blocks run, and its abandoned-stream record is captured and submitted,
+        before ``close`` returns. Delivery may finish later or be dropped. A no-op once the stream has finished, when it was
         never started, or when the sync loop has already been shut down (its
         own shutdown finalized the generator).
         """
@@ -750,24 +751,19 @@ async def _drain_and_close(timeout: float | None) -> None:
         _ = task.cancel()
     if pending:
         _ = await asyncio.gather(*pending, return_exceptions=True)
-    # Join any in-flight ``to_thread`` offloads — llmkit's own log writes run
-    # there (``record_call_async``) — so a clean process exit never drops the
-    # final call's record. Bounded overall by the ``shutdown()`` caller's
-    # timeout on this whole coroutine.
+    # Settle unrelated executor work the host/provider put on this loop.
+    # Managed llmkit sink delivery uses its own daemon worker and is flushed
+    # separately, after generator finalizers have had a chance to submit.
+    # An arbitrary host executor task may outlive the surrounding timeout.
     await asyncio.get_running_loop().shutdown_default_executor()
 
 
-def shutdown(*, timeout: float | None = 10.0) -> None:
-    """Drain and close the persistent loop. Idempotent; registered via :mod:`atexit`.
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else max(0.0, deadline - time.monotonic())
 
-    Drains LiteLLM's pending logging on the loop **once**, cancels its background
-    worker task, runs ``shutdown_asyncgens``, closes the loop, and joins its
-    thread — the bind-once / drain-once teardown that keeps a clean exit free of
-    ``coroutine … was never awaited``. A no-op when the loop was never started or
-    has already been shut down (the globals are cleared under ``_lock``, so a
-    second call returns immediately). Exposed for hosts that want to reclaim the
-    thread explicitly (e.g. before forking); most callers rely on the atexit hook.
-    """
+
+def _shutdown_loop(deadline: float | None) -> None:
+    """Close the sync loop, sharing one caller deadline across drain and join."""
     global _loop, _thread
     with _lock:
         loop = _loop
@@ -777,14 +773,60 @@ def shutdown(*, timeout: float | None = 10.0) -> None:
     if loop is None:
         return
     try:
-        cleanup = asyncio.run_coroutine_threadsafe(_drain_and_close(timeout), loop)
-        _ = cleanup.result(timeout)
+        cleanup = asyncio.run_coroutine_threadsafe(_drain_and_close(_remaining(deadline)), loop)
+        _ = cleanup.result(_remaining(deadline))
     except Exception:  # pragma: no cover - best-effort shutdown drain
         logger.debug("persistent-loop shutdown drain failed", exc_info=True)
     finally:
         _ = loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
-            thread.join(timeout if timeout is not None else 5.0)
+            # _loop_main closes suspended async generators after loop.stop.
+            # Joining here lets their log submissions precede the final flush
+            # whenever they settle inside the caller's remaining budget.
+            remaining = _remaining(deadline)
+            thread.join(remaining if remaining is not None else 5.0)
 
 
-_ = atexit.register(shutdown)
+def shutdown(*, timeout: float | None = 10.0) -> None:
+    """Close the sync loop and perform a bounded managed-log flush.
+
+    Drains LiteLLM's pending logging, cancels background tasks, finalizes async
+    generators and closes the loop. Then waits up to the configured log drain
+    budget (one second by default) for already accepted managed log work. An
+    explicit smaller *timeout* caps the entire wait across loop teardown and
+    logging; each phase spends the remaining budget. ``None`` leaves loop
+    teardown uncapped, but never removes the managed logging drain bound.
+
+    Even when the sync loop never started, logging is flushed. A timeout keeps
+    pending records available for later delivery; it does not close logging or
+    replace its worker. Later calls can restart the sync loop and continue
+    logging. Use :func:`llmkit.flush_llm_logs` and logging health when the caller
+    needs a delivery settlement result. Unrelated host/provider work is outside
+    the managed sink guarantee.
+    """
+    from llmkit.logging._delivery import flush_llm_logs
+    from llmkit.logging._policy import get_delivery_policy
+
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    _shutdown_loop(deadline)
+    remaining = _remaining(deadline)
+    budget = get_delivery_policy().drain_timeout
+    if remaining is not None:
+        budget = min(budget, remaining)
+    _ = flush_llm_logs(timeout=budget)
+
+
+def _shutdown_at_exit() -> None:
+    """One coordinated terminal drain, including async-only applications."""
+    from llmkit.logging._delivery import shutdown_delivery
+
+    try:
+        _shutdown_loop(time.monotonic() + _DRAIN_TIMEOUT_SECONDS)
+    finally:
+        # Do not call public shutdown here: that would spend an ordinary
+        # flush budget and then a second terminal drain budget. Close managed
+        # admission only after applicable stream finalizers submitted records.
+        _ = shutdown_delivery()
+
+
+_ = atexit.register(_shutdown_at_exit)

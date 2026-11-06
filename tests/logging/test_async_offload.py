@@ -1,17 +1,7 @@
-"""Tests for the off-loop offload of sink I/O (``record_call_async``).
+"""Fast sink controls for managed delivery, capture and stream finalization.
 
-Pins the July-2026 audit fix for blocking log I/O on the async hot path:
-
-* every buffered call's record — and a *cleanly finished* stream's — is
-  written on a worker thread, never the event loop, while the abandoned
-  stream deliberately stays synchronous (suspending while ``GeneratorExit``
-  unwinds risks losing the truncation-witness record). Both streaming
-  families are covered, because each carries its own copy of that branch;
-* the ordering contracts survive the offload: the record and the written
-  path are captured before the call returns, and a caller cancelled
-  mid-write still gets the record on disk;
-* the ``RuntimeError`` fallback keeps late writes (no loop / executor shut
-  down) blocking-but-written instead of lost.
+Blocked sinks and delivery limits are exercised in isolated subprocesses in
+``test_delivery.py``. These controls prove normal writes still work.
 """
 
 from __future__ import annotations
@@ -24,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
+from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging, flush_llm_logs_async
 from llmkit import calls as llm_calls
 from llmkit.capture import capture_llm_log_paths, record_call_async
 from llmkit.logging._health import WriteOutcome
@@ -77,11 +67,8 @@ async def test_text_call_writes_log_off_the_event_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() -> None:
-    """The two-branch stream ``finally``: a cleanly consumed stream offloads
-    its (largest-payload) write to a worker thread, while an abandoned stream
-    writes synchronously on the consumer's thread — suspending while
-    ``GeneratorExit`` unwinds could lose the truncation-witness record."""
+async def test_clean_and_abandoned_text_streams_write_off_loop() -> None:
+    """Abandonment submits without awaiting; an explicit flush observes delivery."""
 
     sink = _ThreadRecordingSink()
     configure_llm_logging(sink)
@@ -89,32 +76,26 @@ async def test_clean_stream_finish_writes_off_loop_but_abandonment_stays_sync() 
         with install(lambda _request: Reply(chunks=["a", "b"])):
             # Clean finish → off-loop write.
             _ = [c async for c in llm_calls.text_llm_call_stream("hi", feature="test")]
-            # Abandonment → synchronous write on this (the consumer's) thread.
+            # Abandonment submits to the same worker without waiting.
             stream = llm_calls.text_llm_call_stream("hi", feature="test")
             async for _chunk in stream:
                 break
             await stream.aclose()
+            assert await flush_llm_logs_async()
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
     assert len(sink.records) == 2
     clean_thread, abandoned_thread = sink.write_threads
     assert clean_thread != threading.get_ident()
-    assert abandoned_thread == threading.get_ident()
+    assert abandoned_thread != threading.get_ident()
     assert sink.records[0].error is None
     assert sink.records[1].error == llm_calls.STREAM_ABANDONED_ERROR
 
 
 @pytest.mark.asyncio
-async def test_tool_stream_offloads_a_completed_turn_and_syncs_an_abandoned_one() -> None:
-    """The same two branches on the streaming *tool* lane, which copies them.
-
-    ``calls/tool_stream.py`` does not share ``_stream_once``'s ``finally`` — it
-    has its own — so the text lane's evidence says nothing about it. The extra
-    thing pinned here is the completion latch's effect on the *record path*: a
-    consumer that takes the terminal result and stops must land on the
-    off-loop, error-free branch, not the synchronous abandonment one.
-    """
+async def test_completed_and_abandoned_tool_streams_write_off_loop() -> None:
+    """A terminal result remains successful even when the consumer then closes."""
     from pydantic import BaseModel
 
     from llmkit import ToolCallResult, ToolDefinition
@@ -135,18 +116,19 @@ async def test_tool_stream_offloads_a_completed_turn_and_syncs_an_abandoned_one(
                 if isinstance(event, ToolCallResult):
                     break
             await stream.aclose()
-            # Left mid-prose → a real abandonment, synchronous write.
+            # Left mid-prose → a real abandonment, submitted without waiting.
             early = llm_calls.tool_llm_call_stream("hi", tools, feature="test")
             async for _event in early:
                 break
             await early.aclose()
+            assert await flush_llm_logs_async()
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
     assert len(sink.records) == 2
     completed_thread, abandoned_thread = sink.write_threads
     assert completed_thread != threading.get_ident()
-    assert abandoned_thread == threading.get_ident()
+    assert abandoned_thread != threading.get_ident()
     assert sink.records[0].error is None
     assert sink.records[1].error == llm_calls.STREAM_ABANDONED_ERROR
 
@@ -177,17 +159,17 @@ async def test_loop_stays_responsive_during_a_slow_write() -> None:
             _ = await llm_calls.structured_llm_call("hi", OkSchema, feature="test")
             stop.set()
             await beat
+            assert await flush_llm_logs_async()
     finally:
         configure_llm_logging(LocalYamlLogSink())
-    # A blocked loop would have frozen the heartbeat for the whole 150 ms
-    # write; off-loop it keeps ticking (~15 ticks; assert half to be safe).
+    # The call waits at most 100 ms while this sink needs 150 ms; the
+    # heartbeat progresses during that wait and explicit flush observes completion.
     assert ticks[0] >= 7
 
 
 @pytest.mark.asyncio
 async def test_log_path_is_captured_before_the_call_returns(tmp_path: Path) -> None:
-    """The documented capture contract survives the offload: the written
-    path is in the capture list at the moment the call returns."""
+    """A fast file write is captured when observed inside the delivery wait."""
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
@@ -237,27 +219,25 @@ async def test_cancellation_mid_write_still_lands_the_record(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_offload_falls_back_to_sync_when_to_thread_unavailable(tmp_path: Path) -> None:
-    """A late write hitting a shut-down executor (``RuntimeError``) degrades
-    to the blocking seam instead of losing the record."""
+async def test_delivery_does_not_need_the_default_executor(tmp_path: Path) -> None:
+    """The dedicated delivery thread works when executor submission is unavailable."""
 
     async def _boom_to_thread(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("cannot schedule new futures after shutdown")
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:
-        with patch("llmkit.capture.asyncio.to_thread", side_effect=_boom_to_thread):
+        with patch("asyncio.to_thread", side_effect=_boom_to_thread) as offload:
             path = await record_call_async(_record())
+        offload.assert_not_called()
         assert path is not None
         assert path.exists()
     finally:
         configure_llm_logging(LocalYamlLogSink())
 
 
-def test_sync_bridge_call_writes_and_captures_through_the_offload(tmp_path: Path) -> None:
-    """A ``*_sync`` call driven over the persistent loop still writes the
-    YAML and captures its path before returning — the offload composes with
-    the bridge's context propagation."""
+def test_sync_bridge_fast_write_captures_before_return(tmp_path: Path) -> None:
+    """A fast managed write preserves path capture across the sync bridge."""
 
     configure_llm_logging(LocalYamlLogSink(tmp_path))
     try:

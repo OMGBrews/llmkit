@@ -16,6 +16,7 @@ from llmkit import (
     capture_llm_log_paths,
     capture_llm_records,
     configure_llm_logging,
+    flush_llm_logs_async,
     get_logging_health,
     structured_llm_call,
     text_llm_call,
@@ -134,4 +135,5 @@ async def test_abandoned_stream_preserves_witness_with_broken_sink(
     assert len(records) == 1
     assert records[0].error == STREAM_ABANDONED_ERROR
     assert paths == []
+    assert await flush_llm_logs_async()
     assert get_logging_health().failed == 1

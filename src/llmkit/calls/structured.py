@@ -277,9 +277,8 @@ async def structured_llm_call[T: BaseModel](
             # above, so without this one the ``finally`` would record
             # ``error=None, response=None``: a success that returned nothing.
             # It is recorded as cancelled instead, and re-raised untouched.
-            # The record still lands, for the reason ``calls/tool.py`` gives:
-            # the single delivered cancellation is consumed by the time the
-            # ``finally`` awaits.
+            # The finalizer captures and submits without waiting while this
+            # cancellation unwinds. Delivery can finish later or be dropped.
             error = error_text(exc)
             raise
         finally:

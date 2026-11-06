@@ -42,7 +42,7 @@ from llmkit.calls._shared import (
     usage_log_dict,
 )
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
-from llmkit.capture import record_call, record_call_async
+from llmkit.capture import record_call_async, submit_record_call
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
@@ -408,11 +408,8 @@ async def _stream_tools_once(
             ),
         )
         if error == STREAM_ABANDONED_ERROR:
-            # Abandonment unwinds via GeneratorExit / a re-deliverable
-            # CancelledError: awaiting here risks a second cancellation landing
-            # mid-await and losing the one honest witness that the turn is
-            # truncated. One blocking write is the safe trade — the same choice
-            # ``calls/stream.py`` makes, and for the same reason.
-            _ = record_call(record)
+            # Capture and submit without awaiting or running sink I/O while
+            # GeneratorExit / cancellation unwinds. Delivery may finish later.
+            submit_record_call(record)
         else:
             _ = await record_call_async(record)

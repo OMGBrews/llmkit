@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Bounded managed log delivery.** Calls use one daemon sink worker, a queue
+  defaulting to 256 waiting records, and at most 100 ms of delivery waiting.
+  Cancellation and stream abandonment do not wait for the sink. Record capture
+  happens before admission; paths are captured only when completion is observed
+  within the wait and never appended later. Queued ordinary containers receive
+  private snapshots; opaque objects keep shared-reference semantics. New
+  `LogDeliveryPolicy`, `flush_llm_logs` and `flush_llm_logs_async` configure and
+  inspect bounded draining (one second by default). Health reports queue state,
+  dropped delivery and expired waits separately. Process exit performs one final
+  bounded drain; explicit low-level writes remain synchronous.
+
+
 - Buffered tool calls now attach the latest rejected tool-call turn and one
   validation-error result per call when re-asking an all-malformed round,
   followed by a user instruction to issue a corrected tool call.

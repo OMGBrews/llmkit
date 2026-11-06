@@ -237,7 +237,7 @@ _ABANDON: dict[str, Callable[[Callable[[], Generator[object]]], None]] = {
 @pytest.mark.parametrize("how", sorted(_ABANDON))
 @pytest.mark.parametrize("stream", sorted(_STREAMS))
 def test_abandoning_the_sync_stream_records_the_abandonment(stream: str, how: str) -> None:
-    """The record is written, and captured, before the next statement runs."""
+    """The record is submitted, and captured, before the next statement runs."""
     with install(_answer), capture_llm_records() as records:
         _ABANDON[how](_STREAMS[stream])
         errors = [record.error for record in records]

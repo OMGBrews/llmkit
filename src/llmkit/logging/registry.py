@@ -22,6 +22,7 @@ from typing import Protocol, runtime_checkable
 
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
+from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
 from llmkit.logging.local_yaml import LocalYamlLogSink
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
@@ -77,22 +78,22 @@ def _classify(sink: LogSink | None) -> SinkKind:
 
 
 @dataclass(frozen=True)
-class _Installed:
+class Installed:
     """The configured sink and the health state counting its outcomes."""
 
     sink: LogSink | None
     health: HealthState
 
 
-def _install(sink: LogSink | None) -> _Installed:
-    return _Installed(sink=sink, health=HealthState(sink=_classify(sink)))
+def _install(sink: LogSink | None) -> Installed:
+    return Installed(sink=sink, health=HealthState(sink=_classify(sink)))
 
 
 # Module-level installation, defaulting to the local-YAML sink at the default
 # directory (resolved lazily at first write). The host overrides it once at
 # startup; tests typically point it at a tmp directory. Replaced whole, never
 # mutated, so every reader sees a consistent sink/health pair.
-_installed: _Installed = _install(LocalYamlLogSink())
+_installed: Installed = _install(LocalYamlLogSink())
 
 # Warn-once latch for a *configured* sink that raises out of ``write`` — the
 # custom-sink counterpart of LocalYamlLogSink's internal latches, so a
@@ -111,10 +112,15 @@ class _SinkContractError(TypeError):
     """
 
 
-def configure_llm_logging(sink: LogSink | None) -> None:
+def configure_llm_logging(
+    sink: LogSink | None, *, delivery_policy: LogDeliveryPolicy | None = None
+) -> None:
     """Set the sink that receives every :class:`LLMCallRecord`.
 
     Pass ``None`` to disable logging entirely (writes become no-ops).
+    Optional ``delivery_policy`` configures managed queue capacity and wait/drain
+    budgets before the first managed admission. Later explicit policy changes
+    raise RuntimeError; omitting it preserves policy during sink swaps.
     Re-arms the warn-once latch on sink failures, so a newly configured sink
     gets a fresh loud first warning if it too turns out to be broken, and
     starts fresh :func:`get_logging_health` counts — including when the call
@@ -152,8 +158,15 @@ def configure_llm_logging(sink: LogSink | None) -> None:
             "sink must implement LogSink (a write(record) method) or be None, "
             + f"got {type(sink).__name__}"
         )
+    if delivery_policy is not None:
+        configure_delivery(delivery_policy)
     _installed = _install(sink)
     _sink_latch.succeeded()
+
+
+def get_installed() -> Installed:
+    """Bind the sink and counters together before managed preparation."""
+    return _installed
 
 
 def get_log_sink() -> LogSink | None:
@@ -219,7 +232,11 @@ def get_logging_health() -> LoggingHealth:
     :func:`configure_llm_logging` call, so a temporary sink swap — even one
     restored with :func:`get_log_sink` — clears them. Writes run on worker
     threads; counts are lock-guarded and exact. A write still running when
-    this is read is not yet counted.
+    this is read is visible in ``in_flight``, but has no outcome yet.
+    ``queued`` includes preparation reservations; ``dropped`` counts records
+    never written, ``unavailable`` the shutdown/dead-worker subset, and
+    ``wait_timeouts`` expired waits that may still deliver later.
+    ``preparation_failed`` also contributes to ``failed``.
     """
     return _installed.health.snapshot()
 
@@ -249,7 +266,20 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
     Every outcome is also counted in :func:`get_logging_health`, against the
     installation read here at entry.
     """
-    installed = _installed
+    return write_installed(record, _installed)
+
+
+@dataclass
+class WriteAttempt:
+    """Per-write accounting witness, including when diagnostics later raise."""
+
+    accounted: bool = False
+
+
+def write_installed(
+    record: LLMCallRecord, installed: Installed, attempt: WriteAttempt | None = None
+) -> Path | None:
+    """Write against the installation bound at managed admission or direct entry."""
     sink = installed.sink
     health = installed.health
     if sink is None:
@@ -264,6 +294,8 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
                 health.record_failed("write", error, record.feature, record.label)
             else:
                 health.record_written(record.feature, record.label, outcome.post_write_failures)
+            if attempt is not None:
+                attempt.accounted = True
             _sink_latch.succeeded()
             return outcome.path
         if isinstance(sink, _PathReturningLogSink):
@@ -288,6 +320,8 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
             record.feature,
             record.label,
         )
+        if attempt is not None:
+            attempt.accounted = True
         if _sink_latch.should_warn(exc):
             logger.warning(
                 "LLM log sink raised for %s/%s (further identical failures logged at DEBUG)",
@@ -301,5 +335,7 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
             )
         return None
     health.record_handed_off()
+    if attempt is not None:
+        attempt.accounted = True
     _sink_latch.succeeded()
     return path

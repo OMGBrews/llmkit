@@ -30,6 +30,7 @@ from llmkit import (
     ToolDefinition,
     ToolName,
     configure_llm_client,
+    flush_llm_logs_async,
     make_provider,
     tool_llm_call,
     tool_result_message,
@@ -201,6 +202,7 @@ async def test_a_cancelled_round_is_recorded_as_cancelled_not_as_an_empty_succes
         with pytest.raises(asyncio.CancelledError):
             await call
 
+        assert await flush_llm_logs_async()
         assert len(records) == 1
         assert records[0].error == "CancelledError"
         assert cast("object", records[0].response) is None

@@ -76,7 +76,14 @@ class LoggingHealth:
             a sink raised, or a sink broke its return contract.
         degraded: Written records whose index line or retention housekeeping
             failed afterwards. Each is also counted in ``written``.
-        last_failure: The most recent failure of any stage, or ``None``.
+        queued: Waiting records, including snapshot preparation reservations.
+        in_flight: Records currently inside a sink write.
+        dropped: Records rejected or discarded before a sink write.
+        unavailable: Subset of drops caused by shutdown or a dead worker.
+        wait_timeouts: Caller waits that expired; delivery may still succeed.
+        preparation_failed: Snapshot/startup failures, also counted in failed.
+        last_failure: The most recent sink failure, or ``None``. Admission and
+            preparation counters do not retain payloads or exception text.
         last_success_at: When a record was last written or handed off.
     """
 
@@ -87,6 +94,12 @@ class LoggingHealth:
     degraded: int = 0
     last_failure: LoggingFailure | None = None
     last_success_at: datetime | None = None
+    queued: int = 0
+    in_flight: int = 0
+    dropped: int = 0
+    unavailable: int = 0
+    wait_timeouts: int = 0
+    preparation_failed: int = 0
 
 
 @dataclass(frozen=True)
@@ -122,14 +135,21 @@ class HealthState:
     _handed_off: int = 0
     _failed: int = 0
     _degraded: int = 0
+    _queued: int = 0
+    _in_flight: int = 0
+    _dropped: int = 0
+    _unavailable: int = 0
+    _wait_timeouts: int = 0
+    _preparation_failed: int = 0
     _last_failure: LoggingFailure | None = None
     _last_success_at: datetime | None = None
 
+    @staticmethod
     def _failure(
-        self, stage: FailureStage, exc: BaseException, feature: str, label: str | None
-    ) -> None:
-        # Caller holds the lock.
-        self._last_failure = LoggingFailure(
+        stage: FailureStage, exc: BaseException, feature: str, label: str | None
+    ) -> LoggingFailure:
+        # Exception formatting may run arbitrary sink code: never hold _lock.
+        return LoggingFailure(
             stage=stage,
             error=_describe(exc),
             feature=feature,
@@ -143,13 +163,13 @@ class HealthState:
         label: str | None,
         post_write_failures: tuple[tuple[FailureStage, Exception], ...] = (),
     ) -> None:
+        failures = [self._failure(stage, exc, feature, label) for stage, exc in post_write_failures]
         with self._lock:
             self._written += 1
             self._last_success_at = datetime.now(UTC)
             if post_write_failures:
                 self._degraded += 1
-                for stage, exc in post_write_failures:
-                    self._failure(stage, exc, feature, label)
+                self._last_failure = failures[-1]
 
     def record_handed_off(self) -> None:
         with self._lock:
@@ -159,9 +179,40 @@ class HealthState:
     def record_failed(
         self, stage: FailureStage, exc: BaseException, feature: str, label: str | None
     ) -> None:
+        failure = self._failure(stage, exc, feature, label)
         with self._lock:
             self._failed += 1
-            self._failure(stage, exc, feature, label)
+            self._last_failure = failure
+
+    def delivery(
+        self,
+        *,
+        queued: int = 0,
+        in_flight: int = 0,
+        dropped: int = 0,
+        unavailable: int = 0,
+        wait_timeouts: int = 0,
+        preparation_failed: int = 0,
+    ) -> None:
+        """Update delivery counters without diagnostics or user callbacks.
+
+        Queued includes preparation reservations. Drops never reached the sink;
+        expired waits may still succeed later. Preparation failures count as
+        failed without formatting arbitrary payloads or exceptions on the caller.
+        """
+        with self._lock:
+            self._queued += queued
+            self._in_flight += in_flight
+            self._dropped += dropped
+            self._unavailable += unavailable
+            self._wait_timeouts += wait_timeouts
+            self._preparation_failed += preparation_failed
+            self._failed += preparation_failed
+
+    def record_worker_failure(self) -> None:
+        """Count a fatal worker exception without invoking its formatting hooks."""
+        with self._lock:
+            self._failed += 1
 
     def snapshot(self) -> LoggingHealth:
         with self._lock:
@@ -171,6 +222,12 @@ class HealthState:
                 handed_off=self._handed_off,
                 failed=self._failed,
                 degraded=self._degraded,
+                queued=self._queued,
+                in_flight=self._in_flight,
+                dropped=self._dropped,
+                unavailable=self._unavailable,
+                wait_timeouts=self._wait_timeouts,
+                preparation_failed=self._preparation_failed,
                 last_failure=self._last_failure,
                 last_success_at=self._last_success_at,
             )

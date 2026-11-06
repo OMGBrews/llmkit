@@ -93,6 +93,11 @@ from llmkit.logging import (
     get_log_sink,
     get_logging_health,
 )
+from llmkit.logging._delivery import (
+    flush_llm_logs,
+    flush_llm_logs_async,
+)
+from llmkit.logging._policy import LogDeliveryPolicy
 from llmkit.options import (
     DEFAULT_TEMPERATURE,
     UNSET,
@@ -153,6 +158,9 @@ except PackageNotFoundError:  # pragma: no cover - source tree without an instal
     __version__ = "0.0.0+unknown"
 
 __all__ = [
+    "LogDeliveryPolicy",
+    "flush_llm_logs",
+    "flush_llm_logs_async",
     # Providers + config
     "LLMProviderInterface",
     "Provider",

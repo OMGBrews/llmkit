@@ -966,13 +966,13 @@ LocalYamlLogSink(retention_days=0)                     # ValueError — see belo
 
 Each bound takes a **positive** integer or `None`; `0` and negatives raise `ValueError` at construction. `0` is rejected rather than quietly interpreted because it has two opposite plausible meanings — "keep nothing" (`logrotate`'s `rotate 0`) and "no limit" (many SaaS retention settings) — and the destructive reading is what the mechanics would actually do: the prune cutoff would be *now*, so the first write would delete every log in the directory, including the file it had just written and whose path it returns. `None` is the only opt-out, for both bounds.
 
-Sink I/O never runs on the event loop: writes are offloaded to a worker thread (the one deliberate exception is a stream abandoned mid-flight, whose record is written synchronously so it can't be lost while the generator unwinds).
+Managed call logging sends sink I/O to one dedicated daemon thread, including abandoned streams. Calls wait at most 100 ms for delivery by default; stream abandonment captures and submits without waiting. See the delivery policy below.
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) builds an `LLMCallRecord` and submits it for managed delivery to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
-**`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
+**`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own), before admission and before the call returns or propagates an error. Full or unavailable delivery preserves record capture. Delivery workers never append to these capture lists after return.
 
 ```python
 from llmkit import capture_llm_records, structured_llm_call
@@ -983,14 +983,14 @@ with capture_llm_records() as records:
 total_cost = sum(r.approximate_cost or 0.0 for r in records)
 ```
 
-**`capture_llm_log_paths()` — file paths.** Wrap a scope to receive the per-call log-file path written by the configured file sink. Only a file sink (the default `LocalYamlLogSink`) yields a path; with a third-party sink, or with logging disabled, the list stays empty — reach for `capture_llm_records()` when you want cost/metadata regardless of the sink.
+**`capture_llm_log_paths()` — file paths.** Wrap a scope to receive paths whose sink completion the caller observes within its delivery wait. The default `LocalYamlLogSink` and custom sinks exposing `write_returning_path` can supply paths. A timeout, cancellation, zero wait or abandoned-stream submission promises no captured path, and late completion never appends one. With logging disabled or a sink without path support, the list stays empty. Use `capture_llm_records()` for sink-independent cost/metadata.
 
 ```python
 from llmkit import capture_llm_log_paths, structured_llm_call
 
 with capture_llm_log_paths() as paths:
     result = await structured_llm_call(prompt, MySchema, feature="extraction")
-# paths -> [PosixPath("data/llm-logs/...yaml"), ...]
+# paths contains only paths observed before this call returned; it may be empty.
 ```
 
 ### Write your own `LogSink`
@@ -1002,7 +1002,7 @@ class LogSink(Protocol):
     def write(self, record: LLMCallRecord) -> None: ...
 ```
 
-A custom sink (a database, a metrics pipe, an in-memory buffer) is a one-method object that returns nothing; records (`LLMCallRecord`, a frozen dataclass) are handed to it for every call, and ordinary exceptions from writes are caught. To send records somewhere other than local YAML — a database, an HTTP collector, structured stdout — implement `write` and register it:
+A custom sink (a database, a metrics pipe, an in-memory buffer) is a one-method object that returns nothing; accepted records (`LLMCallRecord`, a frozen dataclass) are handed to it by the delivery worker, and ordinary exceptions from writes are caught. To send records somewhere other than local YAML — a database, an HTTP collector, structured stdout — implement `write` and register it:
 
 ```python
 import json
@@ -1041,12 +1041,69 @@ A custom sink that returns normally counts as a handoff: llmkit cannot see
 whether it actually wrote anything through `write(record) -> None`. Record
 capture proves a record was built, not that a sink persisted it.
 
-**Writes have no deadline.** The async path offloads a write to a worker thread
-but awaits its completion, so a slow or blocked sink delays the call. Cancelling
-that await does not terminate the worker: capture lists can change afterwards,
-and executor shutdown can wait for the write. The synchronous fallback and
-abandoned-stream finalization write inline and can block their calling thread.
-Use a sink with its own bounded I/O when call latency or shutdown time matters.
+**Bounded managed delivery.** One daemon worker handles sink writes, with room for
+256 waiting records plus at most one active write. A full queue drops the incoming
+delivery immediately and counts it in logging health; record capture still works.
+A normal call waits at most 100 ms, including time queued and writing. A timeout
+stops only the wait: accepted delivery can finish later. Cancellation stops waiting
+immediately, including when it is already unwinding through a call finalizer.
+Abandoned streams submit without waiting. These are maintainer-selected defaults,
+not benchmark-derived optima.
+
+Configure the policy before the first managed admission:
+
+```python
+from llmkit import LogDeliveryPolicy, LocalYamlLogSink, configure_llm_logging
+
+configure_llm_logging(
+    LocalYamlLogSink(),
+    delivery_policy=LogDeliveryPolicy(queue_capacity=256, delivery_wait=0.1, drain_timeout=1.0),
+)
+```
+
+`queue_capacity` must be a positive integer (not a bool), `delivery_wait` a finite
+number from zero to 0.1 seconds, and `drain_timeout` a finite nonnegative number.
+An explicit policy supplied after managed delivery starts raises a configuration
+error; omitting it preserves the current policy when swapping sinks. Repeated
+wait timeouts, sink swaps and sync-loop restarts never create replacement workers.
+A permanently stuck sink can prevent further delivery until process restart.
+A sink raising `BaseException` makes the service unavailable; pending delivery is
+accounted for as lost. Reentrant calls from the worker submit without waiting,
+and worker-originated flushes return immediately as incomplete.
+
+Before queueing, llmkit privately snapshots exact built-in dictionaries, lists
+and tuples, recursively, preserving shared references and cycles. Subsequent
+mutations to those containers in application inputs or captured records cannot
+change the queued copy. Opaque objects and container subclasses retain shared
+reference semantics; no custom copy hooks run. This snapshot is taken at log
+submission, not at provider invocation, and does not promise an atomic view of
+concurrent mutation during copying. Snapshot preparation takes time proportional
+to the payload and is outside the 100 ms delivery wait; serialization and sink
+I/O remain on the worker. Cost depends on container structure: immutable text and
+image strings are reused, so serialized byte size alone does not predict copying
+time. Queue capacity counts preparation reservations too,
+but does not bound payload bytes or caller-owned capture buffers.
+
+Explicit low-level `write_llm_log()`, `capture.record_call()` and `sink.write()`
+remain synchronous and unbounded. Managed delivery cannot forcibly terminate
+arbitrary sink code or bound unrelated provider, host executor or background work.
+
+**Flushing and exit.** `flush_llm_logs(timeout=None)` and
+`await flush_llm_logs_async(timeout=None)` wait for records accepted before flush
+entry, using the configured one-second drain budget by default. A finite
+nonnegative override selects another budget; zero polls without waiting. The
+return value says whether that accepted prefix settled, including failed writes.
+Inspect health to distinguish persistence, handoff and failure. Later submissions
+do not extend a flush; a timed-out flush retains pending work, and cancellation
+of an async flush cancels only its wait.
+
+`llmkit.sync.shutdown()` flushes logging even for async-only applications and
+keeps the delivery worker available for later calls. An explicit smaller shutdown
+timeout also limits its logging wait. Normal process exit performs one final
+bounded drain after applicable sync-loop cleanup, then discards remaining queued
+work and counts the loss. An active write remains unconfirmed. The daemon worker
+does not keep the process alive. Abrupt termination can lose records; applications
+that need delivery evidence should flush and inspect health before exiting.
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
@@ -1071,17 +1128,20 @@ Restoring the returned value is what makes this correct in the two starting stat
 from llmkit import get_logging_health
 
 health = get_logging_health()
-if health.failed:
-    print(f"{health.failed} records lost; last: {health.last_failure}")
+if health.failed or health.dropped:
+    print(f"write failures={health.failed}, dropped={health.dropped}")
 ```
 
 - `sink` is `"disabled"` (logging set to `None`), `"builtin"` (`LocalYamlLogSink`), or `"custom"`.
 - `written` counts records the built-in sink wrote to disk. `degraded` counts those whose index line or retention housekeeping failed afterwards: the YAML file exists, but `index.jsonl` may lack its line.
 - `handed_off` counts records a custom sink accepted by returning normally. llmkit cannot see past that return, so a handoff is not evidence the record was stored.
-- `failed` counts records lost to a detected failure: the built-in write failed, a sink raised, or a sink broke its return contract.
-- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. `last_success_at` is the time of the last write or handoff.
+- `failed` counts records lost to a detected failure: preparation failed, the built-in write failed, a sink raised, or a sink broke its return contract.
+- `queued` includes waiting records and snapshot preparation reservations; `in_flight` counts active managed writes for the installation.
+- `dropped` counts rejected or discarded delivery, including a full queue; `unavailable` identifies admission failures when the service cannot accept work. `preparation_failed` counts snapshot or worker-startup failures, also included in `failed`.
+- `wait_timeouts` counts expired caller waits. A timeout is not proof of loss: a later successful write still counts in `written` or `handed_off`.
+- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
 
-Counts belong to the installed sink and reset on every `configure_llm_logging` call, so the temporary swap above clears them even when it restores the same sink. Writes run on worker threads; the counts are lock-guarded and exact, and a write still in progress is not yet counted. If you read the snapshot from an `atexit` handler registered after `import llmkit`, that handler runs before llmkit drains its background event loop, so call `llmkit.sync.shutdown()` first to let any in-flight write finish.
+Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
 
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 

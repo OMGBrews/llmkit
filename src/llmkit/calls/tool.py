@@ -323,10 +323,9 @@ async def tool_llm_call[T: BaseModel](
             # exception itself is re-raised untouched, so control flow —
             # including cancellation semantics — is unchanged.
             #
-            # The record still lands: ``record_call_async`` offloads the write
-            # to a thread that runs to completion, and the single delivered
-            # cancellation has already been consumed by the time the
-            # ``finally`` awaits.
+            # The finalizer captures and submits the record, skipping its
+            # delivery wait while cancellation unwinds. Accepted delivery may
+            # finish later; capture alone is not evidence of persistence.
             #
             # ``str(exc)`` is empty for a bare ``CancelledError``, so the
             # message is dropped rather than logged as ``"CancelledError: "``.
