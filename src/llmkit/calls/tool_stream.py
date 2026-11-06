@@ -33,6 +33,7 @@ from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
+from llmkit._snapshot import snapshot_data, snapshot_prompt, snapshot_tools
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     error_text,
@@ -44,6 +45,7 @@ from llmkit.calls._shared import (
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
 from llmkit.capture import record_call_async, submit_record_call
 from llmkit.logging import LLMCallRecord
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
@@ -138,6 +140,9 @@ async def tool_llm_call_stream(
     keeps the good ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``, exactly as the buffered lane does.
     """
+    # First execution owns the baseline; transport and records get separate copies.
+    prompt = snapshot_prompt(prompt)
+    tools = snapshot_tools(tools)
     args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
@@ -307,13 +312,15 @@ async def _stream_tools_once(
         nonlocal first_chunk_at
         first_chunk_at = at
 
+    requests: list[RequestSnapshot] = []
     _litellm.begin_sent_temperature()
     try:
         async with aclosing(
             _litellm.astream_tools(
-                prompt,
-                tools,
+                snapshot_prompt(prompt),
+                snapshot_tools(tools),
                 tool_choice=tool_choice,
+                requests=requests,
                 temperature=temperature,
                 model=model,
                 max_tokens=max_tokens,
@@ -381,7 +388,8 @@ async def _stream_tools_once(
             temperature=sent_temperature,
             duration_ms=(time.monotonic() - start_t) * 1000,
             schema=TOOL_STREAM_LOG_SCHEMA,
-            prompt=prompt,
+            prompt=snapshot_prompt(prompt),
+            requests=snapshot_data(requests),
             # The partial transcript on an abandoned turn, the full result
             # otherwise — the same "say what actually happened" rule the text
             # stream follows.
@@ -398,7 +406,7 @@ async def _stream_tools_once(
             attempt=attempt,
             queue_wait_ms=current_queue_wait_ms(),
             run_id=get_run_id(),
-            tools=[definition.to_litellm() for definition in tools],
+            tools=snapshot_data([definition.to_litellm() for definition in tools]),
             tool_calls=[call.to_wire() for call in result.tool_calls]
             if result is not None
             else None,

@@ -247,17 +247,14 @@ async def test_tool_reask_repairs_strict_arguments(as_messages: bool) -> None:
     assert reminder["role"] == "user"
     assert isinstance(reminder["content"], str)
     assert "Retry the rejected tool request" in reminder["content"]
-    assert records[1].prompt == [
-        user,
-        assistant,
-        {
-            "role": "tool",
-            "tool_call_id": "bad",
-            "content": error["content"].removeprefix("ERROR: "),
-            "is_error": True,
-        },
-        reminder,
-    ]
+    assert records[1].prompt == prompt
+    [initial_request] = records[0].requests
+    [repair_request] = records[1].requests
+    assert initial_request["repair"] is False
+    assert initial_request["messages"] == list(first.messages)
+    assert repair_request["repair"] is True
+    assert repair_request["messages"] == [user, assistant, error, reminder]
+    assert repair_request["tools"] == [tool.to_litellm()]
     assert prompt == ([{"role": "user", "content": "q"}] if as_messages else "q")
 
 
@@ -1062,7 +1059,16 @@ async def test_tool_repair_tracks_latest_round_and_survives_transport_failure() 
     latest = cast("AssistantToolMessage", latest)
     assert latest["tool_calls"][0]["id"] == "latest"
     assert fake.requests[4].messages == fake.requests[0].messages
-    assert [record.prompt for record in records][1] == records[2].prompt
+    assert [record.prompt for record in records] == ["q"] * 5
+    assert [len(record.requests) for record in records] == [1] * 5
+    history = [record.requests[0] for record in records]
+    assert [request["repair"] for request in history] == [False, True, True, True, False]
+    assert [request["messages"] for request in history] == [
+        list(request.messages) for request in fake.requests
+    ]
+    assert history[1]["messages"] == history[2]["messages"]
+    assert history[1]["messages"] is not history[2]["messages"]
+    assert records[1].error is not None
 
 
 def test_whole_round_error_carries_distinct_individual_errors() -> None:

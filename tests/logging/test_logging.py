@@ -490,3 +490,33 @@ def test_multibyte_feature_clamps_on_a_codepoint_boundary(tmp_path: Path) -> Non
     assert path.exists()
     assert "é" * 40 in path.name
     assert "é" * 41 not in path.name
+
+
+def test_prepared_request_history_persists_only_in_yaml(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from llmkit import RequestSnapshot
+
+    history: list[RequestSnapshot] = [
+        {
+            "messages": [{"role": "user", "content": "prepared"}],
+            "tools": [],
+            "repair": False,
+            "settings": {"model": "openai/example", "temperature": 0.5},
+        },
+        {
+            "messages": [{"role": "user", "content": "prepared"}],
+            "tools": [],
+            "repair": True,
+            "settings": {"model": "openai/example", "additional_drop_params": ["temperature"]},
+        },
+    ]
+    record = replace(_record(prompt="original"), requests=history)
+    path = LocalYamlLogSink(tmp_path).write_returning_path(record)
+    assert path is not None
+    document = cast("dict[str, object]", yaml.safe_load(path.read_text()))
+    assert document["prompt"] == "original"
+    assert document["requests"] == history
+    index = cast("dict[str, object]", json.loads((tmp_path / "index.jsonl").read_text()))
+    assert "requests" not in index
+    assert "messages" not in index

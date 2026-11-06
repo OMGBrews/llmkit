@@ -61,11 +61,11 @@ def test_pinned_digest(monkeypatch: pytest.MonkeyPatch) -> None:
         return fixed_schema
 
     monkeypatch.setattr(_Verdict, "model_json_schema", classmethod(_fixed))
-    assert LLM_CACHE_KEY_VERSION == 4
-    assert _key() == "fa85b920d3a076354c0c90930e0c8f3d924b2eea2935ff8cfbd26e073a1e4fae"
+    assert LLM_CACHE_KEY_VERSION == 5
+    assert _key() == "e8989cca8b6aa29e1434bb21044c5352cfddfd3bdd960c3436001d28141df1b3"
     assert (
         _key(output_schema=None)
-        == "06a64e7e80d437152ec7e96478c8b36944b9933ae62cdafb17d212b10862b71f"
+        == "651138f93078c01b19d3133f86695d793002fd7b0ee5348fbc450320d7bae5ec"
     )
 
 

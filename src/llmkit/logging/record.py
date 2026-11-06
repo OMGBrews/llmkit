@@ -8,9 +8,9 @@ registry.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TypedDict
 
 from llmkit._types import ChatMessage, ReasoningEffort
 
@@ -19,9 +19,23 @@ from llmkit._types import ChatMessage, ReasoningEffort
 INDEX_FILENAME = "index.jsonl"
 
 
+class RequestSnapshot(TypedDict):
+    """One attempted llmkit dispatch, detached from transport working data.
+
+    ``settings`` contains only allowlisted prepared request data, never raw
+    provider kwargs or credentials. This observes llmkit's LiteLLM invocations,
+    including repair and temperature reissues, not SDK-internal activity.
+    """
+
+    messages: list[dict[str, object]]
+    tools: list[dict[str, object]]
+    repair: bool
+    settings: dict[str, object]
+
+
 @dataclass(frozen=True)
 class LLMCallRecord:
-    """A single LLM round-trip, as written to the log sink.
+    """One outer call attempt, as written to the log sink.
 
     ``model`` is the *resolved effective* model (the provider default
     substituted when the caller passed ``None``) and ``provider`` names
@@ -33,14 +47,20 @@ class LLMCallRecord:
     was supplied). Nothing branches on the value — it is a grep key. ``response`` is the Pydantic-dumped result,
     the accumulated text, or ``None``.
 
-    ``prompt`` is the caller's request plus any buffered tool repair history:
-    either the plain string or a full :data:`~llmkit._types.ChatMessage` list,
-    including any
-    assistant-tool-call and tool-result turns a tool loop appended. A sink
-    receives it unnormalized — there is no single string form — so a sink that
-    renders prompts must handle both shapes. On a buffered tool repair attempt,
-    it includes the rejected assistant turn and error results sent on that
-    attempt, with ``is_error`` preserved before wire rendering.
+    ``prompt`` is the unchanged original caller input snapshotted at first
+    execution, before cache and rate-limit waits. Every call family uses this
+    meaning, including buffered tool repair attempts. It is a string or a
+    message sequence, with caller-supplied ``is_error`` flags preserved.
+
+    ``requests`` is an ordered list of detached prepared requests in this
+    outer attempt. Each entry has ``messages``, wire ``tools``, a ``repair``
+    flag and allowlisted ``settings``. Instructor repairs and temperature
+    reissues each add an entry. An entry means llmkit attempted dispatch,
+    including failed, cancelled or abandoned dispatches; it does not prove
+    remote receipt or expose SDK-internal retries/transformations. Cache hits
+    and attempts stopped before dispatch have an empty history. Use ``call_id``
+    and ``attempt`` to join records. These containers are independently owned
+    by the record, not deeply immutable; mutating them cannot affect retries.
 
     ``approximate_cost`` is a best-effort USD estimate for budget
     visibility — NOT a billing figure. It is sourced from LiteLLM's
@@ -183,3 +203,4 @@ class LLMCallRecord:
     cache_hit: bool = False
     source_call_id: str | None = None
     first_chunk_ms: float | None = None
+    requests: list[RequestSnapshot] = field(default_factory=list)

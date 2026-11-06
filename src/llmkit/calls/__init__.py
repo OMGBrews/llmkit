@@ -7,6 +7,13 @@ exceptions are caught; calls wait at most 100 ms for delivery and abandonment
 submits without waiting. See :mod:`llmkit.capture` for capture and cancellation
 behavior.
 
+Each async call snapshots the prompt and offered tools when its body first
+executes, before cache access or rate-limit waits. Streams do so on their first
+advancement; synchronous wrappers inherit the async execution boundary. Keep
+inputs stable while copying. Internal retries use the same private baseline,
+with separate working data for transport and separate copies for records.
+Records retain the original ``prompt`` plus ordered prepared ``requests``.
+
 The provider transport lives in :mod:`llmkit._litellm` (LiteLLM, with
 ``instructor`` for structured output); these functions own the logging,
 retry and cost-recording contract *around* it. Four adjacent concerns are

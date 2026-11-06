@@ -212,18 +212,44 @@ async def test_an_undecodable_entry_is_a_miss(caplog: pytest.LogCaptureFixture) 
 
 
 @pytest.mark.asyncio
-async def test_an_unkeyable_request_bypasses_the_cache(caplog: pytest.LogCaptureFixture) -> None:
-    """A content part that is not JSON-serialisable cannot be fingerprinted:
-    the call still runs, nothing is stored, and one warning says why."""
-    configure_llm_cache(cache := InMemoryLLMCache())
+async def test_unsupported_input_is_rejected_before_cache_access(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid input cannot degrade into a cache miss with shared mutable data."""
+
+    class _UntouchedStore(_DictStore):
+        @override
+        async def get(self, key: str) -> LLMCacheEntry | None:
+            pytest.fail(f"unsupported input reached cache lookup: {key}")
+
+        @override
+        async def set(self, key: str, entry: LLMCacheEntry) -> None:
+            pytest.fail(f"unsupported input reached cache store: {key}, {entry.schema}")
+
+    configure_llm_cache(_UntouchedStore())
     transport = _Counting()
-    # Not a ChatMessage the types admit, which is the point: bytes reach the
-    # call from an untyped caller and cannot be JSON-serialised for the key.
+    # The nested bytes violate the plain-data ownership contract.
     blob = cast("object", {"role": "user", "content": [{"type": "blob", "data": b"\x00"}]})
     prompt = [cast("ChatMessage", blob)]
     with install(transport):
-        a = await text_llm_call(prompt, feature="f", provider=cache_provider())
-        b = await text_llm_call(prompt, feature="f", provider=cache_provider())
+        with pytest.raises(TypeError, match=r"prompt.*content.*data"):
+            _ = await text_llm_call(prompt, feature="f", provider=cache_provider())
+
+    assert transport.calls == 0
+    assert not _cache_warnings(caplog)
+
+
+@pytest.mark.asyncio
+async def test_valid_input_with_unkeyable_endpoint_bypasses_the_cache(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fingerprint failure remains best-effort after valid input is owned."""
+    configure_llm_cache(cache := InMemoryLLMCache())
+    transport = _Counting()
+    provider = cache_provider(request_kwargs={"api_base": object()})
+    with install(transport):
+        a = await text_llm_call("q", feature="f", provider=provider)
+        b = await text_llm_call("q", feature="f", provider=provider)
 
     assert (a, b, len(cache)) == ("answer-1", "answer-2", 0)
     assert len(_cache_warnings(caplog)) == 1

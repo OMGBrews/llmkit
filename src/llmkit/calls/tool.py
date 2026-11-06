@@ -19,6 +19,7 @@ from typing import cast, overload
 
 from pydantic import BaseModel, ValidationError
 
+from llmkit._snapshot import snapshot_data, snapshot_prompt, snapshot_tools
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     compose_validation_budget,
@@ -44,6 +45,7 @@ from llmkit.exceptions import (
     validation_failure_summary,
 )
 from llmkit.logging import LLMCallRecord
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
@@ -144,6 +146,9 @@ async def tool_llm_call[T: BaseModel](
     validation budget; a final answer cut off by the output-token limit raises
     :class:`~llmkit.OutputLimitError` and is not re-asked.
     """
+    # First execution owns the baseline; transport and records get separate copies.
+    prompt = snapshot_prompt(prompt)
+    tools = snapshot_tools(tools)
     args, provider, call_id, attempt_offset = prepare_call(
         options,
         temperature=temperature,
@@ -189,12 +194,6 @@ async def tool_llm_call[T: BaseModel](
 
         nonlocal attempt_count, repair
         attempt_count += 1
-        attempt_prompt: str | Sequence[ChatMessage] = prompt
-        if repair:
-            original: list[ChatMessage] = (
-                [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
-            )
-            attempt_prompt = [*original, *repair]
         begin_queue_wait()
         started_at, start_t = datetime.now(UTC), time.monotonic()
         result: ToolCallResult | ToolComposeResult[T] | None = None
@@ -204,13 +203,15 @@ async def tool_llm_call[T: BaseModel](
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
+        requests: list[RequestSnapshot] = []
         _litellm.begin_sent_temperature()
         try:
             text, raw_calls, stop_reason, counts, cost = await _litellm.acompletion_tools(
-                prompt,
-                tools,
-                repair=repair,
+                snapshot_prompt(prompt),
+                snapshot_tools(tools),
+                repair=snapshot_data(repair),
                 tool_choice=tool_choice,
+                requests=requests,
                 temperature=args.temperature,
                 model=args.model,
                 max_tokens=args.max_tokens,
@@ -345,7 +346,8 @@ async def tool_llm_call[T: BaseModel](
                     schema=(
                         "tools" if output_schema is None else f"tools+{output_schema.__name__}"
                     ),
-                    prompt=attempt_prompt,
+                    prompt=snapshot_prompt(prompt),
+                    requests=snapshot_data(requests),
                     response=_dump_for_log(result, feature, label),
                     error=error,
                     approximate_cost=cost,
@@ -355,7 +357,7 @@ async def tool_llm_call[T: BaseModel](
                     attempt=attempt_offset + attempt_count,
                     queue_wait_ms=current_queue_wait_ms(),
                     run_id=get_run_id(),
-                    tools=[definition.to_litellm() for definition in tools],
+                    tools=snapshot_data([definition.to_litellm() for definition in tools]),
                     tool_calls=[call.to_wire() for call in result.tool_calls]
                     if result is not None
                     else None,

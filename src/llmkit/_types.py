@@ -90,6 +90,9 @@ class Message(TypedDict):
     ``dict[str, object]`` rather than a modelled union: fully typing the
     provider content-part taxonomy would re-import the very wire format this
     type exists to hide, and llmkit forwards the parts verbatim to LiteLLM.
+    At execution, nested data must use exact built-in dict/list/tuple containers
+    with string keys and plain str/int/float/bool/None leaves. Calls reject
+    opaque values, custom nested containers and cycles before cache or transport.
     """
 
     role: Literal["system", "user", "assistant"]

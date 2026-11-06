@@ -52,7 +52,6 @@ This module imports neither LiteLLM nor pytest.
 from __future__ import annotations
 
 import asyncio
-import copy
 import inspect
 import json
 import re
@@ -66,6 +65,7 @@ import httpx
 import openai
 from pydantic import BaseModel
 
+from llmkit._snapshot import snapshot_data, snapshot_tools
 from llmkit._transport import (
     CallContext,
     CallKind,
@@ -321,10 +321,12 @@ def _public_request(call: CallContext) -> TransportRequest:
         call_id=call.call_id,
         attempt=call.attempt,
         repair=call.repair,
-        prompt=call.prompt if isinstance(call.prompt, str) else tuple(copy.deepcopy(call.prompt)),
-        messages=tuple(copy.deepcopy(call.messages)),
+        prompt=call.prompt
+        if isinstance(call.prompt, str)
+        else tuple(snapshot_data(list(call.prompt))),
+        messages=tuple(snapshot_data(list(call.messages))),
         output_schema=call.output_schema,
-        tools=tuple(call.tools),
+        tools=tuple(snapshot_tools(call.tools)),
         tool_choice=call.tool_choice,
         model=call.model,
         provider=call.provider,

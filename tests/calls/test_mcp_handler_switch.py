@@ -33,7 +33,9 @@ async def _send(*errors: Exception, **request: object) -> list[dict[str, object]
         return ModelResponse()
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=fake):
-        _ = await _litellm._acompletion(model="openai/m", messages=[], **request)
+        _ = await _litellm._acompletion(
+            model="openai/m", messages=[], **request, _requests=None, _repair=False
+        )
     return received
 
 

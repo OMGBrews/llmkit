@@ -10,6 +10,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Call reference](#call-reference)
+  - [Input ownership](#input-ownership)
   - [When a structured answer fails validation](#when-a-structured-answer-fails-validation)
   - [When a text answer is cut off](#when-a-text-answer-is-cut-off)
   - [Tool calls with a structured final answer](#tool-calls-with-a-structured-final-answer)
@@ -225,6 +226,48 @@ transient failure only before its first item reaches you; see the
 - `ToolResultMessage` — a tool's answer, as `tool_result_message(...)` builds it.
 
 All three are exported so your own prompt builders can be annotated against them rather than against the transport's wire shape: an unknown key (`{"roel": ...}`) or a mistyped role is a type error, and multimodal content type-checks instead of being rejected. Annotate a plain conversation `list[Message]`, and a tool-loop history — which gains assistant tool turns and tool results as it runs — `list[ChatMessage]`.
+
+### Input ownership
+
+Every call takes a private snapshot of its prompt and offered tools when its
+async body starts executing, before cache lookup, rate-limit admission or retry
+waits. Constructing a coroutine does not take the snapshot; beginning to await
+it does. Async streams take it on their first advancement, and sync streams on
+the first `next()`. Buffered sync calls take it when the underlying async body
+runs on the sync bridge. A sync stream's earlier context capture is separate
+from this input boundary.
+
+General outer message and tool sequences are accepted and materialized once.
+Nested message data and tool parameter schemas must use exact built-in `dict`,
+`list` and `tuple` containers, with exact built-in `str`, `int`, `float`, `bool`
+or `None` leaves and string dictionary keys. Repeated acyclic references are
+valid; cycles, container subclasses, custom containers, bytes and opaque objects
+raise `TypeError` identifying their location before cache or provider activity.
+Convert custom data into those plain containers before calling llmkit. This
+checks Python data ownership, not provider-specific message fields or content
+part kinds. Normal iteration of an outer sequence can run your code; copying
+never invokes custom copy or serialization hooks.
+
+Keep inputs stable while copying: a snapshot is not atomic against another
+thread mutating them during that step. Once copied, later caller mutations
+cannot change the active invocation's prepared requests, retries, cache key or
+logged prompt. The library leaves your objects untouched. Provider instances,
+model classes and callbacks remain shared behavioral references, so keep their
+relevant behavior stable throughout a call. Each new public invocation takes a
+new snapshot, including one made by your own outer retry loop.
+
+Retries work from the same private original. Tool repair and Instructor repair
+build separate request messages; the logs retain both the original `prompt`
+and the prepared [`requests` history](#logging-agent-readable-by-default).
+Return values keep their existing shapes. Captured records are separate data,
+not a mutable view into future attempts.
+
+Copying adds CPU and memory proportional to the expanded container data; each
+prepared dispatch retained in history adds another snapshot. Shared acyclic
+subtrees are copied independently. There is no tunable size cap, but available
+memory and Python's recursion limit still apply; excessive nesting raises a
+path-bearing `TypeError`. Large conversations and many repair attempts can
+therefore make preparation and logging appreciably more expensive.
 
 ### When a structured answer fails validation
 
@@ -473,7 +516,7 @@ else:
 
 Without a standard flag every application invents its own convention — a JSON wrapper, a bare traceback, a sentence in the result — and the same model recovers differently depending on which one it meets. This is the convention, so it doesn't.
 
-**What the model actually receives.** The flag is llmkit's, not the wire's. There is no field to carry it: LiteLLM's Anthropic translation builds its `tool_result` block from the call id and the content alone (LiteLLM's Anthropic translation still leaves `is_error` commented out at 1.104.0, the supported floor — its own source comment records that the OpenAI-normalized shape cannot express the distinction), and an OpenAI-compatible route would forward an unknown key straight to a provider that may reject it. So the transport prefixes the content with `TOOL_ERROR_PREFIX` (`"ERROR: "`, exported so you can recognise or strip it) and drops the key — one rendering, identical on every provider. The flag itself stays on the message you hold and in the `prompt` the log records (including library-added buffered tool repair turns), so your provenance keeps the distinction structurally even though the wire cannot. Omitting `is_error` sends exactly the three-key message it always did.
+**What the model actually receives.** The flag is llmkit's, not the wire's. There is no field to carry it: LiteLLM's Anthropic translation builds its `tool_result` block from the call id and the content alone (LiteLLM's Anthropic translation still leaves `is_error` commented out at 1.104.0, the supported floor — its own source comment records that the OpenAI-normalized shape cannot express the distinction), and an OpenAI-compatible route would forward an unknown key straight to a provider that may reject it. So the transport prefixes the content with `TOOL_ERROR_PREFIX` (`"ERROR: "`, exported so you can recognise or strip it) and drops the key — one rendering, identical on every provider. The flag itself stays on the message you hold and in the original `prompt` the log records. Library-added repair turns appear in `requests` after wire rendering, with `repair: true`, so the log distinguishes them from caller-supplied history. Omitting `is_error` sends exactly the three-key message it always did.
 
 ### Tool schemas: hand them over unprocessed
 
@@ -906,7 +949,28 @@ error: null
 partial_text: null
 response: ...
 prompt: ...
+requests: ...
 ```
+
+`prompt` is always the unchanged original input snapshot, as a string or
+conversation list, including on tool repair attempts. `requests` is an ordered
+list of detached `RequestSnapshot` dictionaries for that record's attempt.
+Join records by `call_id` and `attempt` to read the invocation's history. Each
+entry has `messages` as prepared for LiteLLM, offered wire `tools`, a `repair`
+flag, and a `settings` mapping. Settings use an explicit allowlist: routed
+model, stream flag, temperature, max tokens, reasoning effort, timeout, tool
+choice, response-format/schema data and `additional_drop_params`, when present.
+Credentials, headers, provider objects and model classes are excluded.
+
+The history includes each dispatch llmkit controls: normal attempts, buffered
+tool repairs, Instructor's in-call repairs and temperature reissues. A
+refused-temperature reissue keeps the temperature setting and adds
+`additional_drop_params: [temperature]`, reflecting the arguments handed to
+LiteLLM. An entry means dispatch was attempted; it does not prove an HTTP
+request reached the provider. SDK-internal retries and transformations are not
+observed. Failed, timed-out, cancelled and abandoned dispatches retain their
+entries. Cache hits and attempts stopped before dispatch have `requests: []`.
+The YAML body carries this history; the compact `index.jsonl` does not.
 
 `approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `first_chunk_ms` is, for a streamed attempt, the time from the attempt's start to the first frame of any kind the provider sent, a role-only or reasoning frame included. It is measured like `duration_ms`, so it includes `queue_wait_ms`, and `first_chunk_ms - queue_wait_ms` is the provider's own time to first chunk. A stream that waited 100 seconds and then streamed for 2 reads `first_chunk_ms` near 100000 against a `duration_ms` near 102000. It is `null` on every buffered call, on a cache hit, and on a streamed attempt that received nothing, which is how a stream cut off before its first chunk reads. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on a truncated structured, text or compose final-answer attempt (the same counts as `output_limit`); any other failed attempt writes `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed or truncated; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit` and `partial_text` are always present too, and `null` unless a **structured or text call, or a compose call's final answer, was cut off by its output limit**: then `output_limit` holds the truncated completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported, so a truncation that reported nothing is a mapping of nulls), and `partial_text` holds the unfinished answer. `response` stays `null` on a buffered attempt, because unfinished text is not a finished answer; the streamed lanes differ, logging their partial transcript under `response` too, because the consumer has already received it. `completion_tokens` may include reasoning tokens that never appear in `partial_text`, and a `reasoning_tokens` of `0` can also mean the provider did not break them out. Neither field reaches `index.jsonl`: find the truncations there by their `OutputLimitError` `error`, then open the file. The same values are on the raised error as `OutputLimitError.diagnostics` (an `OutputLimitDiagnostics`); the tool lanes pass `finish_reason` through as `stop_reason` instead and never raise this error, except on a compose call's final answer (`tool_llm_call` with `output_schema=`). `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt (the bare type name when the exception has no message) and `null` for a clean one. A **cancelled** structured, text or tool attempt records `CancelledError` there, for instance when your own `asyncio.timeout` cancels the call, rather than the `null` that would make it indistinguishable from an attempt that succeeded and returned nothing. An attempt cut off by its [`timeout`](#per-request-timeout) records `TimeoutError: no provider response within <n>s` (a structured attempt records the same message inside `InstructorRetryException`), and a stream cut that way records the same rather than the abandoned-stream marker, which stays reserved for a stream your own code stopped consuming.
 
@@ -984,7 +1048,18 @@ with capture_llm_records() as records:
     result = await structured_llm_call(prompt, MySchema, feature="extraction")
 
 total_cost = sum(r.approximate_cost or 0.0 for r in records)
+for record in records:
+    print(record.prompt)                 # original input, unchanged by repairs
+    for request in record.requests:
+        print(request["repair"], request["settings"]["model"], request["messages"])
 ```
+
+Each captured record's prompt, offered tool schemas and request history are
+independent of the call's private baseline and transport working data. The
+record is a frozen dataclass with mutable nested data: editing that data cannot
+change later retries, but does change your captured record. Keeping many
+records retains their full histories in memory; capture does not impose a
+payload or buffer-size limit.
 
 **`capture_llm_log_paths()` — file paths.** Wrap a scope to receive paths whose sink completion the caller observes within its delivery wait. The default `LocalYamlLogSink` and custom sinks exposing `write_returning_path` can supply paths. A timeout, cancellation, zero wait or abandoned-stream submission promises no captured path, and late completion never appends one. With logging disabled or a sink without path support, the list stays empty. Use `capture_llm_records()` for sink-independent cost/metadata.
 
@@ -1078,8 +1153,9 @@ Before queueing, llmkit privately snapshots exact built-in dictionaries, lists
 and tuples, recursively, preserving shared references and cycles. Subsequent
 mutations to those containers in application inputs or captured records cannot
 change the queued copy. Opaque objects and container subclasses retain shared
-reference semantics; no custom copy hooks run. This snapshot is taken at log
-submission, not at provider invocation, and does not promise an atomic view of
+reference semantics; no custom copy hooks run. This delivery snapshot is separate from the stricter
+[call-input snapshot](#input-ownership): it is taken at log submission and also
+covers records you construct yourself. It does not promise an atomic view of
 concurrent mutation during copying. Snapshot preparation takes time proportional
 to the payload and is outside the 100 ms delivery wait; serialization and sink
 I/O remain on the worker. Cost depends on container structure: immutable text and
@@ -1178,17 +1254,17 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 
 ### What counts as the same request
 
-llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`, now 4, so entries an earlier release stored miss once and are replaced); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
+llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`, now 5, so entries an earlier release stored miss once and are replaced); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
 `timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait. Cache reads and writes also have no llmkit deadline. An asynchronous store should bound its own I/O; a store that blocks synchronously stalls the event loop. A caller can bound an entire async call with its own cancellation scope, but cancellation does not terminate synchronous blocked code.
 
 For schema-backed models the key also includes the original schema snapshot, selected dialect, and format-assertion policy, so contracts with identical provider guidance still have separate cache entries. Caller-written Pydantic models keep their existing key format.
 
-Credentials are never part of the key, so rotating an API key keeps your hits. `feature` and `label` are telemetry, not part of the request, so two features asking the identical question share one answer. Two schemas with the same fields in a different order are different requests, because the order is sent to the model and steers the order it writes fields in. A request that cannot be fingerprinted — a content part that is not JSON-serialisable, a third-party provider missing an attribute the key reads — skips the cache and runs normally.
+Credentials are never part of the key, so rotating an API key keeps your hits. `feature` and `label` are telemetry, not part of the request, so two features asking the identical question share one answer. Two schemas with the same fields in a different order are different requests, because the order is sent to the model and steers the order it writes fields in. A valid request that cannot be fingerprinted — for example, a third-party provider missing an attribute the key reads or supplying an unserialisable endpoint setting — skips the cache and runs normally. Unsupported nested prompt data is rejected by the [input ownership check](#input-ownership) before the cache is consulted. Version 5 retires older entries that could associate a pre-mutation key with an answer to changed inputs.
 
 ### What a hit looks like in the log
 
-A hit writes one record like any call, with `cache_hit: true`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight — for a streamed hit, also the time your code spends on its one chunk, as every stream record's duration includes the consumer's handling. A streamed hit's `schema` is `stream`, like any stream record. A replay your code abandons before its end logs as any abandoned stream does, `# ERROR` with the abandonment marker, and still carries `cache=hit` and `$0`. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
+A hit writes one record like any call, with `cache_hit: true` and `requests: []`. It has its own `call_id`, and `source_call_id` names the paid call whose answer it returned. `approximate_cost` is `0.0`, `usage` and `queue_wait_ms` are `null` (no tokens spent, no rate-limiter slot taken), and `duration_ms` is the lookup plus any wait on an identical request in flight — for a streamed hit, also the time your code spends on its one chunk, as every stream record's duration includes the consumer's handling. A streamed hit's `schema` is `stream`, like any stream record. A replay your code abandons before its end logs as any abandoned stream does, `# ERROR` with the abandonment marker, and still carries `cache=hit` and `$0`. The YAML header's second line ends `cache=hit` (the first line keeps its shape), and the `index.jsonl` line carries `"cache_hit": true`, so one scan of the index lists every hit:
 
 ```text
 # ok | reports/exec_summary | google/gemini-3.1-flash-lite | Summary | 2ms | $0
@@ -1916,10 +1992,14 @@ configure_llm_client(previous)          # put back whatever was registered befor
 The fake is a plain function or a coroutine function. It receives one frozen `TransportRequest` per provider round trip, carrying:
 
 - **identity:** `feature`, `label`, `kind` (`"structured"`, `"text"`, `"tool"`, `"text_stream"` or `"tool_stream"`), and the `call_id` and `attempt` the call log records, so a retried call reaches the fake once per attempt;
-- **inputs:** `prompt` as you passed it, `messages` as sent (structured output may add schema instructions or failed answers; buffered tool repair adds the rejected round and its errors), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema repair or a buffered tool re-ask carrying repair history;
+- **inputs:** `prompt` as snapshotted when execution began, `messages` as sent (structured output may add schema instructions or failed answers; buffered tool repair adds the rejected round and its errors), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema repair or a buffered tool re-ask carrying repair history;
 - **effective settings:** the routed `model`, `provider`, `temperature`, `max_tokens`, `reasoning_effort` and `timeout`.
 
-It never carries credentials or provider-native request settings.
+It never carries credentials or provider-native request settings. Its prompt,
+prepared messages and tool parameter schemas are detached from the call's
+private baseline, transport working data and log history. Mutating a fake's
+request cannot change later retries. The frozen dataclass does not make its
+nested data immutable.
 
 A `Reply` answers every kind. `Reply.text(...)` gives text, and `Reply.json(model_instance)` gives the instance's JSON (`model_dump_json(by_alias=True)`). That is a re-serialization, so a model whose dump cannot be read back (computed fields with `extra="forbid"`, a serialization-only alias, an excluded required field) or whose validator transforms its input does not give back the same answer; send the JSON the model would send with `Reply.text`. `Reply(no_choice=True)` answers a buffered call with a response that has no choices, which a structured call, and a tool call with `output_schema=`, raises as `StructuredOutputError`; a text call and a plain tool call treat it as an empty answer. Raw JSON and raw tool arguments (`FakeToolCall("add", '{"left": 1')`) run the real parsing, repair and malformed-call handling. A streaming call splits the text into word-sized deltas, or uses `chunks=[...]` when you give them, then delivers the tool calls; `usage` and `cost` are reported like a provider's. `finish_reason` defaults to `"tool_calls"` or `"stop"`. Set it to `"length"` to get each kind's real truncation behavior: a structured call, a text call and a text stream raise `OutputLimitError` (the stream after delivering its chunks), as does a compose call's final answer, and any other tool call reports it as `stop_reason`.
 

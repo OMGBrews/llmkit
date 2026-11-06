@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Snapshot call inputs at first execution.** Messages, nested content and
+  assistant tool-call history, plus offered tools and their parameter schemas,
+  now have one private baseline for request preparation, retries, cache identity
+  and logging. Async coroutines capture on execution; async and sync streams
+  capture on first advancement. Caller mutations after that boundary cannot
+  change an active call, and captured records cannot mutate future retries.
+  Copying leaves caller data untouched but requires it to stay stable while
+  copying; provider instances, model classes and callbacks remain shared.
+  **Compatibility:** nested data must use exact built-in dictionaries, lists
+  and tuples with string keys and plain scalar leaves. Custom containers,
+  subclasses, opaque objects and cycles now raise a path-bearing `TypeError`
+  before cache or transport activity, without invoking custom copy hooks.
+  General outer sequences remain supported. `LLM_CACHE_KEY_VERSION` is now 5
+  to retire entries that could have paired a pre-mutation key with an answer
+  to changed inputs.
+
+- **Consistent original inputs and prepared-request logs.** Every call record's
+  `prompt` now means the original snapshot. **Compatibility:** buffered tool
+  repair history moves out of `prompt` and into the new `requests` list.
+  Its detached `RequestSnapshot` dictionaries contain prepared messages, wire
+  tools, a repair flag and allowlisted settings for every llmkit-controlled
+  dispatch, including Instructor repairs and temperature reissues. Entries
+  survive failed, cancelled and abandoned dispatches; cache hits and attempts
+  stopped before dispatch have empty histories. The history describes attempted
+  dispatches to LiteLLM, not unobserved SDK retries or final HTTP payloads.
+  YAML includes it; the compact index remains unchanged. Call return types
+  and record-per-attempt organization are unchanged.
+
 - **Declare the supported OpenAI SDK major.** Require `openai>=2.20.0,<3`.
   SDK 3 uses `httpx2`, while llmkit's transport classification, retry-header
   handling and testing helpers currently use `httpx`. Fresh installs now stay
@@ -50,8 +78,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Strict argument validation and retry budgets are unchanged. Streamed tool
   calls still raise without re-asking. Whole-round `ToolArgumentError` exposes
   all rejections in `round_errors`; individual salvaged errors leave it empty.
-  Repair-attempt logs include the added history, while testing fakes keep the
-  original `prompt`, expose the sent `messages`, and mark `repair=True`.
+  Repair-attempt logs include the added history in `requests`; both logs and
+  testing fakes keep the original `prompt`. Fakes expose prepared `messages`
+  and mark `repair=True`.
 
 ### Added
 
@@ -251,7 +280,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   thinking off; their errors now suggest `"lowest"` where it would work.
   DeepSeek is unchanged. Third-party providers that do not override
   `reasoning_kwargs` keep their behaviour, and receive `"lowest"` as
-  `"disable"`. `LLM_CACHE_KEY_VERSION` is now 4, so an answer cached while
+  `"disable"`. `LLM_CACHE_KEY_VERSION` is now 5, so an answer cached while
   `"disable"` was substituted is not replayed for a request that now turns
   thinking off or raises.
 
@@ -366,8 +395,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   answer and schemas that could not round-trip are cached too. A host
   provider whose mode answers outside the message content (such as
   `Mode.TOOLS`) has no answer text, so its answers are not cached. A stored entry that fails to decode is a miss with a
-  warning. `LLM_CACHE_KEY_VERSION` is 4 (this release also moves it for the
-  `reasoning_effort` change above), so entries stored by earlier releases
+  warning. `LLM_CACHE_KEY_VERSION` is 5 (this release also moves it for the
+  `reasoning_effort` and input-ownership corrections above), so entries stored by earlier releases
   miss once. This corrects the 0.13.0 notes, which said a paid
   answer equals its cache hit and that such a schema is never cached; neither
   held for every schema.

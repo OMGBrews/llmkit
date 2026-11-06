@@ -1,7 +1,8 @@
 """Per-call LLM invocation logging via a pluggable sink.
 
-Every LLM round-trip is recorded as an :class:`LLMCallRecord` and handed
-to the configured :class:`LogSink`. The default sink writes one YAML file
+Every outer call attempt is recorded as an :class:`LLMCallRecord` and handed
+to the configured :class:`LogSink`. Its ``requests`` history holds each prepared
+llmkit dispatch, including in-call repairs and temperature reissues. The default sink writes one YAML file
 per call to a directory resolved lazily at first write (see
 :func:`default_log_dir`: ``LLMKIT_LOG_DIR``, else ``data/llm-logs/`` under
 the enclosing project root, else a per-user state directory), preserving
@@ -45,7 +46,7 @@ from llmkit.logging.local_yaml import (
     DEFAULT_RETENTION_DAYS,
     LocalYamlLogSink,
 )
-from llmkit.logging.record import INDEX_FILENAME, LLMCallRecord
+from llmkit.logging.record import INDEX_FILENAME, LLMCallRecord, RequestSnapshot
 from llmkit.logging.registry import (
     configure_llm_logging,
     get_log_sink,
@@ -63,6 +64,7 @@ __all__ = [
     "INDEX_FILENAME",
     "LOG_DIR_ENV_VAR",
     "LLMCallRecord",
+    "RequestSnapshot",
     "LocalYamlLogSink",
     "LogSink",
     "LoggingFailure",

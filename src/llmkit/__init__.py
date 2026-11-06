@@ -89,6 +89,7 @@ from llmkit.logging import (
     LoggingFailure,
     LoggingHealth,
     LogSink,
+    RequestSnapshot,
     configure_llm_logging,
     default_log_dir,
     get_log_sink,
@@ -171,6 +172,7 @@ __all__ = [
     "make_provider",
     # Logging
     "LLMCallRecord",
+    "RequestSnapshot",
     "LogSink",
     "LocalYamlLogSink",
     "configure_llm_logging",

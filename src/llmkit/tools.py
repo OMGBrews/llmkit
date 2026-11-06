@@ -59,7 +59,12 @@ def guard_tool_choice(provider: LLMProviderInterface, tool_choice: ToolChoice | 
 class ToolDefinition:
     """A callable function offered to a model, described with JSON Schema.
 
-    ``parameters`` is forwarded to the transport **verbatim** — llmkit does not
+    Calls snapshot ``parameters`` at first execution and give each transport
+    attempt its own copy. Nested values follow the plain-data input contract:
+    exact built-in dictionaries, lists and tuples with plain scalar leaves.
+    The validating ``model`` class stays borrowed and must remain stable.
+
+    The schema is forwarded to the transport **verbatim** — llmkit does not
     rewrite it — and it does not need to be pre-processed for any supported
     provider. LiteLLM normalises per provider on the way to the wire: on the
     Gemini routes (``vertex_ai/``, ``gemini/``) it strips ``additionalProperties``,

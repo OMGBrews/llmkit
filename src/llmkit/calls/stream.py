@@ -25,6 +25,7 @@ from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
+from llmkit._snapshot import snapshot_prompt
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCacheEntry
 from llmkit.cache.read_through import cached_entry, store_entry
@@ -37,6 +38,7 @@ from llmkit.calls._shared import (
 )
 from llmkit.capture import record_call_async, submit_record_call
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait
@@ -141,6 +143,8 @@ async def text_llm_call_stream(
     keyword** precedence (see :func:`structured_llm_call`); ``None`` leaves
     the flat-keyword path unchanged.
     """
+    # First execution owns the baseline; transport and records get separate copies.
+    prompt = snapshot_prompt(prompt)
     prepared = prepare_call(
         options,
         temperature=temperature,
@@ -377,10 +381,12 @@ async def _stream_once(
         nonlocal first_chunk_at
         first_chunk_at = at
 
+    requests: list[RequestSnapshot] = []
     _litellm.begin_sent_temperature()
     try:
         async for chunk in _litellm.astream_text(
-            prompt,
+            snapshot_prompt(prompt),
+            requests=requests,
             temperature=temperature,
             model=model,
             max_tokens=max_tokens,
@@ -445,6 +451,7 @@ async def _stream_once(
             attempt=attempt,
             usage=usage,
             output_limit=diagnostics,
+            requests=requests,
             first_chunk_at=first_chunk_at,
         )
         if error == STREAM_ABANDONED_ERROR:

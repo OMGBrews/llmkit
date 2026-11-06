@@ -48,9 +48,10 @@ def cache_key_or_none(
 ) -> str | None:
     """:func:`~llmkit.cache.llm_cache_key`, or ``None`` when it cannot be computed.
 
-    A prompt with a content part that is not JSON-serialisable, or a
-    third-party provider missing an attribute the key reads, must not fail the
-    call: it bypasses the cache, stores nothing, and warns once.
+    A third-party provider missing an attribute the key reads, or supplying
+    an endpoint setting that cannot be serialised, bypasses the cache, stores
+    nothing, and warns once. Public calls validate and snapshot prompt data
+    before reaching here; unsupported input data fails that earlier check.
     """
     try:
         return llm_cache_key(

@@ -13,6 +13,7 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
+from llmkit._snapshot import snapshot_prompt
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     build_text_record,
@@ -25,6 +26,7 @@ from llmkit.calls._shared import (
 )
 from llmkit.capture import record_call_async
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait
@@ -127,6 +129,8 @@ async def text_llm_call(
         propagate immediately. The log is still written on every attempt
         with the error recorded.
     """
+    # First execution owns the baseline; transport and records get separate copies.
+    prompt = snapshot_prompt(prompt)
     prepared = prepare_call(
         options,
         temperature=temperature,
@@ -165,10 +169,12 @@ async def text_llm_call(
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
+        requests: list[RequestSnapshot] = []
         _litellm.begin_sent_temperature()
         try:
             text, cost, counts = await _litellm.acompletion_text(
-                prompt,
+                snapshot_prompt(prompt),
+                requests=requests,
                 temperature=args.temperature,
                 model=args.model,
                 max_tokens=args.max_tokens,
@@ -228,6 +234,7 @@ async def text_llm_call(
                     attempt=attempt,
                     usage=usage,
                     output_limit=diagnostics,
+                    requests=requests,
                 )
             )
 
