@@ -54,8 +54,11 @@ within one overall attempt ceiling (see :mod:`llmkit.retry`):
   like a malformed schema response.
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
-single documented ``except``-clause catch-set so existing callers keep
-catching exactly what they did before. The 503 case deserves a note:
+single documented ``except``-clause catch-set. At llmkit's provider boundaries,
+uncovered OpenAI/LiteLLM API errors carrying mapped 500/502/529 become
+:class:`TransientProviderError`, a plain member of the transport tuple.
+Already recognized transport errors retain their types. Custom retry policies
+match the normalized type, not its original ``__cause__``. The 503 case deserves a note:
 litellm's own ``ServiceUnavailableError`` cannot be listed statically
 (that would cost every ``import llmkit`` the multi-second litellm import),
 so the transport boundary (:mod:`llmkit._litellm`) re-raises every
@@ -100,6 +103,7 @@ from tenacity import RetryError
 #   - ``InternalServerError`` — 5xx
 #   - ``APIConnectionError``  — network failures (``APITimeoutError`` subclasses it)
 #   - ``litellm ServiceUnavailableError`` — 503 (see below)
+#   - ``TransientProviderError`` — uncovered mapped 500/502/529 at our boundary
 #   - ``httpx.RequestError``  — lower-level network failures
 #   - ``TimeoutError``        — builtin timeout
 #
@@ -107,18 +111,16 @@ from tenacity import RetryError
 # ``openai`` bases: ``litellm.RateLimitError`` subclasses
 # ``openai.RateLimitError``, ``litellm.InternalServerError`` subclasses
 # ``openai.InternalServerError``, ``litellm.Timeout``/``litellm.APIConnectionError``
-# subclass ``openai.APIConnectionError``. The one transient class that does
-# NOT follow that pattern is ``litellm.exceptions.ServiceUnavailableError``
+# subclass ``openai.APIConnectionError``. Native 503 does not follow that
+# pattern: ``litellm.exceptions.ServiceUnavailableError``
 # (LiteLLM's mapping for HTTP 503): its MRO goes straight to
 # ``openai.APIStatusError``, skipping ``openai.InternalServerError`` — so it
 # must be listed explicitly or real 503s would propagate unretried.
 #
-# Deliberate scope: we do not retry generic ``openai.APIStatusError`` with
-# status >= 500. LiteLLM maps the 5xx family to the named classes above
-# (500 → ``InternalServerError``, 503 → ``ServiceUnavailableError``), and an
-# isinstance-tuple can't express a status-code predicate; a raw
-# ``APIStatusError`` outside those mappings is unexpected enough to surface
-# rather than retry.
+# The provider boundary additionally normalizes uncovered API errors carrying
+# mapped status 500/502/529 to TransientProviderError. Generic APIError and
+# APIStatusError remain outside the tuple: permanent errors and nonselected
+# statuses must not gain retries. Already recognized transport types stay intact.
 
 
 class _LazyServiceUnavailableMeta(type):
@@ -159,7 +161,7 @@ class _LiteLLMServiceUnavailableError(Exception, metaclass=_LazyServiceUnavailab
     Known limit: ``except`` matching bypasses ``__instancecheck__``, so an
     ``except`` clause over the transport tuple does not match this entry.
     That limit no longer reaches hosts through llmkit's call functions: the
-    transport boundary (:func:`normalize_service_unavailable`, applied in
+    transport boundary (:func:`normalize_transient_provider_error`, applied in
     :mod:`llmkit._litellm`) re-raises every litellm-native 503 as
     :class:`ServiceUnavailableError`, a plain tuple member ``except`` does
     match. This stand-in stays for ``isinstance`` classification of the raw
@@ -172,7 +174,8 @@ class LlmkitError(Exception):
     """The base of every exception class llmkit defines.
 
     ``except LlmkitError`` catches every failure llmkit itself raises: a
-    provider outage it normalized (:class:`ServiceUnavailableError`), its
+    provider outage it normalized (:class:`ServiceUnavailableError` or
+    :class:`TransientProviderError`), its
     own fail-fast signals (:class:`CircuitOpenError`,
     :class:`OutputLimitError`), validation it ran or re-owned
     (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
@@ -215,7 +218,7 @@ class ServiceUnavailableError(LlmkitError):
     hooks — so a raw litellm 503 escaping the library would slip through the
     documented ``except LLM_RECOVERABLE_ERRORS`` net. The transport boundary
     (:mod:`llmkit._litellm`) therefore re-raises every litellm-native 503 as
-    this class via :func:`normalize_service_unavailable`, with the original on
+    this class via :func:`normalize_transient_provider_error`, with the original on
     ``__cause__`` — the :class:`CircuitOpenError` / :class:`OutputLimitError`
     precedent of one plain llmkit-owned type per fail signal.
 
@@ -250,32 +253,73 @@ class ServiceUnavailableError(LlmkitError):
         self.response: httpx.Response | None = response
 
 
-def normalize_service_unavailable(exc: Exception) -> Exception:
-    """llmkit's :class:`ServiceUnavailableError` for a litellm-native 503; any
-    other exception unchanged.
+class TransientProviderError(LlmkitError):
+    """An otherwise unclassified provider API error with mapped HTTP 500/502/529.
 
-    The transport boundary (:mod:`llmkit._litellm`) calls this on every error
-    leaving a provider call and re-raises a changed result ``from`` the
-    original, so the litellm class — which ``except`` clauses over the
-    transport tuple cannot match — never propagates to a host raw. Attribute
-    reads are best-effort with ``isinstance`` narrowing: a litellm 503 missing
-    an expected field still normalizes, with that field ``None``.
+    Raised at llmkit's provider boundaries, with the original on ``__cause__``.
+    Already recognized transport errors keep their types, including the
+    existing :class:`ServiceUnavailableError` for native LiteLLM 503s. Custom
+    ``RetryPolicy.retry_on`` tuples must name this type to retry these newly
+    normalized failures; classification does not follow the original cause.
 
-    Deliberately *not* in ``llmkit.__init__``'s exports: like
-    :data:`REPAIRABLE_PARSE_ERRORS`, it is an internal boundary detail — hosts
-    interact with the resulting :class:`ServiceUnavailableError`, not the
-    normalization itself.
+    Metadata reflects what the mapped error still carries, not necessarily
+    the original wire response. ``provider`` and ``model`` are optional tags;
+    ``status_code`` retains the mapped status, ``response`` retains the original
+    httpx response, and numeric ``retry_after`` takes precedence over its headers.
+    Missing metadata is ``None``. Normalization cannot reconstruct discarded
+    wire status or headers, and does not cover independent raw LiteLLM calls.
     """
-    if not isinstance(exc, _LiteLLMServiceUnavailableError):
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        provider: str | None,
+        model: str | None,
+        response: httpx.Response | None,
+        retry_after: int | float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code: int = status_code
+        self.provider: str | None = provider
+        self.model: str | None = model
+        self.response: httpx.Response | None = response
+        self.retry_after: int | float | None = retry_after
+
+
+def normalize_transient_provider_error(exc: Exception) -> Exception:
+    """Own native LiteLLM 503s and uncovered API errors with mapped 500/502/529.
+
+    All other errors retain their identity, including already recognized
+    transport errors and non-provider exceptions with a status-like attribute.
+    The caller re-raises changed results ``from`` the original. Metadata reads
+    are best-effort; the normalizer is internal and never imports LiteLLM eagerly.
+    """
+    native_503 = isinstance(exc, _LiteLLMServiceUnavailableError)
+    if not native_503 and (
+        isinstance(exc, LLM_TRANSPORT_ERRORS) or not isinstance(exc, openai.APIError)
+    ):
         return exc
     provider = getattr(exc, "llm_provider", None)
     model = getattr(exc, "model", None)
     response = getattr(exc, "response", None)
-    return ServiceUnavailableError(
+    provider = provider if isinstance(provider, str) else None
+    model = model if isinstance(model, str) else None
+    response = response if isinstance(response, httpx.Response) else None
+    if native_503:
+        return ServiceUnavailableError(str(exc), provider=provider, model=model, response=response)
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or status not in {500, 502, 529}:
+        return exc
+    retry_after = getattr(exc, "retry_after", None)
+    return TransientProviderError(
         str(exc),
-        provider=provider if isinstance(provider, str) else None,
-        model=model if isinstance(model, str) else None,
-        response=response if isinstance(response, httpx.Response) else None,
+        status_code=status,
+        provider=provider,
+        model=model,
+        response=response,
+        retry_after=retry_after if isinstance(retry_after, (int, float)) else None,
     )
 
 
@@ -285,6 +329,7 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     # llmkit-owned 503 — what the transport boundary re-raises for every
     # litellm-native 503, so ``except`` clauses over this tuple catch it.
     ServiceUnavailableError,
+    TransientProviderError,
     # Raw litellm-native 503 — matches in ``isinstance`` classification only
     # (see the stand-in's docstring); kept so a host's own litellm call
     # wrapped in ``with_retries`` still retries its 503s. The lazy stand-in

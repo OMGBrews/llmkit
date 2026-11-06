@@ -8,6 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Normalize uncovered transient provider errors.** At llmkit's buffered and
+  streaming provider boundaries, API errors with mapped status 500, 502 or 529
+  that were outside the transport set now become public `TransientProviderError`
+  instances. They retry within the existing attempt ceiling and are catchable
+  through `LLM_RECOVERABLE_ERRORS`; streams still never replay after yielding
+  an item. The original cause, available mapped status, provider/model, response
+  and numeric `retry_after` are retained. Already recognized errors keep their
+  types, including the existing native-503 `ServiceUnavailableError` behavior;
+  permanent errors and other uncovered statuses remain excluded.
+  **Compatibility:** custom `retry_on` tuples naming only the original
+  `BadGatewayError` or provider `APIError` class must include
+  `TransientProviderError` for these newly normalized cases. Matching does not
+  follow the original cause. Independent raw LiteLLM calls inside `with_retries`
+  are not normalized. Coverage uses synthetic native-error mapping fixtures;
+  it does not establish that live providers emitted these failures or recover
+  metadata discarded by LiteLLM.
+
 - **Bounded managed log delivery.** Calls use one daemon sink worker, a queue
   defaulting to 256 waiting records, and at most 100 ms of delivery waiting.
   Cancellation and stream abandonment do not wait for the sink. Record capture

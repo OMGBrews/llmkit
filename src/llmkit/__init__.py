@@ -79,6 +79,7 @@ from llmkit.exceptions import (
     StructuredOutputError,
     ToolArgumentError,
     ToolChoiceUnsupportedError,
+    TransientProviderError,
     UnsupportedSchemaError,
 )
 from llmkit.json_schema import model_from_json_schema
@@ -258,6 +259,7 @@ __all__ = [
     "ResultValidationError",
     "ComposeUnsupportedError",
     "ServiceUnavailableError",
+    "TransientProviderError",
     "SchemaEngineError",
     "StructuredOutputError",
     "ToolArgumentError",

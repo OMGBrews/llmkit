@@ -200,3 +200,28 @@ def test_an_unconfigured_call_leaves_litellm_unimported() -> None:
             """
         )
     )
+
+
+def test_transient_normalization_and_catching_stay_litellm_free() -> None:
+    _run_python(
+        textwrap.dedent(
+            """
+            import sys
+            import httpx
+            import openai
+            import llmkit
+            from llmkit.exceptions import normalize_transient_provider_error
+            original = openai.APIStatusError(
+                'temporary', body=None,
+                response=httpx.Response(502, request=httpx.Request('POST', 'https://offline.invalid'))
+            )
+            normalized = normalize_transient_provider_error(original)
+            assert isinstance(normalized, llmkit.TransientProviderError)
+            try:
+                raise normalized from original
+            except llmkit.LLM_RECOVERABLE_ERRORS as caught:
+                assert caught.__cause__ is original
+            assert 'litellm' not in sys.modules
+            """
+        )
+    )

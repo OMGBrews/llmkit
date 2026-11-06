@@ -33,7 +33,7 @@ from instructor.core.exceptions import InstructorRetryException
 from litellm.types.utils import ModelResponseStream
 
 from llmkit import LLM_RECOVERABLE_ERRORS, ServiceUnavailableError, _litellm
-from llmkit.exceptions import normalize_service_unavailable, underlying_provider_error
+from llmkit.exceptions import normalize_transient_provider_error, underlying_provider_error
 from llmkit.rate_limiting._outcomes import is_throttle_signal
 from llmkit.retry import _retry_after_seconds
 from tests._support import OkSchema
@@ -160,7 +160,7 @@ def test_retry_after_survives_normalization() -> None:
     """The copied ``response`` keeps a server ``Retry-After`` readable by the
     retry layer's backoff — normalization must never cost the server-directed
     wait that distinguishes a 503 from a blind exponential."""
-    normalized = normalize_service_unavailable(_litellm_503(headers={"retry-after": "7"}))
+    normalized = normalize_transient_provider_error(_litellm_503(headers={"retry-after": "7"}))
     assert isinstance(normalized, ServiceUnavailableError)
     assert _retry_after_seconds(normalized) == 7.0
 
@@ -169,14 +169,14 @@ def test_throttle_classification_survives_normalization() -> None:
     """``status_code == 503`` keeps the AIMD/breaker feedback classifying the
     normalized error as an overload signal, exactly as it did the raw one."""
     original = _litellm_503()
-    normalized = normalize_service_unavailable(original)
+    normalized = normalize_transient_provider_error(original)
     assert normalized is not original
     assert is_throttle_signal(original)
     assert is_throttle_signal(normalized)
 
 
-def test_non_503_errors_pass_through_untouched() -> None:
-    """The normalizer re-owns only the litellm-native 503; any other exception
-    is returned as the same object, so the boundary adds no wrapping noise."""
+def test_programming_error_passes_through_untouched() -> None:
+    """Programming errors are returned as the same object; adding transient
+    provider status coverage must not turn them into retryable failures."""
     plain = ValueError("not a 503")
-    assert normalize_service_unavailable(plain) is plain
+    assert normalize_transient_provider_error(plain) is plain

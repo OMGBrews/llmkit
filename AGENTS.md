@@ -32,6 +32,11 @@ narrowly: `exceptions` resolves litellm's 503 class lazily, and the Anthropic
 provider reads one capability helper). Start from the subpackage `__init__` when you need the
 design rationale — that is where it is kept.
 
+Provider-error normalization belongs at `_litellm`'s buffered and streaming
+boundaries. The public owned errors and custom-policy compatibility contract
+are documented under [Retries](README.md#retries); `with_retries` itself only
+classifies errors and does not normalize independent raw provider calls.
+
 ## Setup
 
 ```bash

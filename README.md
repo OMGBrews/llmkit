@@ -1760,9 +1760,27 @@ requests each, four requests in total. The outer ceiling does not bound money
 or elapsed time: rate-limit waits, retry sleeps, logging and cache waits are
 separate, and each provider round trip receives its own `timeout`.
 
-**`LlmkitError` is the base of every exception llmkit defines**, from `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises, including `StructuredOutputError` and `UnsupportedSchemaError`; an `on_result` hook that returns a value raises a plain `TypeError`. It does not catch third-party transport errors or instructor's `InstructorRetryException` around one, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
+**`LlmkitError` is the base of every exception llmkit defines**, from `TransientProviderError`, `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises, including `StructuredOutputError` and `UnsupportedSchemaError`; an `on_result` hook that returns a value raises a plain `TypeError`. It does not catch third-party transport errors or instructor's `InstructorRetryException` around one, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
 
 **`LLM_RECOVERABLE_ERRORS` is the single catch-set for transient failures** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
+
+**Mapped 500, 502 and 529 gaps become `TransientProviderError`.** At the same
+provider boundaries, llmkit normalizes an `openai.APIError` (including LiteLLM's
+subclasses) carrying one of these integer statuses when it is not already in
+the transport set. The new type belongs to both `LLM_TRANSPORT_ERRORS` and
+`LLM_RECOVERABLE_ERRORS`. Already recognized transport errors retain their
+types, and native 503s keep the `ServiceUnavailableError` behavior above.
+Permanent 400/401/403 errors, other uncovered statuses such as 520, and
+programming errors are unchanged; this does not make every HTTP 5xx retryable.
+
+`TransientProviderError` carries the available mapped `status_code`, `provider`,
+`model`, original `response` and numeric `retry_after`, with the original error
+on `__cause__`. A numeric directive still takes precedence over response
+headers. These are the details LiteLLM supplied, not reconstructed wire
+evidence: its mapping may already have changed a status or discarded headers.
+Structured calls retain instructor's outer `InstructorRetryException`; llmkit
+unwraps it for classification and retry timing. Streams normalize both opening
+and iteration failures, subject to the no-replay rule below.
 
 ### Backoff and `Retry-After`
 
@@ -1796,11 +1814,24 @@ result = await structured_llm_call(
 )
 ```
 
+**Custom-policy compatibility:** `retry_on` matches the normalized type only;
+it does not follow `TransientProviderError.__cause__` to match the original
+provider type. A policy naming only `litellm.BadGatewayError`, `litellm.APIError`
+or `openai.APIError` must include `TransientProviderError` to retry newly
+normalized failures. For example, `RetryPolicy(retry_on=(TransientProviderError,))`
+selects these transport failures; import the class from `llmkit`. An empty tuple
+or an unrelated type excludes them. The default transport policy already
+includes the new class.
+
 **Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. The tool stream's default policy excludes `ToolArgumentError`, so an all-malformed round is not re-asked by default. A custom `validation_retry_on` may include it for a pre-yield retry within the validation allowance and overall ceiling; it cannot permit replay after an item was yielded. See [Streaming a tool turn](#streaming-a-tool-turn).
 
 ### Wrapping your own work: `with_retries()`
 
 **`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) wraps an awaitable factory representing your own unit of work. It accepts the same `RetryPolicy` and defaults as the call functions: an overall ceiling of three attempts, at most one validation-caused retry, and immediate propagation of permanent or programming errors. Pass `policy=NO_RETRY` for one pass, or supply a custom policy; the former scalar retry keywords are no longer accepted.
+
+Normalization belongs to llmkit's provider boundaries. An independent raw
+LiteLLM call inside `with_retries` does not pass through them: it retains its
+raw exception types and receives only the wrapper's class-based retry policy.
 
 ```python
 from llmkit.retry import with_retries
