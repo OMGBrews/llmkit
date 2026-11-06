@@ -837,3 +837,38 @@ async def main():
 asyncio.run(main())
 print('done', flush=True)
 """)
+
+
+def test_repeated_slow_writes_settle_after_caller_deadlines() -> None:
+    _case(r"""
+class SlowSink(BlockingSink):
+    def write_returning_path(self, record):
+        # The parent controls the initial stall. Each subsequent write also
+        # needs a finite 60 ms, exceeding the selected 10 ms caller budget.
+        path = super().write_returning_path(record)
+        threading.Event().wait(.06)
+        return path
+sink = SlowSink()
+configure_llm_logging(sink, delivery_policy=LogDeliveryPolicy(queue_capacity=3, delivery_wait=.01))
+async def main():
+    with capture_llm_records() as records, capture_llm_log_paths() as paths:
+        first = asyncio.create_task(record_call_async(make_record(label='first')))
+        await until(entered)
+        print('ready', flush=True)
+        rest = [asyncio.create_task(record_call_async(make_record(label=str(i)))) for i in range(3)]
+        assert await first is None
+        assert await asyncio.gather(*rest) == [None] * 3
+        assert len(records) == 4 and paths == []
+        assert get_logging_health().wait_timeouts == 4
+        assert get_logging_health().dropped == 0
+        print('bounded', flush=True)
+    await until(release)
+    assert await flush_llm_logs_async(timeout=2)
+    assert [r.label for r in sink.records] == ['first', '0', '1', '2']
+    assert len(set(sink.threads)) == 1
+    assert get_logging_health().handed_off == 4
+    assert get_logging_health().wait_timeouts == 4
+    assert paths == [] and len(records) == 4
+asyncio.run(main())
+print('done', flush=True)
+""")
