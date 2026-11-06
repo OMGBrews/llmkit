@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit._types import WireUsage as WireUsage
+from llmkit.logging.record import RequestSnapshot
 from llmkit.tools import ToolChoice, ToolDefinition
 
 CallKind = Literal["structured", "text", "tool", "text_stream", "tool_stream"]
@@ -182,6 +183,7 @@ class WireRequest:
 
     kwargs: dict[str, object]
     call: CallContext | None = None
+    requests: list[RequestSnapshot] | None = None
 
 
 class TransportDouble(Protocol):

@@ -60,7 +60,7 @@ class LocalYamlLogSink:
     comment header (status / feature / model / schema / duration / cost),
     then the small metadata fields (including the request-shaping knobs:
     temperature, max_tokens, reasoning_effort), with the large
-    ``partial_text``, ``response`` and ``prompt`` blobs last — so a reader (a human, but in practice mostly
+    ``partial_text``, ``response``, ``prompt`` and ``requests`` blobs last — so a reader (a human, but in practice mostly
     a coding agent) learns what happened from the head of the file without
     paying to scan the whole prompt. The body is dumped with
     :class:`LogSafeDumper`, so the file is always ``yaml.safe_load``-able —
@@ -298,7 +298,7 @@ class LocalYamlLogSink:
             safe_label = safe_path_component(record.label or "unlabeled")
 
             # Verdict-first order: cheap, high-signal metadata up top; the
-            # large ``partial_text``/``response``/``prompt`` blobs last
+            # large ``partial_text``/``response``/``prompt``/``requests`` blobs last
             # (``partial_text`` for truncated, filtered or failed answers,
             # then ``response``, what a debugger usually wants), so the
             # head of the file is the whole story for most reads.
@@ -336,6 +336,7 @@ class LocalYamlLogSink:
                 "partial_text": record.partial_text,
                 "response": cast("object", record.response),
                 "prompt": record.prompt,
+                "requests": record.requests,
             }
             header = self._summary_header(record)
 

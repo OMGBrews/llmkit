@@ -87,6 +87,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 from llmkit._diagnostics import report
 from llmkit._durations import duration
 from llmkit._messages import resolve_reasoning_effort, wire_messages
+from llmkit._snapshot import snapshot_data
 from llmkit._transport import (
     CallContext,
     CallKind,
@@ -116,6 +117,7 @@ from llmkit.exceptions import (
     underlying_provider_error,
     validation_failure_summary,
 )
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import DEFAULT_SCHEMA_REPAIRS
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
@@ -354,7 +356,79 @@ async def _bounded_frames[T](source: AsyncIterator[T], timeout: float | None) ->
             _ = await aclose()
 
 
-async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
+_RECORDED_SETTINGS = (
+    "model",
+    "stream",
+    "temperature",
+    "max_tokens",
+    "reasoning_effort",
+    "timeout",
+    "tool_choice",
+    "response_format",
+    "additional_drop_params",
+)
+
+
+def _transport_owned(key: str, value: object) -> bool:
+    """Whether a request value is LiteLLM's alone, so neither copied nor recorded.
+
+    A provider's ``completion_kwargs`` may supply a non-numeric ``timeout``
+    (an ``httpx.Timeout``, say; see :func:`_deadline`). It is an opaque
+    behavioral object like a client: dispatch borrows it and request history
+    omits it, rather than failing the plain-data snapshot.
+    """
+    return key == "timeout" and value is not None and not isinstance(value, (int, float))
+
+
+def _record_request(
+    requests: list[RequestSnapshot] | None,
+    kwargs: dict[str, object],
+    *,
+    repair: bool,
+) -> None:
+    """Record the prepared dispatch before handing mutable data to transport.
+
+    Deliberately enumerate settings: credentials and arbitrary provider-native
+    kwargs must never enter request history. The history belongs to one outer
+    attempt and is passed explicitly, including across streamed yields.
+    """
+    if requests is None:
+        return
+    requests.append(
+        snapshot_data(
+            RequestSnapshot(
+                messages=cast("list[dict[str, object]]", kwargs.get("messages", [])),
+                tools=cast("list[dict[str, object]]", kwargs.get("tools", [])),
+                repair=repair,
+                settings={
+                    key: kwargs[key]
+                    for key in _RECORDED_SETTINGS
+                    if key in kwargs and not _transport_owned(key, kwargs[key])
+                },
+            ),
+            "request",
+        )
+    )
+
+
+def _dispatch_data(kwargs: dict[str, object]) -> dict[str, object]:
+    """Give each SDK invocation its own data, including in-call reissues.
+
+    A transport can normalize messages or schemas in place. Those edits must
+    not reach Instructor's repair input or a temperature fallback. Behavioral
+    provider kwargs (clients, credentials and so on) remain borrowed.
+    """
+    return {
+        key: snapshot_data(value, f"request.{key}")
+        if key in (*_RECORDED_SETTINGS, "messages", "tools") and not _transport_owned(key, value)
+        else value
+        for key, value in kwargs.items()
+    }
+
+
+async def _acompletion(
+    *, _requests: list[RequestSnapshot] | None = None, _repair: bool = False, **kwargs: object
+) -> ModelResponse | CustomStreamWrapper:
     """Typed boundary over ``litellm.acompletion``.
 
     LiteLLM's shipped stub types ``acompletion`` with ``Unknown`` in several
@@ -425,12 +499,15 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
         _ = kwargs.setdefault(_SKIP_MCP_HANDLER, True)
     try:
         try:
-            result = await _within(timeout, acompletion(**kwargs))
+            _record_request(_requests, kwargs, repair=_repair)
+            result = await _within(timeout, acompletion(**_dispatch_data(kwargs)))
         except Exception as refused:
             if not _refuses_temperature(refused, kwargs):
                 raise
             try:
-                result = await _within(timeout, acompletion(**_without_temperature(kwargs)))
+                fallback = _without_temperature(kwargs)
+                _record_request(_requests, fallback, repair=_repair)
+                result = await _within(timeout, acompletion(**_dispatch_data(fallback)))
             except Exception:
                 # Raised inside this handler, so the second error rides on
                 # ``__context__`` while the caller sees the refusal it caused.
@@ -461,8 +538,15 @@ async def _send(request: WireRequest) -> WireResponse:
     """
     double = active_double()
     if double is not None and request.call is not None:
+        _record_request(request.requests, request.kwargs, repair=request.call.repair)
         return await _within(_deadline(request.kwargs), double.respond(request.call))
-    return _wire_response(await _acompletion(**request.kwargs))
+    return _wire_response(
+        await _acompletion(
+            _requests=request.requests,
+            _repair=request.call.repair if request.call is not None else False,
+            **request.kwargs,
+        )
+    )
 
 
 async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStreamEnd]:
@@ -484,13 +568,21 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
     timeout = _deadline(request.kwargs)
     double = active_double()
     if double is not None and request.call is not None:
+        _record_request(request.requests, request.kwargs, repair=request.call.repair)
         async with aclosing(_bounded_frames(aiter(double.stream(request.call)), timeout)) as frames:
             async for item in frames:
                 yield item
         return
     # stream=True makes acompletion return a CustomStreamWrapper, whose async
     # iteration yields typed ModelResponseStream chunks.
-    stream = cast("CustomStreamWrapper", await _acompletion(**request.kwargs))
+    stream = cast(
+        "CustomStreamWrapper",
+        await _acompletion(
+            _requests=request.requests,
+            _repair=request.call.repair if request.call is not None else False,
+            **request.kwargs,
+        ),
+    )
     usage: object = None
     try:
         async with aclosing(_bounded_frames(aiter(stream), timeout)) as chunks:
@@ -719,7 +811,12 @@ class _Invocations:
 
 
 async def _instructor_completion(
-    *, strict: bool, call: CallContext, invocations: _Invocations, **kwargs: object
+    *,
+    strict: bool,
+    call: CallContext,
+    invocations: _Invocations,
+    requests: list[RequestSnapshot] | None = None,
+    **kwargs: object,
 ) -> ModelResponse:
     """The completion callable handed to ``instructor.from_litellm``.
 
@@ -746,7 +843,7 @@ async def _instructor_completion(
         ),
         repair=invocations.count > 1,
     )
-    response = await _send(WireRequest(kwargs=kwargs, call=call))
+    response = await _send(WireRequest(kwargs=kwargs, call=call, requests=requests))
     invocations.native_finish_reason = response.native_finish_reason
     # Each response overwrites: the record describes the last completion, as
     # it does for the native reason.
@@ -1293,6 +1390,7 @@ async def acompletion_structured[T: BaseModel](
     call_id: str | None = None,
     attempt: int | None = None,
     schema_repairs: int = DEFAULT_SCHEMA_REPAIRS,
+    requests: list[RequestSnapshot] | None = None,
 ) -> tuple[T, float | None, tuple[int | None, int | None, int | None], str, str | None]:
     """Structured completion via instructor pinned to the provider's mode.
 
@@ -1378,6 +1476,7 @@ async def acompletion_structured[T: BaseModel](
         strict=provider.strict_json_schema,
         call=call,
         invocations=invocations,
+        requests=requests,
     )
     # instructor's ``from_litellm`` is overloaded on whether the completion is
     # sync or async; basedpyright has been seen to resolve the *sync* overload
@@ -1593,6 +1692,7 @@ async def acompletion_text(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    requests: list[RequestSnapshot] | None = None,
 ) -> tuple[str, float | None, tuple[int | None, int | None, int | None], str | None]:
     """Plain-text completion via LiteLLM.
 
@@ -1655,6 +1755,7 @@ async def acompletion_text(
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
+        requests=requests,
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
@@ -1700,6 +1801,7 @@ async def acompletion_tools(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    requests: list[RequestSnapshot] | None = None,
 ) -> tuple[
     str | None,
     list[object],
@@ -1753,6 +1855,7 @@ async def acompletion_tools(
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
+        requests=requests,
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
@@ -1942,6 +2045,7 @@ async def astream_tools(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    requests: list[RequestSnapshot] | None = None,
     on_first_frame: Callable[[float], None] | None = None,
 ) -> AsyncGenerator[str | StreamedToolTurn]:
     """Stream a tool-enabled turn: text deltas, then one :class:`StreamedToolTurn`.
@@ -2016,6 +2120,7 @@ async def astream_tools(
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
+        requests=requests,
     )
     fragments: dict[int, _ToolCallFragments] = {}
     transcript: list[str] = []
@@ -2088,6 +2193,7 @@ async def astream_text(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    requests: list[RequestSnapshot] | None = None,
     on_first_frame: Callable[[float], None] | None = None,
 ) -> AsyncGenerator[str | StreamedTextEnd]:
     """Stream plain-text deltas via LiteLLM, then one :class:`StreamedTextEnd`.
@@ -2160,6 +2266,7 @@ async def astream_text(
             **({"max_tokens": max_tokens} if max_tokens is not None else {}),
         },
         call=call,
+        requests=requests,
     )
     transcript: list[str] = []
     stop_reason: str | None = None
