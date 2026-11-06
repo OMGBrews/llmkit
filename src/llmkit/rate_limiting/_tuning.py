@@ -81,23 +81,24 @@ AIMD_RECOVERY_INTERVAL: float = 3.0
 SYNC_GATE_POLL_INTERVAL: float = 0.05
 
 #: Circuit-breaker tuning. Like the AIMD constants these are deliberately
-#: **internal**: the host owns the *switch* (``breaker``), the library owns the
-#: mechanism. The breaker is the "limit is effectively 0 for a cooldown" case
+#: **internal**, except the default cooldown: the host owns the *switch*
+#: (``breaker``) and ``breaker_cooldown``, the library owns the mechanism. The
+#: breaker is the "limit is effectively 0 for a cooldown" case
 #: AIMD's floor-of-1 cannot express — it stops doomed work outright when a
 #: provider is *down* (see opinions.md §6.4). Defaults are conservative because
 #: it is opt-in and flips "eventually succeeds" → "fails fast".
 #:
 #: * ``BREAKER_WINDOW`` — size of the count-based ring of recent *real* outcomes
-#:   (a throttle or a success; a fast ``CircuitOpenError`` and an ambiguous
+#:   (an outage or a success; a fast ``CircuitOpenError`` and an ambiguous
 #:   neutral error record nothing). O(N) state, no timestamps — one wrong OPEN is
 #:   bounded to a single cooldown by the HALF_OPEN probe, so a count ring beats a
 #:   time-bucketed window's complexity here.
 #: * ``BREAKER_MIN_SAMPLES`` — never trip before the ring holds this many
 #:   outcomes, so one early throttle in a near-empty ring can't open the breaker.
 #:   Equal to the window, so the ring must be *full* before it can trip.
-#: * ``BREAKER_THRESHOLD`` — open once the throttled fraction of a full ring
-#:   reaches this (0.5 ⇒ half of the recent real outcomes were throttles).
-#: * ``BREAKER_COOLDOWN`` — seconds the breaker fast-fails while OPEN before it
+#: * ``BREAKER_THRESHOLD`` — open once the outage fraction of a full ring
+#:   reaches this (0.5 ⇒ half of the recent real outcomes were outages).
+#: * ``BREAKER_COOLDOWN`` — default seconds the breaker fast-fails while OPEN before it
 #:   admits a single HALF_OPEN probe to test whether the provider has recovered.
 BREAKER_WINDOW: int = 20
 BREAKER_MIN_SAMPLES: int = 20

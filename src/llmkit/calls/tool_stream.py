@@ -42,7 +42,7 @@ from llmkit.calls._shared import (
     usage_log_dict,
 )
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
-from llmkit.capture import record_call, record_call_async
+from llmkit.capture import record_call_async, submit_record_call
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
@@ -129,9 +129,12 @@ async def tool_llm_call_stream(
     retried. One consequence is worth stating plainly — a round in which
     *every* requested tool call is malformed raises
     :class:`~llmkit.ToolArgumentError` (the same whole-round contract the
-    buffered lane keeps), but here that raise reaches the caller **unretried**:
-    :func:`~llmkit.retry.with_retries_stream` is a transport-only budget with
-    no validation re-ask. A round in which only *some* calls are malformed
+    buffered lane keeps), but here it reaches the caller **unretried by
+    default**: the default stream policy does not include ``ToolArgumentError``
+    in its validation set. A custom ``validation_retry_on`` can include it; the
+    validation allowance then applies within the total outer-attempt ceiling,
+    and a retry is still possible only before any item has been yielded. A
+    round in which only *some* calls are malformed
     keeps the good ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``, exactly as the buffered lane does.
     """
@@ -405,11 +408,8 @@ async def _stream_tools_once(
             ),
         )
         if error == STREAM_ABANDONED_ERROR:
-            # Abandonment unwinds via GeneratorExit / a re-deliverable
-            # CancelledError: awaiting here risks a second cancellation landing
-            # mid-await and losing the one honest witness that the turn is
-            # truncated. One blocking write is the safe trade — the same choice
-            # ``calls/stream.py`` makes, and for the same reason.
-            _ = record_call(record)
+            # Capture and submit without awaiting or running sink I/O while
+            # GeneratorExit / cancellation unwinds. Delivery may finish later.
+            submit_record_call(record)
         else:
             _ = await record_call_async(record)

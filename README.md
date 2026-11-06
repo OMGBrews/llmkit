@@ -94,6 +94,9 @@ from what you installed; a source tree with no installed metadata reports
 
 Requires Python ≥ 3.12.
 
+The supported OpenAI SDK range is `>=2.20.0,<3`;
+SDK 3 uses `httpx2` and is not yet supported by llmkit's error handling.
+
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
 DeepSeek, Cerebras, and Ollama with no extra dependencies. Two providers gate their
 dependencies behind opt-in extras so hosts pay only for what they call:
@@ -419,14 +422,14 @@ Three differences from `tool_llm_call`, all deliberate:
 - **No `output_schema=`.** Compose is rejected at the signature, so the type
   checker enforces it rather than a runtime raise. Use the portable two-step
   pattern (tool loop, then `structured_llm_call`).
-- **Retries are transport-only.** As on `text_llm_call_stream`, only a
-  transient failure *before the first yielded item* is retried; once anything
-  has reached you, a mid-stream error propagates unretried. One consequence
-  worth stating: a round in which **every** requested call is malformed raises
-  `ToolArgumentError` here **without** the buffered lane's repair re-ask, because
-  there is no way to restart a stream the caller has begun consuming. A round
-  in which only *some* calls are malformed behaves identically to the buffered
-  lane — survivors on `tool_calls`, failures on `invalid_calls`.
+- **Retries stop at the first yielded item.** Once anything has reached you,
+  a mid-stream error propagates unretried. An all-malformed round raises
+  `ToolArgumentError` without a re-ask by default, even if it yielded nothing:
+  the default stream policy excludes that error. A custom
+  `validation_retry_on` may include it for a pre-yield retry within the
+  validation allowance and overall attempt ceiling. A round in which only
+  some calls are malformed behaves as on the buffered lane — survivors on
+  `tool_calls`, failures on `invalid_calls`.
 - **Usage is real, not null.** Like the plain text stream, this lane requests
   `stream_options={"include_usage": True}`, so `result.usage`, the log record's
   `usage`, and the token-rate limiter's debit are all populated. Measured on
@@ -743,7 +746,7 @@ Rate limiting is **on by default**, scoped **per provider** (keyed by the effect
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=...)` sets them. Each call changes only the keywords it passes and keeps the rest, so setting `rpm=` at startup and `breaker=True` later leaves both in force; pass `rpm=None` or `tpm=None` to turn that dimension off again. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
+`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=..., breaker_cooldown=...)` sets them. Each call changes only the keywords it passes and keeps the rest, so setting `rpm=` at startup and `breaker=True` later leaves both in force; pass `rpm=None` or `tpm=None` to turn that dimension off again. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` / `breaker_cooldown` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
 from llmkit import configure_rate_limit
@@ -781,16 +784,18 @@ with backpressure_callback(on_backpressure):
     ...  # calls here report every adaptive limit change to on_backpressure
 ```
 
-A callback that raises is swallowed and logged — observability can never break a call.
+Ordinary callback exceptions are caught and logged; cancellation and process interrupts propagate. Callbacks run inline and must not block: there is no separate callback deadline, and a blocked callback delays the call and its event loop.
 
 ### Circuit breaker
 
-Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** is the "limit is effectively 0 while the provider is down" case it cannot express. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Once a provider's throttle rate over a rolling window (the last 20 real outcomes, at least half of them throttled) trips it, llmkit **fails fast** for that provider: every call raises `CircuitOpenError` *immediately* — holding no concurrency slot and deducting no RPM token — for a cooldown, instead of letting each call burn its retry budget into the storm (the load-*adding* pathology of retries under sustained overload). After the cooldown a single probe tests recovery: a clean success closes the breaker, any failure re-opens it for another cooldown.
+Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** stops calls when the provider appears unavailable. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Its rolling window counts successes and outages: throttles (429/503/529), transient server errors (500/502/504), and connection failures. Once at least half of the last 20 counted outcomes are outages, each new call raises `CircuitOpenError` immediately, holding no concurrency slot and deducting no RPM token. The open period lasts `breaker_cooldown` seconds, **30 by default**.
+
+After that period, one process-wide probe tests recovery. A success closes the breaker; an outage reopens it for another cooldown. Caller deadlines, SDK timeouts without an outage HTTP status, cancellation, authentication and validation failures are neutral: they neither fill the outage window nor claim recovery. A neutral probe releases its claim so the next caller may probe immediately. A short caller-selected deadline is not evidence that a provider is down. A positive outage HTTP status takes precedence over exception inheritance: a provider HTTP 504 counts even though LiteLLM represents it as a timeout.
 
 ```python
 from llmkit import configure_rate_limit, CircuitOpenError, structured_llm_call
 
-configure_rate_limit(breaker=True)  # opt in; off by default
+configure_rate_limit(breaker=True, breaker_cooldown=15.0)  # opt in; default cooldown is 30s
 
 try:
     result = await structured_llm_call(prompt, MySchema, feature="extract")
@@ -798,7 +803,7 @@ except CircuitOpenError as exc:
     ...  # the breaker is open for exc.provider — fall back fast, don't hammer it
 ```
 
-It is **off by default** on purpose. Adaptive concurrency is a safe default because it only ever *reduces* load below your cap; the breaker changes the contract — it flips "eventually succeeds" into "fails fast" — so the host decides. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` (a host that already writes `except LLM_RECOVERABLE_ERRORS` to degrade on a 503 keeps catching it, and falls back fast) but the library **never retries it by default** — retrying a circuit you already know is open would defeat the point. A caller that lists `CircuitOpenError` explicitly in a `retry_on` opts back in. Each provider has its own breaker, and the internal thresholds (window 20, trip fraction 0.5, cooldown 30s) are library-owned mechanism, not knobs — the public surface stays "three numbers and three switches" (`enabled` / `adaptive` / `breaker`).
+It is **off by default** on purpose. Adaptive concurrency reduces load below your cap; the breaker instead refuses calls while it is open, so the host chooses whether to enable it. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` for fallback handling, but the default retry policy never retries it. A caller can explicitly list it in `RetryPolicy.retry_on` to opt in. Each provider has its own breaker. The window and trip fraction are internal mechanisms; `breaker_cooldown` is a caller-owned wait budget, must be finite and positive, and retains its current value when omitted from a later configuration call.
 
 ### Joining the global rate limit directly
 
@@ -964,13 +969,13 @@ LocalYamlLogSink(retention_days=0)                     # ValueError — see belo
 
 Each bound takes a **positive** integer or `None`; `0` and negatives raise `ValueError` at construction. `0` is rejected rather than quietly interpreted because it has two opposite plausible meanings — "keep nothing" (`logrotate`'s `rotate 0`) and "no limit" (many SaaS retention settings) — and the destructive reading is what the mechanics would actually do: the prune cutoff would be *now*, so the first write would delete every log in the directory, including the file it had just written and whose path it returns. `None` is the only opt-out, for both bounds.
 
-Sink I/O never runs on the event loop: writes are offloaded to a worker thread (the one deliberate exception is a stream abandoned mid-flight, whose record is written synchronously so it can't be lost while the generator unwinds).
+Managed call logging sends sink I/O to one dedicated daemon thread, including abandoned streams. Calls wait at most 100 ms for delivery by default; stream abandonment captures and submits without waiting. See the delivery policy below.
 
 ### Capturing call records
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) builds an `LLMCallRecord` and hands it to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, and `tool_llm_call_stream_sync`) builds an `LLMCallRecord` and submits it for managed delivery to the configured log sink. A higher-level orchestrator that needs to cross-reference those calls — to total approximate cost, attribute spend per feature, or weave per-call traces — has two additive capture primitives, neither of which requires authoring a sink.
 
-**`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own).
+**`capture_llm_records()` — records (cost / metadata).** Wrap a scope to receive the `LLMCallRecord` for every call made inside it. Each record carries `approximate_cost` (a best-effort USD estimate, `None` when the provider doesn't report it), the resolved `model`/`provider`, `duration_ms`, `error`, and the rest — so a host gets cost and metadata without writing a custom sink. Capture is sink-independent: it works even with logging disabled (`configure_llm_logging(None)`), and crosses the `run_sync` sync bridge, so `structured_llm_call_sync` is captured exactly like the async path. One record is appended per attempt (retries each produce their own), before admission and before the call returns or propagates an error. Full or unavailable delivery preserves record capture. Delivery workers never append to these capture lists after return.
 
 ```python
 from llmkit import capture_llm_records, structured_llm_call
@@ -981,14 +986,14 @@ with capture_llm_records() as records:
 total_cost = sum(r.approximate_cost or 0.0 for r in records)
 ```
 
-**`capture_llm_log_paths()` — file paths.** Wrap a scope to receive the per-call log-file path written by the configured file sink. Only a file sink (the default `LocalYamlLogSink`) yields a path; with a third-party sink, or with logging disabled, the list stays empty — reach for `capture_llm_records()` when you want cost/metadata regardless of the sink.
+**`capture_llm_log_paths()` — file paths.** Wrap a scope to receive paths whose sink completion the caller observes within its delivery wait. The default `LocalYamlLogSink` and custom sinks exposing `write_returning_path` can supply paths. A timeout, cancellation, zero wait or abandoned-stream submission promises no captured path, and late completion never appends one. With logging disabled or a sink without path support, the list stays empty. Use `capture_llm_records()` for sink-independent cost/metadata.
 
 ```python
 from llmkit import capture_llm_log_paths, structured_llm_call
 
 with capture_llm_log_paths() as paths:
     result = await structured_llm_call(prompt, MySchema, feature="extraction")
-# paths -> [PosixPath("data/llm-logs/...yaml"), ...]
+# paths contains only paths observed before this call returned; it may be empty.
 ```
 
 ### Write your own `LogSink`
@@ -1000,7 +1005,7 @@ class LogSink(Protocol):
     def write(self, record: LLMCallRecord) -> None: ...
 ```
 
-A custom sink (a database, a metrics pipe, an in-memory buffer) is a one-method object that returns nothing; records (`LLMCallRecord`, a frozen dataclass) are handed to it for every call, and failures are swallowed so logging can never break a call. To send records somewhere other than local YAML — a database, an HTTP collector, structured stdout — implement `write` and register it:
+A custom sink (a database, a metrics pipe, an in-memory buffer) is a one-method object that returns nothing; accepted records (`LLMCallRecord`, a frozen dataclass) are handed to it by the delivery worker, and ordinary exceptions from writes are caught. To send records somewhere other than local YAML — a database, an HTTP collector, structured stdout — implement `write` and register it:
 
 ```python
 import json
@@ -1030,14 +1035,78 @@ configure_llm_logging(StructuredStdoutSink())   # pass None to disable logging e
 This example writes one JSON line directly to stdout and needs no Python
 logging handlers or formatter. The host owns collecting that output.
 
-Sink failures do not fail the LLM call, and llmkit never retries the provider
-because logging failed. Built-in write failures and exceptions from custom sinks
+Ordinary sink exceptions do not fail the LLM call, and llmkit does not retry the provider
+because a sink raised. Built-in write failures and exceptions from custom sinks
 produce diagnostic warnings, with repeated identical failures reduced to DEBUG;
 host logging configuration can hide those diagnostics, so read
 `get_logging_health()` (below) when you need to know whether records were lost.
 A custom sink that returns normally counts as a handoff: llmkit cannot see
 whether it actually wrote anything through `write(record) -> None`. Record
 capture proves a record was built, not that a sink persisted it.
+
+**Bounded managed delivery.** One daemon worker handles sink writes, with room for
+256 waiting records plus at most one active write. A full queue drops the incoming
+delivery immediately and counts it in logging health; record capture still works.
+A normal call waits at most 100 ms, including time queued and writing. A timeout
+stops only the wait: accepted delivery can finish later. Cancellation stops waiting
+immediately, including when it is already unwinding through a call finalizer.
+Abandoned streams submit without waiting. These are maintainer-selected defaults,
+not benchmark-derived optima.
+
+Configure the policy before the first managed admission:
+
+```python
+from llmkit import LogDeliveryPolicy, LocalYamlLogSink, configure_llm_logging
+
+configure_llm_logging(
+    LocalYamlLogSink(),
+    delivery_policy=LogDeliveryPolicy(queue_capacity=256, delivery_wait=0.1, drain_timeout=1.0),
+)
+```
+
+`queue_capacity` must be a positive integer (not a bool), `delivery_wait` a finite
+number from zero to 0.1 seconds, and `drain_timeout` a finite nonnegative number.
+An explicit policy supplied after managed delivery starts raises a configuration
+error; omitting it preserves the current policy when swapping sinks. Repeated
+wait timeouts, sink swaps and sync-loop restarts never create replacement workers.
+A permanently stuck sink can prevent further delivery until process restart.
+A sink raising `BaseException` makes the service unavailable; pending delivery is
+accounted for as lost. Reentrant calls from the worker submit without waiting,
+and worker-originated flushes return immediately as incomplete.
+
+Before queueing, llmkit privately snapshots exact built-in dictionaries, lists
+and tuples, recursively, preserving shared references and cycles. Subsequent
+mutations to those containers in application inputs or captured records cannot
+change the queued copy. Opaque objects and container subclasses retain shared
+reference semantics; no custom copy hooks run. This snapshot is taken at log
+submission, not at provider invocation, and does not promise an atomic view of
+concurrent mutation during copying. Snapshot preparation takes time proportional
+to the payload and is outside the 100 ms delivery wait; serialization and sink
+I/O remain on the worker. Cost depends on container structure: immutable text and
+image strings are reused, so serialized byte size alone does not predict copying
+time. Queue capacity counts preparation reservations too,
+but does not bound payload bytes or caller-owned capture buffers.
+
+Explicit low-level `write_llm_log()`, `capture.record_call()` and `sink.write()`
+remain synchronous and unbounded. Managed delivery cannot forcibly terminate
+arbitrary sink code or bound unrelated provider, host executor or background work.
+
+**Flushing and exit.** `flush_llm_logs(timeout=None)` and
+`await flush_llm_logs_async(timeout=None)` wait for records accepted before flush
+entry, using the configured one-second drain budget by default. A finite
+nonnegative override selects another budget; zero polls without waiting. The
+return value says whether that accepted prefix settled, including failed writes.
+Inspect health to distinguish persistence, handoff and failure. Later submissions
+do not extend a flush; a timed-out flush retains pending work, and cancellation
+of an async flush cancels only its wait.
+
+`llmkit.sync.shutdown()` flushes logging even for async-only applications and
+keeps the delivery worker available for later calls. An explicit smaller shutdown
+timeout also limits its logging wait. Normal process exit performs one final
+bounded drain after applicable sync-loop cleanup, then discards remaining queued
+work and counts the loss. An active write remains unconfirmed. The daemon worker
+does not keep the process alive. Abrupt termination can lose records; applications
+that need delivery evidence should flush and inspect health before exiting.
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
@@ -1062,17 +1131,20 @@ Restoring the returned value is what makes this correct in the two starting stat
 from llmkit import get_logging_health
 
 health = get_logging_health()
-if health.failed:
-    print(f"{health.failed} records lost; last: {health.last_failure}")
+if health.failed or health.dropped:
+    print(f"write failures={health.failed}, dropped={health.dropped}")
 ```
 
 - `sink` is `"disabled"` (logging set to `None`), `"builtin"` (`LocalYamlLogSink`), or `"custom"`.
 - `written` counts records the built-in sink wrote to disk. `degraded` counts those whose index line or retention housekeeping failed afterwards: the YAML file exists, but `index.jsonl` may lack its line.
 - `handed_off` counts records a custom sink accepted by returning normally. llmkit cannot see past that return, so a handoff is not evidence the record was stored.
-- `failed` counts records lost to a detected failure: the built-in write failed, a sink raised, or a sink broke its return contract.
-- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. `last_success_at` is the time of the last write or handoff.
+- `failed` counts records lost to a detected failure: preparation failed, the built-in write failed, a sink raised, or a sink broke its return contract.
+- `queued` includes waiting records and snapshot preparation reservations; `in_flight` counts active managed writes for the installation.
+- `dropped` counts rejected or discarded delivery, including a full queue; `unavailable` identifies admission failures when the service cannot accept work. `preparation_failed` counts snapshot or worker-startup failures, also included in `failed`.
+- `wait_timeouts` counts expired caller waits. A timeout is not proof of loss: a later successful write still counts in `written` or `handed_off`.
+- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
 
-Counts belong to the installed sink and reset on every `configure_llm_logging` call, so the temporary swap above clears them even when it restores the same sink. Writes run on worker threads; the counts are lock-guarded and exact, and a write still in progress is not yet counted. If you read the snapshot from an `atexit` handler registered after `import llmkit`, that handler runs before llmkit drains its background event loop, so call `llmkit.sync.shutdown()` first to let any in-flight write finish.
+Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
 
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 
@@ -1108,7 +1180,7 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 
 llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`, now 4, so entries an earlier release stored miss once and are replaced); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
-`timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait.
+`timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait. Cache reads and writes also have no llmkit deadline. An asynchronous store should bound its own I/O; a store that blocks synchronously stalls the event loop. A caller can bound an entire async call with its own cancellation scope, but cancellation does not terminate synchronous blocked code.
 
 For schema-backed models the key also includes the original schema snapshot, selected dialect, and format-assertion policy, so contracts with identical provider guidance still have separate cache entries. Caller-written Pydantic models keep their existing key format.
 
@@ -1151,7 +1223,7 @@ configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
 
 `LLMCacheEntry` is a frozen dataclass of plain strings — `response` (the answer text the provider sent, for a structured call too), `schema`, `provider`, `model`, and the `call_id` of the call that stored it — so any store can persist it. It has no expiry field: retention is the store's policy, as it is a log sink's.
 
-`configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. A store that raises never fails a call: the call proceeds as a miss, and llmkit logs one warning on the `llmkit.cache` logger, with repeats of the same failure at DEBUG until the cache is reconfigured.
+`configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. An ordinary exception from a cache read or write does not fail the provider call: a failed read becomes a miss, a failed write discards the store, and llmkit logs one warning on the `llmkit.cache` logger, with repeats of the same failure at DEBUG until the cache is reconfigured.
 
 ## Configuration
 
@@ -1673,23 +1745,49 @@ one attempt.
 
 ### Automatic retries, on by default
 
-Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, `tool_llm_call_stream_sync`) retries *transient* provider errors on its own — you don't wrap anything. The recoverable errors split into subsets the policy budgets **separately**:
+Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_llm_call`, `text_llm_call_sync`, `text_llm_call_stream`, `text_llm_call_stream_sync`, `tool_llm_call`, `tool_llm_call_sync`, `tool_llm_call_stream`, `tool_llm_call_stream_sync`) retries transient provider errors on its own. **`RetryPolicy.max_attempts` is the total ceiling on outer attempts, including the first: three by default, and `1` means no outer retry.** Every attempt counts, whatever failed. Validation failures have an additional, smaller allowance inside that ceiling:
 
-- **Transport errors** (`LLM_TRANSPORT_ERRORS`: 429 / 503 / 5xx, network/timeout) get the full `max_attempts` budget — **three attempts** by default — since a retry on a fresh connection routinely succeeds. A timed-out request gets a fresh per-request `timeout` on each attempt.
-- **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: llmkit's `StructuredOutputError`, pydantic `ValidationError`, instructor `InstructorRetryException`) get the lower `validation_max_attempts` budget — **two attempts (one retry)** by default — so a transiently-malformed JSON response is still recovered, but a *deterministically-wrong* schema can't burn the full transport budget on doomed re-asks. (A structured answer that fails validation surfaces as `StructuredOutputError`; instructor's `InstructorRetryException` now reaches you only around a failure that was not a validation failure. instructor wraps *transport* failures in it; the retry layer unwraps it, so a wrapped 429/5xx/network error still gets the full transport budget, not this lower one — and a wrapped *permanent* error such as a 401/400/403 fails fast after a single attempt, never charged to either budget.)
-- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) are charged to the same `validation_max_attempts` budget by `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. Their re-asks attach the rejected calls and validation errors when every call has an id and tool name. `tool_llm_call_stream` and its sync form do not re-ask them — see the streaming caveat below.
+- **Transport errors** (`LLM_TRANSPORT_ERRORS`: curated rate-limit, transient server, network and timeout classes) may retry while the overall ceiling permits. A timed-out request gets a fresh per-request `timeout` on the next attempt. This is class-based classification, not a promise to retry every HTTP 5xx error.
+- **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: llmkit's `StructuredOutputError`, pydantic `ValidationError`, instructor `InstructorRetryException`) may cause at most `validation_max_attempts - 1` retries, **one by default**. Those retries still fit inside `max_attempts`; a transport error between validation failures does not reset the allowance. The retry layer unwraps instructor errors before classifying them: a wrapped transport error does not consume the validation allowance, and a wrapped permanent error such as 401/400/403 fails immediately.
+- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) use the same validation-retry allowance within the overall ceiling in `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. Buffered re-asks attach the rejected calls and validation errors when every call has an id and tool name. `tool_llm_call_stream` and its sync form do not re-ask them by default — see the streaming caveat below.
 - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion, or a compose call's final answer, is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
 - **Backpressure** (`LLM_BACKPRESSURE_ERRORS`: llmkit's own `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)) also gets **zero budget**: re-asking a circuit already known to be open is doomed by construction.
 
 The two zero-budget subsets are fail-fast *defaults*, not prohibitions: a caller that genuinely wants the retry opts back in by listing `OutputLimitError` or `CircuitOpenError` explicitly in a `retry_on`. Programming errors (e.g. `TypeError`) are outside the recoverable set and propagate immediately, never retried. Each attempt is its own logged call, so `data/llm-logs/` shows one record per attempt.
 
-**`LlmkitError` is the base of every exception llmkit defines**, from `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises, including `StructuredOutputError` and `UnsupportedSchemaError`; an `on_result` hook that returns a value raises a plain `TypeError`. It does not catch third-party transport errors or instructor's `InstructorRetryException` around one, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
+**An attempt is not a provider-request or spending cap.** Instructor may issue
+one schema-repair request within an attempt; a refused temperature can cause
+one re-issue; the provider SDK can also retry internally. For example,
+persistent malformed JSON can make two outer attempts with two instructor
+requests each, four requests in total. The outer ceiling does not bound money
+or elapsed time: rate-limit waits, retry sleeps, logging and cache waits are
+separate, and each provider round trip receives its own `timeout`.
+
+**`LlmkitError` is the base of every exception llmkit defines**, from `TransientProviderError`, `ServiceUnavailableError` and `CircuitOpenError` to configuration errors such as `LLMClientNotConfiguredError`; `except LlmkitError` catches anything llmkit itself raises, including `StructuredOutputError` and `UnsupportedSchemaError`; an `on_result` hook that returns a value raises a plain `TypeError`. It does not catch third-party transport errors or instructor's `InstructorRetryException` around one, and it must not go in a `retry_on`, where it would re-enable retries for the zero-budget subclasses.
 
 **`LLM_RECOVERABLE_ERRORS` is the single catch-set for transient failures** — the union of all five subsets. Keep using it in `except` clauses; the split only changes how the *retry layer* budgets them. One note on the 503 case: so that `import llmkit` doesn't pay LiteLLM's multi-second import cost, litellm's own 503 class (`litellm.exceptions.ServiceUnavailableError`) is never imported eagerly — instead, llmkit re-raises every litellm-native 503 at its transport boundary as llmkit's own **`ServiceUnavailableError`**, a plain member of `LLM_TRANSPORT_ERRORS`, so `except LLM_RECOVERABLE_ERRORS:` genuinely catches it. It carries `provider`, `model`, `status_code` (always 503), and the original `response` (so a server `Retry-After` stays honoured), with the original litellm error on `__cause__`. Around llmkit calls, catch `llmkit.ServiceUnavailableError` (or the documented tuple), not litellm's class; the raw litellm class still *classifies* as transport in `isinstance` checks — e.g. your own litellm call wrapped in `with_retries` — via a lazy stand-in resolved once litellm is loaded.
 
+**Mapped 500, 502 and 529 gaps become `TransientProviderError`.** At the same
+provider boundaries, llmkit normalizes an `openai.APIError` (including LiteLLM's
+subclasses) carrying one of these integer statuses when it is not already in
+the transport set. The new type belongs to both `LLM_TRANSPORT_ERRORS` and
+`LLM_RECOVERABLE_ERRORS`. Already recognized transport errors retain their
+types, and native 503s keep the `ServiceUnavailableError` behavior above.
+Permanent 400/401/403 errors, other uncovered statuses such as 520, and
+programming errors are unchanged; this does not make every HTTP 5xx retryable.
+
+`TransientProviderError` carries the available mapped `status_code`, `provider`,
+`model`, original `response` and numeric `retry_after`, with the original error
+on `__cause__`. A numeric directive still takes precedence over response
+headers. These are the details LiteLLM supplied, not reconstructed wire
+evidence: its mapping may already have changed a status or discarded headers.
+Structured calls retain instructor's outer `InstructorRetryException`; llmkit
+unwraps it for classification and retry timing. Streams normalize both opening
+and iteration failures, subject to the no-replay rule below.
+
 ### Backoff and `Retry-After`
 
-Both budgets use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s so a large attempt budget can't grow the worst-case sleep unboundedly.
+All eligible retries use bounded **full-jitter** backoff: the sleep before retry *n* is a random delay in `[0, min(backoff_base_seconds * 2**(n-1), max_backoff_seconds)]`, with the per-sleep cap (`max_backoff_seconds`) defaulting to 30s. The retry number increases across transport and validation failures; switching failure classes never resets the backoff.
 
 **`Retry-After` is honoured first.** When a retried provider error carries a `Retry-After` (a header — delta-seconds, `retry-after-ms`, or an HTTP-date — or the SDK's numeric attribute), the backoff waits *that* duration instead of the computed exponential, capped at `RetryPolicy.retry_after_cap` (default 60s) so a hostile value can't wedge a call, plus a random jitter of up to `backoff_base_seconds` so a fan-out doesn't retry in lockstep. The sleep can therefore exceed the cap by up to `backoff_base_seconds`; with a base of 0 it is exactly the capped server value. It is read from the *unwrapped* provider error, so a structured call honours it too, and it is honoured even when `backoff_base_seconds` is 0 (a server directive, not opt-in backoff); absent a header, the exponential is used unchanged.
 
@@ -1719,23 +1817,36 @@ result = await structured_llm_call(
 )
 ```
 
-**Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. On the tool stream this also means an all-malformed round's `ToolArgumentError` is **not** re-asked, unlike `tool_llm_call`; see [Streaming a tool turn](#streaming-a-tool-turn).
+**Custom-policy compatibility:** `retry_on` matches the normalized type only;
+it does not follow `TransientProviderError.__cause__` to match the original
+provider type. A policy naming only `litellm.BadGatewayError`, `litellm.APIError`
+or `openai.APIError` must include `TransientProviderError` to retry newly
+normalized failures. For example, `RetryPolicy(retry_on=(TransientProviderError,))`
+selects these transport failures; import the class from `llmkit`. An empty tuple
+or an unrelated type excludes them. The default transport policy already
+includes the new class.
+
+**Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. The tool stream's default policy excludes `ToolArgumentError`, so an all-malformed round is not re-asked by default. A custom `validation_retry_on` may include it for a pre-yield retry within the validation allowance and overall ceiling; it cannot permit replay after an item was yielded. See [Streaming a tool turn](#streaming-a-tool-turn).
 
 ### Wrapping your own work: `with_retries()`
 
-**`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) is the explicit, composable path for wrapping *any* awaitable — useful when you want to retry a unit of work that isn't a single call function. The attempt count is `max_attempts` (total attempts including the first, **N not 1+N**). Wrap a `retry_progress_callback(...)` scope around the work to observe per-attempt failures (e.g. for a progress UI):
+**`with_retries()`** (imported from `llmkit.retry`; see [`retry.py`](src/llmkit/retry.py)) wraps an awaitable factory representing your own unit of work. It accepts the same `RetryPolicy` and defaults as the call functions: an overall ceiling of three attempts, at most one validation-caused retry, and immediate propagation of permanent or programming errors. Pass `policy=NO_RETRY` for one pass, or supply a custom policy; the former scalar retry keywords are no longer accepted.
+
+Normalization belongs to llmkit's provider boundaries. An independent raw
+LiteLLM call inside `with_retries` does not pass through them: it retains its
+raw exception types and receives only the wrapper's class-based retry policy.
 
 ```python
 from llmkit.retry import with_retries
-from llmkit import LLM_TRANSPORT_ERRORS
+from llmkit import RetryPolicy
 
 result = await with_retries(
     lambda: do_some_work(),
-    max_attempts=3,
-    backoff_base_seconds=0.5,
-    retry_on=LLM_TRANSPORT_ERRORS,
+    policy=RetryPolicy(max_attempts=5, backoff_base_seconds=1.0),
 )
 ```
+
+Wrap a `retry_progress_callback(...)` scope around the work to observe failures before another attempt. Its `attempt` and `max_attempts` describe the overall outer count, not a separate failure-class counter.
 
 A `RetryProgressCallback` is invoked once per non-final failed attempt with keyword arguments `label`, `attempt`, `max_attempts`, and `error`:
 
@@ -1748,7 +1859,7 @@ def on_retry(*, label: str, attempt: int, max_attempts: int, error: BaseExceptio
 
 ### instructor's in-call schema repair
 
-instructor re-asks the model to fix malformed JSON *within a single call*, before any `StructuredOutputError` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError`, or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). instructor's async validators (`async_field_validator`, `async_model_validator`) are not supported: no lane runs them, so llmkit refuses a schema that declares one with `UnsupportedSchemaError` before any request (llmkit requires instructor 1.17.0 or later). A response with no choices gets no in-call re-ask; it raises `StructuredOutputError` and is re-asked on the validation budget. Every other failure is declined by the in-call loop, so it costs exactly **one** provider request per attempt: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the automatic layer, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the automatic layer: instructor repairs within one attempt; the policy's `validation_max_attempts` (default 2) governs how many *fresh* attempts a persistent schema failure earns. The two budgets are never conflated, so attempts aren't double-counted.
+instructor re-asks the model to fix malformed JSON *within a single call*, before any `StructuredOutputError` reaches the retry layer. llmkit pins instructor's budget to **two in-call attempts** (a per-call tenacity `AsyncRetrying` stopping after 2 — instructor counts *total attempts*, so that is exactly one repair re-ask) — and it is not a caller-facing knob. The re-ask fires for a **genuine parse failure only**: malformed JSON, a Pydantic `ValidationError`, or instructor's own `ResponseParsingError` (e.g. a blocked Gemini `Mode.JSON` response). instructor's async validators (`async_field_validator`, `async_model_validator`) are not supported: no lane runs them, so llmkit refuses a schema that declares one with `UnsupportedSchemaError` before any request (llmkit requires instructor 1.17.0 or later). A response with no choices gets no in-call re-ask; it raises `StructuredOutputError` and is re-asked on the validation budget. Every other failure is declined by instructor's in-call loop, so instructor adds no repair request: a transport failure (429/5xx/network) leaves the rate-limiter slot immediately and is retried by the automatic layer, with backoff and `Retry-After` honoured, rather than being re-sent inside the same slot with neither; a permanent failure (401/400/403) fails fast with no in-call duplicate; and a completion **truncated by the output-token limit** is never re-asked (the re-ask would run on the identical budget and can only truncate again) and surfaces immediately as `OutputLimitError`. This stays **separate** from the automatic layer: instructor repairs within one outer attempt. The policy permits at most `validation_max_attempts - 1` validation-caused outer retries (one by default), always within `max_attempts`. Refused-temperature re-issues and SDK retries can add requests independently of instructor's repair.
 
 ### Re-rolling on a semantically-bad result
 
@@ -1766,7 +1877,7 @@ result = await structured_llm_call(
 )
 ```
 
-The re-roll is charged against the **validation budget** (`RetryPolicy.validation_max_attempts`, default 2) — the same budget a schema failure uses, and for the same reason: a deterministically-bad result shouldn't burn the full transport budget on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
+The re-roll uses the **validation allowance** (`RetryPolicy.validation_max_attempts - 1`, one by default) inside the overall `max_attempts` ceiling — the same allowance a schema failure uses, so a deterministically-bad result cannot spend the full ceiling on doomed re-asks. When the budget is exhausted the last `ResultValidationError` propagates. Each attempt — including a rejected one — is its own logged call, so `data/llm-logs/` shows the rejected response alongside the error.
 
 `on_result` is available on `structured_llm_call` and `text_llm_call`, and on both sync wrappers (`structured_llm_call_sync`, `text_llm_call_sync`); the text-path hooks receive the response *text*. It is *not* part of `LLMCallOptions` — like `feature`, it stays a conscious per-call choice.
 

@@ -1,37 +1,22 @@
-"""Per-call record/log-path capture, and the record sink seam.
+"""Caller-owned record/path capture and bounded managed log submission.
 
-The call functions in :mod:`llmkit.calls` funnel every built
-:class:`~llmkit.logging.LLMCallRecord` through :func:`record_call` — the
-single seam that writes the configured sink and feeds the two opt-in capture
-context managers — usually via :func:`record_call_async`, which runs that
-same seam on a worker thread so sink I/O never blocks the event loop:
-
-* :func:`capture_llm_records` — yields the full per-call records
-  (``approximate_cost``, resolved ``model``/``provider``, ``duration_ms``,
-  ``error`` …) without authoring a :class:`~llmkit.logging.LogSink`;
-* :func:`capture_llm_log_paths` — yields the per-call log-file paths the file
-  sink wrote.
-
-This module owns capture + the record seam only: with the record's
-model/provider resolution moved to the call layer that builds records
-(:mod:`llmkit.calls`), its whole dependency set is :mod:`llmkit.logging`. The
-option merge lives in :mod:`llmkit.options`, and the call surface itself in
-:mod:`llmkit.calls`.
+Call functions capture records before submitting private snapshots to the log
+worker. Only the caller may append a path, when completion is observed within
+its delivery wait. Late writes never mutate capture buffers. The explicit
+low-level :func:`record_call` remains synchronous.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextvars
-import logging
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
 from llmkit.logging import LLMCallRecord, write_llm_log
-
-logger = logging.getLogger(__name__)
-
+from llmkit.logging._delivery import Receipt, submit, wait_for_receipt, worker_origin
 
 _captured_log_paths: contextvars.ContextVar[list[Path] | None] = contextvars.ContextVar(
     "_llm_captured_log_paths", default=None
@@ -43,15 +28,11 @@ _captured_records: contextvars.ContextVar[list[LLMCallRecord] | None] = contextv
 
 
 def record_call(record: LLMCallRecord) -> Path | None:
-    """Write *record* to the configured sink and feed the active captures.
+    """Synchronously write *record* and feed the active captures.
 
-    The single seam every call path funnels its built
-    :class:`~llmkit.logging.LLMCallRecord` through, so the two capture
-    primitives stay in lock-step: the record itself is appended to any
-    active :func:`capture_llm_records` buffer, and the returned file path
-    (when a file sink wrote one) is appended to any active
-    :func:`capture_llm_log_paths` buffer. Returns the path so the existing
-    path-capture call sites keep working unchanged.
+    This low-level seam waits for sink completion without a delivery bound.
+    Managed call functions use :func:`record_call_async` or
+    :func:`submit_record_call` instead.
     """
     captured_records = _captured_records.get()
     if captured_records is not None:
@@ -63,33 +44,50 @@ def record_call(record: LLMCallRecord) -> Path | None:
     return path
 
 
-async def record_call_async(record: LLMCallRecord) -> Path | None:
-    """:func:`record_call`, offloaded so sink I/O never blocks the event loop.
+def _capture_and_submit(record: LLMCallRecord) -> Receipt | None:
+    captured_records = _captured_records.get()
+    if captured_records is not None:
+        captured_records.append(record)
+    context = contextvars.copy_context()
+    # Preserve application context for custom sinks, but never give the worker
+    # ownership of the caller's mutable capture buffers, even through reentry.
+    _ = context.run(_captured_records.set, None)
+    _ = context.run(_captured_log_paths.set, None)
+    return submit(record, context)
 
-    The default sink's write is real blocking work — ``mkdir``, a
-    full-payload ``yaml.dump``, two file writes, retention housekeeping —
-    which :func:`asyncio.to_thread` moves onto a worker thread.
-    ``to_thread`` runs the seam inside a *copy* of the caller's context, and
-    the capture ContextVars hold shared list objects, so capture appends made
-    in the worker are visible to the caller exactly as on the sync path; the
-    thread completes even if the awaiting task is cancelled mid-write, so
-    the record (and its captured path) still lands.
 
-    Falls back to the synchronous seam when the offload itself is impossible
-    (``RuntimeError``: no running loop, or the loop's default executor was
-    already shut down by a late teardown write) — logging must never break
-    the call, and a blocking write in a dying process beats a lost record.
+def submit_record_call(record: LLMCallRecord) -> None:
+    """Capture and submit without waiting; safe during stream abandonment.
 
-    Deliberately additive: the sync :func:`record_call` stays, both because
-    it is an importable seam and because the abandoned-stream path *must*
-    write synchronously (suspending while ``GeneratorExit`` unwinds risks
-    losing the record — see ``_stream_once``).
+    Sink I/O stays on the delivery worker. Rejection preserves record capture,
+    and this nonwaiting path never promises or later appends a captured path.
     """
-    try:
-        return await asyncio.to_thread(record_call, record)
-    except RuntimeError:
-        logger.debug("Log-write offload unavailable; writing synchronously", exc_info=True)
-        return record_call(record)
+    _ = _capture_and_submit(record)
+
+
+async def record_call_async(record: LLMCallRecord) -> Path | None:
+    """Capture, submit and wait within the configured delivery deadline.
+
+    Record capture precedes admission, including when disabled or rejected.
+    Ordinary built-in containers are snapshotted before publication; preparation
+    is outside the delivery wait. A timeout or cancellation leaves accepted work
+    available for later delivery but never permits later capture appends.
+    Cancellation already unwinding through a call finalizer skips waiting.
+    """
+    receipt = _capture_and_submit(record)
+    task = asyncio.current_task()
+    if (
+        receipt is None
+        or worker_origin()
+        or (task is not None and task.cancelling())
+        or isinstance(sys.exception(), (asyncio.CancelledError, GeneratorExit))
+    ):
+        return None
+    path = await wait_for_receipt(receipt)
+    captured_paths = _captured_log_paths.get()
+    if captured_paths is not None and path is not None:
+        captured_paths.append(path)
+    return path
 
 
 @contextmanager
@@ -109,10 +107,12 @@ def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     sync stream captures the context when it is created, so enter this block
     before calling the ``*_stream_sync`` function.
 
-    Like path-capture, one record is appended *per attempt* — retries each
-    produce their own logged record — and capture is independent of the
-    configured sink, so it works even when logging is disabled
-    (``configure_llm_logging(None)``).
+    One record is appended *per attempt*, before delivery admission and before
+    the call returns or propagates its error. Retries each produce their own
+    record. Capture works when logging is disabled, full or unavailable and
+    proves record construction, not persistence. Delivery workers never append
+    to this list after the call returns. The captured record retains its original
+    nested objects; managed delivery receives a separate container snapshot.
     """
     records: list[LLMCallRecord] = []
     token = _captured_records.set(records)
@@ -126,13 +126,12 @@ def capture_llm_records() -> Generator[list[LLMCallRecord]]:
 def capture_llm_log_paths() -> Generator[list[Path]]:
     """Capture log paths written by the call functions in this scope.
 
-    The returned list is appended to once per LLM call inside the
-    ``with`` block — including retries, since ``with_retries`` lives
-    outside the call functions and each attempt is its own call. Only the
-    configured file sink (:class:`~llmkit.LocalYamlLogSink`) yields a path;
-    with a third-party :class:`~llmkit.logging.LogSink` (or logging
-    disabled) the list stays empty — use :func:`capture_llm_records` to
-    capture cost/metadata regardless of the sink.
+    Each attempt may append a path if sink completion is observed within its
+    configured delivery wait. The default file sink and compatible custom sinks
+    exposing ``write_returning_path`` can supply paths. A timeout, cancellation,
+    zero wait or abandoned-stream submission promises no path; later completion
+    never appends one. Disabled logging and sinks without path support also leave
+    the list empty. Use :func:`capture_llm_records` for sink-independent metadata.
     """
     paths: list[Path] = []
     token = _captured_log_paths.set(paths)

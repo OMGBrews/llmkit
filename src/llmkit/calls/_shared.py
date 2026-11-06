@@ -355,14 +355,8 @@ async def run_with_policy[T](
     """
     return await with_retries(
         attempt,
-        max_attempts=policy.max_attempts,
+        policy=dataclasses.replace(policy, validation_retry_on=validation_retry_on),
         label=tag,
-        backoff_base_seconds=policy.backoff_base_seconds,
-        max_backoff_seconds=policy.max_backoff_seconds,
-        retry_after_cap=policy.retry_after_cap,
-        retry_on=policy.retry_on,
-        validation_max_attempts=policy.validation_max_attempts,
-        validation_retry_on=validation_retry_on,
     )
 
 
@@ -684,9 +678,9 @@ def build_text_record(
     ``start_t``; ``None`` (every buffered call, every hit) records ``None``.
 
     Building is separate from recording on purpose: the buffered path hands
-    the record to :func:`~llmkit.capture.record_call_async` (off-loop I/O)
-    while the abandoned-stream path must record *synchronously* — so the
-    shared part is the build, and each caller picks its record step.
+    the record to :func:`~llmkit.capture.record_call_async` for bounded waiting,
+    while abandoned streams capture and submit without waiting. Both deliver
+    sink I/O on the same worker; each caller picks its waiting behavior.
     """
     duration_ms = (time.monotonic() - start_t) * 1000
     resolved_model, resolved_provider = resolve_model_and_provider(model, provider)

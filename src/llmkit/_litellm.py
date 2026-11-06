@@ -97,7 +97,7 @@ from llmkit.exceptions import (
     OutputLimitError,
     StructuredOutputError,
     UnsupportedSchemaError,
-    normalize_service_unavailable,
+    normalize_transient_provider_error,
     underlying_provider_error,
     validation_failure_summary,
 )
@@ -327,9 +327,9 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     ``isinstance`` hook that ``except`` clauses bypass, so left raw it would slip
     through a host's documented ``except LLM_RECOVERABLE_ERRORS`` net. It is
     re-raised as :class:`llmkit.exceptions.ServiceUnavailableError` (original on
-    ``__cause__``); every other exception propagates untouched. This cannot be an
-    ``except <type>`` clause — that is the very matching the litellm class fails —
-    hence the catch-all plus ``isinstance`` inside the normalizer.
+    ``__cause__``). Uncovered provider API errors with mapped 500/502/529 become
+    :class:`llmkit.exceptions.TransientProviderError`; other errors retain their
+    identity. The shared normalizer decides which caught errors change.
 
     It is also where a refused ``temperature`` is omitted. When LiteLLM
     (client-side), the provider (an HTTP 400), or OpenRouter (a 404 from its
@@ -394,7 +394,7 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
         _ = _sent_temperature.set(sent if isinstance(sent, (int, float)) else None)
         return result
     except Exception as e:
-        normalized = normalize_service_unavailable(e)
+        normalized = normalize_transient_provider_error(e)
         if normalized is not e:
             raise normalized from e
         raise
@@ -406,8 +406,8 @@ async def _send(request: WireRequest) -> WireResponse:
     The boundary the buffered transports await, always inside the
     rate-limiter slot. A double installed through :mod:`llmkit.testing`
     answers here in place of the provider; otherwise the LiteLLM adapter does:
-    :func:`_acompletion`, whose duties (503 re-ownership, the temperature
-    re-issue and stamp, the MCP-handler opt-out, the deadline) this only wraps
+    :func:`_acompletion`, whose duties (transient-error normalization, the
+    temperature re-issue and stamp, the MCP-handler opt-out, the deadline) this only wraps
     with a conversion. The double answers under the same deadline, so a
     ``Reply(delay=...)`` longer than the request's ``timeout`` times out.
     """
@@ -420,8 +420,8 @@ async def _send(request: WireRequest) -> WireResponse:
 async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStreamEnd]:
     """One streamed provider round trip: wire chunks, then one :class:`WireStreamEnd`.
 
-    A 503 can surface mid-iteration, because the wrapper fetches chunks lazily
-    after :func:`_acompletion` has returned. It is re-owned exactly as the
+    A transient API error can surface mid-iteration, because the wrapper fetches
+    chunks lazily after :func:`_acompletion` has returned. It is re-owned exactly as the
     call-time boundary does, so the stream path keeps the
     ``except LLM_RECOVERABLE_ERRORS`` contract too.
 
@@ -452,7 +452,7 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
                     usage = frame_usage
                 yield _wire_chunk(chunk)
     except Exception as e:
-        normalized = normalize_service_unavailable(e)
+        normalized = normalize_transient_provider_error(e)
         if normalized is not e:
             raise normalized from e
         raise

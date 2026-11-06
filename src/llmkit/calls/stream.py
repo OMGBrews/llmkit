@@ -35,7 +35,7 @@ from llmkit.calls._shared import (
     prepare_call,
     resolve_model_and_provider,
 )
-from llmkit.capture import record_call, record_call_async
+from llmkit.capture import record_call_async, submit_record_call
 from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
@@ -167,7 +167,7 @@ async def text_llm_call_stream(
         if entry is not None:
             # Inline rather than a helper generator: another generator layer
             # would need its own ``aclosing`` for the abandoned record to be
-            # written deterministically. The hit never touches the transport,
+            # captured and submitted deterministically. The hit never touches the transport,
             # so it takes no slot and never calls ``begin_queue_wait``.
             error: str | None = None
             try:
@@ -205,7 +205,7 @@ async def text_llm_call_stream(
                 # The same record-step split as ``_stream_once``, for the same
                 # reason: never suspend while abandonment is unwinding.
                 if error == STREAM_ABANDONED_ERROR:
-                    _ = record_call(record)
+                    submit_record_call(record)
                 else:
                     _ = await record_call_async(record)
             return
@@ -448,14 +448,10 @@ async def _stream_once(
             first_chunk_at=first_chunk_at,
         )
         if error == STREAM_ABANDONED_ERROR:
-            # Abandonment unwinds via GeneratorExit / a re-deliverable
-            # CancelledError: suspending again here (an await) risks a second
-            # cancellation landing mid-await and losing this record — the one
-            # honest witness that the transcript is truncated. Abandonment is
-            # rare and terminal, so one blocking write is the safe trade.
-            _ = record_call(record)
+            # Capture and submit without awaiting or running sink I/O while
+            # GeneratorExit / cancellation unwinds. Delivery may finish later.
+            submit_record_call(record)
         else:
-            # Clean finish or provider error: normal unwinding, safe to
-            # await — and streams carry the largest payloads, so this is the
-            # off-loop offload that matters most.
+            # Clean finish or provider error: wait only within the managed
+            # delivery budget. Cancellation in progress skips that wait.
             _ = await record_call_async(record)

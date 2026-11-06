@@ -2,8 +2,8 @@
 
 The async and sync acquire paths must react to a completed call identically —
 two parallel copies of "was this a throttle?" would drift — so both call the one
-:func:`record_gate_outcome` here, over the one :func:`is_throttle_signal`
-classifier.
+:func:`record_gate_outcome` here. AIMD reacts only to overload; the breaker
+also reacts to connection failures and transient server errors.
 
 :class:`ConcurrencyGate` is satisfied **structurally**: neither gate in
 ``_adaptive`` inherits from it. That absence is deliberate — it is what keeps
@@ -11,6 +11,9 @@ this module a one-way dependency of the gates rather than a cycle with them.
 """
 
 from typing import Protocol
+
+import httpx
+import openai
 
 from llmkit.exceptions import underlying_provider_error
 from llmkit.rate_limiting._breaker import CircuitBreaker
@@ -33,6 +36,33 @@ def is_throttle_signal(exc: BaseException) -> bool:
     root = underlying_provider_error(exc)
     status = getattr(root, "status_code", None)
     return isinstance(status, int) and status in THROTTLE_STATUS_CODES
+
+
+# Generic 5xx statuses such as 501/505 can signal permanent incompatibility.
+# Count the transient statuses supported here, not every server-side failure.
+_OUTAGE_STATUS_CODES = THROTTLE_STATUS_CODES | {500, 502, 504}
+
+
+def is_outage_signal(exc: BaseException) -> bool:
+    """Whether an outcome is evidence that the provider cannot serve requests.
+
+    The breaker shares AIMD's overload signals, and additionally sees connection
+    failures and transient server errors. A positive HTTP outage status takes
+    precedence over the exception class: LiteLLM represents a provider's HTTP
+    504 response as a ``Timeout``. Without that status, timeout classes are
+    neutral: llmkit's caller deadline raises a built-in ``TimeoutError``, and
+    an SDK timeout cannot establish whether the chosen wait was too short or
+    the provider was down. OpenAI's timeout inherits from its connection error,
+    so exclude it before matching connection classes.
+    Authentication, validation, cancellation and programming errors are neutral.
+    """
+    root = underlying_provider_error(exc)
+    status = getattr(root, "status_code", None)
+    if isinstance(status, int) and status in _OUTAGE_STATUS_CODES:
+        return True
+    if isinstance(root, (TimeoutError, openai.APITimeoutError, httpx.TimeoutException)):
+        return False
+    return isinstance(root, (ConnectionError, openai.APIConnectionError, httpx.NetworkError))
 
 
 class ConcurrencyGate(Protocol):
@@ -72,9 +102,9 @@ def record_gate_outcome(
 
     A throttle (429/503/529, **unwrapped** so a structured call's wrapped error is
     seen) while saturated lowers the AIMD limit; a success recovers it. A
-    non-throttle ("neutral") error is ambiguous overload-wise, so — exactly as
-    AIMD ignores it — it feeds neither the window nor recovery; a probe, however,
-    must resolve on *any* outcome so it can never wedge HALF_OPEN. Backpressure
+    non-throttle error leaves AIMD alone. The breaker independently classifies
+    outage signals; neutral errors feed neither its window nor recovery. A
+    neutral probe releases its claim so a later caller may probe again. Backpressure
     events fire outside the gate/breaker locks.
     """
     throttled = (
@@ -82,19 +112,30 @@ def record_gate_outcome(
         if (outcome is not None and (adaptive or breaker is not None))
         else False
     )
+    # Resolve both mechanisms before invoking host code. A callback interrupt
+    # (or a failing diagnostic logger) must not strand a HALF_OPEN probe after
+    # AIMD has changed but before the breaker has recorded the same outcome.
+    adaptive_event: BackpressureEvent | None = None
+    breaker_event: BackpressureEvent | None = None
     if outcome is not None:
         if adaptive and throttled:
-            emit_backpressure(gate.on_throttle())
+            adaptive_event = gate.on_throttle()
         if breaker is not None:
+            outage = is_outage_signal(outcome)
             if is_probe:
-                emit_backpressure(breaker.on_probe_failure())
-            elif throttled:
-                emit_backpressure(breaker.on_record(throttled=True))
+                if outage:
+                    breaker_event = breaker.on_probe_failure()
+                else:
+                    breaker.on_probe_neutral()
+            elif outage:
+                breaker_event = breaker.on_record(outage=True)
     else:
         if adaptive:
-            emit_backpressure(gate.on_success())
+            adaptive_event = gate.on_success()
         if breaker is not None:
             if is_probe:
-                emit_backpressure(breaker.on_probe_success())
+                breaker_event = breaker.on_probe_success()
             else:
-                emit_backpressure(breaker.on_record(throttled=False))
+                breaker_event = breaker.on_record(outage=False)
+    emit_backpressure(adaptive_event)
+    emit_backpressure(breaker_event)

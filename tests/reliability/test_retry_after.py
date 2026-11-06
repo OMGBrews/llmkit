@@ -33,7 +33,7 @@ from instructor.core import InstructorRetryException
 
 from llmkit import calls as llm_calls
 from llmkit import retry
-from llmkit.retry import _retry_after_seconds, with_retries
+from llmkit.retry import RetryPolicy, _retry_after_seconds, with_retries
 from llmkit.testing import Reply, TransportRequest, install, rate_limit_error
 from tests._support import OkSchema
 
@@ -150,7 +150,10 @@ async def test_header_overrides_exponential(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(openai.RateLimitError):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            ),
         )
 
     assert slept == [5.0]  # the server directive, not 0.5
@@ -172,7 +175,10 @@ async def test_capped_at_retry_after_cap(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with pytest.raises(openai.RateLimitError):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            ),
         )
 
     assert slept == [60.0]
@@ -195,10 +201,12 @@ async def test_custom_retry_after_cap_is_honored(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(openai.RateLimitError):
         _ = await with_retries(
             _fn,
-            max_attempts=2,
-            retry_on=(openai.RateLimitError,),
-            backoff_base_seconds=0.5,
-            retry_after_cap=10.0,
+            policy=RetryPolicy(
+                max_attempts=2,
+                retry_on=(openai.RateLimitError,),
+                backoff_base_seconds=0.5,
+                retry_after_cap=10.0,
+            ),
         )
 
     assert slept == [10.0]
@@ -220,7 +228,10 @@ async def test_honored_even_when_backoff_zero(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(openai.RateLimitError):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.0
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.0
+            ),
         )
 
     assert slept == [5.0]
@@ -243,7 +254,10 @@ async def test_jitter_added_to_server_value(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(openai.RateLimitError):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            ),
         )
 
     assert slept == [5.5]  # 5 (capped server value) + 0.5 (max jitter)
@@ -265,7 +279,8 @@ async def test_absent_header_falls_back_to_exponential(monkeypatch: pytest.Monke
 
     with pytest.raises(TimeoutError):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=2.0
+            _fn,
+            policy=RetryPolicy(max_attempts=2, retry_on=(TimeoutError,), backoff_base_seconds=2.0),
         )
 
     assert slept == [2.0]  # exponential ceiling at attempt 1, not a server value
@@ -292,7 +307,10 @@ async def test_wrapped_header_honored_through_with_retries(
 
     with pytest.raises(InstructorRetryException):
         _ = await with_retries(
-            _fn, max_attempts=2, retry_on=(InstructorRetryException,), backoff_base_seconds=0.5
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(InstructorRetryException,), backoff_base_seconds=0.5
+            ),
         )
 
     assert slept == [5.0]

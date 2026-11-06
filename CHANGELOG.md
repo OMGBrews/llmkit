@@ -8,6 +8,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Declare the supported OpenAI SDK major.** Require `openai>=2.20.0,<3`.
+  SDK 3 uses `httpx2`, while llmkit's transport classification, retry-header
+  handling and testing helpers currently use `httpx`. Fresh installs now stay
+  within the supported major instead of admitting incompatible error objects.
+
+- **Normalize uncovered transient provider errors.** At llmkit's buffered and
+  streaming provider boundaries, API errors with mapped status 500, 502 or 529
+  that were outside the transport set now become public `TransientProviderError`
+  instances. They retry within the existing attempt ceiling and are catchable
+  through `LLM_RECOVERABLE_ERRORS`; streams still never replay after yielding
+  an item. The original cause, available mapped status, provider/model, response
+  and numeric `retry_after` are retained. Already recognized errors keep their
+  types, including the existing native-503 `ServiceUnavailableError` behavior;
+  permanent errors and other uncovered statuses remain excluded.
+  **Compatibility:** custom `retry_on` tuples naming only the original
+  `BadGatewayError` or provider `APIError` class must include
+  `TransientProviderError` for these newly normalized cases. Matching does not
+  follow the original cause. Independent raw LiteLLM calls inside `with_retries`
+  are not normalized. Coverage uses synthetic native-error mapping fixtures;
+  it does not establish that live providers emitted these failures or recover
+  metadata discarded by LiteLLM.
+
+- **Bounded managed log delivery.** Calls use one daemon sink worker, a queue
+  defaulting to 256 waiting records, and at most 100 ms of delivery waiting.
+  Cancellation and stream abandonment do not wait for the sink. Record capture
+  happens before admission; paths are captured only when completion is observed
+  within the wait and never appended later. Queued ordinary containers receive
+  private snapshots; opaque objects keep shared-reference semantics. New
+  `LogDeliveryPolicy`, `flush_llm_logs` and `flush_llm_logs_async` configure and
+  inspect bounded draining (one second by default). Health reports queue state,
+  dropped delivery and expired waits separately. Process exit performs one final
+  bounded drain; explicit low-level writes remain synchronous.
+
+
 - Buffered tool calls now attach the latest rejected tool-call turn and one
   validation-error result per call when re-asking an all-malformed round,
   followed by a user instruction to issue a corrected tool call.
@@ -20,6 +54,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   original `prompt`, expose the sent `messages`, and mark `repair=True`.
 
 ### Added
+
+- **Configurable circuit-breaker cooldown.** `configure_rate_limit` accepts
+  `breaker_cooldown`, finite positive seconds, defaulting to 30. The effective
+  value is available on `get_rate_limit_config()`; an omitted keyword keeps
+  the previous value, while reconfiguration still clears limiter state.
 
 - **`describe_llm` describes a per-call provider and reports the route's
   decisions.** `describe_llm(provider=...)` takes what a call's `provider=`
@@ -157,6 +196,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **Breaking: one overall outer-attempt ceiling.** `RetryPolicy.max_attempts`
+  now bounds every outer pass, including mixed transport and validation
+  failures. `validation_max_attempts - 1` limits validation-caused retries
+  inside that ceiling; neither counter resets when the failure class changes.
+  Defaults permit at most three outer attempts and one validation-caused retry.
+  `max_attempts=1` now means no outer retry even if validation retries are
+  enabled. Buffered and pre-yield streaming retries use the same counting;
+  streams still never replay an item already yielded. Instructor repair,
+  temperature re-issues and SDK retries remain additional provider requests
+  within an outer attempt, so the ceiling is not a request, cost or time cap.
+
+- **Breaking: `with_retries` takes `policy=` instead of scalar retry keywords.**
+  The composable helper now uses `DEFAULT_RETRY_POLICY`, matching ordinary
+  calls. Replace `with_retries(fn, max_attempts=5, ...)` with
+  `with_retries(fn, policy=RetryPolicy(max_attempts=5, ...))`; use
+  `policy=NO_RETRY` for one pass. Permanent and programming errors fail
+  immediately by default. Explicit exception overrides and protection against
+  nested retry multiplication remain available.
+
+- **Opt-in circuit breakers now recognize provider outages beyond throttles.**
+  Connection failures and transient HTTP 500/502/504 errors join the existing
+  429/503/529 signals. Adaptive concurrency still reacts only to throttling.
+  Caller deadlines and SDK timeouts without an outage HTTP status,
+  authentication/validation failures and cancellation are neutral,
+  including during recovery probes: a neutral probe releases its claim for
+  the next caller without reopening the breaker or declaring recovery.
 
 - **Breaking: `reasoning_effort="disable"` turns thinking off or raises, on
   every route; the new `"lowest"` replaces the old substitution.** On some
@@ -449,6 +515,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `completion_kwargs`.
 
 ### Fixed
+
+- **Backpressure callbacks can no longer strand recovery probes.** Both
+  mechanisms record a completed probe's outcome before invoking callbacks, so
+  cancellation, process interrupts or a failing diagnostic logger cannot leave
+  the probe claimed. An interrupted admission callback also releases its claim.
+  Cancellation during acquisition continues to refund an acquired RPM token.
 
 - **A cancelled structured or text attempt is recorded as cancelled.** An
   `asyncio.CancelledError` reaching a buffered structured or text attempt (a

@@ -516,7 +516,7 @@ def test_sync_acquire_raises_circuit_open_when_breaker_open(
     key = "openai"  # its casefolded display name, the internal registry key
     breaker = GlobalRateLimiter._get_breaker(key)
     for _ in range(BREAKER_MIN_SAMPLES):  # a full window of throttles opens it
-        _ = breaker.on_record(throttled=True)
+        _ = breaker.on_record(outage=True)
     assert breaker._state is CircuitState.OPEN
 
     # ``acquire_sync`` fetches the gate *before* consulting the breaker, so

@@ -44,6 +44,7 @@ from llmkit import (
     ToolChoiceUnsupportedError,
     ToolDefinition,
     ToolName,
+    flush_llm_logs_async,
     make_provider,
     tool_llm_call_stream,
 )
@@ -159,6 +160,7 @@ async def test_taking_the_result_and_stopping_is_a_completed_call_not_an_abandon
                 result = event
                 break
         await stream.aclose()
+        assert await flush_llm_logs_async()
 
     assert result is not None and len(result.tool_calls) == 1
     assert len(records) == 1
@@ -174,6 +176,7 @@ async def test_abandoning_before_the_result_records_the_partial_transcript() -> 
         async for _event in stream:
             break
         await stream.aclose()
+        assert await flush_llm_logs_async()
 
     assert len(records) == 1
     assert records[0].error == STREAM_ABANDONED_ERROR
@@ -558,6 +561,7 @@ async def test_cancelling_the_consumer_records_the_abandonment() -> None:
         _ = task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert await flush_llm_logs_async()
 
     assert any(record.error == STREAM_ABANDONED_ERROR for record in records)
 

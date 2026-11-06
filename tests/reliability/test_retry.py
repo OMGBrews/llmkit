@@ -14,7 +14,7 @@ import random
 
 import pytest
 
-from llmkit.retry import retry_progress_callback, with_retries
+from llmkit.retry import RetryPolicy, retry_progress_callback, with_retries
 
 
 class _Callback:
@@ -47,7 +47,11 @@ async def test_progress_callback_invoked_on_non_final_failure() -> None:
         return "ok"
 
     with retry_progress_callback(cb):
-        result = await with_retries(flaky, max_attempts=2, label="x")
+        result = await with_retries(
+            flaky,
+            policy=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     assert result == "ok"
     assert cb.calls == [("x", 1, 2, "first try fails")]
@@ -56,7 +60,7 @@ async def test_progress_callback_invoked_on_non_final_failure() -> None:
 @pytest.mark.asyncio
 async def test_progress_callback_receives_max_attempts_keyword() -> None:
     """The callback is invoked with the ``max_attempts`` keyword (the unified
-    name) carrying the budget for the failing class — not the removed
+    name) carrying the total outer-attempt ceiling — not the removed
     ``max_retries`` alias."""
     seen: list[dict[str, object]] = []
 
@@ -72,7 +76,11 @@ async def test_progress_callback_receives_max_attempts_keyword() -> None:
         return "ok"
 
     with retry_progress_callback(record):
-        result = await with_retries(flaky, max_attempts=2, label="x")
+        result = await with_retries(
+            flaky,
+            policy=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     assert result == "ok"
     assert len(seen) == 1
@@ -92,7 +100,11 @@ async def test_progress_callback_not_invoked_on_first_success() -> None:
         return 42
 
     with retry_progress_callback(cb):
-        result = await with_retries(succeed, max_attempts=3, label="x")
+        result = await with_retries(
+            succeed,
+            policy=RetryPolicy(max_attempts=3, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     assert result == 42
     assert cb.calls == []
@@ -110,7 +122,11 @@ async def test_progress_callback_not_invoked_for_final_failure() -> None:
         raise ValueError("nope")
 
     with retry_progress_callback(cb), pytest.raises(ValueError, match="nope"):
-        _ = await with_retries(always_fails, max_attempts=2, label="x")
+        _ = await with_retries(
+            always_fails,
+            policy=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     # Only one callback: attempt 1/2 (non-final). Attempt 2/2 is final → no callback.
     assert cb.calls == [("x", 1, 2, "nope")]
@@ -128,7 +144,11 @@ async def test_progress_callback_default_none_no_op() -> None:
         return "ok"
 
     # No retry_progress_callback context — relies on default ContextVar value (None).
-    result = await with_retries(flaky, max_attempts=2, label="x")
+    result = await with_retries(
+        flaky,
+        policy=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+        label="x",
+    )
     assert result == "ok"
 
 
@@ -151,16 +171,19 @@ async def test_progress_callback_exception_does_not_break_retry(
         return "ok"
 
     with retry_progress_callback(bad_callback), caplog.at_level(logging.ERROR):
-        result = await with_retries(flaky, max_attempts=2, label="x")
+        result = await with_retries(
+            flaky,
+            policy=RetryPolicy(max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     assert result == "ok"
     assert any("retry progress callback raised" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_no_backoff_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``backoff_base_seconds`` defaults to 0 — no sleep between retries
-    (preserves prior behaviour for callers that don't opt in)."""
+async def test_explicit_zero_backoff_disables_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A policy with zero backoff performs eligible retries without sleeping."""
     slept: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
@@ -175,7 +198,11 @@ async def test_no_backoff_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
             raise ValueError("fail")
         return "ok"
 
-    result = await with_retries(flaky, max_attempts=3, label="x")
+    result = await with_retries(
+        flaky,
+        policy=RetryPolicy(max_attempts=3, backoff_base_seconds=0.0, retry_on=(ValueError,)),
+        label="x",
+    )
     assert result == "ok"
     assert slept == []  # no backoff configured
 
@@ -203,7 +230,11 @@ async def test_backoff_sleeps_between_retries_with_jittered_ceiling(
         raise ValueError("nope")
 
     with pytest.raises(ValueError, match="nope"):
-        _ = await with_retries(always_fails, max_attempts=3, label="x", backoff_base_seconds=2.0)
+        _ = await with_retries(
+            always_fails,
+            policy=RetryPolicy(max_attempts=3, backoff_base_seconds=2.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     # Two non-final failures (attempts 1 and 2) → two sleeps; attempt 3 is
     # final (no sleep). Ceilings: 2*2**0=2.0, 2*2**1=4.0.
@@ -233,7 +264,11 @@ async def test_backoff_ceiling_is_capped_at_default_max_backoff(
         raise ValueError("nope")
 
     with pytest.raises(ValueError, match="nope"):
-        _ = await with_retries(always_fails, max_attempts=12, label="x", backoff_base_seconds=2.0)
+        _ = await with_retries(
+            always_fails,
+            policy=RetryPolicy(max_attempts=12, backoff_base_seconds=2.0, retry_on=(ValueError,)),
+            label="x",
+        )
 
     # 11 non-final failures → 11 sleeps. Early attempts keep the pure
     # exponential ceiling; once it crosses 30s the cap holds it flat.
@@ -266,10 +301,13 @@ async def test_custom_max_backoff_seconds_is_honored(
     with pytest.raises(ValueError, match="nope"):
         _ = await with_retries(
             always_fails,
-            max_attempts=5,
+            policy=RetryPolicy(
+                max_attempts=5,
+                backoff_base_seconds=2.0,
+                max_backoff_seconds=5.0,
+                retry_on=(ValueError,),
+            ),
             label="x",
-            backoff_base_seconds=2.0,
-            max_backoff_seconds=5.0,
         )
 
     # Ceilings 2.0, 4.0 stay exponential; 8.0 and 16.0 are capped at 5.0.
@@ -289,7 +327,10 @@ async def test_backoff_not_slept_on_success(monkeypatch: pytest.MonkeyPatch) -> 
     async def succeed() -> int:
         return 7
 
-    result = await with_retries(succeed, max_attempts=3, backoff_base_seconds=5.0)
+    result = await with_retries(
+        succeed,
+        policy=RetryPolicy(max_attempts=3, backoff_base_seconds=5.0, retry_on=(ValueError,)),
+    )
     assert result == 7
     assert slept == []
 
@@ -306,10 +347,22 @@ async def test_retry_progress_callback_resets_on_exit() -> None:
 
     with retry_progress_callback(cb_outer):
         with retry_progress_callback(cb_inner), pytest.raises(ValueError):
-            _ = await with_retries(flaky, max_attempts=2, label="inner")
+            _ = await with_retries(
+                flaky,
+                policy=RetryPolicy(
+                    max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)
+                ),
+                label="inner",
+            )
         # Outer scope's callback should be active again.
         with pytest.raises(ValueError):
-            _ = await with_retries(flaky, max_attempts=2, label="outer")
+            _ = await with_retries(
+                flaky,
+                policy=RetryPolicy(
+                    max_attempts=2, backoff_base_seconds=0.0, retry_on=(ValueError,)
+                ),
+                label="outer",
+            )
 
     assert cb_inner.calls == [("inner", 1, 2, "always")]
     assert cb_outer.calls == [("outer", 1, 2, "always")]

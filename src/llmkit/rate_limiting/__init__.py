@@ -98,7 +98,7 @@ concurrency cap alone leaves an old RPM tuning inert).
 
 A single ``max_concurrent`` / ``rpm`` / ``tpm`` value applies to *all*
 providers; there is intentionally no per-provider cap map, to keep the public
-surface small (three numbers, three switches: ``enabled`` / ``adaptive`` /
+surface small (shared budgets and three switches: ``enabled`` / ``adaptive`` /
 ``breaker``).
 
 Token bucket, not sliding window
@@ -166,7 +166,7 @@ the circuit breaker in particular was invisible in the single-file form:
 * ``_adaptive`` — the *concurrency* dimension: AIMD state and its async and
   sync gates;
 * ``_breaker`` — the opt-in circuit breaker;
-* ``_outcomes`` — the one throttle classifier and outcome-feedback path both
+* ``_outcomes`` — the throttle/outage classifiers and outcome-feedback path both
   acquire paths share, so their reactions cannot drift;
 * ``_limiter`` — :class:`GlobalRateLimiter`, the process-global registries and
   the two acquire context managers.
@@ -190,6 +190,7 @@ from llmkit.rate_limiting._observability import (
     begin_queue_wait,
     current_queue_wait_ms,
 )
+from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN
 
 __all__ = [
     "BackpressureCallback",
@@ -215,7 +216,8 @@ class RateLimitConfig:
     effective limits at startup without reaching into limiter internals.
     ``rpm`` / ``tpm`` are ``None`` when those opt-in dimensions are off;
     ``adaptive`` is whether the concurrency limit adapts to provider overload;
-    ``breaker`` is whether the per-provider circuit breaker is armed (opt-in).
+    ``breaker`` is whether the per-provider circuit breaker is armed (opt-in),
+    and ``breaker_cooldown`` is the duration of its open period in seconds.
     """
 
     enabled: bool
@@ -224,6 +226,7 @@ class RateLimitConfig:
     tpm: int | None
     adaptive: bool
     breaker: bool
+    breaker_cooldown: float = BREAKER_COOLDOWN
 
 
 def configure_rate_limit(
@@ -233,6 +236,7 @@ def configure_rate_limit(
     tpm: int | None | Unset = UNSET,
     adaptive: bool | Unset = UNSET,
     breaker: bool | Unset = UNSET,
+    breaker_cooldown: float | Unset = UNSET,
 ) -> None:
     """Configure the global, per-provider LLM rate limit.
 
@@ -267,9 +271,15 @@ def configure_rate_limit(
 
     The circuit breaker (``breaker``, **off** by default) is the aggregate guard
     for a provider that is *down*: armed, it fast-fails a provider's calls with
-    :class:`~llmkit.exceptions.CircuitOpenError` once that provider's throttle
-    rate over a rolling window crosses the trip threshold, for a cooldown, then
-    lets a single probe test recovery. It is opt-in — unlike adaptive concurrency
+    :class:`~llmkit.exceptions.CircuitOpenError` once that provider's outage
+    rate over a rolling window crosses the trip threshold, for
+    ``breaker_cooldown`` seconds (30 by default), then lets a single probe test
+    recovery. Throttles, connection failures and transient
+    server errors count as outages; caller deadlines, timeouts without an
+    outage HTTP status, cancellation, authentication and validation errors are
+    neutral. A neutral probe releases its claim for the
+    next caller without declaring recovery or reopening the circuit. It is
+    opt-in — unlike adaptive concurrency
     (which only ever *reduces* load and so is a safe default), the breaker flips
     "eventually succeeds" → "fails fast", so the host decides. ``CircuitOpenError``
     is in :data:`~llmkit.exceptions.LLM_RECOVERABLE_ERRORS` (a host's existing
@@ -289,10 +299,13 @@ def configure_rate_limit(
         breaker: Whether the per-provider circuit breaker is armed (**off**
             until set). ``True`` makes a known-down provider fail fast for a
             cooldown instead of letting every call burn its retry budget.
+        breaker_cooldown: Seconds to fail fast before a recovery probe; finite
+            and positive, 30 until set. Omitting it retains the current value.
 
     Raises:
         ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` / ``tpm``
-            is set to a non-positive value.
+            is set to a non-positive value, or ``breaker_cooldown`` is not finite
+            and positive.
     """
     GlobalRateLimiter.configure(
         max_concurrent=max_concurrent,
@@ -301,6 +314,7 @@ def configure_rate_limit(
         tpm=tpm,
         adaptive=adaptive,
         breaker=breaker,
+        breaker_cooldown=breaker_cooldown,
     )
 
 
@@ -316,7 +330,7 @@ def get_rate_limit_config() -> RateLimitConfig:
         A :class:`RateLimitConfig` snapshot of the current ``enabled`` flag,
         per-provider ``max_concurrent`` cap, per-provider ``rpm`` / ``tpm``
         limits (``None`` when those dimensions are off), the ``adaptive`` flag,
-        and the ``breaker`` flag.
+        the ``breaker`` flag, and its ``breaker_cooldown`` in seconds.
     """
     return RateLimitConfig(
         enabled=GlobalRateLimiter.is_enabled(),
@@ -325,6 +339,7 @@ def get_rate_limit_config() -> RateLimitConfig:
         tpm=GlobalRateLimiter.tpm(),
         adaptive=GlobalRateLimiter.adaptive(),
         breaker=GlobalRateLimiter.breaker(),
+        breaker_cooldown=GlobalRateLimiter.breaker_cooldown(),
     )
 
 

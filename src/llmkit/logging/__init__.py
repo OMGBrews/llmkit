@@ -7,11 +7,12 @@ per call to a directory resolved lazily at first write (see
 the enclosing project root, else a per-user state directory), preserving
 the historical log shape so existing analysis tooling keeps working.
 
-Logging is unconditional and best-effort — a sink that raises is swallowed
-so the LLM call itself never breaks because logging did. The host
-application points the sink at its chosen directory once at startup via
-:func:`configure_llm_logging`, mirroring the ``configure_rate_limit``
-module-level pattern.
+Managed logging uses one daemon worker and a bounded queue (256 waiting
+records by default). Calls wait at most 100 ms after snapshot preparation;
+abandoned streams submit without waiting. Accepted writes may finish later,
+but caller capture lists never receive late path appends. Explicit low-level
+``write_llm_log`` and sink writes remain synchronous. Configure the sink and
+optional :class:`LogDeliveryPolicy` at startup with :func:`configure_llm_logging`.
 Module layout
 -------------
 
@@ -32,8 +33,13 @@ they own:
   in ``llmkit._latch``, because the response cache shares it.
 """
 
+from llmkit.logging._delivery import (
+    flush_llm_logs,
+    flush_llm_logs_async,
+)
 from llmkit.logging._health import LoggingFailure, LoggingHealth
 from llmkit.logging._paths import LOG_DIR_ENV_VAR, default_log_dir
+from llmkit.logging._policy import LogDeliveryPolicy
 from llmkit.logging.local_yaml import (
     DEFAULT_MAX_INDEX_BYTES,
     DEFAULT_RETENTION_DAYS,
@@ -49,6 +55,9 @@ from llmkit.logging.registry import (
 from llmkit.logging.sink import LogSink
 
 __all__ = [
+    "LogDeliveryPolicy",
+    "flush_llm_logs",
+    "flush_llm_logs_async",
     "DEFAULT_MAX_INDEX_BYTES",
     "DEFAULT_RETENTION_DAYS",
     "INDEX_FILENAME",

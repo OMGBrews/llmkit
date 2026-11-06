@@ -14,11 +14,11 @@ work when a provider is *down* — the ``0.4.0`` follow-on to adaptive concurren
   in ``InstructorRetryException``) feeds the window (D0);
 * the HALF_OPEN probe through the real acquire path — closes on success, re-opens
   on a throttle, and a **cancelled** probe (in the body *or* parked mid-acquire)
-  reverts to OPEN and refunds its RPM token, so the breaker never wedges;
+  releases its claim and refunds its RPM token, so the breaker never wedges;
 * per-provider isolation, the breaker being one object shared across event loops
   (single process-wide probe), and ``breaker=False`` being a complete no-op;
 * ``CircuitOpenError`` is **not** retried by ``with_retries`` — not even under
-  its ``retry_on=None`` default, whether the error arrives bare or wrapped in
+  its default policy, whether the error arrives bare or wrapped in
   ``InstructorRetryException`` — the structured call function, or the streaming
   loop; an explicit ``retry_on`` listing the type still opts back in.
 
@@ -70,7 +70,7 @@ def _wrapped(status: int) -> InstructorRetryException:
 def _fill_throttles(breaker: CircuitBreaker, n: int) -> None:
     """Feed *n* throttle outcomes straight into a breaker's window."""
     for _ in range(n):
-        _ = breaker.on_record(throttled=True)
+        _ = breaker.on_record(outage=True)
 
 
 # --- CircuitBreaker state machine (frozen clock) ------------------------
@@ -82,10 +82,10 @@ def test_full_window_of_throttles_opens(monkeypatch: pytest.MonkeyPatch) -> None
     breaker = CircuitBreaker("openai", ceiling=8)
     # Below the minimum sample, even all-throttles cannot trip the breaker.
     for _ in range(BREAKER_MIN_SAMPLES - 1):
-        assert breaker.on_record(throttled=True) is None
+        assert breaker.on_record(outage=True) is None
         assert breaker._state is CircuitState.CLOSED
     # The outcome that fills the window to the minimum sample opens it.
-    event = breaker.on_record(throttled=True)
+    event = breaker.on_record(outage=True)
     assert event == BackpressureEvent("openai", 8, 0, "breaker_open")
     assert breaker._state is CircuitState.OPEN
     # Within the cooldown, every admission is rejected (no event re-fired).
@@ -98,7 +98,7 @@ def test_sub_threshold_window_does_not_open(monkeypatch: pytest.MonkeyPatch) -> 
     breaker = CircuitBreaker("openai", ceiling=8)
     # 9 throttles + 11 successes over a 20-wide window = 0.45 < 0.5.
     for i in range(BREAKER_MIN_SAMPLES):
-        _ = breaker.on_record(throttled=i < 9)
+        _ = breaker.on_record(outage=i < 9)
     assert breaker._state is CircuitState.CLOSED
     assert breaker.admit()[0] is Admit.NORMAL
 
@@ -110,14 +110,14 @@ def test_rolling_window_opens_once_throttles_dominate(monkeypatch: pytest.Monkey
     breaker = CircuitBreaker("openai", ceiling=4)
     # Fill the window with successes — healthy, stays closed.
     for _ in range(BREAKER_MIN_SAMPLES):
-        assert breaker.on_record(throttled=False) is None
+        assert breaker.on_record(outage=False) is None
     assert breaker._state is CircuitState.CLOSED
     # Now a throttle storm. The window is 20 wide, so the 10th throttle makes the
     # rolling fraction exactly 0.5 (10 throttles evicting 10 of the old successes).
     for _ in range(BREAKER_MIN_SAMPLES // 2 - 1):
-        assert breaker.on_record(throttled=True) is None
+        assert breaker.on_record(outage=True) is None
     assert breaker._state is CircuitState.CLOSED
-    event = breaker.on_record(throttled=True)
+    event = breaker.on_record(outage=True)
     assert event == BackpressureEvent("openai", 4, 0, "breaker_open")
 
 
@@ -277,8 +277,8 @@ async def test_half_open_probe_reopens_on_throttle(monkeypatch: pytest.MonkeyPat
             pass
 
 
-async def test_cancelled_probe_in_body_reverts_to_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A probe cancelled while its body runs reverts to OPEN (claim released) —
+async def test_cancelled_probe_in_body_releases_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe cancelled while its body runs releases its claim —
     no wedged HALF_OPEN — and other calls stay rejected meanwhile (single probe)."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
@@ -308,7 +308,7 @@ async def test_cancelled_probe_in_body_reverts_to_open(monkeypatch: pytest.Monke
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert breaker._state is CircuitState.OPEN  # reverted, not wedged HALF_OPEN
+    assert breaker._state is CircuitState.HALF_OPEN  # cancellation is neutral
     assert breaker._probe_in_flight is False  # claim released
 
 
@@ -316,7 +316,7 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A probe cancelled *during acquisition* (parked on the TPM gate, after its
-    RPM token is deducted) reverts to OPEN and refunds the RPM token — the probe
+    RPM token is deducted) releases its claim and refunds the RPM token — the probe
     claim shares the rpm-refund-on-cancel leak class and is released coherently."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])  # frozen: no refill
@@ -350,7 +350,7 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert breaker._state is CircuitState.OPEN  # reverted
+    assert breaker._state is CircuitState.HALF_OPEN  # cancellation is neutral
     assert breaker._probe_in_flight is False  # claim released
     assert rpm_bucket._level == 7.0  # RPM refunded, not silently lost
 
@@ -439,21 +439,18 @@ async def test_circuit_open_error_not_retried_by_with_retries() -> None:
     with pytest.raises(CircuitOpenError):
         _ = await with_retries(
             fn,
-            max_attempts=3,
-            retry_on=LLM_TRANSPORT_ERRORS,
-            validation_max_attempts=2,
-            validation_retry_on=LLM_SCHEMA_ERRORS,
+            policy=RetryPolicy(
+                max_attempts=3,
+                retry_on=LLM_TRANSPORT_ERRORS,
+                validation_max_attempts=2,
+                validation_retry_on=LLM_SCHEMA_ERRORS,
+            ),
         )
     assert calls[0] == 1
 
 
-async def test_with_retries_retry_on_none_does_not_retry_circuit_open_error() -> None:
-    """The regression test for the bare-``CircuitOpenError`` hole: with the
-    documented default ``retry_on=None`` ("retry on any Exception"),
-    ``with_retries`` must still fail fast on a bare ``CircuitOpenError`` —
-    re-asking a circuit the breaker already knows is open would defeat its
-    purpose. Fails pre-fix with ``calls[0] == 3`` (charged to the transport
-    budget); passes with the zero-budget carve-out."""
+async def test_with_retries_default_does_not_retry_circuit_open_error() -> None:
+    """The composable helper's default policy fails fast on an open circuit."""
     calls = [0]
 
     async def fn() -> None:
@@ -461,7 +458,7 @@ async def test_with_retries_retry_on_none_does_not_retry_circuit_open_error() ->
         raise CircuitOpenError("openai")
 
     with pytest.raises(CircuitOpenError):
-        _ = await with_retries(fn, max_attempts=3)
+        _ = await with_retries(fn)
     assert calls[0] == 1
 
 
@@ -476,19 +473,17 @@ async def test_with_retries_explicit_opt_in_still_retries_circuit_open_error() -
         raise CircuitOpenError("openai")
 
     with pytest.raises(CircuitOpenError):
-        _ = await with_retries(fn, max_attempts=2, retry_on=(CircuitOpenError,))
+        _ = await with_retries(
+            fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(CircuitOpenError,), backoff_base_seconds=0
+            ),
+        )
     assert calls[0] == 2
 
 
-async def test_with_retries_retry_on_none_wrapped_circuit_open_fails_fast() -> None:
-    """A ``CircuitOpenError`` wrapped in ``InstructorRetryException`` fails fast
-    under ``retry_on=None`` — one attempt. This pins the *wrapped form's*
-    fail-fast behaviour, not which guard owns it: both the zero-budget carve-out
-    and the pre-existing ``wraps_permanent_cause`` guard (a wrapped cause that is
-    neither transport- nor schema-shaped) catch it, so it passed before this
-    change too and stays green as a regression guard on the wrapped path. The
-    *bare*-``CircuitOpenError`` test above is the discriminating regression for
-    the new carve-out (it fails pre-fix with ``calls == 3``)."""
+async def test_with_retries_default_wrapped_circuit_open_fails_fast() -> None:
+    """The composable helper's default fails fast on a wrapped open circuit too."""
     calls = [0]
 
     async def fn() -> None:
@@ -496,7 +491,7 @@ async def test_with_retries_retry_on_none_wrapped_circuit_open_fails_fast() -> N
         raise InstructorRetryException(CircuitOpenError("openai"), n_attempts=1, total_usage=0)
 
     with pytest.raises(InstructorRetryException):
-        _ = await with_retries(fn, max_attempts=3, retry_on=None, validation_max_attempts=2)
+        _ = await with_retries(fn)
     assert calls[0] == 1
 
 

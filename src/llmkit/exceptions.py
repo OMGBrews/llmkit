@@ -7,27 +7,27 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into five subsets the retry layer budgets
-**separately** (see :mod:`llmkit.retry`):
+The recoverable set is split into five subsets the retry layer classifies
+within one overall attempt ceiling (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
-  limits, transient 5xx, network/timeout). These get the full transport
-  retry budget, since a retry on a fresh connection routinely succeeds.
+  limits, transient 5xx, network/timeout). These may retry up to the overall
+  attempt ceiling, since a retry on a fresh connection routinely succeeds.
 * :data:`LLM_SCHEMA_ERRORS` — *schema-validation* failures (llmkit's
   :class:`StructuredOutputError`, raised when a structured answer fails
   validation after instructor's in-call repair, or when a compose lane's final
   answer fails validation; pydantic ``ValidationError``; instructor's
   ``InstructorRetryException`` for an exhausted attempt that was not a parse
-  failure). These get a **lower** budget: a transiently-malformed JSON
-  response still earns one cross-call retry, but a deterministically-wrong
-  schema can't burn the full transport budget on doomed re-asks.
+  failure). These get a **lower** retry allowance inside that ceiling: a
+  transiently-malformed JSON response still earns one cross-call retry, but a deterministically-wrong
+  schema can't burn the full attempt ceiling on doomed re-asks.
 
   Caveat — ``InstructorRetryException`` is a *wrapper*: instructor re-raises
   **every** exhausted attempt this way, including transport failures (a 429
   or network blip caught inside its create call). llmkit re-owns the
   parse-shaped ones as :class:`StructuredOutputError`; the rest keep the
   wrapper, and the retry layer unwraps it via :func:`underlying_provider_error`
-  and charges a wrapped transport cause to the transport budget — so
+  and gives a wrapped transport cause no validation charge — so
   membership here is the default-but-not-final classification, not a promise
   the failure is genuinely schema-shaped.
 * :data:`LLM_BACKPRESSURE_ERRORS` — llmkit's *own* fail-fast backpressure
@@ -37,7 +37,7 @@ The recoverable set is split into five subsets the retry layer budgets
   fallback) instead of crashing on a new uncaught type — but it is deliberately
   **not** retried by default: it lives outside the transport set,
   and ``with_retries`` additionally carves it out as a zero-budget fail-fast
-  signal, so neither ``with_retries`` (even on its ``retry_on=None`` default)
+  signal, so neither ``with_retries`` with its default policy
   nor the streaming loop (which keys off the transport/schema subsets, never
   the union) ever re-asks a circuit the breaker already knows is open — unless
   a caller explicitly lists the type in ``retry_on``.
@@ -49,13 +49,16 @@ The recoverable set is split into five subsets the retry layer budgets
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_TOOL_ERRORS` — a tool round the model got wrong
   (:class:`ToolArgumentError`: an unknown tool, or arguments that are not
-  valid JSON or fail the tool's model). The tool lanes charge it to the
-  **validation** budget, so a round whose every call is malformed is re-asked
+  valid JSON or fail the tool's model). The buffered tool lanes charge it to the
+  **validation** allowance, so a round whose every call is malformed is re-asked
   like a malformed schema response.
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
-single documented ``except``-clause catch-set so existing callers keep
-catching exactly what they did before. The 503 case deserves a note:
+single documented ``except``-clause catch-set. At llmkit's provider boundaries,
+uncovered OpenAI/LiteLLM API errors carrying mapped 500/502/529 become
+:class:`TransientProviderError`, a plain member of the transport tuple.
+Already recognized transport errors retain their types. Custom retry policies
+match the normalized type, not its original ``__cause__``. The 503 case deserves a note:
 litellm's own ``ServiceUnavailableError`` cannot be listed statically
 (that would cost every ``import llmkit`` the multi-second litellm import),
 so the transport boundary (:mod:`llmkit._litellm`) re-raises every
@@ -100,6 +103,7 @@ from tenacity import RetryError
 #   - ``InternalServerError`` — 5xx
 #   - ``APIConnectionError``  — network failures (``APITimeoutError`` subclasses it)
 #   - ``litellm ServiceUnavailableError`` — 503 (see below)
+#   - ``TransientProviderError`` — uncovered mapped 500/502/529 at our boundary
 #   - ``httpx.RequestError``  — lower-level network failures
 #   - ``TimeoutError``        — builtin timeout
 #
@@ -107,18 +111,16 @@ from tenacity import RetryError
 # ``openai`` bases: ``litellm.RateLimitError`` subclasses
 # ``openai.RateLimitError``, ``litellm.InternalServerError`` subclasses
 # ``openai.InternalServerError``, ``litellm.Timeout``/``litellm.APIConnectionError``
-# subclass ``openai.APIConnectionError``. The one transient class that does
-# NOT follow that pattern is ``litellm.exceptions.ServiceUnavailableError``
+# subclass ``openai.APIConnectionError``. Native 503 does not follow that
+# pattern: ``litellm.exceptions.ServiceUnavailableError``
 # (LiteLLM's mapping for HTTP 503): its MRO goes straight to
 # ``openai.APIStatusError``, skipping ``openai.InternalServerError`` — so it
 # must be listed explicitly or real 503s would propagate unretried.
 #
-# Deliberate scope: we do not retry generic ``openai.APIStatusError`` with
-# status >= 500. LiteLLM maps the 5xx family to the named classes above
-# (500 → ``InternalServerError``, 503 → ``ServiceUnavailableError``), and an
-# isinstance-tuple can't express a status-code predicate; a raw
-# ``APIStatusError`` outside those mappings is unexpected enough to surface
-# rather than retry.
+# The provider boundary additionally normalizes uncovered API errors carrying
+# mapped status 500/502/529 to TransientProviderError. Generic APIError and
+# APIStatusError remain outside the tuple: permanent errors and nonselected
+# statuses must not gain retries. Already recognized transport types stay intact.
 
 
 class _LazyServiceUnavailableMeta(type):
@@ -159,7 +161,7 @@ class _LiteLLMServiceUnavailableError(Exception, metaclass=_LazyServiceUnavailab
     Known limit: ``except`` matching bypasses ``__instancecheck__``, so an
     ``except`` clause over the transport tuple does not match this entry.
     That limit no longer reaches hosts through llmkit's call functions: the
-    transport boundary (:func:`normalize_service_unavailable`, applied in
+    transport boundary (:func:`normalize_transient_provider_error`, applied in
     :mod:`llmkit._litellm`) re-raises every litellm-native 503 as
     :class:`ServiceUnavailableError`, a plain tuple member ``except`` does
     match. This stand-in stays for ``isinstance`` classification of the raw
@@ -172,7 +174,8 @@ class LlmkitError(Exception):
     """The base of every exception class llmkit defines.
 
     ``except LlmkitError`` catches every failure llmkit itself raises: a
-    provider outage it normalized (:class:`ServiceUnavailableError`), its
+    provider outage it normalized (:class:`ServiceUnavailableError` or
+    :class:`TransientProviderError`), its
     own fail-fast signals (:class:`CircuitOpenError`,
     :class:`OutputLimitError`), validation it ran or re-owned
     (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
@@ -215,7 +218,7 @@ class ServiceUnavailableError(LlmkitError):
     hooks — so a raw litellm 503 escaping the library would slip through the
     documented ``except LLM_RECOVERABLE_ERRORS`` net. The transport boundary
     (:mod:`llmkit._litellm`) therefore re-raises every litellm-native 503 as
-    this class via :func:`normalize_service_unavailable`, with the original on
+    this class via :func:`normalize_transient_provider_error`, with the original on
     ``__cause__`` — the :class:`CircuitOpenError` / :class:`OutputLimitError`
     precedent of one plain llmkit-owned type per fail signal.
 
@@ -250,32 +253,73 @@ class ServiceUnavailableError(LlmkitError):
         self.response: httpx.Response | None = response
 
 
-def normalize_service_unavailable(exc: Exception) -> Exception:
-    """llmkit's :class:`ServiceUnavailableError` for a litellm-native 503; any
-    other exception unchanged.
+class TransientProviderError(LlmkitError):
+    """An otherwise unclassified provider API error with mapped HTTP 500/502/529.
 
-    The transport boundary (:mod:`llmkit._litellm`) calls this on every error
-    leaving a provider call and re-raises a changed result ``from`` the
-    original, so the litellm class — which ``except`` clauses over the
-    transport tuple cannot match — never propagates to a host raw. Attribute
-    reads are best-effort with ``isinstance`` narrowing: a litellm 503 missing
-    an expected field still normalizes, with that field ``None``.
+    Raised at llmkit's provider boundaries, with the original on ``__cause__``.
+    Already recognized transport errors keep their types, including the
+    existing :class:`ServiceUnavailableError` for native LiteLLM 503s. Custom
+    ``RetryPolicy.retry_on`` tuples must name this type to retry these newly
+    normalized failures; classification does not follow the original cause.
 
-    Deliberately *not* in ``llmkit.__init__``'s exports: like
-    :data:`REPAIRABLE_PARSE_ERRORS`, it is an internal boundary detail — hosts
-    interact with the resulting :class:`ServiceUnavailableError`, not the
-    normalization itself.
+    Metadata reflects what the mapped error still carries, not necessarily
+    the original wire response. ``provider`` and ``model`` are optional tags;
+    ``status_code`` retains the mapped status, ``response`` retains the original
+    httpx response, and numeric ``retry_after`` takes precedence over its headers.
+    Missing metadata is ``None``. Normalization cannot reconstruct discarded
+    wire status or headers, and does not cover independent raw LiteLLM calls.
     """
-    if not isinstance(exc, _LiteLLMServiceUnavailableError):
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        provider: str | None,
+        model: str | None,
+        response: httpx.Response | None,
+        retry_after: int | float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code: int = status_code
+        self.provider: str | None = provider
+        self.model: str | None = model
+        self.response: httpx.Response | None = response
+        self.retry_after: int | float | None = retry_after
+
+
+def normalize_transient_provider_error(exc: Exception) -> Exception:
+    """Own native LiteLLM 503s and uncovered API errors with mapped 500/502/529.
+
+    All other errors retain their identity, including already recognized
+    transport errors and non-provider exceptions with a status-like attribute.
+    The caller re-raises changed results ``from`` the original. Metadata reads
+    are best-effort; the normalizer is internal and never imports LiteLLM eagerly.
+    """
+    native_503 = isinstance(exc, _LiteLLMServiceUnavailableError)
+    if not native_503 and (
+        isinstance(exc, LLM_TRANSPORT_ERRORS) or not isinstance(exc, openai.APIError)
+    ):
         return exc
     provider = getattr(exc, "llm_provider", None)
     model = getattr(exc, "model", None)
     response = getattr(exc, "response", None)
-    return ServiceUnavailableError(
+    provider = provider if isinstance(provider, str) else None
+    model = model if isinstance(model, str) else None
+    response = response if isinstance(response, httpx.Response) else None
+    if native_503:
+        return ServiceUnavailableError(str(exc), provider=provider, model=model, response=response)
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or status not in {500, 502, 529}:
+        return exc
+    retry_after = getattr(exc, "retry_after", None)
+    return TransientProviderError(
         str(exc),
-        provider=provider if isinstance(provider, str) else None,
-        model=model if isinstance(model, str) else None,
-        response=response if isinstance(response, httpx.Response) else None,
+        status_code=status,
+        provider=provider,
+        model=model,
+        response=response,
+        retry_after=retry_after if isinstance(retry_after, (int, float)) else None,
     )
 
 
@@ -285,6 +329,7 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     # llmkit-owned 503 — what the transport boundary re-raises for every
     # litellm-native 503, so ``except`` clauses over this tuple catch it.
     ServiceUnavailableError,
+    TransientProviderError,
     # Raw litellm-native 503 — matches in ``isinstance`` classification only
     # (see the stand-in's docstring); kept so a host's own litellm call
     # wrapped in ``with_retries`` still retries its 503s. The lazy stand-in
@@ -400,10 +445,10 @@ def validation_failure_summary(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-# Schema-validation failures — retried on their own *lower* budget, distinct
-# from the transport set, so a deterministic schema failure can't consume the
-# full transport budget on doomed re-asks while a transiently-malformed JSON
-# response still earns one cross-call retry.
+# Schema-validation failures — a lower retry allowance within the overall
+# attempt ceiling, distinct from the transport set, so a deterministic schema
+# failure cannot consume the full ceiling on doomed re-asks while a
+# transiently-malformed JSON response still earns one cross-call retry.
 #   - ``StructuredOutputError``     — llmkit's own type for a structured answer
 #     that failed validation, on either the structured or the compose lane.
 #     The structured lane re-raises an exhausted parse-cause
@@ -414,8 +459,8 @@ def validation_failure_summary(exc: BaseException) -> str:
 #     escaping that loop this way — transport and permanent errors included,
 #     which llmkit's parse-only predicate declines after a single attempt (no
 #     re-ask). The retry layer unwraps it (``underlying_provider_error``) so a
-#     wrapped transport cause is charged the transport budget rather than this
-#     lower one, and a wrapped permanent error fails fast on neither.
+#     wrapped transport cause does not consume this allowance, and a wrapped
+#     permanent error fails fast. Every pass still counts toward max_attempts.
 LLM_SCHEMA_ERRORS: tuple[type[Exception], ...] = (
     StructuredOutputError,
     ValidationError,
@@ -487,7 +532,7 @@ class CircuitOpenError(LlmkitError):
 
     The breaker (opt-in via ``configure_rate_limit(breaker=True)``) is the
     aggregate guard that stops doomed work when a provider is *down*: once its
-    throttle rate over a rolling window crosses the trip threshold it opens, and
+    outage rate over a rolling window crosses the trip threshold it opens, and
     the limiter then raises this **immediately** — before any concurrency slot is
     held or RPM token deducted — instead of admitting a call that would only burn
     its retry budget into the storm. It is raised whenever the breaker won't admit
@@ -503,9 +548,8 @@ class CircuitOpenError(LlmkitError):
     :data:`LLM_TRANSPORT_ERRORS` (and so out of the default ``retry_on``):
     retrying a circuit the breaker already knows is open would defeat its
     purpose. :func:`~llmkit.retry.with_retries` treats it as a zero-budget
-    fail-fast signal, so it is never re-asked under *any* configuration —
-    including the ``retry_on=None`` ("retry on any Exception") default of a
-    direct caller — unless that caller explicitly lists the type in ``retry_on``
+    fail-fast signal: it is not re-asked unless a caller explicitly lists
+    the type in ``RetryPolicy.retry_on``
     (an explicit opt-in wins, matching :class:`OutputLimitError`). It *is* a
     member of :data:`LLM_BACKPRESSURE_ERRORS` and therefore of
     :data:`LLM_RECOVERABLE_ERRORS`, so a host that already writes
@@ -649,8 +693,8 @@ LLM_OUTPUT_LIMIT_ERRORS: tuple[type[Exception], ...] = (OutputLimitError,)
 # The full recoverable set is the union of the five subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
 # exactly what they did before even though the retry layer now budgets the
-# subsets separately (and, unless a caller opts in through ``retry_on``, never
-# retries the backpressure/output-limit subsets).
+# subsets within one ceiling (and, unless a caller opts in through
+# ``retry_on``, never retries the backpressure/output-limit subsets).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
@@ -725,12 +769,14 @@ class ResultValidationError(LlmkitError):
     callback raises this (a result that *parsed* but is *semantically* wrong —
     an empty risk register, a citation that doesn't resolve, a total that
     doesn't reconcile), the call re-rolls **within the same validation budget**
-    that governs schema-validation retries (``RetryPolicy.validation_max_attempts``),
-    so a deterministically-bad result can't burn the full transport budget.
+    that governs schema-validation retries (at most
+    ``RetryPolicy.validation_max_attempts - 1`` retries within the overall
+    ``max_attempts`` ceiling), so a deterministically-bad result cannot spend
+    the full ceiling on validation re-asks.
 
     It is in spirit a *schema-validation* failure (the content is wrong, not the
-    transport), so it is charged against the validation budget rather than the
-    transport one. On budget exhaustion the last ``ResultValidationError``
+    transport), so it consumes the validation allowance as well as the
+    overall attempt count. On budget exhaustion the last ``ResultValidationError``
     propagates to the caller, carrying the rejecting message (and, if the host
     raised it ``from`` another error, that ``__cause__``).
     """
