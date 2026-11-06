@@ -94,6 +94,9 @@ from what you installed; a source tree with no installed metadata reports
 
 Requires Python ≥ 3.12.
 
+The supported OpenAI SDK range is `>=2.20.0,<3`;
+SDK 3 uses `httpx2` and is not yet supported by llmkit's error handling.
+
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
 DeepSeek, Cerebras, and Ollama with no extra dependencies. Two providers gate their
 dependencies behind opt-in extras so hosts pay only for what they call:

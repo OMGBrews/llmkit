@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Declare the supported OpenAI SDK major.** Require `openai>=2.20.0,<3`.
+  SDK 3 uses `httpx2`, while llmkit's transport classification, retry-header
+  handling and testing helpers currently use `httpx`. Fresh installs now stay
+  within the supported major instead of admitting incompatible error objects.
+
 - **Normalize uncovered transient provider errors.** At llmkit's buffered and
   streaming provider boundaries, API errors with mapped status 500, 502 or 529
   that were outside the transport set now become public `TransientProviderError`

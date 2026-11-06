@@ -66,7 +66,11 @@ dependencies = [
     # shipped pin against the real registry, so a drift inside this range
     # fails CI, not production.
     "instructor>=1.17.0,<2",
-    "openai>=2.20.0",
+    # SDK 3 switches to httpx2; our transport classification, Retry-After
+    # response handling and public testing helpers currently use httpx.
+    # Keep fresh resolutions on the supported major until that migration
+    # is implemented and verified, including real provider error metadata.
+    "openai>=2.20.0,<3",
     # 2.11.0 is the lowest pydantic that litellm>=1.104.0 allows below Python
     # 3.14, so it is the lowest version the CI floors job (Python 3.12) can
     # install and test; llmkit itself needs nothing newer. On 3.14 litellm
