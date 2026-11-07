@@ -186,19 +186,27 @@ class GlobalRateLimiter:
                 probe; finite and positive, 30 until set.
 
         Raises:
-            ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` /
-                ``tpm`` is set to a non-positive value. A gate with capacity 0
-                would admit nothing, so without this check a ``max_concurrent=0``
-                would silently hang every subsequent LLM call.
+            ValueError: if ``max_concurrent`` is not a positive ``int``, or
+                ``rpm`` / ``tpm`` is set to anything but ``None`` or a positive
+                ``int`` (a ``bool``, a float such as ``3.5e3``, NaN and infinity
+                are all refused), or ``breaker_cooldown`` is a ``bool`` or not
+                finite and positive. A gate with capacity 0 would admit
+                nothing, so without this check a ``max_concurrent=0`` would
+                silently hang every subsequent LLM call. Nothing changes when
+                a call is refused.
         """
-        if not isinstance(max_concurrent, Unset) and max_concurrent < 1:
+        if not isinstance(max_concurrent, Unset) and (
+            type(max_concurrent) is not int or max_concurrent < 1
+        ):
             raise ValueError(f"max_concurrent must be a positive integer, got {max_concurrent!r}")
-        if not isinstance(rpm, Unset) and rpm is not None and rpm <= 0:
+        if not isinstance(rpm, Unset) and rpm is not None and (type(rpm) is not int or rpm < 1):
             raise ValueError(f"rpm must be a positive integer or None, got {rpm!r}")
-        if not isinstance(tpm, Unset) and tpm is not None and tpm <= 0:
+        if not isinstance(tpm, Unset) and tpm is not None and (type(tpm) is not int or tpm < 1):
             raise ValueError(f"tpm must be a positive integer or None, got {tpm!r}")
         if not isinstance(breaker_cooldown, Unset) and (
-            not math.isfinite(breaker_cooldown) or breaker_cooldown <= 0
+            isinstance(breaker_cooldown, bool)
+            or not math.isfinite(breaker_cooldown)
+            or breaker_cooldown <= 0
         ):
             raise ValueError(
                 f"breaker_cooldown must be finite and positive, got {breaker_cooldown!r}"

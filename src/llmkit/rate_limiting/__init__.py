@@ -303,9 +303,11 @@ def configure_rate_limit(
             and positive, 30 until set. Omitting it retains the current value.
 
     Raises:
-        ValueError: if ``max_concurrent`` is non-positive, or ``rpm`` / ``tpm``
-            is set to a non-positive value, or ``breaker_cooldown`` is not finite
-            and positive.
+        ValueError: if ``max_concurrent`` is not a positive ``int``, or ``rpm``
+            / ``tpm`` is set to anything but ``None`` or a positive ``int`` (a
+            ``bool``, a float, NaN and infinity are refused), or
+            ``breaker_cooldown`` is a ``bool`` or not finite and positive. A
+            refused call changes nothing.
     """
     GlobalRateLimiter.configure(
         max_concurrent=max_concurrent,

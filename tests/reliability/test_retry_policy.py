@@ -242,6 +242,52 @@ def test_non_positive_retry_after_cap_raises_value_error(bad_cap: float) -> None
         _ = RetryPolicy(retry_after_cap=bad_cap)
 
 
+_COUNT_FIELDS = ("max_attempts", "validation_max_attempts")
+_DURATION_FIELDS = {
+    "backoff_base_seconds": "backoff_base_seconds must be >= 0",
+    "max_backoff_seconds": "max_backoff_seconds must be > 0",
+    "retry_after_cap": "retry_after_cap must be > 0",
+}
+
+
+def _policy(**fields: object) -> RetryPolicy:
+    """Build a policy from untyped values, as config-driven host code would."""
+    return RetryPolicy(**fields)  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("name", _COUNT_FIELDS)
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True, False, 2.5, 3.0])
+def test_attempt_counts_must_be_positive_nonbool_ints(name: str, bad: object) -> None:
+    """NaN and infinity used to pass the bare ``< 1`` check, a fractional count
+    ran a different number of passes on the stream and non-stream loops, and
+    ``True`` read as one attempt. Each is now refused at construction."""
+    with pytest.raises(ValueError, match=f"{name} must be >= 1"):
+        _ = _policy(**{name: bad})
+
+
+@pytest.mark.parametrize(("name", "prefix"), list(_DURATION_FIELDS.items()))
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), True, False])
+def test_durations_must_be_finite_nonbool(name: str, prefix: str, bad: object) -> None:
+    """A nonfinite duration disabled the guard it belongs to (NaN skipped the
+    backoff or the cap; infinity let ``Retry-After: inf`` sleep forever), and a
+    ``bool`` read as a number of seconds. Each is now refused at construction."""
+    with pytest.raises(ValueError, match=prefix):
+        _ = _policy(**{name: bad})
+
+
+def test_valid_numeric_domains_still_construct() -> None:
+    """Integer durations and the zero-base opt-out stay valid."""
+    policy = RetryPolicy(
+        max_attempts=2000,
+        validation_max_attempts=1,
+        backoff_base_seconds=0,
+        max_backoff_seconds=5,
+        retry_after_cap=1,
+    )
+    assert policy.backoff_base_seconds == 0
+    assert policy.max_backoff_seconds == 5
+
+
 # --- transient set excludes auth / non-429 4xx ---------------------------
 
 
