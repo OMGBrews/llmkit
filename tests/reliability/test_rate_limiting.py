@@ -1413,6 +1413,28 @@ def test_configure_rejects_nonpositive_max_concurrent() -> None:
         configure_rate_limit(max_concurrent=-1)
 
 
+@pytest.mark.parametrize("name", ["max_concurrent", "rpm", "tpm"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 2.5, 3.5e3, True, False, 0, -1])
+def test_configure_rejects_non_int_limits_without_changing_config(name: str, bad: object) -> None:
+    """NaN made ``max_concurrent`` wait forever and disabled an ``rpm``/``tpm``
+    bucket, infinity overflowed the adaptive limit on the first throttle, and a
+    float or ``bool`` slipped through as a number. Each is refused before any
+    setting changes."""
+    configure_rate_limit(max_concurrent=3, rpm=120, tpm=90_000)
+    before = get_rate_limit_config()
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        configure_rate_limit(**{name: bad})  # pyright: ignore[reportArgumentType]
+    assert get_rate_limit_config() == before
+
+
+def test_configure_rejects_bool_breaker_cooldown() -> None:
+    """``breaker_cooldown=True`` is not one second; it is a configuration error."""
+    before = get_rate_limit_config()
+    with pytest.raises(ValueError, match="breaker_cooldown"):
+        configure_rate_limit(breaker_cooldown=True)
+    assert get_rate_limit_config() == before
+
+
 async def test_rpm_off_by_default_creates_no_bucket() -> None:
     """With no rpm/tpm configured, acquiring creates no rate buckets (byte-identical)."""
     async with GlobalRateLimiter.acquire_async("openai"):

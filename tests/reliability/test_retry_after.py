@@ -56,6 +56,14 @@ class _ErrWithRetryAfter(Exception):
         self.retry_after: float = retry_after
 
 
+class _ErrWithRetryAfterAndHeaders(_ErrWithRetryAfter):
+    """A ``retry_after`` attribute plus a ``response`` carrying headers."""
+
+    def __init__(self, retry_after: float, headers: dict[str, str]) -> None:
+        super().__init__(retry_after)
+        self.response: httpx.Response = httpx.Response(429, headers=headers, request=_request())
+
+
 async def _drain(stream: AsyncIterator[str]) -> list[str]:
     return [chunk async for chunk in stream]
 
@@ -122,6 +130,37 @@ def test_negative_seconds_clamped_to_zero() -> None:
     assert _retry_after_seconds(_rate_limit({"retry-after": "-5"})) == 0.0
 
 
+@pytest.mark.parametrize("raw", ["inf", "nan", "-inf", "1e400", "Infinity"])
+def test_nonfinite_retry_after_header_is_unparseable(raw: str) -> None:
+    """A ``retry-after`` that parses to NaN or infinity is no wait at all."""
+    assert _retry_after_seconds(_rate_limit({"retry-after": raw})) is None
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf"])
+def test_nonfinite_retry_after_ms_header_is_unparseable(raw: str) -> None:
+    """A nonfinite ``retry-after-ms`` alone yields ``None``."""
+    assert _retry_after_seconds(_rate_limit({"retry-after-ms": raw})) is None
+
+
+def test_nonfinite_retry_after_ms_falls_through_to_retry_after() -> None:
+    """A nonfinite ``retry-after-ms`` no longer shadows a valid ``retry-after``."""
+    headers = {"retry-after-ms": "nan", "retry-after": "5"}
+    assert _retry_after_seconds(_rate_limit(headers)) == 5.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_attribute_falls_through_to_headers(value: float) -> None:
+    """A nonfinite ``retry_after`` attribute is skipped, so the header is read."""
+    exc = _ErrWithRetryAfterAndHeaders(value, {"retry-after": "5"})
+    assert _retry_after_seconds(exc) == 5.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_nonfinite_attribute_alone_returns_none(value: float) -> None:
+    """With nothing else to read, a nonfinite attribute yields ``None``."""
+    assert _retry_after_seconds(_ErrWithRetryAfter(value)) is None
+
+
 def test_retry_after_unwraps_instructor_wrapper() -> None:
     """A structured-call throttle wrapped in ``InstructorRetryException`` still
     surfaces its ``Retry-After`` — the parser unwraps first (D0)."""
@@ -182,6 +221,37 @@ async def test_capped_at_retry_after_cap(monkeypatch: pytest.MonkeyPatch) -> Non
         )
 
     assert slept == [60.0]
+
+
+@pytest.mark.asyncio
+async def test_infinite_header_falls_back_to_exponential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``Retry-After: inf`` is ignored, so the computed exponential runs.
+
+    The contrast with ``test_capped_at_retry_after_cap``: a finite hostile value
+    is capped, a nonfinite one is not a directive at all. Before the fix the
+    infinity reached ``min(..., retry_after_cap)`` and slept the full cap (and
+    with ``retry_after_cap=inf`` it would have slept forever).
+    """
+    slept: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    async def _fn() -> str:
+        raise rate_limit_error(retry_after=float("inf"))
+
+    with pytest.raises(openai.RateLimitError):
+        _ = await with_retries(
+            _fn,
+            policy=RetryPolicy(
+                max_attempts=2, retry_on=(openai.RateLimitError,), backoff_base_seconds=0.5
+            ),
+        )
+
+    assert slept == [0.5]  # the attempt-1 exponential ceiling, not 60
 
 
 @pytest.mark.asyncio

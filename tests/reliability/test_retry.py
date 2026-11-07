@@ -14,7 +14,7 @@ import random
 
 import pytest
 
-from llmkit.retry import RetryPolicy, retry_progress_callback, with_retries
+from llmkit.retry import RetryPolicy, handle_retry_failure, retry_progress_callback, with_retries
 
 
 class _Callback:
@@ -366,3 +366,64 @@ async def test_retry_progress_callback_resets_on_exit() -> None:
 
     assert cb_inner.calls == [("inner", 1, 2, "always")]
     assert cb_outer.calls == [("outer", 1, 2, "always")]
+
+
+@pytest.mark.parametrize("attempt", [1024, 1025, 1026, 10**6])
+@pytest.mark.asyncio
+async def test_huge_attempt_number_sleeps_the_cap_without_overflow(
+    monkeypatch: pytest.MonkeyPatch, attempt: int
+) -> None:
+    """A late attempt under a large valid budget sleeps ``max_backoff_seconds``.
+
+    The exponential ceiling used to be an ``int`` power of two scaled to a
+    float, which raised ``OverflowError`` from attempt 1025 instead of being
+    capped; the cap must apply however large the attempt number grows.
+    """
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    await handle_retry_failure(
+        tag="x",
+        attempt=attempt,
+        max_attempts=attempt + 1,
+        error=ValueError("nope"),
+        backoff_base_seconds=0.5,
+        max_backoff_seconds=30.0,
+    )
+
+    assert slept == [30.0]
+
+
+@pytest.mark.asyncio
+async def test_early_attempt_ceilings_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The overflow-safe power yields the same ceilings for ordinary attempts."""
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    def _max_jitter(_lo: float, hi: float) -> float:
+        return hi
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(random, "uniform", _max_jitter)
+
+    for attempt in range(1, 6):
+        await handle_retry_failure(
+            tag="x",
+            attempt=attempt,
+            max_attempts=6,
+            error=ValueError("nope"),
+            backoff_base_seconds=0.5,
+            max_backoff_seconds=30.0,
+        )
+
+    assert slept == [0.5, 1.0, 2.0, 4.0, 8.0]

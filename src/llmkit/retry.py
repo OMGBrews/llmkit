@@ -39,6 +39,7 @@ multiplying — while a *distinct* call in its own task (spawned via
 import asyncio
 import contextvars
 import logging
+import math
 import random
 import uuid
 import warnings
@@ -47,7 +48,7 @@ from contextlib import aclosing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, cast, final
+from typing import Protocol, final
 
 import httpx
 
@@ -91,18 +92,22 @@ def _as_float(value: object) -> float | None:
     Accepts an ``int``/``float`` (an attribute) or a numeric ``str`` (a header);
     returns ``None`` for anything else (a non-numeric string, ``None``, an odd
     type). ``bool`` is rejected explicitly so a stray ``True`` is not read as
-    ``1.0``.
+    ``1.0``. A value that parses to NaN or infinity (``"inf"``, ``"nan"``,
+    ``"1e400"``, a nonfinite attribute) is unparseable too: it is no wait a
+    server could mean, and passing it on would let it wedge or skip the sleep.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        parsed = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value.strip())
+            parsed = float(value.strip())
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _http_date_delay(raw: str) -> float | None:
@@ -145,6 +150,9 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     1. a numeric ``retry_after`` attribute (the OpenAI/LiteLLM SDK surface);
     2. a ``retry-after-ms`` header (milliseconds), divided to seconds;
     3. a ``retry-after`` header, as delta-seconds or an HTTP-date.
+
+    A nonfinite value (NaN or infinity) from any source is skipped exactly like
+    an unparseable one, so the next source is read; nothing is clamped.
 
     Returns non-negative seconds, or ``None`` when no parseable value is present
     (a ``ValidationError``/timeout/network error carries none) — the caller then
@@ -245,22 +253,23 @@ class RetryPolicy:
 
     Attributes:
         max_attempts: Total outer attempts across all error classes, including
-            the first (``1`` = no retry). Defaults to ``3``.
+            the first (``1`` = no retry). Defaults to ``3``. Must be an
+            ``int`` >= 1; a ``bool`` or a float such as ``3.0`` is rejected.
         validation_max_attempts: A value of N permits at most N-1 retries caused
             by validation failures, within ``max_attempts``. ``1`` permits none;
             the default ``2`` permits one. A larger value cannot raise the total
-            ceiling.
+            ceiling. Must be an ``int`` >= 1, like ``max_attempts``.
         backoff_base_seconds: Full-jitter backoff base; the sleep before
             retry *n* is a random delay in
-            ``[0, min(base * 2**(n-1), max_backoff_seconds)]``. Must be >= 0
-            (``0`` disables the computed backoff); a negative base would jitter
+            ``[0, min(base * 2**(n-1), max_backoff_seconds)]``. Must be finite
+            and >= 0 (``0`` disables the computed backoff); a negative base would jitter
             a server ``Retry-After`` *backwards* into an immediate retry.
         max_backoff_seconds: Ceiling on any single backoff sleep. Caps the
             exponential term so a large ``max_attempts`` can't grow the
             worst-case sleep unboundedly (at the default base, attempt 15
             would otherwise permit a multi-hour sleep). Defaults to 30
             seconds — generous spacing for transient-error recovery while
-            bounding the worst case. Must be > 0; to disable backoff
+            bounding the worst case. Must be finite and > 0; to disable backoff
             entirely, set ``backoff_base_seconds=0`` instead.
         retry_after_cap: Ceiling on a *server-supplied* ``Retry-After`` wait
             (seconds). When a retried provider error carries ``Retry-After``,
@@ -270,7 +279,7 @@ class RetryPolicy:
             ``max_backoff_seconds`` (which caps the library's *own* exponential):
             this bounds a value the provider chose, so a hostile
             ``Retry-After: 99999`` can't wedge a call while a legitimate 45 s
-            directive is still respected. Defaults to 60 s; must be > 0.
+            directive is still respected. Defaults to 60 s; must be finite and > 0.
         retry_on: The exception types treated as transient *transport*
             errors, retried against ``max_attempts``. Anything outside both
             sets (e.g. a programming error) propagates immediately. Defaults
@@ -289,18 +298,39 @@ class RetryPolicy:
     validation_retry_on: tuple[type[BaseException], ...] = field(default=LLM_SCHEMA_ERRORS)
 
     def __post_init__(self) -> None:
-        if self.max_attempts < 1:
-            raise ValueError(f"max_attempts must be >= 1, got {self.max_attempts}")
-        if self.validation_max_attempts < 1:
-            raise ValueError(
-                f"validation_max_attempts must be >= 1, got {self.validation_max_attempts}"
-            )
-        if self.backoff_base_seconds < 0:
-            raise ValueError(f"backoff_base_seconds must be >= 0, got {self.backoff_base_seconds}")
-        if self.max_backoff_seconds <= 0:
-            raise ValueError(f"max_backoff_seconds must be > 0, got {self.max_backoff_seconds}")
-        if self.retry_after_cap <= 0:
-            raise ValueError(f"retry_after_cap must be > 0, got {self.retry_after_cap}")
+        _check_count("max_attempts", self.max_attempts)
+        _check_count("validation_max_attempts", self.validation_max_attempts)
+        _check_duration("backoff_base_seconds", self.backoff_base_seconds, allow_zero=True)
+        _check_duration("max_backoff_seconds", self.max_backoff_seconds, allow_zero=False)
+        _check_duration("retry_after_cap", self.retry_after_cap, allow_zero=False)
+
+
+def _check_count(name: str, value: int) -> None:
+    """Reject an attempt count that is not a positive ``int``.
+
+    ``type(...) is int`` (not ``isinstance``) refuses ``bool``, which would
+    otherwise read as ``1``, as well as floats such as ``2.5`` or ``3.0`` and
+    integer-like foreign types. The same rule as
+    :class:`~llmkit.logging.LogDeliveryPolicy`'s ``queue_capacity``.
+    """
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be >= 1 (an int, not a bool), got {value!r}")
+
+
+def _check_duration(name: str, value: float, *, allow_zero: bool) -> None:
+    """Reject a duration that is a ``bool``, nonfinite, or below its floor.
+
+    NaN slips past every comparison and infinity defeats every cap, so either
+    would silently disable the guard the field exists for. An ``int`` is fine.
+    """
+    bound = ">= 0" if allow_zero else "> 0"
+    if (
+        isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+        or (value == 0 and not allow_zero)
+    ):
+        raise ValueError(f"{name} must be {bound} (finite, not a bool), got {value!r}")
 
 
 #: The budget applied when a call function's ``retry`` argument is left at
@@ -506,6 +536,10 @@ async def handle_retry_failure(
     (default 30s), so a large attempt budget can't grow the worst-case sleep
     unboundedly. With no ``Retry-After`` and ``backoff_base_seconds == 0`` there
     is no sleep — byte-identical to the pre-feature behaviour.
+
+    The keyword budgets are trusted as given: the library passes a validated
+    :class:`RetryPolicy`'s fields, and a direct caller is responsible for
+    passing values inside that policy's domains.
     """
     logger.warning("%s: attempt %d/%d failed: %s", tag, attempt, max_attempts, error)
     callback = _progress_callback.get()
@@ -525,13 +559,13 @@ async def handle_retry_failure(
         delay = min(retry_after, retry_after_cap) + random.uniform(0, backoff_base_seconds)
         await asyncio.sleep(delay)
     elif backoff_base_seconds > 0:
-        # int ** int widens to Any in the stubs (negative exponents yield
-        # float); attempt >= 1 keeps the exponent non-negative, so cast the
-        # power back to the int it really is before scaling to a float ceiling.
         # The exponential ceiling is capped at max_backoff_seconds so late
-        # attempts under a large budget can't sleep for hours.
+        # attempts under a large budget can't sleep for hours. The power is a
+        # float on an exponent capped at 1023, the largest a float power of two
+        # can hold: an int power would overflow converting to float from
+        # attempt 1025, and an infinite product is harmless inside min().
         ceiling = min(
-            backoff_base_seconds * cast("int", 2 ** (attempt - 1)),
+            backoff_base_seconds * 2.0 ** min(attempt - 1, 1023),
             max_backoff_seconds,
         )
         await asyncio.sleep(random.uniform(0, ceiling))

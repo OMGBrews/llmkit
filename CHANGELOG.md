@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Reliability budgets reject values that defeat their bounds.**
+  `RetryPolicy` now requires `max_attempts` and `validation_max_attempts` to be
+  positive integers (not bools or floats), and `backoff_base_seconds`,
+  `max_backoff_seconds` and `retry_after_cap` to be finite and not bools. NaN
+  used to slip past every comparison, so it skipped the computed backoff or
+  disabled a cap, and a fractional count ran a different number of passes on
+  the buffered and streaming loops. `configure_rate_limit` applies the same
+  rule to `max_concurrent`, `rpm` and `tpm`, and rejects a bool
+  `breaker_cooldown`; a refused call changes nothing. A `Retry-After` value
+  that parses to NaN or infinity, from the attribute or either header, is
+  now treated as unparseable, so the next source is read and otherwise the
+  computed exponential runs, where `Retry-After: inf` used to sleep the full
+  cap (or forever with an infinite cap). The exponential ceiling no longer
+  raises `OverflowError` from retry 1025 under a large `max_attempts`; it
+  sleeps `max_backoff_seconds`.
+  **Compatibility:** values previously accepted now raise `ValueError`: NaN,
+  infinity and bools for any of these settings, fractional or float attempt
+  counts such as `3.0`, and float `max_concurrent`, `rpm` or `tpm` values
+  such as `rpm=3.5e3`. A host building these from configuration should
+  convert the value to an `int` (or a finite float) at its source.
+
 - **Declare the supported OpenAI SDK major.** Require `openai>=2.20.0,<3`.
   SDK 3 uses `httpx2`, while llmkit's transport classification, retry-header
   handling and testing helpers currently use `httpx`. Fresh installs now stay
