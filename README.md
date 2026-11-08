@@ -423,13 +423,13 @@ Three differences from `tool_llm_call`, all deliberate:
   checker enforces it rather than a runtime raise. Use the portable two-step
   pattern (tool loop, then `structured_llm_call`).
 - **Retries stop at the first yielded item.** Once anything has reached you,
-  a mid-stream error propagates unretried. An all-malformed round raises
-  `ToolArgumentError` without a re-ask by default, even if it yielded nothing:
-  the default stream policy excludes that error. A custom
-  `validation_retry_on` may include it for a pre-yield retry within the
-  validation allowance and overall attempt ceiling. A round in which only
-  some calls are malformed behaves as on the buffered lane — survivors on
-  `tool_calls`, failures on `invalid_calls`.
+  a mid-stream error propagates unretried. A round in which every call is
+  malformed and no prose was streamed has yielded nothing, so it is re-asked
+  with the buffered lane's repair history, within `validation_max_attempts`
+  and the overall attempt ceiling. If prose was streamed first, it raises
+  `ToolArgumentError` unretried, whatever the policy lists. A round in which
+  only some calls are malformed behaves as on the buffered lane — survivors
+  on `tool_calls`, failures on `invalid_calls`.
 - **Usage is real, not null.** Like the plain text stream, this lane requests
   `stream_options={"include_usage": True}`, so `result.usage`, the log record's
   `usage`, and the token-rate limiter's debit are all populated. Measured on
@@ -454,7 +454,7 @@ for error in result.invalid_calls:  # what the model got wrong, if anything
     log.warning("dropped %s: %s", error.tool_name, error)
 ```
 
-`result.to_message()` is built from `tool_calls` alone, so the assistant turn you append names only the calls you can answer — pair each with a `tool_result_message` and the history has no dangling `tool_call_id` for the provider to reject. A buffered round in which **every** requested call is malformed is re-asked within `RetryPolicy.validation_max_attempts` with the rejected assistant tool-call turn and one `ERROR:` tool result per call, naming the tool, call id and validation error, followed by a user instruction to issue a corrected tool call. Only the latest rejected round is attached; the original prompt appears once. Non-object or invalid JSON arguments are replayed as `{}`, with the raw arguments in the error result; unknown tools are named with the offered alternatives. If any call lacks an id or tool name, the re-ask keeps the original history because the round cannot be paired with results. Exhausting the budget raises `ToolArgumentError`, whose `round_errors` holds every rejection. Strict JSON validation is unchanged. The streaming lane still raises without re-asking. Dropped calls also appear under `invalid_calls` in the call's log record, so a round that quietly lost one never reads as a clean round.
+`result.to_message()` is built from `tool_calls` alone, so the assistant turn you append names only the calls you can answer — pair each with a `tool_result_message` and the history has no dangling `tool_call_id` for the provider to reject. A round in which **every** requested call is malformed is re-asked within `RetryPolicy.validation_max_attempts` with the rejected assistant tool-call turn and one `ERROR:` tool result per call, naming the tool, call id and validation error, followed by a user instruction to issue a corrected tool call. Only the latest rejected round is attached; the original prompt appears once. Non-object or invalid JSON arguments are replayed as `{}`, with the raw arguments in the error result; unknown tools are named with the offered alternatives. If any call lacks an id or tool name, the re-ask keeps the original history because the round cannot be paired with results. Exhausting the budget raises `ToolArgumentError`, whose `round_errors` holds every rejection. Strict JSON validation is unchanged. The streaming lane re-asks the same way, but only when the round streamed no prose first; otherwise it raises `ToolArgumentError` unretried. Dropped calls also appear under `invalid_calls` in the call's log record, so a round that quietly lost one never reads as a clean round.
 
 ### Telling the model a tool failed
 
@@ -1749,7 +1749,7 @@ Every call function (`structured_llm_call`, `structured_llm_call_sync`, `text_ll
 
 - **Transport errors** (`LLM_TRANSPORT_ERRORS`: curated rate-limit, transient server, network and timeout classes) may retry while the overall ceiling permits. A timed-out request gets a fresh per-request `timeout` on the next attempt. This is class-based classification, not a promise to retry every HTTP 5xx error.
 - **Schema-validation errors** (`LLM_SCHEMA_ERRORS`: llmkit's `StructuredOutputError`, pydantic `ValidationError`, instructor `InstructorRetryException`) may cause at most `validation_max_attempts - 1` retries, **one by default**. Those retries still fit inside `max_attempts`; a transport error between validation failures does not reset the allowance. The retry layer unwraps instructor errors before classifying them: a wrapped transport error does not consume the validation allowance, and a wrapped permanent error such as 401/400/403 fails immediately.
-- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) use the same validation-retry allowance within the overall ceiling in `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`. Buffered re-asks attach the rejected calls and validation errors when every call has an id and tool name. `tool_llm_call_stream` and its sync form do not re-ask them by default — see the streaming caveat below.
+- **Tool-argument errors** (`LLM_TOOL_ERRORS`: `ToolArgumentError`, raised for a tool round in which every requested call is malformed) use the same validation-retry allowance within the overall ceiling in `tool_llm_call` and `tool_llm_call_sync`, with or without `output_schema=`, and in `tool_llm_call_stream` and its sync form while nothing has been yielded — see the streaming caveat below. Re-asks attach the rejected calls and validation errors when every call has an id and tool name. The allowance applies whatever `validation_retry_on` lists; opt out with `validation_max_attempts=1`, `max_attempts=1` or `NO_RETRY`.
 - **Output-limit truncations** (`LLM_OUTPUT_LIMIT_ERRORS`: llmkit's own `OutputLimitError`, raised when a structured or text completion, or a compose call's final answer, is cut off by the output-token limit, `finish_reason='length'`) get **zero budget**: a re-ask with an identical token budget can only truncate again (the motivating production failure was a degenerate repetition loop that burned to the provider's 65k-token ceiling on the original ask *and* on every blind re-ask, turning a seconds-long call into minutes of doomed generation). The error carries `model` / `max_tokens` / `completion_tokens`, plus `diagnostics` — the partial answer text, finish reason and token counts, also written to the call's YAML log (see [Logging](#logging-agent-readable-by-default)). A truncation does not say *why* it happened: the answer may legitimately need more room, the model may be repeating itself, reasoning may have consumed the budget (`completion_tokens` can include reasoning tokens), or the prompt may lack the evidence to finish. Read the partial text before raising the cap or retrying. Fail-fast is the default; an explicit `retry_on` listing the type opts back into retries — except that a text stream which has already yielded text is never replayed (see the streaming caveat below).
 - **Backpressure** (`LLM_BACKPRESSURE_ERRORS`: llmkit's own `CircuitOpenError`, raised by the opt-in [circuit breaker](#circuit-breaker)) also gets **zero budget**: re-asking a circuit already known to be open is doomed by construction.
 
@@ -1828,7 +1828,7 @@ selects these transport failures; import the class from `llmkit`. An empty tuple
 or an unrelated type excludes them. The default transport policy already
 includes the new class.
 
-**Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. The tool stream's default policy excludes `ToolArgumentError`, so an all-malformed round is not re-asked by default. A custom `validation_retry_on` may include it for a pre-yield retry within the validation allowance and overall ceiling; it cannot permit replay after an item was yielded. See [Streaming a tool turn](#streaming-a-tool-turn).
+**Streaming caveat:** `text_llm_call_stream`, `tool_llm_call_stream` and their sync forms can only retry a transient failure that happens *before the first item reaches the caller*. Once anything has been yielded, a mid-stream error propagates unretried — a partially-consumed stream can't be safely restarted. The tool stream re-asks an all-malformed round within the validation allowance and overall ceiling only when that round yielded nothing; no policy permits replay after an item was yielded. See [Streaming a tool turn](#streaming-a-tool-turn).
 
 ### Wrapping your own work: `with_retries()`
 
@@ -1918,7 +1918,7 @@ configure_llm_client(previous)          # put back whatever was registered befor
 The fake is a plain function or a coroutine function. It receives one frozen `TransportRequest` per provider round trip, carrying:
 
 - **identity:** `feature`, `label`, `kind` (`"structured"`, `"text"`, `"tool"`, `"text_stream"` or `"tool_stream"`), and the `call_id` and `attempt` the call log records, so a retried call reaches the fake once per attempt;
-- **inputs:** `prompt` as you passed it, `messages` as sent (structured output may add schema instructions or failed answers; buffered tool repair adds the rejected round and its errors), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema repair or a buffered tool re-ask carrying repair history;
+- **inputs:** `prompt` as you passed it, `messages` as sent (structured output may add schema instructions or failed answers; tool repair adds the rejected round and its errors), `output_schema`, `tools` and `tool_choice`, and `repair`, which marks a structured call's in-call schema repair or a tool re-ask, buffered or streamed, carrying repair history;
 - **effective settings:** the routed `model`, `provider`, `temperature`, `max_tokens`, `reasoning_effort` and `timeout`.
 
 It never carries credentials or provider-native request settings.

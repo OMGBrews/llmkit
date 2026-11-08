@@ -543,8 +543,9 @@ def parse_tool_calls(
     :func:`~llmkit.tool_llm_call_stream` both terminate in a
     :class:`~llmkit.ToolCallResult`, so parsing once here is what keeps the
     buffered and streamed lanes' salvage semantics from drifting apart. The
-    streaming lane cannot re-ask on the validation budget (a partially consumed
-    stream cannot be restarted), so the all-malformed raise reaches its caller
+    streaming lane re-asks on the same validation budget only while nothing
+    has been yielded (a partially consumed stream cannot be restarted), so an
+    all-malformed round that followed streamed prose reaches its caller
     unretried — the contract is the same, its enforcement differs.
     """
     parsed: list[ToolCall] = []

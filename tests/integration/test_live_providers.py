@@ -1430,8 +1430,10 @@ async def test_live_tool_stream_reports_cost(provider: Provider) -> None:
     strictly, so a number written as text is rejected for an ``int`` field (the
     structured-output contract audit's item 15, shipped as a breaking change).
     Ollama's default model wrote the integer ``add`` tool's arguments as text in
-    6 of 10 direct calls (measured 2026-11-03), and the streamed lane cannot
-    re-ask, so an integer tool made this test fail intermittently on Ollama.
+    6 of 10 direct calls (measured 2026-11-03). The streamed lane could not
+    re-ask then, so an integer tool made this test fail intermittently on
+    Ollama; a re-ask now repairs most such rounds but adds a request and can
+    still fail twice.
     The test measures price recording and never reads the arguments, so do not
     reintroduce an integer tool here. ``tool_choice`` stays unset because the
     Ollama route cannot force a tool.

@@ -27,7 +27,7 @@ beside populated ``tool_calls``; restored, it passes.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import cast, final
 from unittest.mock import MagicMock, patch
@@ -38,6 +38,7 @@ from pydantic import BaseModel
 from llmkit import (
     NO_RETRY,
     Provider,
+    RetryPolicy,
     TextDeltaEvent,
     ToolArgumentError,
     ToolCallResult,
@@ -47,10 +48,11 @@ from llmkit import (
     flush_llm_logs_async,
     make_provider,
     tool_llm_call_stream,
+    tool_llm_call_stream_sync,
 )
 from llmkit._litellm import StreamedToolTurn
 from llmkit.calls import STREAM_ABANDONED_ERROR
-from llmkit.testing import FakeToolCall, Reply, TransportRequest, install
+from llmkit.testing import FakeToolCall, Reply, TransportRequest, install, timeout_error
 from llmkit.tools import TokenUsage, ToolChoice
 from tests._support import capturing_sink, provider_mock, quiet_logging
 
@@ -204,18 +206,184 @@ async def test_partly_malformed_round_keeps_the_good_calls() -> None:
     assert [error.call_id for error in result.invalid_calls] == ["call_bad"]
 
 
-async def test_all_malformed_round_raises_and_is_not_retried() -> None:
-    """The whole-round contract holds, but the stream cannot re-ask.
+# The default budgets (transport 3, validation 2) without the backoff sleeps.
+_NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
 
-    ``with_retries_stream`` is a transport-only budget, so ``ToolArgumentError``
-    reaches the caller after exactly one transport call — the documented
-    divergence from the buffered lane's ``tool_validation_budget`` re-ask.
-    """
+# Strictly validated, so a quoted integer is rejected but the arguments are
+# still a JSON object the repair turn can replay.
+_BAD_ARGS = '{"left": "1", "right": 1}'
+
+
+def _malformed_then_good() -> Callable[[TransportRequest], Reply]:
+    replies = iter(
+        [
+            Reply(tool_calls=[_add_call(_BAD_ARGS, id="call_bad")]),
+            Reply(tool_calls=[_add_call('{"left": 1, "right": 2}', id="call_good")]),
+        ]
+    )
+    return lambda _request: next(replies)
+
+
+def _assert_repaired_retry(requests: Sequence[TransportRequest]) -> None:
+    """Two requests; the second re-sent the prompt plus the rejected round."""
+    assert len(requests) == 2
+    first, second = requests
+    assert first.repair is False
+    assert second.repair is True
+    assert second.prompt == first.prompt == "add"
+    user, assistant, error, reminder = second.messages
+    assert user == {"role": "user", "content": "add"}
+    assert assistant == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_bad",
+                "type": "function",
+                "function": {"name": "add", "arguments": _BAD_ARGS},
+            }
+        ],
+    }
+    assert error["role"] == "tool"
+    assert error["tool_call_id"] == "call_bad"
+    assert error["content"].startswith("ERROR: ")
+    assert reminder["role"] == "user"
+    assert "Retry the rejected tool request" in cast("str", reminder["content"])
+
+
+async def test_all_malformed_round_is_re_asked_with_repair_before_any_yield() -> None:
+    """A tool-only round whose every call is malformed has yielded nothing, so
+    it takes the buffered lane's validation allowance: a second request that
+    carries the rejected call and its error, then the corrected turn."""
+    with install(_malformed_then_good()) as installed, capturing_sink() as records:
+        events = [
+            event
+            async for event in tool_llm_call_stream(
+                "add", [_add_tool()], feature="chat", retry=_NO_BACKOFF
+            )
+        ]
+
+    assert len(events) == 1
+    result = events[0]
+    assert isinstance(result, ToolCallResult)
+    assert result.tool_calls[0].validated == _AdditionArgs(left=1, right=2)
+    _assert_repaired_retry(installed.requests)
+    # One logical call across both attempts, and the repair attempt's record
+    # shows what was actually sent.
+    first, second = records
+    assert first.call_id == second.call_id
+    assert (first.attempt, second.attempt) == (1, 2)
+    assert first.error is not None and first.error.startswith("ToolArgumentError")
+    assert second.error is None
+    assert first.prompt == "add"
+    sent = installed.requests[1].messages
+    assert isinstance(second.prompt, list)
+    logged = second.prompt
+    assert len(logged) == 4
+    assert logged[:2] == list(sent[:2])
+    assert cast("dict[str, object]", cast("object", logged[2]))["tool_call_id"] == "call_bad"
+    assert logged[3] == sent[3]
+
+
+def test_sync_form_re_asks_an_all_malformed_round_the_same_way() -> None:
+    with install(_malformed_then_good()) as installed:
+        events = list(
+            tool_llm_call_stream_sync("add", [_add_tool()], feature="chat", retry=_NO_BACKOFF)
+        )
+
+    assert len(events) == 1
+    assert isinstance(events[0], ToolCallResult)
+    assert events[0].tool_calls[0].validated == _AdditionArgs(left=1, right=2)
+    _assert_repaired_retry(installed.requests)
+
+
+async def test_all_malformed_rounds_exhaust_the_validation_allowance() -> None:
+    """Two malformed rounds spend the default validation allowance of two; the
+    error surfaces and no result, so nothing a host could execute, was ever
+    yielded."""
+    reply = Reply(tool_calls=[_add_call("{not json", id="call_bad")])
+    events: list[TextDeltaEvent | ToolCallResult] = []
+    with install(lambda _request: reply) as installed, pytest.raises(ToolArgumentError):
+        async for event in tool_llm_call_stream(
+            "add", [_add_tool()], feature="chat", retry=_NO_BACKOFF
+        ):
+            events.append(event)
+
+    assert events == []
+    assert len(installed.requests) == 2
+    assert installed.requests[1].repair is True
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param(RetryPolicy(max_attempts=1), id="max_attempts=1"),
+        pytest.param(NO_RETRY, id="NO_RETRY"),
+        pytest.param(
+            RetryPolicy(validation_max_attempts=1, backoff_base_seconds=0.0),
+            id="validation_max_attempts=1",
+        ),
+    ],
+)
+async def test_all_malformed_round_respects_the_attempt_ceiling(policy: RetryPolicy) -> None:
     reply = Reply(tool_calls=[_add_call("{not json", id="call_bad")])
     with install(lambda _request: reply) as installed, pytest.raises(ToolArgumentError):
-        _ = [event async for event in tool_llm_call_stream("add", [_add_tool()], feature="chat")]
+        _ = [
+            event
+            async for event in tool_llm_call_stream(
+                "add", [_add_tool()], feature="chat", retry=policy
+            )
+        ]
 
     assert len(installed.requests) == 1
+
+
+async def test_prose_before_an_all_malformed_round_forbids_the_re_ask() -> None:
+    """Once a delta has reached the consumer the stream cannot be restarted,
+    even when the caller explicitly lists the error as retryable."""
+    reply = Reply(chunks=["Adding."], tool_calls=[_add_call("{not json", id="call_bad")])
+    policy = RetryPolicy(
+        retry_on=(ToolArgumentError,),
+        validation_retry_on=(ToolArgumentError,),
+        backoff_base_seconds=0.0,
+    )
+    events: list[TextDeltaEvent | ToolCallResult] = []
+    with install(lambda _request: reply) as installed, pytest.raises(ToolArgumentError):
+        async for event in tool_llm_call_stream("add", [_add_tool()], feature="chat", retry=policy):
+            events.append(event)
+
+    assert events == [TextDeltaEvent("Adding.")]
+    assert len(installed.requests) == 1
+
+
+async def test_a_transport_failure_keeps_the_previous_repair() -> None:
+    """Only a received round replaces the repair history, as on the buffered
+    lane: a transport failure between rounds leaves it for the next attempt."""
+    answers = iter(
+        [
+            Reply(tool_calls=[_add_call(_BAD_ARGS, id="call_bad")]),
+            None,
+            Reply(tool_calls=[_add_call('{"left": 1, "right": 2}', id="call_good")]),
+        ]
+    )
+
+    def _answer(_request: TransportRequest) -> Reply:
+        reply = next(answers)
+        if reply is None:
+            raise timeout_error()
+        return reply
+
+    with install(_answer) as installed:
+        events = [
+            event
+            async for event in tool_llm_call_stream(
+                "add", [_add_tool()], feature="chat", retry=_NO_BACKOFF
+            )
+        ]
+
+    assert isinstance(events[-1], ToolCallResult)
+    assert [request.repair for request in installed.requests] == [False, True, True]
+    assert installed.requests[2].messages == installed.requests[1].messages
 
 
 async def test_a_failed_attempt_records_the_provider_error() -> None:

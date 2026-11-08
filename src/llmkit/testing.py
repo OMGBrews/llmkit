@@ -111,12 +111,13 @@ class TransportRequest:
         attempt: The absolute attempt number, the same as the call log
             record's. A retried call reaches the fake once per attempt.
         repair: ``True`` for a structured call's in-attempt schema repair or
-            a buffered tool re-ask carrying rejected calls and their errors.
+            a tool re-ask, buffered or streamed, carrying rejected calls and
+            their errors.
         prompt: The caller's prompt as given: a string, or a tuple of messages,
             without any library-added repair history.
         messages: The messages sent to the provider. They differ from
             ``prompt`` when structured output adds schema instructions or a
-            failed answer, or a buffered tool re-ask adds a rejected round.
+            failed answer, or a tool re-ask adds a rejected round.
         output_schema: The structured output model, or the compose schema of a
             tool call; otherwise ``None``.
         tools: The tool definitions offered (tool kinds only).

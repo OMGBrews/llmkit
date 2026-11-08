@@ -165,9 +165,10 @@ class ToolCallResult:
     ``invalid_calls`` as the :class:`~llmkit.ToolArgumentError` it raised —
     nothing has executed yet, so discarding the whole round would only be a
     lossy re-ask. A turn in which **every** requested call is malformed still
-    raises ``ToolArgumentError``. The buffered lane re-asks within
+    raises ``ToolArgumentError``. Both lanes re-ask within
     ``RetryPolicy.validation_max_attempts`` with the rejected calls and their
-    errors attached when replayable; the streaming lane does not re-ask.
+    errors attached when replayable; the streaming lane only when the round
+    yielded no prose, because a partly consumed stream cannot be restarted.
 
     ``to_message()`` is built from ``tool_calls`` alone, so the assistant turn
     it produces names only the calls you can actually answer: feed a

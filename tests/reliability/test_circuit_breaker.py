@@ -522,8 +522,9 @@ async def test_streaming_call_does_not_retry_circuit_open_error() -> None:
     ``policy.validation_retry_on`` inside
     :func:`~llmkit.retry.with_retries_stream`, and neither set nor that check
     varies by calling family. The tool lane's distinct retry property — that a
-    whole-round ``ToolArgumentError`` also escapes unretried, which is *not*
-    true of the buffered tool lane — is pinned in ``tests/calls/test_tool_stream.py``.
+    whole-round ``ToolArgumentError`` is re-asked only before the first yield,
+    unlike the buffered tool lane, which always can — is pinned in
+    ``tests/calls/test_tool_stream.py``.
     """
     calls = [0]
 
