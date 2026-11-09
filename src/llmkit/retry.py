@@ -229,8 +229,8 @@ class RetryPolicy:
     explicitly in ``retry_on`` opts back in.
 
     This layer is kept deliberately separate from instructor's in-call
-    schema-repair budget (two attempts total, i.e. one schema-repair re-ask
-    per call — fired only for a genuine parse failure, and refused for a length
+    schema-repair budget (``schema_repairs`` re-asks within one attempt, one
+    by default — fired only for a genuine parse failure, and refused for a length
     truncation; a transport or permanent error is not re-asked in-call) — the
     two are never conflated, so attempts are not double-counted *within* one
     call.

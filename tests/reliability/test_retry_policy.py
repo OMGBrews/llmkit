@@ -405,6 +405,17 @@ async def test_structured_litellm_503_is_retried_then_succeeds() -> None:
 # --- instructor's in-call schema-repair budget -----------------------------
 
 
+@pytest.mark.parametrize("repairs", [0, 1, 2, 5])
+def test_the_in_call_budget_stops_after_repairs_plus_one(repairs: int) -> None:
+    """``schema_repairs`` counts re-asks, so the attempt stops after
+    ``repairs + 1`` sends; the predicate and ``reraise`` do not change."""
+    from llmkit._litellm import _schema_repair_retrying
+
+    retrying = _schema_repair_retrying(repairs)
+    assert getattr(retrying.stop, "max_attempt_number", None) == repairs + 1
+    assert retrying.reraise is True
+
+
 def test_instructor_in_call_budget_is_two_attempts_one_parse_repair() -> None:
     """The structured call feeds instructor a per-call ``AsyncRetrying`` that
     keeps the historical budget (``stop_after_attempt(2)`` counts *total
@@ -426,6 +437,7 @@ def test_instructor_in_call_budget_is_two_attempts_one_parse_repair() -> None:
     seen = capture_structured_provider_kwargs()
     retrying = seen["max_retries"]
     assert isinstance(retrying, AsyncRetrying)
+    # The default allowance, one re-ask, is two sends at most.
     assert getattr(retrying.stop, "max_attempt_number", None) == 2
     # ``reraise=True`` matches instructor's int path: on exhaustion the raw last
     # error rides ``__cause__`` (no tenacity ``RetryError`` hop).

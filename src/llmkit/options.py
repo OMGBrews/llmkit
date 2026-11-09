@@ -76,7 +76,7 @@ class LLMCallOptions:
     :func:`tool_llm_call_stream` and :func:`tool_llm_call_stream_sync`): a feature
     module builds one
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
-    instead of repeating the same eight-keyword block at each site. The flat
+    instead of repeating the same keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.
 
     Every field is **optional and unset by default** (the :data:`UNSET`
@@ -134,6 +134,19 @@ class LLMCallOptions:
             next chunk) and also forwards to LiteLLM. Unset or ``None`` sets
             no deadline and sends no timeout keyword; LiteLLM supplies its
             default.
+        schema_repairs: How many in-call schema-repair re-asks instructor
+            may make within one outer attempt of a structured call, after a
+            genuine parse failure only. Unset defers to the per-call
+            ``schema_repairs`` keyword, then to
+            :data:`DEFAULT_SCHEMA_REPAIRS` (one). ``0`` makes one provider
+            send per outer attempt; it does not disable validation, and a
+            failed parse still draws on ``retry``'s validation allowance.
+            Read only by :func:`structured_llm_call` and its sync form; the
+            other families ignore a valid value, but every family rejects an
+            invalid one before any request: anything but a non-negative
+            ``int`` (a ``bool``, a float such as ``1.0``, a negative value)
+            raises ``ValueError``, the rule :class:`~llmkit.RetryPolicy`
+            applies to its attempt counts.
     """
 
     temperature: float | None | Unset = UNSET
@@ -144,11 +157,12 @@ class LLMCallOptions:
     provider: LLMProviderInterface | Provider | None | Unset = UNSET
     cache: bool | Unset = UNSET
     timeout: float | None | Unset = UNSET
+    schema_repairs: int | Unset = UNSET
 
     @override
     def __repr__(self) -> str:
         # Only the fields actually set: ``LLMCallOptions(temperature=0.9)``,
-        # not eight ``=UNSET`` entries drowning the one value a user debugging
+        # not a row of ``=UNSET`` entries drowning the one value a user debugging
         # a merge is looking for. (Generated repr suppressed via
         # ``repr=False``; ``field(repr=False)`` would wrongly hide set
         # fields too.)
@@ -178,6 +192,7 @@ class ResolvedCallArgs:
     provider: LLMProviderInterface | Provider | None
     cache: bool
     timeout: float | None
+    schema_repairs: int
 
 
 def resolve_call_args(
@@ -191,6 +206,7 @@ def resolve_call_args(
     provider: LLMProviderInterface | Provider | None | Unset,
     cache: bool | Unset,
     timeout: float | None | Unset,
+    schema_repairs: int | Unset = UNSET,
 ) -> ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
@@ -203,7 +219,8 @@ def resolve_call_args(
       whatever its value (highest precedence);
     * otherwise a field that is *set* on ``options`` is used;
     * otherwise the true default stands (:data:`DEFAULT_TEMPERATURE`,
-      :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``True`` for ``cache``, ``None``
+      :data:`~llmkit.DEFAULT_RETRY_POLICY`, ``True`` for ``cache``,
+      :data:`DEFAULT_SCHEMA_REPAIRS` for ``schema_repairs``, ``None``
       for the rest — ``model`` and ``reasoning_effort`` then fall to the
       provider the call runs on, the registered one or ``provider``; unset
       ``timeout`` sends no keyword).
@@ -214,6 +231,10 @@ def resolve_call_args(
     resolves the same way. An explicit number is forwarded, except that a
     model refusing it as unsupported gets the request re-issued once without
     it (see :func:`llmkit._litellm._acompletion`).
+
+    The resolved ``schema_repairs`` is checked here, before the call is
+    claimed from an enclosing retry loop and before any request: anything
+    but a non-negative ``int`` raises ``ValueError``. There is no upper bound.
 
     ``options=None`` is simply an all-unset options, so the flat-kwarg path
     resolves to the same values as before options existed. The true defaults
@@ -230,7 +251,23 @@ def resolve_call_args(
         provider=_pick(provider, opts.provider, None),
         cache=_pick(cache, opts.cache, True),
         timeout=_pick(timeout, opts.timeout, None),
+        schema_repairs=_check_schema_repairs(
+            _pick(schema_repairs, opts.schema_repairs, DEFAULT_SCHEMA_REPAIRS)
+        ),
     )
+
+
+def _check_schema_repairs(value: object) -> int:
+    """Return *value* if it is a usable repair allowance, else raise.
+
+    The rule :class:`~llmkit.RetryPolicy` applies to its attempt counts, with
+    a floor of zero: ``type(...) is int`` (not ``isinstance``) refuses
+    ``bool``, which would otherwise read as one repair, and floats such as
+    ``1.0``.
+    """
+    if type(value) is not int or value < 0:
+        raise ValueError(f"schema_repairs must be >= 0 (an int, not a bool), got {value!r}")
+    return value
 
 
 def _pick[V](keyword: V | Unset, option: V | Unset, default: V) -> V:
@@ -256,6 +293,15 @@ def _pick[V](keyword: V | Unset, option: V | Unset, default: V) -> V:
 #: real default; applied in :func:`resolve_call_args` (the signatures carry
 #: :data:`UNSET` instead), so it has exactly one definition site.
 DEFAULT_TEMPERATURE: float | None = None
+
+#: The default in-call schema-repair allowance for a structured call: how many
+#: times instructor may re-ask, within one outer attempt, after the answer
+#: fails to parse. One re-ask means a persistently malformed answer costs two
+#: provider sends per outer attempt. Only a genuine parse failure is re-asked;
+#: a truncated completion, a transport or a permanent provider error never is,
+#: whatever the allowance. Applied in :func:`resolve_call_args` when neither the
+#: ``schema_repairs`` keyword nor ``options`` supplies one.
+DEFAULT_SCHEMA_REPAIRS: int = 1
 
 # Shared all-unset instance for the ``options=None`` path, so resolving the
 # flat-keyword call doesn't allocate a throwaway options object per call.

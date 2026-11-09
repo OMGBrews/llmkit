@@ -111,7 +111,8 @@ class VertexProvider(BaseProvider):
     - ``structured_output="json"`` switches to ``Mode.JSON``: the response is
       still server-side guaranteed to be JSON *syntax* (the mime-type
       constraint), but the schema moves into the system prompt and is validated
-      client-side, with instructor's single repair re-ask on a mismatch. This
+      client-side, with instructor's in-call repair re-ask on a mismatch
+      (``schema_repairs``, one by default). This
       gives up server-side *schema* enforcement to escape the loop trap. Choose
       it when a non-trivial schema drives runaway loops on real workloads; the
       cost is an occasional repair round-trip. (``DeepSeekProvider`` pins the

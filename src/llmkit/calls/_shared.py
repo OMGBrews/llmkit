@@ -288,6 +288,7 @@ def prepare_call(
     label: str | None,
     cache: bool | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
+    schema_repairs: int | Unset = UNSET,
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
@@ -313,7 +314,9 @@ def prepare_call(
 
     *cache* is passed by the families that read the response cache — the two
     buffered ones and the streamed text family; the tool families leave it
-    unset.
+    unset. *schema_repairs* is passed by the structured family only; the
+    others leave it unset, so only an ``options`` value reaches the merge,
+    where an invalid one is still rejected.
     """
     args = resolve_call_args(
         options,
@@ -325,6 +328,7 @@ def prepare_call(
         retry=retry,
         provider=provider,
         cache=cache,
+        schema_repairs=schema_repairs,
     )
     # Before the claim: inside an outer with_retries a claim counts an attempt,
     # so an error raised after it would count a phantom one.
