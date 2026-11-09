@@ -53,6 +53,7 @@ async def structured_llm_call[T: BaseModel](
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
+    schema_repairs: int | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -139,6 +140,21 @@ async def structured_llm_call[T: BaseModel](
             bypasses lookup, request coalescing and store — pass it when
             re-sending the same prompt to get a different sample, since a
             cache returns the first sample of an identical request.
+        schema_repairs: How many in-call schema-repair re-asks instructor may
+            make within one outer attempt after the answer fails to parse,
+            each feeding the failed answer and its errors back to the model.
+            Unset defers to ``options``, then to
+            :data:`~llmkit.DEFAULT_SCHEMA_REPAIRS` (one), so a persistently
+            malformed answer costs ``schema_repairs + 1`` provider sends per
+            outer attempt. ``0`` sends once per outer attempt; it does not
+            disable validation, and a failed parse still draws on ``retry``'s
+            validation allowance. Only a genuine parse failure is re-asked: a
+            truncated completion, a transport and a permanent provider error
+            fail fast under every allowance. Anything but a non-negative ``int``
+            (a ``bool``, a float, a negative value) raises ``ValueError``,
+            before any request. The rate limiter charges one request per outer attempt
+            whatever the allowance, and the response cache does not key on
+            it, so a cached answer is returned whatever is set here.
         on_result: Optional semantic-validation hook. Called with the parsed
             result of each attempt; raise
             :class:`~llmkit.ResultValidationError` from it to **reject** a
@@ -158,7 +174,8 @@ async def structured_llm_call[T: BaseModel](
             a predicate cannot accept every result silently.
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
-            ``retry``/``provider``/``cache``/``timeout`` once for reuse across many calls.
+            ``retry``/``provider``/``cache``/``timeout``/``schema_repairs`` once for
+            reuse across many calls.
             Precedence is **config < options < explicit keyword**, exactly:
             every mergeable keyword above defaults to :data:`~llmkit.UNSET`,
             so any keyword you pass — including ``None``, including a value
@@ -174,7 +191,8 @@ async def structured_llm_call[T: BaseModel](
 
     Raises:
         StructuredOutputError: The answer still failed validation after
-            instructor's in-call repair and the validation budget; it carries
+            instructor's in-call repair re-asks (``schema_repairs``) and the
+            validation budget; it carries
             the raw answer and pydantic's field errors.
         OutputLimitError: The completion was cut off by the output-token
             limit; never retried by default.
@@ -201,6 +219,7 @@ async def structured_llm_call[T: BaseModel](
         feature=feature,
         label=label,
         cache=cache,
+        schema_repairs=schema_repairs,
     )
     args, provider, call_id, attempt_offset = prepared
     attempt_count = 0
@@ -244,6 +263,7 @@ async def structured_llm_call[T: BaseModel](
                 label=label,
                 call_id=call_id,
                 attempt=attempt,
+                schema_repairs=args.schema_repairs,
             )
             sent_temperature = _litellm.sent_temperature(args.temperature)
             usage = TokenUsage(*counts)
@@ -407,6 +427,7 @@ def structured_llm_call_sync[T: BaseModel](
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
+    schema_repairs: int | Unset = UNSET,
     on_result: Callable[[T], Awaitable[None] | None] | None = None,
     options: LLMCallOptions | None = None,
 ) -> T:
@@ -426,7 +447,8 @@ def structured_llm_call_sync[T: BaseModel](
     the call runs on). ``retry`` is the transient-error budget, inherited from
     the async path (default-on; pass :data:`~llmkit.NO_RETRY` to opt out).
     ``cache`` is the same response-cache opt-out (``False`` bypasses lookup
-    and store). ``on_result`` is the same semantic-validation re-roll hook the
+    and store). ``schema_repairs`` is the same in-call repair allowance
+    (unset defers to ``options``, then to one re-ask). ``on_result`` is the same semantic-validation re-roll hook the
     async call takes (raise :class:`~llmkit.ResultValidationError` to reject a
     result and re-roll on the validation budget). ``options`` is the same
     opt-in :class:`LLMCallOptions` bundle the async call takes, with the same
@@ -452,6 +474,7 @@ def structured_llm_call_sync[T: BaseModel](
             provider=provider,
             retry=retry,
             cache=cache,
+            schema_repairs=schema_repairs,
             on_result=on_result,
             options=options,
         ),

@@ -97,6 +97,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Configurable structured repair allowance.** `structured_llm_call` and
+  `structured_llm_call_sync` accept `schema_repairs`, also settable on
+  `LLMCallOptions`: how many in-call schema-repair re-asks instructor may make
+  within one outer attempt. It defaults to `DEFAULT_SCHEMA_REPAIRS`, one, so
+  existing calls are unchanged. `0` sends once per outer attempt and still
+  validates; a malformed answer raises `StructuredOutputError` on the policy's
+  validation allowance. Only genuine parse failures are re-asked under any
+  allowance: truncation, transport, permanent and JSON Schema engine failures
+  still fail fast in-call. Anything but a non-negative `int` (a `bool`, a
+  float, a negative value) raises `ValueError` before any request, on every
+  call family, matching the `RetryPolicy` count rule.
+  The exhausted-repair error now names the re-asks that ran ("after 2 in-call
+  repair re-asks", "with no in-call repair") instead of a fixed "after in-call
+  repair". The rate limiter still charges one request per outer attempt, the
+  response cache does not key on the allowance, and allowances above one are
+  verified offline only.
+
 - **Configurable circuit-breaker cooldown.** `configure_rate_limit` accepts
   `breaker_cooldown`, finite positive seconds, defaulting to 30. The effective
   value is available on `get_rate_limit_config()`; an omitted keyword keeps
