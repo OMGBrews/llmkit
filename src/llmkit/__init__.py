@@ -100,6 +100,7 @@ from llmkit.logging._delivery import (
 )
 from llmkit.logging._policy import LogDeliveryPolicy
 from llmkit.options import (
+    DEFAULT_SCHEMA_REPAIRS,
     DEFAULT_TEMPERATURE,
     UNSET,
     LLMCallOptions,
@@ -225,6 +226,7 @@ __all__ = [
     "LLMCallOptions",
     "Unset",
     "UNSET",
+    "DEFAULT_SCHEMA_REPAIRS",
     "DEFAULT_TEMPERATURE",
     "Message",
     "ChatMessage",

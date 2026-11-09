@@ -31,6 +31,7 @@ from unittest.mock import patch
 
 import litellm
 import pytest
+from instructor.core.exceptions import InstructorRetryException
 from litellm import exceptions as litellm_errors
 
 from llmkit import (
@@ -227,6 +228,48 @@ async def test_the_refused_temperature_reissue_gets_its_own_deadline() -> None:
         )
     assert text == "ok"
     assert len(sends) == 2
+
+
+async def test_each_schema_repair_send_gets_its_own_deadline() -> None:
+    """Three sends at 60% of the deadline each: pooled, they would breach it.
+
+    Broken implementation caught: one deadline around the whole attempt,
+    shared by instructor's re-asks.
+    """
+    deadline = 0.3
+    answers = iter(['{"ok": "x"}', '{"ok": "y"}', '{"ok": true}'])
+
+    def _fake(_request: TransportRequest) -> Reply:
+        return Reply.text(next(answers), delay=deadline * 0.6)
+
+    with install(_fake) as fake:
+        result = await calls.structured_llm_call(
+            "hi",
+            OkSchema,
+            feature="deadline",
+            timeout=deadline,
+            retry=NO_RETRY,
+            schema_repairs=2,
+        )
+    assert result.ok is True
+    assert [request.repair for request in fake.requests] == [False, True, True]
+
+
+async def test_a_repair_send_past_its_deadline_is_cut_off() -> None:
+    def _fake(request: TransportRequest) -> Reply:
+        return Reply.text('{"ok": "x"}', delay=_STALL if request.repair else 0.0)
+
+    with install(_fake) as fake, pytest.raises(InstructorRetryException) as caught:
+        _ = await calls.structured_llm_call(
+            "hi",
+            OkSchema,
+            feature="deadline",
+            timeout=_DEADLINE,
+            retry=NO_RETRY,
+            schema_repairs=2,
+        )
+    assert isinstance(underlying_provider_error(caught.value), TimeoutError)
+    assert [request.repair for request in fake.requests] == [False, True]
 
 
 async def test_a_litellm_send_that_never_answers_is_cut_off() -> None:

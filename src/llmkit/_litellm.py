@@ -101,6 +101,7 @@ from llmkit.exceptions import (
     underlying_provider_error,
     validation_failure_summary,
 )
+from llmkit.options import DEFAULT_SCHEMA_REPAIRS
 from llmkit.providers import LLMProviderInterface, build_provider
 from llmkit.rate_limiting import GlobalRateLimiter
 from llmkit.tools import ToolChoice, ToolDefinition, ToolName, guard_tool_choice
@@ -941,12 +942,17 @@ def _text_output_limit_error(
     )
 
 
-def _schema_repair_retrying() -> AsyncRetrying:
-    """instructor's in-call repair budget: one schema-repair re-ask, for a
-    genuine parse failure only.
+def _schema_repair_retrying(repairs: int = DEFAULT_SCHEMA_REPAIRS) -> AsyncRetrying:
+    """instructor's in-call repair budget: *repairs* schema-repair re-asks,
+    for a genuine parse failure only.
 
-    ``stop_after_attempt(2)`` keeps the historical budget (instructor feeds
-    this to tenacity as *total attempts*, so 2 = one repair re-ask). The
+    *repairs* counts re-asks after the first send, so
+    ``stop_after_attempt(repairs + 1)`` bounds the attempt's sends (tenacity
+    counts total attempts); the default, :data:`~llmkit.DEFAULT_SCHEMA_REPAIRS`,
+    is one re-ask, and ``0`` sends once. llmkit hands instructor this object
+    rather than an ``int``, so instructor's own int path, and the
+    ``stop_after_delay`` it adds, never apply. The caller has already
+    validated *repairs* (:func:`llmkit.options.resolve_call_args`). The
     predicate retries **only** the parse failures in
     :data:`REPAIRABLE_PARSE_ERRORS` — the same set instructor's own int-based
     path restricts to (mirrored, not imported from its private tuple). This is
@@ -975,7 +981,7 @@ def _schema_repair_retrying() -> AsyncRetrying:
     ``reraise=True`` matches instructor's own int path exactly. It changes only
     the cause chain, not whether instructor wraps: any non-``IncompleteOutput``
     exception escaping this loop — a declined transport/permanent error (**1**
-    call) or an exhausted parse re-ask (**2** calls) — is caught by
+    call) or an exhausted parse re-ask (``repairs + 1`` calls) — is caught by
     instructor's blanket ``except Exception as e: raise
     InstructorRetryException(...) from e``, so the type escaping instructor is
     always ``InstructorRetryException``. What ``reraise`` controls is
@@ -993,7 +999,7 @@ def _schema_repair_retrying() -> AsyncRetrying:
     structured calls on the same loop.
     """
     return AsyncRetrying(
-        stop=stop_after_attempt(2),
+        stop=stop_after_attempt(repairs + 1),
         retry=retry_if_exception(
             lambda e: (
                 isinstance(e, REPAIRABLE_PARSE_ERRORS)
@@ -1114,13 +1120,14 @@ async def acompletion_structured[T: BaseModel](
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
+    schema_repairs: int = DEFAULT_SCHEMA_REPAIRS,
 ) -> tuple[T, float | None, tuple[int | None, int | None, int | None], str]:
     """Structured completion via instructor pinned to the provider's mode.
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
     completion (for cost) are both in hand. instructor's in-call schema-repair
-    budget is pinned to two total attempts (one schema-repair re-ask,
-    deliberately low) and restricted to genuine *parse* failures — a transport
+    budget is ``schema_repairs`` re-asks (one by default, so two sends at
+    most) and restricted to genuine *parse* failures — a transport
     or permanent provider error is **not** re-asked in-call (it would only be a
     blind, backoff-free re-send inside the rate-limiter slot; the cross-call
     layer handles it). A completion truncated by the output-token limit
@@ -1217,13 +1224,13 @@ async def acompletion_structured[T: BaseModel](
                 model=litellm_model,
                 messages=messages,  # pyright: ignore[reportArgumentType]  # raw-llm — instructor over-strict ChatCompletionMessageParam
                 response_model=output_schema,
-                # instructor's in-call schema-repair budget: two total attempts
-                # = exactly one schema-repair re-ask, and only for a genuine
+                # instructor's in-call schema-repair budget: ``schema_repairs``
+                # re-asks (one by default), and only for a genuine
                 # parse failure — never for a length truncation, a transport, or
                 # a permanent error (see _schema_repair_retrying). Built per
                 # call — tenacity retrying objects mutate iteration state. The
                 # cross-call transient/validation budgets live in llmkit.retry.
-                max_retries=_schema_repair_retrying(),
+                max_retries=_schema_repair_retrying(schema_repairs),
                 # Strict JSON validation, explicitly: llmkit's rule on every
                 # lane (structured, compose, cache hit, tool arguments), not
                 # an inherited instructor default.
@@ -1281,9 +1288,18 @@ async def acompletion_structured[T: BaseModel](
                 ) from e
             if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
                 raise
+            # Word the message by the re-asks that actually ran: with an
+            # allowance of zero no repair happened, and saying otherwise would
+            # put a false claim in the call log's ``error`` field.
+            reasks = max(e.n_attempts - 1, 0)
+            repair_note = (
+                "with no in-call repair"
+                if reasks == 0
+                else f"after {reasks} in-call repair re-ask{'s' if reasks != 1 else ''}"
+            )
             raise StructuredOutputError(
                 f"structured answer for {output_schema.__name__} failed validation "
-                + f"after in-call repair ({validation_failure_summary(cause)})",
+                + f"{repair_note} ({validation_failure_summary(cause)})",
                 schema_name=output_schema.__name__,
                 raw_text=_completion_text(last_completion),
                 errors=cause.errors(include_url=False)

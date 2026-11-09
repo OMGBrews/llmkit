@@ -71,8 +71,8 @@ additionally keeps *raw* litellm 503s classifying as transport in
 
 ``with_retries()`` (see :mod:`llmkit.retry`) is the transient-retry
 layer; in-call schema repair is handled separately by instructor's retry
-loop (two total attempts, pinned in :mod:`llmkit._litellm` — with the one
-carve-out that a length truncation is never re-asked and surfaces as
+loop (``schema_repairs`` re-asks per attempt, one by default, in
+:mod:`llmkit._litellm` — with the one carve-out that a length truncation is never re-asked and surfaces as
 :class:`OutputLimitError` instead).
 """
 

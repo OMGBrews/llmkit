@@ -940,13 +940,25 @@ def test_no_choice_carries_nothing_else(fields: dict[str, object]) -> None:
         _ = Reply(no_choice=True, **fields)  # pyright: ignore[reportArgumentType]  # test-helper — kwargs splat
 
 
-async def test_no_choice_is_a_structured_output_error_re_asked_on_the_validation_budget() -> None:
+@pytest.mark.parametrize("schema_repairs", [0, 1, 2])
+async def test_no_choice_is_a_structured_output_error_re_asked_on_the_validation_budget(
+    schema_repairs: int,
+) -> None:
+    # Whatever the repair allowance: instructor's re-ask handler indexes the
+    # empty choice list before its retry loop decides whether to stop.
     with (
         install(lambda _request: Reply(no_choice=True)) as fake,
         capture_llm_records() as records,
         pytest.raises(StructuredOutputError) as caught,
     ):
-        _ = await structured_llm_call("q", _N, feature="f", retry=_NO_BACKOFF, provider=_PROVIDER)
+        _ = await structured_llm_call(
+            "q",
+            _N,
+            feature="f",
+            retry=_NO_BACKOFF,
+            provider=_PROVIDER,
+            schema_repairs=schema_repairs,
+        )
     assert caught.value.raw_text is None
     assert caught.value.errors is None
     assert "no choices" in str(caught.value)
