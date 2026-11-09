@@ -49,9 +49,10 @@ within one overall attempt ceiling (see :mod:`llmkit.retry`):
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_TOOL_ERRORS` — a tool round the model got wrong
   (:class:`ToolArgumentError`: an unknown tool, or arguments that are not
-  valid JSON or fail the tool's model). The buffered tool lanes charge it to the
+  valid JSON or fail the tool's model). The tool lanes charge it to the
   **validation** allowance, so a round whose every call is malformed is re-asked
-  like a malformed schema response.
+  like a malformed schema response — on the streaming lane only while nothing
+  has been yielded.
 
 ``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
 single documented ``except``-clause catch-set. At llmkit's provider boundaries,
@@ -472,8 +473,9 @@ class ToolArgumentError(LlmkitError):
     """A model requested an unknown tool or supplied invalid arguments.
 
     ``round_errors`` carries every rejection in an all-malformed round, for
-    buffered repair re-asks. Individual salvaged-round errors leave it empty.
-    The streaming lane also exposes the round but does not re-ask it.
+    repair re-asks. Individual salvaged-round errors leave it empty. The
+    streaming lane re-asks the round too, but only when it streamed no prose
+    first; after a yield it raises with the round attached.
     """
 
     def __init__(

@@ -36,10 +36,10 @@ import openai
 import pytest
 from pydantic import BaseModel
 
-from llmkit import NO_RETRY, RetryPolicy, ToolDefinition
+from llmkit import NO_RETRY, RetryPolicy, ToolArgumentError, ToolDefinition
 from llmkit import calls as llm_calls
 from llmkit.retry import _retry_scope, _RetryScope, with_retries
-from llmkit.testing import Fake, Reply, TransportRequest, install, timeout_error
+from llmkit.testing import Fake, FakeToolCall, Reply, TransportRequest, install, timeout_error
 from tests._support import quiet_logging
 
 _NO_BACKOFF = RetryPolicy(backoff_base_seconds=0.0)
@@ -368,3 +368,34 @@ async def test_tool_stream_does_not_retry_after_the_first_event() -> None:
                 )
             ]
     assert attempts == 1
+
+
+async def test_tool_stream_all_malformed_round_under_outer_wrapper_runs_once_and_warns() -> None:
+    """An all-malformed tool-only round is retryable on the stream's own
+    validation allowance, so under an outer llmkit loop it collapses to a
+    single pass and warns, as the buffered lane does. The outer policy's
+    default validation set does not include the error, so nothing re-asks."""
+
+    def _malformed(_request: TransportRequest) -> Reply:
+        return Reply(tool_calls=[FakeToolCall("add", "{not json", id="bad")])
+
+    async def _wrapped() -> list[object]:
+        return [
+            e
+            async for e in llm_calls.tool_llm_call_stream(
+                "a", _TOOLS, feature="t", retry=_NO_BACKOFF
+            )
+        ]
+
+    with (
+        install(_malformed) as installed,
+        warnings.catch_warnings(record=True) as recorded,
+        pytest.raises(ToolArgumentError),
+    ):
+        warnings.simplefilter("default")
+        _ = await with_retries(_wrapped, policy=_NO_BACKOFF)
+
+    caught = [w for w in recorded if issubclass(w.category, RuntimeWarning)]
+    assert len(caught) == 1
+    assert "tool_llm_call_stream" in str(caught[0].message)
+    assert len(installed.requests) == 1

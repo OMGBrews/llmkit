@@ -28,8 +28,9 @@ Two invariants this module owns, both easy to get subtly wrong:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
-from collections.abc import AsyncGenerator, Generator, Sequence
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
@@ -39,10 +40,13 @@ from llmkit.calls._shared import (
     parse_tool_calls,
     prepare_call,
     resolve_model_and_provider,
+    tool_repair_messages,
+    tool_validation_budget,
     usage_log_dict,
 )
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
 from llmkit.capture import record_call_async, submit_record_call
+from llmkit.exceptions import ToolArgumentError
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
@@ -125,18 +129,21 @@ async def tool_llm_call_stream(
 
     ``retry`` is the transient-error budget, and it behaves as it does on the
     text stream: a partially-consumed stream cannot be transparently
-    restarted, so only a transient failure **before the first yielded item** is
-    retried. One consequence is worth stating plainly — a round in which
-    *every* requested tool call is malformed raises
+    restarted, so a failure is retried only **before the first yielded item**.
+    A round in which *every* requested tool call is malformed raises
     :class:`~llmkit.ToolArgumentError` (the same whole-round contract the
-    buffered lane keeps), but here it reaches the caller **unretried by
-    default**: the default stream policy does not include ``ToolArgumentError``
-    in its validation set. A custom ``validation_retry_on`` can include it; the
-    validation allowance then applies within the total outer-attempt ceiling,
-    and a retry is still possible only before any item has been yielded. A
-    round in which only *some* calls are malformed
+    buffered lane keeps). When the round streamed no prose, nothing has reached
+    you yet, so it is re-asked on the validation allowance
+    (``validation_max_attempts``, within the ``max_attempts`` ceiling) exactly
+    as the buffered lane re-asks it: the retry carries the rejected calls and
+    their errors so the model can correct them. ``ToolArgumentError`` is always
+    part of that allowance, whatever ``validation_retry_on`` lists; opt out
+    with ``validation_max_attempts=1``, ``max_attempts=1`` or ``NO_RETRY``. A
+    round that streamed any prose first raises unretried, because those deltas
+    were already yielded. A round in which only *some* calls are malformed
     keeps the good ones on ``tool_calls`` and reports the rest on
-    ``invalid_calls``, exactly as the buffered lane does.
+    ``invalid_calls``, exactly as the buffered lane does. No tool executes in
+    either case: llmkit never runs your tools.
     """
     args, provider, call_id, attempt_offset = prepare_call(
         options,
@@ -161,11 +168,22 @@ async def tool_llm_call_stream(
     # spells out: an async generator's body runs in its *consumer's* context,
     # so the stream's identity would leak into the consumer's own llmkit calls
     # between chunks.
+    #
+    # The rejected round of an all-malformed attempt, fed to the next attempt
+    # as the buffered lane does. Only a received round replaces it: a transport
+    # failure before the terminal item leaves the previous round in place.
+    repair: list[ChatMessage] = []
+
+    def _set_repair(messages: list[ChatMessage]) -> None:
+        nonlocal repair
+        repair = messages
 
     def _attempt(attempt: int) -> AsyncGenerator[TextDeltaEvent | ToolCallResult]:
         return _stream_tools_once(
             prompt,
             tools,
+            repair=repair,
+            on_repair=_set_repair,
             feature=feature,
             label=label,
             tool_choice=tool_choice,
@@ -186,7 +204,12 @@ async def tool_llm_call_stream(
     async with aclosing(
         with_retries_stream(
             _attempt,
-            policy=args.retry,
+            # The buffered lane's tool-argument allowance. Only a round that
+            # yielded nothing can use it: the loop refuses to retry after any
+            # yield, so a round that streamed prose first still raises.
+            policy=dataclasses.replace(
+                args.retry, validation_retry_on=tool_validation_budget(args.retry)
+            ),
             label=tag,
             surface="tool_llm_call_stream",
             # This frame's ``async for`` sits between the double-wrap warning
@@ -255,6 +278,8 @@ async def _stream_tools_once(
     prompt: str | Sequence[ChatMessage],
     tools: Sequence[ToolDefinition],
     *,
+    repair: Sequence[ChatMessage],
+    on_repair: Callable[[list[ChatMessage]], None],
     feature: str,
     label: str | None,
     tool_choice: ToolChoice | None,
@@ -273,6 +298,10 @@ async def _stream_tools_once(
     writes its own record (the one-attempt-one-log contract
     ``capture_llm_log_paths`` relies on). ``call_id``/``attempt`` arrive as
     plain parameters for the ContextVar reason the caller documents.
+
+    *repair* is the previous attempt's rejected round, appended after the
+    prompt; *on_repair* receives this attempt's replacement once its terminal
+    item arrives (empty unless every call in it was malformed).
     """
     # Function-local + module-bound; see :mod:`llmkit._litellm`.
     import llmkit._litellm as _litellm
@@ -284,6 +313,14 @@ async def _stream_tools_once(
     # coherent. See ``calls/stream.py``.
     begin_queue_wait()
     definitions = {definition.name: definition for definition in tools}
+    # What this attempt sent, for its record: the caller's prompt, or on a
+    # repair attempt the prompt followed by the rejected round.
+    attempt_prompt: str | Sequence[ChatMessage] = prompt
+    if repair:
+        original: list[ChatMessage] = (
+            [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+        )
+        attempt_prompt = [*original, *repair]
     accumulated: list[str] = []
     result: ToolCallResult | None = None
     cost: float | None = None
@@ -313,6 +350,7 @@ async def _stream_tools_once(
             _litellm.astream_tools(
                 prompt,
                 tools,
+                repair=repair,
                 tool_choice=tool_choice,
                 temperature=temperature,
                 model=model,
@@ -337,8 +375,15 @@ async def _stream_tools_once(
                     continue
                 # The terminal transport item: the turn is assembled here, so
                 # a parse failure is raised before anything is recorded as a
-                # clean turn.
-                parsed_calls, invalid_calls = parse_tool_calls(item.raw_calls, definitions)
+                # clean turn. A received round replaces the repair history
+                # before parsing, as on the buffered lane; only an
+                # all-malformed round sets a new one.
+                on_repair([])
+                try:
+                    parsed_calls, invalid_calls = parse_tool_calls(item.raw_calls, definitions)
+                except ToolArgumentError as exc:
+                    on_repair(tool_repair_messages(exc.round_errors, list(definitions)))
+                    raise
                 cost = item.approximate_cost
                 result = ToolCallResult(
                     "".join(accumulated) or None,
@@ -381,7 +426,7 @@ async def _stream_tools_once(
             temperature=sent_temperature,
             duration_ms=(time.monotonic() - start_t) * 1000,
             schema=TOOL_STREAM_LOG_SCHEMA,
-            prompt=prompt,
+            prompt=attempt_prompt,
             # The partial transcript on an abandoned turn, the full result
             # otherwise — the same "say what actually happened" rule the text
             # stream follows.

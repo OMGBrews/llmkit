@@ -1716,6 +1716,7 @@ async def astream_tools(
     prompt: str | Sequence[ChatMessage],
     tools: Sequence[ToolDefinition],
     *,
+    repair: Sequence[ChatMessage] = (),
     tool_choice: ToolChoice | None,
     temperature: float | None,
     model: str | None,
@@ -1754,6 +1755,10 @@ async def astream_tools(
     a role-only, reasoning, usage or tool-fragment frame counts, so the
     instant is the provider's, not the first text's. It is not called for a
     stream that received no frame.
+
+    *repair* is appended after *prompt* on the wire, as on
+    :func:`acompletion_tools`: the rejected round of an all-malformed previous
+    attempt, which marks this request as a repair.
     """
     provider = provider if provider is not None else build_provider()
     guard_tool_choice(provider, tool_choice)
@@ -1763,7 +1768,7 @@ async def astream_tools(
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
     litellm_model = provider.litellm_model(model)
-    messages = wire_messages(prompt)
+    messages = [*wire_messages(prompt), *wire_messages(repair)]
     call = _call_context(
         "tool_stream",
         prompt,
@@ -1778,6 +1783,7 @@ async def astream_tools(
         label=label,
         call_id=call_id,
         attempt=attempt,
+        repair=bool(repair),
         tools=tools,
         tool_choice=tool_choice,
     )

@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Streamed tool rounds re-ask malformed calls before anything is yielded.**
+  `tool_llm_call_stream` and its sync form now give a round whose every
+  requested call is malformed the buffered lane's validation allowance when the
+  round streamed no prose: the retry carries the rejected calls and their
+  errors, within `validation_max_attempts` and the overall `max_attempts`
+  ceiling, and its log record and testing fake request show the repair history
+  (`repair=True`) under the same `call_id`. A round that streamed any prose
+  first still raises unretried, whatever the policy lists, because those deltas
+  already reached the caller. Partly malformed rounds are unchanged. llmkit
+  executes no tool in either case.
+  **Compatibility:** a tool-only streamed round whose every call is malformed
+  now makes up to two paid requests by default instead of one. A host that
+  caught the first-attempt `ToolArgumentError` to read `round_errors` now sees
+  attempt 2's rejections; attempt 1's are only in its log record. The opt-outs
+  are `validation_max_attempts=1`, `max_attempts=1` or `NO_RETRY`: a custom
+  `validation_retry_on` that omits `ToolArgumentError` no longer prevents the
+  re-ask, matching the buffered lane. Such a round inside an outer llmkit
+  retry loop now runs a single pass and emits the double-wrap `RuntimeWarning`
+  the buffered lane already emits.
+
 - **Reliability budgets reject values that defeat their bounds.**
   `RetryPolicy` now requires `max_attempts` and `validation_max_attempts` to be
   positive integers (not bools or floats), and `backoff_base_seconds`,
@@ -69,7 +89,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Invalid or non-object JSON is safely replayed as `{}` with the raw arguments
   in the error result; missing ids or names retain the original blind re-ask.
   Strict argument validation and retry budgets are unchanged. Streamed tool
-  calls still raise without re-asking. Whole-round `ToolArgumentError` exposes
+  calls re-ask the same way before anything is yielded (see the entry above).
+  Whole-round `ToolArgumentError` exposes
   all rejections in `round_errors`; individual salvaged errors leave it empty.
   Repair-attempt logs include the added history, while testing fakes keep the
   original `prompt`, expose the sent `messages`, and mark `repair=True`.
