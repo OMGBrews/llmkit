@@ -9,8 +9,9 @@ handler's exception never replaces the call's result or the provider's error.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from typing import override
 
 from llmkit import get_diagnostics_health
 
@@ -39,9 +40,10 @@ class RaisingHandler(logging.Handler):
     ) -> None:
         super().__init__(level=logging.DEBUG)
         self.records: list[logging.LogRecord] = []
-        self._error = error
-        self._raise_on = raise_on
+        self._error: Callable[[], BaseException] = error
+        self._raise_on: Callable[[logging.LogRecord], bool] | None = raise_on
 
+    @override
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
         if self._raise_on is None or self._raise_on(record):
@@ -54,7 +56,7 @@ def raising_handler(
     *,
     error: Callable[[], BaseException] = _default_error,
     raise_on: Callable[[logging.LogRecord], bool] | None = None,
-) -> Iterator[RaisingHandler]:
+) -> Generator[RaisingHandler]:
     """Install a :class:`RaisingHandler` on logger *name* at DEBUG, then restore it.
 
     The logger's level is lowered to DEBUG for the duration so both the
