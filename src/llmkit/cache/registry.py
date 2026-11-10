@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.cache.store import LLMCache
 
@@ -82,13 +83,21 @@ def report_cache_failure(what: str, exc: BaseException) -> None:
 
     *what* names the step that failed (``"get"``, ``"set"``, ``"key"``,
     ``"decode"``, ``"encode"``); the call proceeds as a miss either way.
+
+    Never raises an ordinary exception: the record goes through
+    :func:`llmkit._diagnostics.report`, so a host handler that raises while
+    handling it is contained and counted in
+    :func:`~llmkit.get_diagnostics_health` rather than replacing the call's
+    answer or the provider's error. A handler that blocks is not contained.
     """
     if _cache_latch.should_warn(exc):
-        logger.warning(
+        _ = report(
+            logger,
+            logging.WARNING,
             "LLM response cache %s failed; the call proceeds as a miss "
             + "(further identical failures logged at DEBUG)",
             what,
             exc_info=exc,
         )
     else:
-        logger.debug("LLM response cache %s failed", what, exc_info=exc)
+        _ = report(logger, logging.DEBUG, "LLM response cache %s failed", what, exc_info=exc)
