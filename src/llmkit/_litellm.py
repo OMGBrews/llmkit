@@ -76,6 +76,7 @@ from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, Strea
 from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
+from llmkit._diagnostics import report
 from llmkit._messages import resolve_reasoning_effort, wire_messages
 from llmkit._transport import (
     CallContext,
@@ -208,7 +209,8 @@ def _report_dropped_temperature(model: object, value: object) -> None:
         first = name not in _temperature_warned_models
         _temperature_warned_models.add(name)
     level = logging.WARNING if first else logging.DEBUG
-    logger.log(
+    _ = report(
+        logger,
         level,
         "%s refused temperature=%r, so llmkit re-sent the request without it; "
         + "the provider's own default applied. Stop passing temperature for this "
@@ -479,7 +481,9 @@ def _stream_cost(usage: object, model: object) -> float | None:
         # Nonlocal zero entries may be placeholders, not evidence of a free call.
         return cost if cost != 0 or model.startswith("ollama_chat/") else None
     except Exception:
-        logger.debug("Could not price streamed response for %s", model, exc_info=True)
+        _ = report(
+            logger, logging.DEBUG, "Could not price streamed response for %s", model, exc_info=True
+        )
         return None
 
 
@@ -777,7 +781,9 @@ async def drain_async_logging(*, timeout: float | None) -> None:
 
     Best-effort by contract: this reaches into a LiteLLM internal, so any
     failure (the internal moving, no queue yet, the flush erroring) is swallowed
-    — draining logging must never turn a successful call into a failed one.
+    — draining logging must never turn a successful call into a failed one. Its
+    debugs go through :func:`~llmkit._diagnostics.report`, which contains an
+    ordinary exception from a host handler (a blocking handler is not).
     """
     try:
         from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
@@ -786,9 +792,11 @@ async def drain_async_logging(*, timeout: float | None) -> None:
     try:
         await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout)
     except TimeoutError:
-        logger.debug("LiteLLM async-logging drain timed out after %ss", timeout)
+        _ = report(
+            logger, logging.DEBUG, "LiteLLM async-logging drain timed out after %ss", timeout
+        )
     except Exception:  # pragma: no cover - best-effort drain
-        logger.debug("LiteLLM async-logging drain failed", exc_info=True)
+        _ = report(logger, logging.DEBUG, "LiteLLM async-logging drain failed", exc_info=True)
 
 
 def _reasoning_request_kwargs(
@@ -904,7 +912,7 @@ def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics
             reasoning_tokens=usage.reasoning_tokens,
         )
     except Exception:
-        logger.debug("Could not read output-limit diagnostics", exc_info=True)
+        _ = report(logger, logging.DEBUG, "Could not read output-limit diagnostics", exc_info=True)
         return OutputLimitDiagnostics()
 
 
@@ -1385,7 +1393,9 @@ def _as_output_schema[T: BaseModel](parsed: object, output_schema: type[T], text
         try:
             return output_schema.model_validate_json(text, strict=True)
         except Exception as exc:
-            logger.warning(
+            _ = report(
+                logger,
+                logging.WARNING,
                 "Structured answer for %s validated in instructor but not on its own "
                 + "text (%s); returning instructor's answer",
                 output_schema.__name__,

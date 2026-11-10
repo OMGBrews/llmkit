@@ -52,6 +52,7 @@ from typing import Protocol, final
 
 import httpx
 
+from llmkit._diagnostics import report
 from llmkit.exceptions import (
     LLM_BACKPRESSURE_ERRORS,
     LLM_OUTPUT_LIMIT_ERRORS,
@@ -517,8 +518,13 @@ async def handle_retry_failure(
 ) -> None:
     """Run the shared book-keeping for one *non-final* failed attempt.
 
-    Logs a warning, fires the installed progress callback (swallowing any
-    error it raises), then sleeps — in that order. Shared by
+    Logs a warning, fires the installed progress callback (logging and
+    otherwise swallowing any ordinary exception it raises), then sleeps — in
+    that order. Both diagnostics go through :func:`llmkit._diagnostics.report`,
+    so a host :class:`logging.Handler` that raises an ordinary exception is
+    contained and counted in :func:`llmkit.get_diagnostics_health` rather than
+    replacing the retry; a handler that blocks is not contained, and
+    cancellation raised from either propagates. Shared by
     :func:`with_retries` and the streaming retry loop in
     :func:`with_retries_stream` so both surfaces back off, warn, and report
     identically. The final failure is *not* routed here: callers learn about
@@ -541,13 +547,23 @@ async def handle_retry_failure(
     :class:`RetryPolicy`'s fields, and a direct caller is responsible for
     passing values inside that policy's domains.
     """
-    logger.warning("%s: attempt %d/%d failed: %s", tag, attempt, max_attempts, error)
+    _ = report(
+        logger,
+        logging.WARNING,
+        "%s: attempt %d/%d failed: %s",
+        tag,
+        attempt,
+        max_attempts,
+        error,
+    )
     callback = _progress_callback.get()
     if callback is not None:
         try:
             callback(label=tag, attempt=attempt, max_attempts=max_attempts, error=error)
         except Exception:
-            logger.exception("%s: retry progress callback raised", tag)
+            _ = report(
+                logger, logging.ERROR, "%s: retry progress callback raised", tag, exc_info=True
+            )
     retry_after = _retry_after_seconds(error)
     if retry_after is not None:
         # The provider told us when to come back: honour it (capped so a hostile
@@ -700,7 +716,14 @@ async def with_retries_stream[T](
                 if attempt >= policy.max_attempts or (
                     is_validation and validation_failures >= policy.validation_max_attempts
                 ):
-                    logger.error("%s: stopped after %d attempts: %s", tag, attempt, exc)
+                    _ = report(
+                        logger,
+                        logging.ERROR,
+                        "%s: stopped after %d attempts: %s",
+                        tag,
+                        attempt,
+                        exc,
+                    )
                     raise
                 await handle_retry_failure(
                     tag=tag,
@@ -815,7 +838,14 @@ async def with_retries[T](
                 if attempt >= policy.max_attempts or (
                     is_validation and validation_failures >= policy.validation_max_attempts
                 ):
-                    logger.error("%s: stopped after %d attempts: %s", tag, attempt, error)
+                    _ = report(
+                        logger,
+                        logging.ERROR,
+                        "%s: stopped after %d attempts: %s",
+                        tag,
+                        attempt,
+                        error,
+                    )
                     raise
                 await handle_retry_failure(
                     tag=tag,

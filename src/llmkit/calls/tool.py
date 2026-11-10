@@ -12,6 +12,7 @@ list and the requested calls.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from typing import cast, overload
 
 from pydantic import BaseModel, ValidationError
 
+from llmkit._diagnostics import report
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     compose_validation_budget,
@@ -395,14 +397,18 @@ def _dump_for_log(
 
     A raising serializer on the output schema must not turn a validated final
     answer into an exception: the dump exists only for the log, as on the
-    structured lane.
+    structured lane. The warning goes through
+    :func:`~llmkit._diagnostics.report`, so a host handler that raises on it
+    is contained and counted rather than replacing the answer.
     """
     if result is None:
         return None
     try:
         return result.to_log_dict()
     except Exception:
-        logger.warning(
+        _ = report(
+            logger,
+            logging.WARNING,
             "Could not dump the %s/%s compose result for the log; recording response as null",
             feature,
             label,

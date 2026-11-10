@@ -48,6 +48,7 @@ from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 
 from pydantic import BaseModel
 
+from llmkit._diagnostics import report
 from llmkit._types import AssistantToolMessage, ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import CacheDecodeError, cache_key_or_none, read_through
@@ -242,7 +243,10 @@ def build_call_provider(
     except Exception:
         # The call must not break here; let the transport raise the real
         # error (logged + retried per attempt) and the log degrade to None.
-        logger.debug("Could not pre-resolve provider for LLM call", exc_info=True)
+        # report() contains a host handler that raises on this debug.
+        _ = report(
+            logger, logging.DEBUG, "Could not pre-resolve provider for LLM call", exc_info=True
+        )
         return None
 
 
@@ -569,7 +573,9 @@ def parse_tool_calls(
             round_errors=tuple(invalid),
         ) from first
     if invalid:
-        logger.warning(
+        _ = report(
+            logger,
+            logging.WARNING,
             "Dropped %d malformed tool call(s) from a round of %d: %s",
             len(invalid),
             len(raw_calls),
@@ -590,7 +596,9 @@ def resolve_model_and_provider(
     as-is so the log names the provider that *actually* ran, not the
     registered one. Best-effort: any failure resolving the
     provider degrades to ``(model, None)`` rather than breaking the log
-    write — logging must never break the LLM call.
+    write, and its debug goes through :func:`~llmkit._diagnostics.report`, so
+    an ordinary exception from a host handler is contained and counted too (a
+    handler that blocks is not).
     """
     try:
         if provider is None:
@@ -599,8 +607,8 @@ def resolve_model_and_provider(
             provider = build_provider()
         return (model or provider.model, provider.name)
     except Exception:
-        # Logging must never break the LLM call; degrade to (model, None).
-        logger.debug("Could not resolve provider for LLM log", exc_info=True)
+        # Degrade to (model, None); report() contains a raising handler.
+        _ = report(logger, logging.DEBUG, "Could not resolve provider for LLM log", exc_info=True)
         return (model, None)
 
 

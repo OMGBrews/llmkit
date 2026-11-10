@@ -812,27 +812,43 @@ print('done', flush=True)
 def test_raising_diagnostic_handler_does_not_count_one_write_failure_twice() -> None:
     _case(r"""
 import logging
+from llmkit import get_diagnostics_health
 class Handler(logging.Handler):
     def emit(self, record):
         raise RuntimeError('diagnostic handler failed')
 class Sink:
+    def __init__(self):
+        self.labels = []
     def write(self, record):
-        raise ValueError('sink failed')
+        if record.label == 'broken':
+            raise ValueError('sink failed')
+        self.labels.append(record.label)
 logger = logging.getLogger('llmkit.logging')
 logger.handlers[:] = [Handler()]
 logger.propagate = False
 logger.setLevel(logging.WARNING)
-configure_llm_logging(Sink())
+sink = Sink()
+configure_llm_logging(sink)
 async def main():
     print('ready', flush=True)
+    lost = get_diagnostics_health().lost
     with capture_llm_records() as records:
-        assert await record_call_async(make_record()) is None
+        assert await record_call_async(make_record(label='broken')) is None
         assert await flush_llm_logs_async(timeout=1)
         assert len(records) == 1
     health = get_logging_health()
     assert health.failed == 1, 'one failed delivery was counted twice: ' + repr(health)
-    submit_record_call(make_record(label='after-death'))
-    assert get_logging_health().unavailable == 1
+    assert get_diagnostics_health().lost == lost + 1, get_diagnostics_health()
+    # The handler's exception was contained before the worker saw it, so the
+    # worker survives and the next record is still delivered.
+    submit_record_call(make_record(label='after-handler-failure'))
+    assert await flush_llm_logs_async(timeout=2)
+    assert sink.labels == ['after-handler-failure'], sink.labels
+    health = get_logging_health()
+    assert health.unavailable == 0, health
+    assert health.dropped == 0, health
+    assert health.failed == 1, health
+    assert health.handed_off == 1, health
     print('bounded', flush=True)
 asyncio.run(main())
 print('done', flush=True)
