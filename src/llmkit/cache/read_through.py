@@ -7,16 +7,19 @@ streamed text lane cannot be an awaitable *run* — its answer is complete only
 when its consumer pulls the last chunk — so it takes no part in the single
 flight and calls :func:`cached_entry` and :func:`store_entry` directly. Every
 cache-side failure degrades to a miss and reports to the one warn-once latch in
-:mod:`llmkit.cache.registry`.
+:mod:`llmkit.cache.registry`, whose diagnostics are contained: a host logging
+handler that raises cannot turn that miss into a failed call.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 
 from pydantic import BaseModel
 
+from llmkit._diagnostics import report
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache._flight import land, lead_or_follow
 from llmkit.cache.key import llm_cache_key
@@ -181,7 +184,9 @@ async def _accept[T](
     except ResultValidationError:
         # Not a cache failure: this caller's ``on_result`` rejects the stored
         # answer, so it asks the provider for its own.
-        logger.debug("on_result rejected a cached answer; treating it as a miss")
+        _ = report(
+            logger, logging.DEBUG, "on_result rejected a cached answer; treating it as a miss"
+        )
         return None
     except CacheDecodeError as exc:
         report_cache_failure("decode", exc.__cause__ or exc)

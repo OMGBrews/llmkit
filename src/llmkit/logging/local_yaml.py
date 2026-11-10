@@ -19,6 +19,7 @@ from typing import Any, cast
 
 import yaml
 
+from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import FailureStage, WriteOutcome
 from llmkit.logging._paths import (
@@ -203,14 +204,23 @@ class LocalYamlLogSink:
             except Exception:
                 # Best-effort: an unseedable .gitignore must not break the
                 # write that triggered the mkdir.
-                logger.debug("Could not seed .gitignore in %s", self.log_dir, exc_info=True)
+                _ = report(
+                    logger,
+                    logging.DEBUG,
+                    "Could not seed .gitignore in %s",
+                    self.log_dir,
+                    exc_info=True,
+                )
 
     def _announce_once(self) -> None:
         """One INFO after the first successful write: where the logs are.
 
         Persistence is on by default, so the location (and the retention
         policy, *before* the first prune could ever delete anything) must be
-        discoverable without reading the docs.
+        discoverable without reading the docs. Runs after the file is
+        written and outside any ``try``, so the notice goes through
+        :func:`~llmkit._diagnostics.report`: a host handler that raises on it
+        is contained and counted, and the written record keeps its path.
         """
         if self._announced:
             return
@@ -220,7 +230,9 @@ class LocalYamlLogSink:
             if self.retention_days is not None
             else "no retention (files kept forever)"
         )
-        logger.info(
+        _ = report(
+            logger,
+            logging.INFO,
             "llmkit is logging LLM calls to %s (%s; configure_llm_logging(None) disables)",
             self.log_dir.resolve(),
             retention,
@@ -244,7 +256,9 @@ class LocalYamlLogSink:
         (:func:`~llmkit.capture.capture_llm_log_paths`) can
         cross-reference it, without that file detail leaking into the shared
         :class:`LogSink` contract. ``None`` is returned when the write
-        failed (best-effort: logging must never break the LLM call).
+        failed (best-effort: an ordinary write failure, or a host logging
+        handler that raises while it is reported, does not break the LLM
+        call).
         Behavior is otherwise that of :meth:`write_with_outcome`.
         """
         return self.write_with_outcome(record).path
@@ -369,21 +383,27 @@ class LocalYamlLogSink:
                 )
         except Exception as exc:
             # Best-effort by contract: *any* failure (not just the common
-            # OSError/YAMLError/UnicodeError cases) degrades to a warning so
-            # logging can never break the LLM call. Never BaseException —
+            # OSError/YAMLError/UnicodeError cases) degrades to a warning so an
+            # ordinary write failure does not break the LLM call; the warning
+            # goes through report(), so a raising host handler is contained and
+            # counted too (a blocking one is not). Never BaseException —
             # KeyboardInterrupt/SystemExit must propagate. The latch keeps a
-            # *persistently* broken sink from flooding stderr with one
-            # traceback per call: the first failure (and any new failure
-            # signature) warns, repeats drop to DEBUG.
+            # *persistently* broken sink from flooding stderr with one traceback
+            # per call: the first failure (and any new failure signature) warns,
+            # repeats drop to DEBUG.
             if self._yaml_latch.should_warn(exc):
-                logger.warning(
+                _ = report(
+                    logger,
+                    logging.WARNING,
                     "Failed to write LLM invocation log for %s/%s (repeats logged at DEBUG)",
                     record.feature,
                     record.label,
                     exc_info=True,
                 )
             else:
-                logger.debug(
+                _ = report(
+                    logger,
+                    logging.DEBUG,
                     "Failed to write LLM invocation log for %s/%s",
                     record.feature,
                     record.label,
@@ -446,19 +466,20 @@ class LocalYamlLogSink:
         """Append one compact JSON line for *record* to ``index.jsonl``.
 
         Best-effort: *any* :class:`Exception` is swallowed with a warning
-        (logging must never break the call) and returned so the caller can
-        report it; ``None`` means the line was appended. The dataclass doesn't enforce
-        its field types, so a directly-constructed record can make
+        (an ordinary failure does not break the call) and returned so the
+        caller can report it; ``None`` means the line was appended. The
+        dataclass doesn't enforce its field types, so a directly-constructed record can make
         ``json.dumps`` raise ``TypeError``/``ValueError`` (or ``round`` raise
         on a non-numeric ``duration_ms``) — those must not escape here, where
         they would discard the per-call YAML path that was already written.
         A single ``write`` of a sub-4KB line under ``O_APPEND`` is atomic on
         POSIX, so concurrent calls don't interleave lines.
 
-        The line carries only the cross-call triage fields, ``cache_hit``
-        and a stream's ``first_chunk_ms`` among them; request-shaping knobs (temperature, max_tokens,
-        reasoning_effort) and ``source_call_id`` are deliberately omitted to
-        keep the index compact — they live in the per-call YAML.
+        The line carries only the cross-call triage fields, ``cache_hit`` and a
+        stream's ``first_chunk_ms`` among them; request-shaping knobs
+        (temperature, max_tokens, reasoning_effort) and ``source_call_id`` are
+        deliberately omitted to keep the index compact — they live in the
+        per-call YAML.
         """
         try:
             line: dict[str, str | float | bool | None] = {
@@ -492,14 +513,18 @@ class LocalYamlLogSink:
                 _ = f.write(payload)
         except Exception as exc:
             if self._index_latch.should_warn(exc):
-                logger.warning(
+                _ = report(
+                    logger,
+                    logging.WARNING,
                     "Failed to append LLM log index for %s/%s (repeats logged at DEBUG)",
                     record.feature,
                     record.label,
                     exc_info=True,
                 )
             else:
-                logger.debug(
+                _ = report(
+                    logger,
+                    logging.DEBUG,
                     "Failed to append LLM log index for %s/%s",
                     record.feature,
                     record.label,
@@ -528,13 +553,21 @@ class LocalYamlLogSink:
             self._prune()
         except Exception as exc:
             if self._prune_latch.should_warn(exc):
-                logger.warning(
+                _ = report(
+                    logger,
+                    logging.WARNING,
                     "Failed to prune LLM log dir %s (further identical failures logged at DEBUG)",
                     self.log_dir,
                     exc_info=True,
                 )
             else:
-                logger.debug("Failed to prune LLM log dir %s", self.log_dir, exc_info=True)
+                _ = report(
+                    logger,
+                    logging.DEBUG,
+                    "Failed to prune LLM log dir %s",
+                    self.log_dir,
+                    exc_info=True,
+                )
             return exc
         self._prune_latch.succeeded()
         return None

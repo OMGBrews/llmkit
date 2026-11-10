@@ -30,11 +30,12 @@ dependencies = [
     # `thinkingBudget` Google's upcoming models reject with 400.
     # tests/providers/test_gemini_thinking_level.py fails below it.
     #
-    # No upper bound, although 1.106.0-1.106.2 break tool calls on a plain
+    # No upper bound, although 1.106.0-1.108.3 break tool calls on a plain
     # install: they import the `mcp` package (shipped only in LiteLLM's
     # `mcp`/`proxy` extras) on every completion carrying `tools`, inside a
     # proxy-MCP-gateway check (BerriAI/litellm#46045; fixed on LiteLLM's main
-    # by #45961, commit 783cf06, in no release as of 2026-10-22). llmkit's
+    # by #45961, commit 783cf06, first released in 1.108.4, checked 2026-11-10
+    # against every stable release from 1.106.0). llmkit's
     # transport funnel (`_acompletion` in src/llmkit/_litellm.py) passes
     # LiteLLM's per-call `_skip_mcp_handler=True` on those requests, so the
     # check is never entered. The switch is private but read in every release
@@ -47,8 +48,8 @@ dependencies = [
     # release stops honouring the switch. A cap would hand consumers
     # unresolvable installs and shut out a 1.106.x backport; depending on
     # `litellm[mcp]` would install a web-server stack (starlette, uvicorn,
-    # sse-starlette) llmkit never uses. Once a release contains 783cf06 the
-    # switch is redundant but harmless: revisit this comment, not the code.
+    # sse-starlette) llmkit never uses. From 1.108.4 on the switch is redundant
+    # but harmless; it stays for the older releases the floor still admits.
     "litellm>=1.104.0",
     # instructor's `from_litellm` validates the provider mode pins against its
     # LiteLLM mode registry at client construction (1.15.3 removed the

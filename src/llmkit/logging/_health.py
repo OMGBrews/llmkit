@@ -5,10 +5,12 @@ which counts, and the shipped sink, which reports its outcome, can depend on
 it without a cycle.
 
 Diagnostic warnings can be hidden by the host's logging configuration; this
-state cannot. The registry owns one :class:`HealthState` per installed sink
-and is the only writer, so a sink driven directly (outside
-:func:`~llmkit.logging.configure_llm_logging`) or wrapped by another sink is
-never counted twice.
+state cannot. A host handler that raises on one of those warnings is contained
+and counted separately, in :func:`~llmkit.get_diagnostics_health`, never here,
+so a sink failure whose warning is also lost counts once in each. The registry
+owns one :class:`HealthState` per installed sink and is the only writer, so a
+sink driven directly (outside :func:`~llmkit.logging.configure_llm_logging`)
+or wrapped by another sink is never counted twice.
 """
 
 from __future__ import annotations

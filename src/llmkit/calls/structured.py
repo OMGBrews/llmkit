@@ -7,6 +7,7 @@ schema failure would be.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from typing import cast
 
 from pydantic import BaseModel, JsonValue
 
+from llmkit._diagnostics import report
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     error_text,
@@ -403,8 +405,11 @@ def _dump_for_log(
         # The dump exists only for the log, so it degrades to None — logging
         # must never break the call (success path) or mask the real provider
         # error (error path). Same warn pattern as the sink failures in
-        # llmkit.logging.
-        logger.warning(
+        # llmkit.logging; report() contains an ordinary exception from a host
+        # handler on the warning itself (a blocking handler is not contained).
+        _ = report(
+            logger,
+            logging.WARNING,
             "Failed to serialize LLM response for log %s/%s; recording response as None",
             feature,
             label,

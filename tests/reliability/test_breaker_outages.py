@@ -7,6 +7,7 @@ are controlled; no provider requests or real cooldown sleeps are involved.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 import httpx
@@ -23,9 +24,10 @@ from llmkit import (
 )
 from llmkit._litellm import _within
 from llmkit.exceptions import CircuitOpenError, ResultValidationError
-from llmkit.rate_limiting import GlobalRateLimiter, _observability, _tuning
+from llmkit.rate_limiting import GlobalRateLimiter, _tuning
 from llmkit.rate_limiting._breaker import Admit, CircuitState
 from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
+from tests._support.diagnostics import lost_diagnostics, raising_handler
 
 
 def _error(kind: str) -> BaseException:
@@ -311,6 +313,13 @@ async def test_interrupted_transition_callback_releases_probe(
 async def test_probe_resolves_before_outcome_callback_can_interrupt(
     monkeypatch: pytest.MonkeyPatch, sync: bool, outcome: str, interruption: str
 ) -> None:
+    """The probe resolves before the outcome callback runs.
+
+    ``cancel`` and ``interrupt`` raise from the callback and escape; under
+    ``diagnostic`` the callback raises an ordinary exception and the host
+    handler on ``llmkit.rate_limiting`` raises while logging it, and both are
+    contained: the caller sees its own outcome and the loss is counted once.
+    """
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
     configure_rate_limit(max_concurrent=2, breaker=True, adaptive=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
@@ -318,33 +327,48 @@ async def test_probe_resolves_before_outcome_callback_can_interrupt(
     _ = GlobalRateLimiter._get_sync_gate("openai")
     state = GlobalRateLimiter._adaptive_states["openai"]
     seen: list[str] = []
-    error = (
-        RuntimeError("diagnostic failed") if interruption == "diagnostic" else _error(interruption)
-    )
-
-    def broken_diagnostic(*_args: object, **_kwargs: object) -> None:
-        raise error
+    contained = interruption == "diagnostic"
+    error = ValueError("callback failed") if contained else _error(interruption)
 
     def interrupted(event: BackpressureEvent) -> None:
         seen.append(event.reason)
         if event.reason in {"throttle", "recover"}:
-            if interruption == "diagnostic":
-                raise ValueError("callback failed")
             raise error
-
-    if interruption == "diagnostic":
-        monkeypatch.setattr(_observability.logger, "exception", broken_diagnostic)
 
     async def probe() -> None:
         breaker._state = CircuitState.OPEN
         breaker._opened_at = 0.0
-        with backpressure_callback(interrupted), pytest.raises(type(error)) as caught:
-            await _attempt(sync, _error("status-429") if outcome == "throttle" else None)
-        assert caught.value is error
+        provider_error = _error("status-429") if outcome == "throttle" else None
+        if contained:
+            # Installed after configure_rate_limit: its configure-time INFO
+            # record is a plain log call, not a contained diagnostic.
+            before = lost_diagnostics()
+            with raising_handler("llmkit.rate_limiting") as handler:
+                with backpressure_callback(interrupted):
+                    if provider_error is None:
+                        await _attempt(sync, None)
+                    else:
+                        with pytest.raises(openai.APIStatusError) as provider_caught:
+                            await _attempt(sync, provider_error)
+                        assert provider_caught.value is provider_error
+            assert lost_diagnostics() == before + 1
+            errors = [r for r in handler.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1
+            assert errors[0].exc_info is not None
+            assert errors[0].exc_info[1] is error
+        else:
+            with backpressure_callback(interrupted), pytest.raises(type(error)) as caught:
+                await _attempt(sync, provider_error)
+            assert caught.value is error
         assert not breaker._probe_in_flight
         expected = CircuitState.OPEN if outcome == "throttle" else CircuitState.CLOSED
         assert breaker._state is expected
-        assert seen == ["breaker_half_open", "throttle" if outcome == "throttle" else "recover"]
+        expected_seen = ["breaker_half_open", "throttle" if outcome == "throttle" else "recover"]
+        if contained:
+            # Nothing escaped the outcome callback, so the outcome path ran on
+            # to report the breaker's own transition.
+            expected_seen.append("breaker_open" if outcome == "throttle" else "breaker_closed")
+        assert seen == expected_seen
 
     if outcome == "throttle":
         # A normal request admitted before OPEN occupies the other slot. The

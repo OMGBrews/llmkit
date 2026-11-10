@@ -34,6 +34,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from llmkit._diagnostics import report
+
 # Named explicitly rather than via ``__name__`` so every module in this package
 # keeps emitting under the one logger name operators already filter on.
 logger = logging.getLogger("llmkit.rate_limiting")
@@ -88,8 +90,9 @@ class BackpressureCallback(Protocol):
     """Receives :class:`BackpressureEvent`s from the adaptive limiter.
 
     Installed via :func:`backpressure_callback`. Invoked on the loop that observed
-    the limit change; implementations must not raise (a raise is caught and
-    logged, never allowed to break a call) and should not block. The event is
+    the limit change; implementations must not raise (an :class:`Exception` is
+    caught and logged, and a failure of that log call is itself contained, so
+    neither breaks the call) and should not block. The event is
     passed positionally, so a plain ``def f(event): ...``, a lambda, or even
     ``list.append`` all satisfy this protocol.
     """
@@ -151,7 +154,13 @@ def emit_backpressure(event: BackpressureEvent | None) -> None:
     Read from a context variable so it propagates across the ``run_sync`` /
     ``to_thread`` boundaries (the persistent-loop bridge copies the caller's
     context) without threading a parameter through every call. A callback that
-    raises is swallowed and logged — observability must never break a call.
+    raises an :class:`Exception` is swallowed and logged at ERROR, and that log
+    call goes through :func:`llmkit._diagnostics.report`, so a host
+    :class:`logging.Handler` that raises while handling it is contained and
+    counted in :func:`llmkit.get_diagnostics_health` rather than escaping into
+    the admission or outcome path. ``BaseException`` subclasses (cancellation,
+    ``KeyboardInterrupt``) from either propagate, and a handler that blocks is
+    not contained: it runs inline on this thread.
     """
     if event is None:
         return
@@ -161,7 +170,13 @@ def emit_backpressure(event: BackpressureEvent | None) -> None:
     try:
         callback(event)
     except Exception:
-        logger.exception("backpressure callback raised for %s", event.provider)
+        _ = report(
+            logger,
+            logging.ERROR,
+            "backpressure callback raised for %s",
+            event.provider,
+            exc_info=True,
+        )
 
 
 @contextlib.contextmanager

@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A raising logging handler no longer replaces a call's outcome.** When a
+  host's `logging.Handler` raised while llmkit reported a problem it had
+  already contained, the handler's exception surfaced in place of the result
+  or of the provider's error: a broken cache `get` raised with no provider
+  request, a raising sink failed the call on the direct write path, a retry
+  warning stopped a call that would have succeeded on attempt 2, an exhausted
+  retry raised the handler's error instead of the provider's, and a raising
+  backpressure callback escaped admission. Cache, log sink, retry,
+  backpressure and other call-path diagnostics now go through one shared
+  seam that contains ordinary exceptions and counts each loss in the new
+  `get_diagnostics_health()`. Managed log delivery stays available after a
+  raising handler; previously the `llmkit-log-delivery` worker stopped and
+  every later record was dropped as `unavailable` for the life of the
+  process. Records still name their real call site in `funcName` and
+  `lineno`, and an explicit `exc_info` is forwarded unchanged.
+  `asyncio.CancelledError`, `KeyboardInterrupt` and `SystemExit` raised by a
+  handler still propagate, and on the delivery worker still take its
+  existing fatal path. A handler that blocks is not contained: diagnostics
+  run inline on the calling thread or the delivery worker. Configure-time
+  logging, such as the rate limiter's "Configured LLM rate limit" notice, is
+  not routed.
+
 - **Streamed tool rounds re-ask malformed calls before anything is yielded.**
   `tool_llm_call_stream` and its sync form now give a round whose every
   requested call is malformed the buffered lane's validation allowance when the
@@ -96,6 +118,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   original `prompt`, expose the sent `messages`, and mark `repair=True`.
 
 ### Added
+
+- **`get_diagnostics_health()` — see whether llmkit's own warnings were
+  lost.** Returns a frozen `DiagnosticsHealth` snapshot: `lost`, the
+  diagnostics whose logging call raised and was contained since the process
+  started (process-wide, never reset), and `last_loss`, a `DiagnosticLoss`
+  naming the logger, level, error text and time. It is separate from
+  `get_logging_health()`, which counts lost call records; a sink failure
+  whose warning is also lost counts in both. Exported from `llmkit` beside
+  `get_logging_health` and `LoggingHealth`, and documented in README's
+  "Write your own `LogSink`".
 
 - **Configurable structured repair allowance.** `structured_llm_call` and
   `structured_llm_call_sync` accept `schema_repairs`, also settable on

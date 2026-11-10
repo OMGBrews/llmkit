@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
 from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
@@ -212,9 +213,11 @@ def get_logging_health() -> LoggingHealth:
 
     Diagnostic warnings about logging failures go through the standard
     ``llmkit.logging`` logger, which the host's logging configuration may
-    hide. This snapshot does not depend on it: an application can read it
-    after a batch, in a health endpoint, or before exiting, and decide for
-    itself whether a lost record matters.
+    hide. A host handler that raises while handling one is contained and
+    counted in :func:`~llmkit.get_diagnostics_health`, not here. This
+    snapshot does not depend on either: an application can read it after a
+    batch, in a health endpoint, or before exiting, and decide for itself
+    whether a lost record matters.
 
     * ``sink`` is ``"disabled"``, ``"builtin"`` (the shipped
       :class:`LocalYamlLogSink`, whose writes llmkit verifies) or
@@ -244,8 +247,15 @@ def get_logging_health() -> LoggingHealth:
 def write_llm_log(record: LLMCallRecord) -> Path | None:
     """Hand ``record`` to the configured sink, swallowing any failure.
 
-    Logging must never break the LLM call, so a sink that raises is
-    caught here in addition to the sink's own best-effort handling.
+    Logging must not break the LLM call, so a sink that raises an
+    :class:`Exception` is caught here in addition to the sink's own
+    best-effort handling. The warning about that failure is reported through
+    :func:`llmkit._diagnostics.report`, so a host logging handler that raises
+    while handling it is contained too and counted in
+    :func:`~llmkit.get_diagnostics_health`. A handler that blocks is not
+    contained: it runs inline on the calling thread and the write waits for
+    it. ``BaseException`` (cancellation, ``KeyboardInterrupt``,
+    ``SystemExit``) propagates.
 
     Returns the written file path when the configured sink is a
     file sink that exposes one (it advertises a ``write_returning_path``
@@ -323,15 +333,22 @@ def write_installed(
         if attempt is not None:
             attempt.accounted = True
         if _sink_latch.should_warn(exc):
-            logger.warning(
+            _ = report(
+                logger,
+                logging.WARNING,
                 "LLM log sink raised for %s/%s (further identical failures logged at DEBUG)",
                 record.feature,
                 record.label,
                 exc_info=True,
             )
         else:
-            logger.debug(
-                "LLM log sink raised for %s/%s", record.feature, record.label, exc_info=True
+            _ = report(
+                logger,
+                logging.DEBUG,
+                "LLM log sink raised for %s/%s",
+                record.feature,
+                record.label,
+                exc_info=True,
             )
         return None
     health.record_handed_off()
