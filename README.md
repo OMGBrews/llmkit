@@ -1041,6 +1041,13 @@ because a sink raised. Built-in write failures and exceptions from custom sinks
 produce diagnostic warnings, with repeated identical failures reduced to DEBUG;
 host logging configuration can hide those diagnostics, so read
 `get_logging_health()` (below) when you need to know whether records were lost.
+The diagnostics themselves are contained too: an ordinary exception raised by a
+host's `logging.Handler` while llmkit reports a problem (a sink failure, a cache
+failure, a retry, a backpressure callback error) does not replace the call's
+result or the provider's error, and is counted in `get_diagnostics_health()`
+(below). Cancellation, `KeyboardInterrupt` and `SystemExit` still propagate. A
+handler that blocks is not contained: diagnostics run inline, on the calling
+thread or the delivery worker, and wait for it.
 A custom sink that returns normally counts as a handoff: llmkit cannot see
 whether it actually wrote anything through `write(record) -> None`. Record
 capture proves a record was built, not that a sink persisted it.
@@ -1146,6 +1153,21 @@ if health.failed or health.dropped:
 - `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
 
 Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
+
+**Checking for lost diagnostics: `get_diagnostics_health()`.** Logging health answers whether records were lost; diagnostics health answers whether llmkit's own warnings were lost, so a sink failure whose warning is also lost increments both, for different reasons. When a host `logging.Handler` raises while handling a record on an `llmkit.*` logger, llmkit discards that record, keeps the call's outcome, and counts the loss in a frozen `DiagnosticsHealth` snapshot:
+
+```python
+from llmkit import get_diagnostics_health
+
+diagnostics = get_diagnostics_health()
+if diagnostics.lost:
+    print(f"lost diagnostics={diagnostics.lost}, last={diagnostics.last_loss}")
+```
+
+- `lost` counts diagnostics whose logging call raised, since the process started. It is process-wide and never reset, because it is not tied to a sink installation.
+- `last_loss` is a `DiagnosticLoss` naming the logger, the level of the lost record, the handler's `"Type: message"` error text and the time, or `None` when nothing was lost.
+
+A lost diagnostic is not reported through logging again, since the broken handler would only raise again. A handler that blocks rather than raises is not detected here.
 
 The shipped `LocalYamlLogSink` additionally exposes the path it wrote via its own `write_returning_path(record) -> Path | None` method — that file detail stays off the shared `LogSink` contract, and it is what powers `capture_llm_log_paths()` internally. A sink that defines `write_returning_path` opts into path capture and must honor that return type: anything else is treated as a failed write (one warning, no captured path), so `capture_llm_log_paths()` only ever hands you real `Path`s.
 
