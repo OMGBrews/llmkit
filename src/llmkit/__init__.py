@@ -26,6 +26,7 @@ the concrete ``*Provider`` classes, ``describe_llm`` / ``LLMInfo``,
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
+from llmkit._diagnostics import DiagnosticLoss, DiagnosticsHealth, get_diagnostics_health
 from llmkit._types import (
     TOOL_ERROR_PREFIX,
     AssistantToolMessage,
@@ -179,6 +180,9 @@ __all__ = [
     "get_logging_health",
     "LoggingHealth",
     "LoggingFailure",
+    "get_diagnostics_health",
+    "DiagnosticsHealth",
+    "DiagnosticLoss",
     "default_log_dir",
     # Response cache (host-pluggable; off until configured)
     "LLMCache",
