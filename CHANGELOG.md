@@ -24,9 +24,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   used to answer now misses or drops its write: raise `timeout` for it. The
   cache-failure warning now says a failed write returns the answer and stores
   nothing, where it said every failure proceeded as a miss. A buffered call
-  that joined an identical call in flight still waits for that call to answer,
-  fail or be cancelled, bounded by the leading call's `timeout` and retry
-  budget; that is now documented rather than left implied.
+  that joined an identical call in flight still waits for that call's
+  provider pass to answer, fail or be cancelled, bounded by the leading
+  call's `timeout` and retry budget; that is now documented rather than left
+  implied.
 
 - **A raising logging handler no longer replaces a call's outcome.** When a
   host's `logging.Handler` raised while llmkit reported a problem it had

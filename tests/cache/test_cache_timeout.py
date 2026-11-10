@@ -17,7 +17,7 @@ import concurrent.futures
 import logging
 import math
 from collections.abc import Awaitable, Iterator
-from typing import override
+from typing import cast, override
 
 import pytest
 from pydantic import BaseModel
@@ -283,21 +283,44 @@ async def test_a_store_timeout_error_before_the_deadline_is_its_own(
     assert warning.exc_info is not None and warning.exc_info[1] is own
 
 
+class _ScopeSpy:
+    """Stands in for the ``asyncio`` module inside ``read_through`` and records
+    every ``asyncio.timeout`` scope the cache helpers open."""
+
+    def __init__(self) -> None:
+        self.scopes: list[float | None] = []
+
+    def __getattr__(self, name: str) -> object:
+        return cast("object", getattr(asyncio, name))
+
+    def timeout(self, delay: float | None) -> asyncio.Timeout:
+        self.scopes.append(delay)
+        return asyncio.timeout(delay)
+
+
 @pytest.mark.asyncio
-async def test_none_turns_the_bound_off(gated: list[_Gated]) -> None:
-    """With ``timeout=None`` a stalled ``get`` holds the call until the store
-    answers; releasing the gate is what lets it finish."""
+async def test_none_turns_the_bound_off(
+    gated: list[_Gated], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``timeout=None`` no scope is opened around the store at all, so a
+    stalled ``get`` holds the call until the store answers; releasing the gate
+    is what lets it finish. The spy, not the wait, is what tells "off" from a
+    longer budget the gate happened to be released inside."""
+    spy = _ScopeSpy()
+    monkeypatch.setattr("llmkit.cache.read_through.asyncio", spy)
     store = _store(gated, "get")
+    configure_llm_cache(store, timeout=BUDGET)
     configure_llm_cache(store, timeout=None)
     with install(_answer) as installed:
         task = asyncio.create_task(_text(cache_provider()))
-        # Well past the budget the other tests configure, and past nothing else.
+        # Past the budget configured just before ``None``.
         done, _ = await asyncio.wait({task}, timeout=BUDGET * 5)
         assert not done
         assert store.entered == ["get"]
         store.release()
         assert await _guarded(task) == "answer"
 
+    assert spy.scopes == []
     assert store.cancelled == []
     assert len(installed.requests) == 1
 
@@ -312,8 +335,12 @@ async def test_cancelling_the_call_during_a_store_operation_propagates(
     configure_llm_cache(store)  # the default budget, far longer than this test
     with install(_answer) as installed:
         task = asyncio.create_task(_text(cache_provider()))
-        while not store.entered:
-            await asyncio.sleep(0)
+        try:
+            async with asyncio.timeout(GUARD):
+                while not store.entered:
+                    await asyncio.sleep(0)
+        except TimeoutError:
+            pytest.fail(f"the call did not reach the cache store within {GUARD}s")
         _ = task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -338,6 +365,46 @@ async def test_a_zero_budget_still_serves_the_in_memory_store(
     assert len(installed.requests) == 1
     assert len(cache) == 1
     assert not [r for r in caplog.records if r.name == "llmkit.cache"]
+
+
+@pytest.mark.asyncio
+async def test_a_zero_budget_cuts_off_a_store_that_suspends(
+    gated: list[_Gated], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half of ``0``: a store that suspends at all is cancelled at
+    that first suspension, so ``0`` is a bound, not "off"."""
+    store = _store(gated, "get")
+    configure_llm_cache(store, timeout=0)
+    with install(_answer) as installed:
+        assert await _guarded(_text(cache_provider())) == "answer"
+
+    assert store.cancelled == ["get"]
+    assert len(installed.requests) == 1
+    (warning,) = _cache_warnings(caplog)
+    assert warning.exc_info is not None
+    assert str(warning.exc_info[1]) == "cache get took longer than 0s"
+
+
+def test_each_failure_names_what_the_call_does_about_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A read or decode failure is a miss; a write or encode failure keeps the
+    answer and stores nothing; a key failure bypasses the cache."""
+    from llmkit.cache.registry import report_cache_failure
+
+    outcomes = {
+        "get": "the call proceeds as a miss",
+        "decode": "the call proceeds as a miss",
+        "set": "the call returns its answer and stores nothing",
+        "encode": "the call returns its answer and stores nothing",
+        "key": "the call bypasses the cache and stores nothing",
+    }
+    for what, outcome in outcomes.items():
+        configure_llm_cache(None)  # re-arms the latch, so each one warns
+        caplog.clear()
+        report_cache_failure(what, ValueError(what))
+        (warning,) = _cache_warnings(caplog)
+        assert warning.getMessage().startswith(f"LLM response cache {what} failed; {outcome} (")
 
 
 # --- configuration -------------------------------------------------------------

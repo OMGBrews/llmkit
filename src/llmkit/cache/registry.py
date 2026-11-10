@@ -64,8 +64,9 @@ def configure_llm_cache(cache: LLMCache | None, *, timeout: float | None | Unset
     loop synchronously or swallows the cancellation is outside it (see
     :class:`~llmkit.cache.LLMCache`). It never bounds the wait of a call that
     joined an identical call already in flight: that wait ends when the
-    leading call finishes, fails or is cancelled, so the leading call's own
-    ``timeout`` and retry budget bound it.
+    leading call's provider pass answers, fails or is cancelled, before the
+    leader writes to the cache, so what bounds that pass (the leader's
+    per-request ``timeout`` and retry budget) bounds the wait.
 
     Re-arms the warn-once latch, so a newly configured store — or the same
     store under a new *timeout* — gets a fresh loud first warning if it turns
@@ -116,13 +117,22 @@ def cache_timeout() -> float | None:
     return _timeout
 
 
+# What the call does after each step fails; anything unlisted proceeds as a miss.
+_OUTCOMES = {
+    "set": "the call returns its answer and stores nothing",
+    "encode": "the call returns its answer and stores nothing",
+    "key": "the call bypasses the cache and stores nothing",
+}
+
+
 def report_cache_failure(what: str, exc: BaseException) -> None:
     """Log a cache-side failure: WARNING for a new signature, DEBUG for a repeat.
 
     *what* names the step that failed (``"get"``, ``"set"``, ``"key"``,
     ``"decode"``, ``"encode"``), and the warning says what the call does about
-    it: a failed ``set`` or ``encode`` returns the answer and stores nothing;
-    any other failure proceeds as a miss.
+    it: a failed ``set`` or ``encode`` returns the answer and stores nothing, a
+    failed ``key`` bypasses the cache, and a failed ``get`` or ``decode``
+    proceeds as a miss.
 
     Never raises an ordinary exception: the record goes through
     :func:`llmkit._diagnostics.report`, so a host handler that raises while
@@ -131,11 +141,7 @@ def report_cache_failure(what: str, exc: BaseException) -> None:
     answer or the provider's error. A handler that blocks is not contained.
     """
     if _cache_latch.should_warn(exc):
-        outcome = (
-            "the call returns its answer and stores nothing"
-            if what in ("set", "encode")
-            else "the call proceeds as a miss"
-        )
+        outcome = _OUTCOMES.get(what, "the call proceeds as a miss")
         _ = report(
             logger,
             logging.WARNING,
