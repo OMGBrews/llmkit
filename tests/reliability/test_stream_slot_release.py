@@ -39,7 +39,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from llmkit import ToolCallResult, ToolDefinition
+from llmkit import ToolCallResult, ToolDefinition, flush_llm_logs_async
 from llmkit import calls as llm_calls
 from llmkit.calls import STREAM_ABANDONED_ERROR
 from llmkit.rate_limiting import GlobalRateLimiter, configure_rate_limit
@@ -161,6 +161,9 @@ async def test_cancelled_stream_consumer_releases_rate_limit_slot() -> None:
         async with asyncio.timeout(2):
             async with GlobalRateLimiter.acquire_async("openai"):
                 pass
+        # The record reaches the sink on the log-delivery worker; wait for it
+        # before the sink is restored and the assertion reads the list.
+        assert await flush_llm_logs_async(timeout=2)
 
     assert any(record.error == STREAM_ABANDONED_ERROR for record in captured)
 

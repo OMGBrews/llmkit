@@ -351,12 +351,12 @@ async def _acompletion(**kwargs: object) -> ModelResponse | CustomStreamWrapper:
     It is also where a request carrying ``tools`` opts out of LiteLLM's proxy
     MCP gateway, with LiteLLM's per-call ``_skip_mcp_handler=True``. Unless that
     switch is set, ``completion`` enters a check that asks whether any tool names
-    the gateway, and in LiteLLM 1.106.0 through 1.106.2 the check's module
+    the gateway, and in LiteLLM 1.106.0 through 1.108.3 the check's module
     imports the ``mcp`` package at module level. ``mcp`` ships only in LiteLLM's
     ``mcp``/``proxy`` extras, so on a plain install every tool call failed
     before anything was sent, as an ``APIConnectionError`` reading
-    ``No module named 'mcp'`` (BerriAI/litellm#46045, fixed on LiteLLM's
-    ``main`` by #45961). Skipping is safe because llmkit builds only
+    ``No module named 'mcp'`` (BerriAI/litellm#46045, fixed by #45961 and first
+    released in 1.108.4). Skipping is safe because llmkit builds only
     ``{"type": "function", ...}`` tools, which that check classifies as non-MCP
     anyway. ``completion`` pops the key before parameter mapping, so it never
     reaches a provider, and it is set on these *kwargs* so the temperature

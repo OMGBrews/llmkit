@@ -1,11 +1,11 @@
 """Tool calls run on a plain LiteLLM install, which has no ``mcp`` package.
 
-LiteLLM 1.106.0 through 1.106.2 import the ``mcp`` package (shipped only in
+LiteLLM 1.106.0 through 1.108.3 import the ``mcp`` package (shipped only in
 LiteLLM's ``mcp``/``proxy`` extras) on every completion that carries ``tools``, before
 anything is sent: ``completion`` enters its proxy-MCP-gateway check unless the
 per-call ``_skip_mcp_handler`` is set, and that check's module now imports the
-proxy MCP catalog at module level (BerriAI/litellm#46045, fixed on LiteLLM's
-``main`` by #45961). The transport funnel (``llmkit._litellm._acompletion``)
+proxy MCP catalog at module level (BerriAI/litellm#46045, fixed by #45961 and
+first released in 1.108.4). The transport funnel (``llmkit._litellm._acompletion``)
 sets the switch on every request carrying tools.
 
 These tests call the *real* ``litellm.acompletion`` against a mock response, so
@@ -21,7 +21,6 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
-from importlib.metadata import version
 
 import pytest
 
@@ -71,10 +70,6 @@ def _run_python(code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _litellm_release() -> tuple[int, ...]:
-    return tuple(int(part) for part in version("litellm").split(".")[:3])
-
-
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
 def test_a_tool_call_does_not_import_mcp(stream: bool) -> None:
     """The funnel's tool request completes with ``mcp`` unimportable.
@@ -103,36 +98,3 @@ def test_a_tool_call_does_not_import_mcp(stream: bool) -> None:
         """
     )
     assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.skipif(
-    _litellm_release() < (1, 106, 0),
-    reason="only LiteLLM 1.106.0 and later import mcp on the tool path",
-)
-def test_control_raw_litellm_tool_call_needs_mcp() -> None:
-    """Without the switch, the same request fails for want of ``mcp``.
-
-    This proves the simulation above is live, so the primary test's pass is
-    evidence rather than decoration. It is expected to start failing once the
-    installed LiteLLM contains upstream commit ``783cf06`` (BerriAI/litellm#45961).
-    Then record the first fixed release in the comment on the ``litellm``
-    requirement in ``pyproject.toml`` and retire this control; keep the
-    primary test.
-    """
-    result = _run_python(
-        """
-        import litellm
-
-        async def main():
-            try:
-                await litellm.acompletion(**TOOL_REQUEST)
-            except Exception as exc:
-                print(exc)
-            else:
-                raise SystemExit("the raw tool call succeeded without mcp")
-
-        asyncio.run(main())
-        """
-    )
-    assert result.returncode == 0, result.stderr
-    assert "No module named 'mcp'" in result.stdout, result.stdout
