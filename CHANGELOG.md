@@ -8,6 +8,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A stalled cache store no longer holds a call.** `configure_llm_cache`
+  takes a keyword-only `timeout`, the seconds one store `get` or `set` may
+  take, 1.0 by default. llmkit cancels an operation that overruns it: a read
+  becomes a miss and the call goes to the provider; a write is dropped and the
+  call returns its answer unchanged. Either is warned once on the
+  `llmkit.cache` logger, like any other store failure, as a `TimeoutError`
+  naming the operation and the budget. Previously a store whose `get` or `set`
+  never returned held the call indefinitely, before the provider request or
+  after the answer had arrived, whatever the call's own `timeout`. `None`
+  turns the bound off; omitting `timeout` on a later call keeps the configured
+  value; NaN, infinities, negative numbers and booleans raise `ValueError`.
+  The bound is cooperative: a store that blocks the event loop synchronously
+  or swallows cancellation is outside it. A store slower than one second that
+  used to answer now misses or drops its write: raise `timeout` for it. The
+  cache-failure warning now says a failed write returns the answer and stores
+  nothing, where it said every failure proceeded as a miss. A buffered call
+  that joined an identical call in flight still waits for that call's
+  provider pass to answer, fail or be cancelled, bounded by the leading
+  call's `timeout` and retry budget; that is now documented rather than left
+  implied.
+
 - **A raising logging handler no longer replaces a call's outcome.** When a
   host's `logging.Handler` raised while llmkit reported a problem it had
   already contained, the handler's exception surfaced in place of the result

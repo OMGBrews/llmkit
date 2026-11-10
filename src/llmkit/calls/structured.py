@@ -463,7 +463,8 @@ def structured_llm_call_sync[T: BaseModel](
     ``timeout`` is seconds for one provider round trip, enforced by llmkit as
     on the async form; unset or ``None`` sets no deadline. The sync bridge adds
     no whole-call ceiling: as on the async form, the per-request timeout and
-    the retry budget bound the call.
+    the retry budget bound the call, with the configured cache ``timeout`` on
+    each store read and write.
     """
     return run_sync(
         structured_llm_call(

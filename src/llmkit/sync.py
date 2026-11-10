@@ -87,7 +87,8 @@ logger = logging.getLogger(__name__)
 # at call time, not bound as the parameter default, so it is one place to
 # change. The call functions' sync forms do not use it: they pass
 # ``timeout=None``, because a sync call must not add a limit the async call
-# lacks (the per-request ``timeout`` and the retry budget bound both forms).
+# lacks (the per-request ``timeout``, the retry budget and the cache's own
+# ``timeout`` on each store read and write bound both forms).
 _DEFAULT_TIMEOUT_SECONDS: float = 600.0
 
 # The bound on each logging drain the loop-on-loop fallback runs after its
@@ -412,7 +413,8 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None | U
     concurrency backpressure; this ceiling exists only to bound a *hung*
     coroutine. Pass ``None`` to wait unbounded. The call functions' sync forms
     pass ``None``: like their async forms, they are bounded by the per-request
-    ``timeout`` and the retry budget, not by a whole-call ceiling.
+    ``timeout``, the retry budget and the cache's own ``timeout`` on each store
+    read and write, not by a whole-call ceiling.
 
     On the persistent-loop path — including reentrant calls from a foreign
     loop — a timeout (or a :class:`KeyboardInterrupt` in the calling thread)

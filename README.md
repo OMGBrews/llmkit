@@ -613,7 +613,9 @@ and a streamed attempt records `first_chunk_ms`, the time to its first chunk.
 The sync wrappers behave the same way: the sync bridge adds no whole-call
 ceiling of its own, and a sync stream adds no limit to each wait for its next
 item beyond this one. This setting is not a whole-call deadline on either
-form; the retry budget and each request's timeout are what bound a call.
+form; the retry budget and each request's timeout are what bound a call,
+with, when a response cache is configured, the cache's own `timeout` on each
+store read and write (see [Response cache](#response-cache)).
 
 ### Contracts as JSON-schema dicts
 
@@ -1189,6 +1191,7 @@ When an application sends the same request twice, the second one is normally pai
 from llmkit import InMemoryLLMCache, configure_llm_cache
 
 configure_llm_cache(InMemoryLLMCache(max_entries=1024))   # None (the default) turns it off
+configure_llm_cache(my_store, timeout=0.25)                # seconds per store read or write; 1.0 by default
 ```
 
 The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers, and by `text_llm_call_stream` and its sync form; the tool families do not read it. A streamed and a buffered text request for the same prompt are the same request, so either one answers the other. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
@@ -1211,7 +1214,9 @@ The re-roll pattern in [Wrapping your own work](#wrapping-your-own-work-with_ret
 
 llmkit computes the key, because only llmkit holds the resolved request. `llm_cache_key` is a sha256 over, in a fixed order: a key-format version (`llmkit.cache.LLM_CACHE_KEY_VERSION`, now 4, so entries an earlier release stored miss once and are replaced); the provider's name; the model as routed to LiteLLM (your `model`, or the provider default); the provider's endpoint settings — `api_base`, `extra_body`, `aws_region_name`, `vertex_project` and `vertex_location`, where present; the messages as sent; the output schema's JSON schema, or `"text"`; `temperature` (the value you asked for, even when the model refused it and llmkit omitted it on the wire); `max_tokens`; the effective reasoning effort (yours, or the provider's configured one); and, for a structured call, the provider's structured-output mode and strict-schema setting.
 
-`timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the leader's round trip; the follower's own `timeout` does not bound that wait. Cache reads and writes also have no llmkit deadline. An asynchronous store should bound its own I/O; a store that blocks synchronously stalls the event loop. A caller can bound an entire async call with its own cancellation scope, but cancellation does not terminate synchronous blocked code.
+`timeout` is not part of the key because it does not change the answer. An identical buffered request joining one already in flight waits for the rest of the leader's provider pass — its attempts, backoff sleeps and any rate-limiter queue wait — not one round trip, and the follower's own `timeout` does not bound that wait. The leader releases its followers as soon as that pass answers, fails or is cancelled, before it writes the answer to the cache, so what bounds the pass (the leader's per-request `timeout` on each round trip and its retry budget) bounds the follower too; a rate-limiter queue wait is bounded by neither, for the leader or the follower. If the leader failed or was cancelled, the follower then runs on its own budget. A follower deadline sized like one round trip would expire while a healthy leader was retrying or queued for a rate-limiter slot and send a duplicate request, which is what joining exists to prevent, so there is none.
+
+Cache reads and writes have their own budget, the `timeout` passed to `configure_llm_cache`: 1.0 second unless configured, `None` to turn it off. A read that overruns it is cancelled and becomes a miss, so the call goes to the provider; a write that overruns it is cancelled and dropped, and the call returns its answer unchanged. Either is reported like any other store failure, below. Omitting `timeout` on a later `configure_llm_cache` call keeps the configured value, including when you only swap the store or turn caching off. The budget works by cancelling the store's await, so it bounds an asynchronous store that honours cancellation. A store that blocks the event loop synchronously, or that catches the cancellation and carries on, is outside it; bound your own I/O as well, with your client's timeout. A caller can bound an entire async call with its own cancellation scope, but cancellation does not terminate synchronous blocked code.
 
 For schema-backed models the key also includes the original schema snapshot, selected dialect, and format-assertion policy, so contracts with identical provider guidance still have separate cache entries. Caller-written Pydantic models keep their existing key format.
 
@@ -1254,7 +1259,9 @@ configure_llm_cache(RedisLLMCache(redis_client, ttl_seconds=86_400))
 
 `LLMCacheEntry` is a frozen dataclass of plain strings — `response` (the answer text the provider sent, for a structured call too), `schema`, `provider`, `model`, and the `call_id` of the call that stored it — so any store can persist it. It has no expiry field: retention is the store's policy, as it is a log sink's.
 
-`configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. An ordinary exception from a cache read or write does not fail the provider call: a failed read becomes a miss, a failed write discards the store, and llmkit logs one warning on the `llmkit.cache` logger, with repeats of the same failure at DEBUG until the cache is reconfigured.
+A store owes llmkit two things beyond the two methods: it bounds its own I/O, and its `get` and `set` honour cancellation. llmkit cancels a read or write that overruns the cache `timeout` (above) and moves on, so a store whose client has no timeout is still cut off, provided the cancellation reaches the await it is stuck in.
+
+`configure_llm_cache` checks what you hand it, as `configure_llm_logging` does: a non-cache, or the class where you meant an instance, raises `TypeError` there and then, and a bare `MagicMock()` does not match. `get_llm_cache()` reads back what is installed, for save-and-restore. An ordinary exception from a cache read or write, or one that overruns the cache `timeout`, does not fail the provider call: a failed read becomes a miss, a failed write is dropped and the call returns its answer, and llmkit logs one warning on the `llmkit.cache` logger saying which, with repeats of the same failure at DEBUG until the cache is reconfigured. An overrun logs as a `TimeoutError` naming the operation and the budget; a `TimeoutError` your store raised itself is logged as yours.
 
 ## Configuration
 
