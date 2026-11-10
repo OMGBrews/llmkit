@@ -45,9 +45,16 @@ class LLMCache(Protocol):
     when to store, request coalescing, and the hit record; the store owns
     persistence and retention.
 
-    A store that raises never fails the call: llmkit treats the failure as a
-    miss and logs one warning per failure signature until the cache is
-    reconfigured.
+    A store that raises never fails the call: llmkit treats a failed ``get``
+    as a miss and a failed ``set`` as a dropped write, and logs one warning per
+    failure signature until the cache is reconfigured.
+
+    What a store owes llmkit: bound your own I/O, and let ``get`` and ``set``
+    be cancelled. llmkit cancels an operation that overruns the ``timeout``
+    configured with :func:`~llmkit.cache.configure_llm_cache` (1.0 second
+    unless configured) and treats it as failed, as above. That bound works only
+    through cancellation: a store that blocks the event loop synchronously, or
+    that catches the cancellation and carries on, is outside it.
 
     ``@runtime_checkable`` so :func:`~llmkit.cache.configure_llm_cache` can
     reject a non-cache at configuration time. The check is structural and

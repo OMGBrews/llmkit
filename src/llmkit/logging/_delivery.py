@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import cast
 
 import llmkit.logging.registry as registry
+from llmkit._durations import duration
 from llmkit.logging._health import HealthState
 from llmkit.logging._policy import (
     LogDeliveryPolicy,
-    duration,
     freeze_delivery_policy,
     get_delivery_policy,
 )

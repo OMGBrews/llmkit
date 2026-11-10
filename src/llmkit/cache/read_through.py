@@ -6,9 +6,16 @@ to accept a stored one), so the structured and text paths cannot drift. The
 streamed text lane cannot be an awaitable *run* — its answer is complete only
 when its consumer pulls the last chunk — so it takes no part in the single
 flight and calls :func:`cached_entry` and :func:`store_entry` directly. Every
-cache-side failure degrades to a miss and reports to the one warn-once latch in
-:mod:`llmkit.cache.registry`, whose diagnostics are contained: a host logging
-handler that raises cannot turn that miss into a failed call.
+cache-side failure degrades to a miss (a failed write, to an answer that is not
+stored) and reports to the one warn-once latch in :mod:`llmkit.cache.registry`,
+whose diagnostics are contained: a host logging handler that raises cannot turn
+that miss into a failed call.
+
+Those two helpers are also where the configured cache ``timeout`` applies: each
+store ``get`` and ``set`` runs inside it, and one that overruns is cancelled and
+reported as that operation's failure. A follower's wait on the single flight is
+not bounded here; it ends when the leader lands its flight, which the leader
+does in a ``finally`` whether it answers, fails or is cancelled.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ from llmkit._diagnostics import report
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.cache._flight import land, lead_or_follow
 from llmkit.cache.key import llm_cache_key
-from llmkit.cache.registry import logger, report_cache_failure
+from llmkit.cache.registry import cache_timeout, logger, report_cache_failure
 from llmkit.cache.store import LLMCache, LLMCacheEntry
 from llmkit.exceptions import ResultValidationError
 from llmkit.providers import LLMProviderInterface
@@ -143,9 +150,12 @@ async def _run_and_store[T](
 
 
 async def cached_entry(cache: LLMCache, key: str) -> LLMCacheEntry | None:
-    """The entry *cache* holds for *key*, or ``None`` on a miss or any failure."""
+    """The entry *cache* holds for *key*, or ``None`` on a miss or any failure.
+
+    A ``get`` that overruns the configured cache ``timeout`` is a failure.
+    """
     try:
-        entry = await cache.get(key)
+        entry = await _bounded("get", cache.get(key))
         # A structural protocol match promises the method exists, never that it
         # honours its return annotation.
         if entry is not None and not isinstance(entry, LLMCacheEntry):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard on a third-party return
@@ -159,11 +169,38 @@ async def cached_entry(cache: LLMCache, key: str) -> LLMCacheEntry | None:
 
 
 async def store_entry(cache: LLMCache, key: str, entry: LLMCacheEntry) -> None:
-    """Store *entry* under *key*; a failing store is reported, never raised."""
+    """Store *entry* under *key*; a failing store is reported, never raised.
+
+    A ``set`` that overruns the configured cache ``timeout`` is a failure.
+    """
     try:
-        await cache.set(key, entry)
+        await _bounded("set", cache.set(key, entry))
     except Exception as exc:
         report_cache_failure("set", exc)
+
+
+async def _bounded[T](what: str, operation: Awaitable[T]) -> T:
+    """Await one store *operation*, cancelled after the configured cache ``timeout``.
+
+    The same shape as the provider round trip's deadline in
+    :mod:`llmkit._litellm`: ``asyncio.timeout`` cancels the store's await at
+    the deadline, and the ``TimeoutError`` it raises, which carries no message,
+    is replaced by one naming the operation and the budget. A ``TimeoutError``
+    the store raised itself, before the deadline, passes through unchanged and
+    is reported as the store's own failure. A cancellation of the call itself
+    is a ``BaseException`` and propagates as before.
+    """
+    budget = cache_timeout()
+    if budget is None:
+        return await operation
+    scope = asyncio.timeout(budget)
+    try:
+        async with scope:
+            return await operation
+    except TimeoutError:
+        if scope.expired():
+            raise TimeoutError(f"cache {what} took longer than {budget:g}s") from None
+        raise
 
 
 def _encode[T](encode: Callable[[T], LLMCacheEntry | None], result: T) -> LLMCacheEntry | None:

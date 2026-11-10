@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 
 from llmkit._diagnostics import report
+from llmkit._durations import duration
 from llmkit._latch import OnceLatch
 from llmkit.cache.store import LLMCache
+from llmkit.options import UNSET, Unset
 
 # Named explicitly so every module in the package emits under one logger name.
 logger = logging.getLogger("llmkit.cache")
@@ -20,6 +22,14 @@ logger = logging.getLogger("llmkit.cache")
 # ``None`` is the default: no cache, and every request byte-identical to a
 # library without one.
 _cache: LLMCache | None = None
+
+#: Seconds one store ``get`` or ``set`` may take before llmkit cancels it: a
+#: read that overruns is a miss, a write that overruns is dropped.
+DEFAULT_CACHE_TIMEOUT = 1.0
+
+# ``None`` turns the bound off. Kept apart from ``_cache`` so a later
+# ``configure_llm_cache(store)`` that omits ``timeout`` keeps the configured one.
+_timeout: float | None = DEFAULT_CACHE_TIMEOUT
 
 # One warn-once latch for every cache-side failure — computing the key,
 # ``get``, ``set``, encoding or decoding an entry. Unlike the sink's latch it
@@ -29,8 +39,8 @@ _cache: LLMCache | None = None
 _cache_latch = OnceLatch()
 
 
-def configure_llm_cache(cache: LLMCache | None) -> None:
-    """Set the response cache the call functions read through.
+def configure_llm_cache(cache: LLMCache | None, *, timeout: float | None | Unset = UNSET) -> None:
+    """Set the response cache the call functions read through, and its time budget.
 
     Pass ``None`` (the default state) to turn caching off. With a cache
     configured, :func:`~llmkit.structured_llm_call`,
@@ -41,8 +51,25 @@ def configure_llm_cache(cache: LLMCache | None) -> None:
     flight at once into one provider call. ``cache=False`` on a call or on
     :class:`~llmkit.LLMCallOptions` opts that call out.
 
-    Re-arms the warn-once latch, so a newly configured store gets a fresh loud
-    first warning if it too turns out to be broken.
+    *timeout* is the seconds one store ``get`` or ``set`` may take,
+    :data:`DEFAULT_CACHE_TIMEOUT` (1.0) unless configured. llmkit cancels an
+    operation that overruns it: a read becomes a miss and the call asks the
+    provider, a write is dropped and the call returns its answer unchanged,
+    each reported like any other cache failure. ``None`` turns the bound off.
+    ``0`` cancels at the store's first suspension, so a store that never
+    suspends — :class:`~llmkit.InMemoryLLMCache` among them — still answers.
+    Omitting *timeout* keeps the value configured before, so a later call that
+    only swaps the store, or turns caching off, does not reset it. The bound
+    is cooperative: it works by cancellation, so a store that blocks the event
+    loop synchronously or swallows the cancellation is outside it (see
+    :class:`~llmkit.cache.LLMCache`). It never bounds the wait of a call that
+    joined an identical call already in flight: that wait ends when the
+    leading call finishes, fails or is cancelled, so the leading call's own
+    ``timeout`` and retry budget bound it.
+
+    Re-arms the warn-once latch, so a newly configured store — or the same
+    store under a new *timeout* — gets a fresh loud first warning if it turns
+    out to be broken.
 
     Raises:
         TypeError: if *cache* is neither ``None`` nor an :class:`LLMCache`
@@ -50,8 +77,10 @@ def configure_llm_cache(cache: LLMCache | None) -> None:
             it. The structural check tests attribute presence only, so, as
             with :func:`~llmkit.configure_llm_logging`, a bare ``MagicMock()``
             does not match; stub with a small fake class.
+        ValueError: if *timeout* is a ``bool``, nonfinite or negative.
+            Nothing is changed when either check fails.
     """
-    global _cache
+    global _cache, _timeout
     if isinstance(cache, type):
         # A class object carries ``get`` and ``set`` as attributes, so it passes
         # the structural check below while failing every call on the missing
@@ -65,7 +94,11 @@ def configure_llm_cache(cache: LLMCache | None) -> None:
             "cache must implement LLMCache (async get(key) and set(key, entry)) or be None, "
             + f"got {type(cache).__name__}"
         )
+    if not isinstance(timeout, Unset) and timeout is not None:
+        timeout = duration(timeout, "timeout")
     _cache = cache
+    if not isinstance(timeout, Unset):
+        _timeout = timeout
     _cache_latch.succeeded()
 
 
@@ -78,11 +111,18 @@ def get_llm_cache() -> LLMCache | None:
     return _cache
 
 
+def cache_timeout() -> float | None:
+    """The configured budget for one store ``get`` or ``set``; ``None`` when off."""
+    return _timeout
+
+
 def report_cache_failure(what: str, exc: BaseException) -> None:
     """Log a cache-side failure: WARNING for a new signature, DEBUG for a repeat.
 
     *what* names the step that failed (``"get"``, ``"set"``, ``"key"``,
-    ``"decode"``, ``"encode"``); the call proceeds as a miss either way.
+    ``"decode"``, ``"encode"``), and the warning says what the call does about
+    it: a failed ``set`` or ``encode`` returns the answer and stores nothing;
+    any other failure proceeds as a miss.
 
     Never raises an ordinary exception: the record goes through
     :func:`llmkit._diagnostics.report`, so a host handler that raises while
@@ -91,12 +131,17 @@ def report_cache_failure(what: str, exc: BaseException) -> None:
     answer or the provider's error. A handler that blocks is not contained.
     """
     if _cache_latch.should_warn(exc):
+        outcome = (
+            "the call returns its answer and stores nothing"
+            if what in ("set", "encode")
+            else "the call proceeds as a miss"
+        )
         _ = report(
             logger,
             logging.WARNING,
-            "LLM response cache %s failed; the call proceeds as a miss "
-            + "(further identical failures logged at DEBUG)",
+            "LLM response cache %s failed; %s (further identical failures logged at DEBUG)",
             what,
+            outcome,
             exc_info=exc,
         )
     else:

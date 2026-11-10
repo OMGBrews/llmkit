@@ -28,6 +28,7 @@ from llmkit import (
     configure_llm_client,
     configure_llm_logging,
 )
+from llmkit.cache.registry import DEFAULT_CACHE_TIMEOUT
 from llmkit.rate_limiting import GlobalRateLimiter
 
 # The usage triple a faked ``acompletion_structured`` / ``acompletion_text``
@@ -100,13 +101,13 @@ def ollama_call_defaults() -> Generator[None]:
     :mod:`llmkit.testing` fake: the fake answers only the round trip, so a real
     configured provider must still resolve, and Ollama needs no key. The rate
     limiter keeps the shipped defaults (breaker off). Restores the previous
-    provider config and resets the cache and limiter on exit. A ``conftest.py``
+    provider config and resets the cache, its timeout and the limiter on exit. A ``conftest.py``
     wraps this in an autouse fixture.
     """
     previous = configure_llm_client(
         lambda: LLMClientConfig(provider=Provider.OLLAMA, model="fake-model")
     )
-    configure_llm_cache(None)
+    configure_llm_cache(None, timeout=DEFAULT_CACHE_TIMEOUT)
     GlobalRateLimiter._reset()
     _litellm.reset_temperature_warnings()
     try:
@@ -115,7 +116,7 @@ def ollama_call_defaults() -> Generator[None]:
     finally:
         GlobalRateLimiter._reset()
         _litellm.reset_temperature_warnings()
-        configure_llm_cache(None)
+        configure_llm_cache(None, timeout=DEFAULT_CACHE_TIMEOUT)
         _ = configure_llm_client(previous)
 
 

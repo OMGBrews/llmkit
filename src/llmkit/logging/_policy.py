@@ -1,14 +1,9 @@
 """Managed delivery configuration, independent of the sink registry."""
 
-import math
 import threading
 from dataclasses import dataclass
 
-
-def duration(value: float, name: str) -> float:
-    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be finite and nonnegative")
-    return value
+from llmkit._durations import duration
 
 
 @dataclass(frozen=True)
