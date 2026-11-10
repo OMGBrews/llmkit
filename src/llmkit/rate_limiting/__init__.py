@@ -82,8 +82,9 @@ call sites, because it never spells the name at all.
 favours the common access pattern — fan-out — out of the box, bounding a
 self-inflicted burst (and the bill / 429s that follow) without quietly
 serialising real multi-call workloads. A host on a tightly-metered plan can
-lower it via :func:`configure_rate_limit`; a local Ollama server happy to fan
-out harder can raise it.
+lower it with a :class:`RateLimitPolicy` passed to :func:`configure_rate_limit`
+(for every provider or as one provider's override); a local Ollama server
+happy to fan out harder can raise it.
 
 **RPM and TPM are opt-in and off by default.** Unlike concurrency, there is no
 universal sane requests-/tokens-per-minute number — the right value is the
@@ -92,14 +93,20 @@ byte-identical request to the pre-feature behaviour (no throttle on those
 dimensions). Set them to your account's published RPM/TPM and llmkit smooths
 calls to stay under them. The binding limit on a metered cloud account is
 usually RPM/TPM, **not** concurrency, so a migrator moving off a
-requests-per-minute knob should set ``rpm=`` here rather than expect the
+requests-per-minute knob should set ``RateLimitPolicy(rpm=...)`` rather than expect the
 concurrency cap to stand in for it (the two limit different things, and the
 concurrency cap alone leaves an old RPM tuning inert).
 
-A single ``max_concurrent`` / ``rpm`` / ``tpm`` value applies to *all*
-providers; there is intentionally no per-provider cap map, to keep the public
-surface small (shared budgets and three switches: ``enabled`` / ``adaptive`` /
-``breaker``).
+The numbers live in a :class:`RateLimitPolicy` (``max_concurrent``, ``rpm``,
+``tpm``, ``breaker_cooldown``); the switches ``enabled`` / ``adaptive`` /
+``breaker`` stay keywords. One policy is the shared default, and
+``configure_rate_limit(overrides=...)`` gives a provider whose account has
+different limits its own policy. A provider runs under its override if it has
+one and under the default otherwise — no field-level merging — so switching a
+program from one provider to another picks up the destination's budget, and
+each provider's gates, buckets and breaker are built from its own policy.
+Override keys are ``Provider`` members or provider instances, resolved to the
+same provider name the hand-join functions and llmkit's own calls charge.
 
 Token bucket, not sliding window
 --------------------------------
@@ -159,6 +166,8 @@ the circuit breaker in particular was invisible in the single-file form:
 
 * ``_tuning`` — the internal constants and the shared monotonic clock (a test
   seam; see that module before moving a clock read);
+* ``_policy`` — :class:`RateLimitPolicy`, the per-provider budget value object
+  and its validation;
 * ``_observability`` — backpressure events and the per-attempt queue-wait
   stamp, both context-scoped and both identity-critical;
 * ``_buckets`` — the *rate* dimension (RPM/TPM token buckets) and
@@ -176,8 +185,10 @@ module boundary; the package's public surface is exactly ``__all__`` below.
 """
 
 import contextlib
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import cast
 
 from llmkit.options import UNSET, Unset
 from llmkit.providers import LLMProviderInterface, Provider, provider_display_name
@@ -190,19 +201,22 @@ from llmkit.rate_limiting._observability import (
     begin_queue_wait,
     current_queue_wait_ms,
 )
-from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN
+from llmkit.rate_limiting._policy import DEFAULT_RATE_LIMIT_POLICY, RateLimitPolicy
 
 __all__ = [
     "BackpressureCallback",
+    "DEFAULT_RATE_LIMIT_POLICY",
     "BackpressureEvent",
     "GlobalRateLimiter",
     "RateLimitConfig",
+    "RateLimitPolicy",
     "RateLimitSlot",
     "backpressure_callback",
     "begin_queue_wait",
     "configure_rate_limit",
     "current_queue_wait_ms",
     "get_rate_limit_config",
+    "get_rate_limit_policy",
     "rate_limit_acquire_async",
     "rate_limit_acquire_sync",
 ]
@@ -214,48 +228,64 @@ class RateLimitConfig:
 
     Returned by :func:`get_rate_limit_config` so a host can log or assert its
     effective limits at startup without reaching into limiter internals.
-    ``rpm`` / ``tpm`` are ``None`` when those opt-in dimensions are off;
     ``adaptive`` is whether the concurrency limit adapts to provider overload;
-    ``breaker`` is whether the per-provider circuit breaker is armed (opt-in),
-    and ``breaker_cooldown`` is the duration of its open period in seconds.
+    ``breaker`` is whether the per-provider circuit breaker is armed (opt-in).
+    ``policy`` is the :class:`RateLimitPolicy` every provider without an
+    override runs under, and ``overrides`` maps each overridden provider's
+    display name (the value the call log's ``provider`` field records, e.g.
+    ``"Google Agent Platform"`` for ``Provider.VERTEX``) to its policy. To ask
+    which policy one provider runs under, use :func:`get_rate_limit_policy`.
     """
 
     enabled: bool
-    max_concurrent: int
-    rpm: int | None
-    tpm: int | None
     adaptive: bool
     breaker: bool
-    breaker_cooldown: float = BREAKER_COOLDOWN
+    policy: RateLimitPolicy
+    overrides: Mapping[str, RateLimitPolicy]
 
 
 def configure_rate_limit(
-    max_concurrent: int | Unset = UNSET,
+    policy: RateLimitPolicy | Unset = UNSET,
+    overrides: Mapping[Provider | LLMProviderInterface, RateLimitPolicy] | Unset = UNSET,
     enabled: bool | Unset = UNSET,
-    rpm: int | None | Unset = UNSET,
-    tpm: int | None | Unset = UNSET,
     adaptive: bool | Unset = UNSET,
     breaker: bool | Unset = UNSET,
-    breaker_cooldown: float | Unset = UNSET,
 ) -> None:
     """Configure the global, per-provider LLM rate limit.
 
     Rate limiting is on by default (concurrency cap 8 per provider, adaptive; RPM
-    and TPM off; circuit breaker off). Call this to change the concurrency cap,
-    turn limiting off, opt into a per-provider requests-/tokens-per-minute
-    ceiling, turn off adaptive concurrency, or arm the circuit breaker. When
-    enabled, every provider call routed through the LiteLLM call layer passes
-    through that provider's limiters.
+    and TPM off; circuit breaker off). The numbers live in a
+    :class:`RateLimitPolicy`; the switches are keywords:
+
+    * ``policy`` — the budget every provider runs under unless it has an
+      override (:data:`DEFAULT_RATE_LIMIT_POLICY` until set).
+    * ``overrides`` — a map from provider (a :class:`~llmkit.providers.Provider`
+      member or a provider instance) to the policy that provider runs under
+      instead, for accounts whose limits differ. A provider's effective policy is
+      its override if it has one, otherwise ``policy``; the two are never merged
+      field by field, so derive an override with :func:`dataclasses.replace`.
+    * ``enabled`` / ``adaptive`` / ``breaker`` — the on/off switches.
 
     Each call changes only the keywords it passes; an omitted keyword keeps its
-    current value, so ``configure_rate_limit(rpm=3_500)`` at startup and
-    ``configure_rate_limit(breaker=True)`` later leave both in force. Pass
-    ``rpm=None`` or ``tpm=None`` to turn that dimension off again. Every call
-    also clears the per-provider limiter state (adaptive limits, breaker
-    windows, token buckets), so call it at startup rather than mid-run.
+    current value, so ``configure_rate_limit(policy=...)`` at startup and
+    ``configure_rate_limit(breaker=True)`` later leave both in force. Passing
+    ``overrides`` replaces the whole map: ``overrides={}`` removes every
+    override, and a provider missing from the new map goes back to ``policy``.
+    Inside a policy, ``rpm=None`` / ``tpm=None`` means that dimension is off for
+    the providers running under it. Every call also clears the per-provider
+    limiter state (adaptive limits, breaker windows, token buckets), so call it
+    at startup rather than mid-run; in-flight calls finish on the resources they
+    already hold.
+
+    Usage::
+
+        configure_rate_limit(
+            policy=RateLimitPolicy(rpm=3_500, tpm=2_000_000),
+            overrides={Provider.ANTHROPIC: RateLimitPolicy(max_concurrent=4, rpm=50)},
+        )
 
     The binding limit on a metered cloud account is usually RPM/TPM rather than
-    concurrency: set ``rpm=`` / ``tpm=`` to your account's published per-minute
+    concurrency: set ``rpm`` / ``tpm`` to your account's published per-minute
     limits and llmkit smooths calls to stay under them (a token bucket per
     provider). Leaving them unset (the default) sends a byte-identical request
     to the pre-feature behaviour — the concurrency cap alone does not stand in
@@ -264,15 +294,15 @@ def configure_rate_limit(
     Adaptive concurrency (``adaptive``, on by default) is the library-side
     generalization of a hand-tuned RPM ceiling: it *discovers* a safe concurrency
     by halving the per-provider limit on a provider overload signal (429/503/529)
-    and recovering it toward ``max_concurrent`` once the provider stops pushing
-    back — zero per-account tuning. It can only ever lower the limit *below*
-    ``max_concurrent``, never above, so with no throttles it is identical to a
-    fixed cap.
+    and recovering it toward the policy's ``max_concurrent`` once the provider
+    stops pushing back — zero per-account tuning. It can only ever lower the
+    limit *below* ``max_concurrent``, never above, so with no throttles it is
+    identical to a fixed cap.
 
     The circuit breaker (``breaker``, **off** by default) is the aggregate guard
     for a provider that is *down*: armed, it fast-fails a provider's calls with
     :class:`~llmkit.exceptions.CircuitOpenError` once that provider's outage
-    rate over a rolling window crosses the trip threshold, for
+    rate over a rolling window crosses the trip threshold, for the policy's
     ``breaker_cooldown`` seconds (30 by default), then lets a single probe test
     recovery. Throttles, connection failures and transient
     server errors count as outages; caller deadlines, timeouts without an
@@ -286,79 +316,127 @@ def configure_rate_limit(
     degrade-on-503 ``except`` keeps catching it) but never retried by the library.
 
     Args:
-        max_concurrent: Maximum concurrent API calls **per provider** (the
-            ceiling the adaptive limit starts at and recovers toward); 8 until
-            set.
+        policy: The default :class:`RateLimitPolicy`.
+        overrides: Per-provider policies, keyed by ``Provider`` member or
+            provider instance. Replaces the previous map.
         enabled: Whether rate limiting is active; on until set.
-        rpm: Sustained requests-per-minute **per provider**, or ``None`` to
-            turn the request-rate dimension off (off until set).
-        tpm: Sustained tokens-per-minute **per provider**, or ``None`` to turn
-            the token-rate dimension off (off until set).
         adaptive: Whether the concurrency limit adapts to provider overload
             (on until set). ``False`` pins it at ``max_concurrent``.
         breaker: Whether the per-provider circuit breaker is armed (**off**
             until set). ``True`` makes a known-down provider fail fast for a
             cooldown instead of letting every call burn its retry budget.
-        breaker_cooldown: Seconds to fail fast before a recovery probe; finite
-            and positive, 30 until set. Omitting it retains the current value.
 
     Raises:
-        ValueError: if ``max_concurrent`` is not a positive ``int``, or ``rpm``
-            / ``tpm`` is set to anything but ``None`` or a positive ``int`` (a
-            ``bool``, a float, NaN and infinity are refused), or
-            ``breaker_cooldown`` is a ``bool`` or not finite and positive. A
-            refused call changes nothing.
+        TypeError: if ``policy`` or an override value is not a
+            :class:`RateLimitPolicy`, ``overrides`` is not a mapping (``None``
+            included), or an override key is neither a ``Provider`` member nor
+            a provider instance (a plain string such as ``"openai"`` is refused).
+        ValueError: if two override keys name the same provider (for example a
+            member and an instance of it).
+
+        A refused call changes nothing. Invalid numbers are refused earlier, by
+        the :class:`RateLimitPolicy` constructor.
     """
+    # Annotations are not enforced at runtime; a dict or a bare number here
+    # would otherwise fail later, inside the limiter, under its lock.
+    if not isinstance(cast("object", policy), (RateLimitPolicy, Unset)):
+        raise TypeError(
+            f"configure_rate_limit policy must be a RateLimitPolicy, got {type(policy).__name__}"
+        )
+    resolved: dict[str, RateLimitPolicy] | Unset = UNSET
+    if not isinstance(overrides, Unset):
+        resolved = _resolve_overrides(overrides)
     GlobalRateLimiter.configure(
-        max_concurrent=max_concurrent,
+        policy=policy,
+        overrides=resolved,
         enabled=enabled,
-        rpm=rpm,
-        tpm=tpm,
         adaptive=adaptive,
         breaker=breaker,
-        breaker_cooldown=breaker_cooldown,
     )
+
+
+def _resolve_overrides(overrides: object) -> dict[str, RateLimitPolicy]:
+    """Check an ``overrides=`` argument and key it by provider display name.
+
+    Runs before the limiter is touched, so every refusal leaves it unchanged.
+    """
+    if not isinstance(overrides, Mapping):
+        raise TypeError(
+            "configure_rate_limit overrides must be a mapping from provider to "
+            + f"RateLimitPolicy, got {type(overrides).__name__}; pass {{}} to remove "
+            + "every override"
+        )
+    resolved: dict[str, RateLimitPolicy] = {}
+    sources: dict[str, object] = {}
+    for provider_key, override in cast("Mapping[object, object]", overrides).items():
+        name = _limiter_key(provider_key, "configure_rate_limit overrides")
+        if not isinstance(override, RateLimitPolicy):
+            raise TypeError(
+                f"configure_rate_limit overrides[{provider_key!r}] must be a "
+                + f"RateLimitPolicy, got {type(override).__name__} {override!r}"
+            )
+        normalized = GlobalRateLimiter.normalize_key(name)
+        if normalized in sources:
+            raise ValueError(
+                f"configure_rate_limit overrides name provider {name!r} twice: "
+                + f"{sources[normalized]!r} and {provider_key!r}"
+            )
+        sources[normalized] = provider_key
+        resolved[name] = override
+    return resolved
 
 
 def get_rate_limit_config() -> RateLimitConfig:
     """Read the effective rate-limit configuration.
 
     The symmetric read for :func:`configure_rate_limit`: lets a host log or
-    assert its effective limits at startup without touching limiter internals
-    (e.g. ``GlobalRateLimiter._max_concurrent``). The ``enabled`` flag on the
-    returned snapshot is the public way to check whether limiting is active.
+    assert its effective limits at startup without touching limiter internals.
+    The ``enabled`` flag on the returned snapshot is the public way to check
+    whether limiting is active.
 
     Returns:
-        A :class:`RateLimitConfig` snapshot of the current ``enabled`` flag,
-        per-provider ``max_concurrent`` cap, per-provider ``rpm`` / ``tpm``
-        limits (``None`` when those dimensions are off), the ``adaptive`` flag,
-        the ``breaker`` flag, and its ``breaker_cooldown`` in seconds.
+        A :class:`RateLimitConfig` snapshot of the ``enabled``, ``adaptive``
+        and ``breaker`` switches, the default ``policy``, and the
+        ``overrides`` keyed by provider display name.
     """
     return RateLimitConfig(
         enabled=GlobalRateLimiter.is_enabled(),
-        max_concurrent=GlobalRateLimiter.max_concurrent(),
-        rpm=GlobalRateLimiter.rpm(),
-        tpm=GlobalRateLimiter.tpm(),
         adaptive=GlobalRateLimiter.adaptive(),
         breaker=GlobalRateLimiter.breaker(),
-        breaker_cooldown=GlobalRateLimiter.breaker_cooldown(),
+        policy=GlobalRateLimiter.policy(),
+        overrides=MappingProxyType(GlobalRateLimiter.overrides()),
     )
 
 
-def _limiter_key(provider_key: object) -> str:
-    """Resolve a hand-join argument to the key llmkit's own calls charge.
+def get_rate_limit_policy(provider: Provider | LLMProviderInterface) -> RateLimitPolicy:
+    """The :class:`RateLimitPolicy` one provider's calls run under.
+
+    Resolves ``provider`` exactly as :func:`configure_rate_limit` resolves an
+    override key and as the hand-join functions resolve theirs, and returns its
+    override if it has one, otherwise the default policy.
+
+    Raises:
+        TypeError: if ``provider`` is neither a ``Provider`` member nor a
+            provider instance.
+    """
+    return GlobalRateLimiter.policy_for(_limiter_key(provider, "get_rate_limit_policy"))
+
+
+def _limiter_key(provider_key: object, caller: str) -> str:
+    """Resolve a provider argument to the key llmkit's own calls charge.
 
     A :class:`Provider` member is checked first: it is a ``StrEnum``, so any
     string handling ahead of it would pass the member through as its value,
     which differs from the provider name for some members. Anything that is
-    neither a member nor a provider instance is refused, strings included.
+    neither a member nor a provider instance is refused, strings included;
+    ``caller`` names the public function in that refusal.
     """
     if isinstance(provider_key, Provider):
         return provider_display_name(provider_key)
     if isinstance(provider_key, LLMProviderInterface):
         return provider_key.name
     raise TypeError(
-        "rate_limit_acquire_async/rate_limit_acquire_sync take a Provider member "
+        f"{caller}: expected a Provider member "
         + "(e.g. Provider.OPENAI) or a provider instance, not "
         + f"{type(provider_key).__name__} {provider_key!r}"
     )
@@ -395,7 +473,7 @@ async def rate_limit_acquire_async(
             provider instance; a plain string such as ``"openai"`` is refused,
             before the limiter is touched.
     """
-    key = _limiter_key(provider_key)
+    key = _limiter_key(provider_key, "rate_limit_acquire_async/rate_limit_acquire_sync")
     async with GlobalRateLimiter.acquire_async(key) as slot:
         yield slot
 
@@ -429,6 +507,6 @@ def rate_limit_acquire_sync(
             provider instance; a plain string such as ``"openai"`` is refused,
             before the limiter is touched.
     """
-    key = _limiter_key(provider_key)
+    key = _limiter_key(provider_key, "rate_limit_acquire_async/rate_limit_acquire_sync")
     with GlobalRateLimiter.acquire_sync(key) as slot:
         yield slot

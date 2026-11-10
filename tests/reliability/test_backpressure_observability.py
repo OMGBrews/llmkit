@@ -32,7 +32,7 @@ from llmkit import (
     backpressure_callback,
     configure_rate_limit,
 )
-from llmkit.rate_limiting import GlobalRateLimiter, _tuning
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, _tuning
 from llmkit.rate_limiting._observability import _backpressure_callback
 from llmkit.rate_limiting._tuning import AIMD_RECOVERY_INTERVAL
 from llmkit.sync import run_sync
@@ -77,7 +77,7 @@ async def _saturated_throttle(key: str) -> None:
 async def test_throttle_event_fires_with_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """A saturated throttle emits a ``throttle`` event carrying old/new limits."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     events: list[BackpressureEvent] = []
     with backpressure_callback(events.append):
         await _saturated_throttle("google")
@@ -88,7 +88,7 @@ async def test_recover_event_fires_with_payload(monkeypatch: pytest.MonkeyPatch)
     """A success after a recovery interval emits a ``recover`` event."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     key = "google"
     gate = GlobalRateLimiter._get_async_gate(key)
     gate._state._limit = 1  # as if AIMD had driven it down
@@ -109,7 +109,7 @@ async def test_recover_event_fires_with_payload(monkeypatch: pytest.MonkeyPatch)
 async def test_none_callback_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     """No callback installed: the decrease still happens and nothing raises."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     with backpressure_callback(None):
         await _saturated_throttle("google")
     assert GlobalRateLimiter._adaptive_states["google"].limit() == 1
@@ -120,7 +120,7 @@ async def test_raising_callback_is_swallowed(
 ) -> None:
     """A callback that raises is logged, never allowed to break the call/limit."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
 
     def boom(_event: BackpressureEvent) -> None:
         raise RuntimeError("callback boom")
@@ -157,7 +157,7 @@ def test_event_propagates_across_run_sync(monkeypatch: pytest.MonkeyPatch) -> No
     """A callback installed in the calling thread fires for a limit change observed
     on the persistent sync loop — the bridge copies the caller's context."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     events: list[BackpressureEvent] = []
 
     with backpressure_callback(events.append):

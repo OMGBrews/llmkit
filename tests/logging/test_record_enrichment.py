@@ -41,7 +41,7 @@ from llmkit import (
 from llmkit import (
     calls as llm_calls,
 )
-from llmkit.rate_limiting import GlobalRateLimiter
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy
 from llmkit.rate_limiting._observability import _queue_wait_ms
 from llmkit.testing import Reply, TransportRequest, install
 from tests._support import OkSchema, provider_mock
@@ -192,7 +192,7 @@ async def test_queue_wait_is_reset_between_attempts_never_stale() -> None:
 async def test_queue_wait_measures_contended_wait() -> None:
     """With the concurrency gate saturated, the queued caller's stamp reflects
     the real wait behind the limiter."""
-    GlobalRateLimiter.configure(max_concurrent=1, enabled=True)
+    GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=1), enabled=True)
     try:
         release = asyncio.Event()
         holding = asyncio.Event()
@@ -217,20 +217,20 @@ async def test_queue_wait_measures_contended_wait() -> None:
         assert wait_ms is not None
         assert wait_ms >= 25.0
     finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
+        GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=8), enabled=True)
 
 
 @pytest.mark.asyncio
 async def test_queue_wait_is_zero_when_limiter_disabled() -> None:
     """A disabled limiter stamps ``0.0`` — no queue exists, which is different
     from "never acquired" (``None``)."""
-    GlobalRateLimiter.configure(max_concurrent=8, enabled=False)
+    GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=8), enabled=False)
     try:
         async with GlobalRateLimiter.acquire_async("qw-test"):
             pass
         assert _queue_wait_ms.get() == 0.0
     finally:
-        GlobalRateLimiter.configure(max_concurrent=8, enabled=True)
+        GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=8), enabled=True)
 
 
 # 3. Rendering in the sink.

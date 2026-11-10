@@ -24,7 +24,7 @@ from llmkit import (
 )
 from llmkit._litellm import _within
 from llmkit.exceptions import CircuitOpenError, ResultValidationError
-from llmkit.rate_limiting import GlobalRateLimiter, _tuning
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, _tuning
 from llmkit.rate_limiting._breaker import Admit, CircuitState
 from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
 from tests._support.diagnostics import lost_diagnostics, raising_handler
@@ -121,7 +121,7 @@ async def test_only_outages_fill_breaker_window(
     monkeypatch: pytest.MonkeyPatch, sync: bool, kind: str
 ) -> None:
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
-    configure_rate_limit(max_concurrent=4, breaker=True, adaptive=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4), breaker=True, adaptive=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     for _ in range(BREAKER_MIN_SAMPLES):
         error = _error(kind)
@@ -148,7 +148,7 @@ async def test_probe_uses_same_outage_classification_and_releases_claim(
 ) -> None:
     clock = [100.0]
     monkeypatch.setattr(_tuning, "now", lambda: clock[0])
-    configure_rate_limit(breaker=True, breaker_cooldown=2.0)
+    configure_rate_limit(policy=RateLimitPolicy(breaker_cooldown=2.0), breaker=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     for _ in range(BREAKER_MIN_SAMPLES):
         _ = breaker.on_record(outage=True)
@@ -189,7 +189,7 @@ async def test_actual_caller_deadline_does_not_reopen_probe(
 ) -> None:
     clock = [100.0]
     monkeypatch.setattr(_tuning, "now", lambda: clock[0])
-    configure_rate_limit(breaker=True, breaker_cooldown=2.0)
+    configure_rate_limit(policy=RateLimitPolicy(breaker_cooldown=2.0), breaker=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     for _ in range(BREAKER_MIN_SAMPLES):
         _ = breaker.on_record(outage=True)
@@ -207,11 +207,11 @@ async def test_actual_caller_deadline_does_not_reopen_probe(
 def test_cooldown_is_configurable_retained_and_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = [100.0]
     monkeypatch.setattr(_tuning, "now", lambda: clock[0])
-    assert get_rate_limit_config().breaker_cooldown == 30.0
-    configure_rate_limit(breaker=True, breaker_cooldown=1.25)
+    assert get_rate_limit_config().policy.breaker_cooldown == 30.0
+    configure_rate_limit(policy=RateLimitPolicy(breaker_cooldown=1.25), breaker=True)
     old = GlobalRateLimiter._get_breaker("openai")
-    configure_rate_limit(rpm=120)
-    assert get_rate_limit_config().breaker_cooldown == 1.25
+    configure_rate_limit(adaptive=False)  # omitting ``policy`` keeps it
+    assert get_rate_limit_config().policy.breaker_cooldown == 1.25
     breaker = GlobalRateLimiter._get_breaker("openai")
     assert breaker is not old
     for _ in range(BREAKER_MIN_SAMPLES):
@@ -221,17 +221,17 @@ def test_cooldown_is_configurable_retained_and_reset(monkeypatch: pytest.MonkeyP
     clock[0] += 0.25
     assert breaker.admit()[0] is Admit.PROBE
     GlobalRateLimiter._reset()
-    assert get_rate_limit_config().breaker_cooldown == 30.0
+    assert get_rate_limit_config().policy.breaker_cooldown == 30.0
     assert not GlobalRateLimiter._breaker_states
 
 
-@pytest.mark.parametrize("cooldown", [0.0, -1.0, float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("cooldown", [0.0, -1.0, float("inf"), float("-inf"), float("nan"), True])
 def test_invalid_cooldown_does_not_change_configuration(cooldown: float) -> None:
-    configure_rate_limit(breaker=True, breaker_cooldown=2.0)
+    configure_rate_limit(policy=RateLimitPolicy(breaker_cooldown=2.0), breaker=True)
     before = get_rate_limit_config()
     breaker = GlobalRateLimiter._get_breaker("openai")
     with pytest.raises(ValueError, match="breaker_cooldown"):
-        configure_rate_limit(max_concurrent=1, breaker_cooldown=cooldown)
+        configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1, breaker_cooldown=cooldown))
     assert get_rate_limit_config() == before
     assert GlobalRateLimiter._get_breaker("openai") is breaker
 
@@ -240,7 +240,7 @@ def test_sync_interrupted_probe_acquisition_refunds_and_releases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
-    configure_rate_limit(breaker=True, rpm=120)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=120), breaker=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     breaker._state = CircuitState.OPEN
     breaker._opened_at = 0.0
@@ -269,7 +269,7 @@ async def test_only_throttles_reduce_saturated_adaptive_limit(
     monkeypatch: pytest.MonkeyPatch, sync: bool, kind: str
 ) -> None:
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
-    configure_rate_limit(max_concurrent=2, breaker=True, adaptive=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2), breaker=True, adaptive=True)
     error = _error(kind)
     if sync:
         with GlobalRateLimiter.acquire_sync("openai"):
@@ -290,7 +290,7 @@ async def test_interrupted_transition_callback_releases_probe(
     monkeypatch: pytest.MonkeyPatch, sync: bool
 ) -> None:
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
-    configure_rate_limit(breaker=True, rpm=120)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=120), breaker=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     breaker._state = CircuitState.OPEN
     breaker._opened_at = 0.0
@@ -321,7 +321,7 @@ async def test_probe_resolves_before_outcome_callback_can_interrupt(
     contained: the caller sees its own outcome and the loss is counted once.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 100.0)
-    configure_rate_limit(max_concurrent=2, breaker=True, adaptive=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2), breaker=True, adaptive=True)
     breaker = GlobalRateLimiter._get_breaker("openai")
     # Create the shared adaptive state before configuring the recovery case.
     _ = GlobalRateLimiter._get_sync_gate("openai")

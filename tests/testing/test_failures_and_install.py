@@ -29,6 +29,7 @@ from llmkit.exceptions import (
     CircuitOpenError,
     ServiceUnavailableError,
 )
+from llmkit.rate_limiting import RateLimitPolicy
 from llmkit.rate_limiting._outcomes import is_throttle_signal
 from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
 from llmkit.testing import (
@@ -106,7 +107,7 @@ async def test_throttles_from_the_fake_trip_the_circuit_breaker() -> None:
 
 
 async def test_delay_is_spent_inside_the_rate_limiter_slot() -> None:
-    configure_rate_limit(max_concurrent=1, adaptive=False)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1), adaptive=False)
     with install(lambda _request: Reply.text("slow", delay=0.1)):
         started = time.monotonic()
         results = await asyncio.gather(

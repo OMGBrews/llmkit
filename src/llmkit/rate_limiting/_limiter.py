@@ -14,9 +14,8 @@ deadlock, and contention-dependently at that.
 import asyncio
 import contextlib
 import logging
-import math
 import threading
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator, Mapping
 
 import llmkit.rate_limiting._tuning as _tuning
 from llmkit.exceptions import CircuitOpenError
@@ -26,7 +25,8 @@ from llmkit.rate_limiting._breaker import Admit, CircuitBreaker
 from llmkit.rate_limiting._buckets import RateBucket, RateLimitSlot
 from llmkit.rate_limiting._observability import emit_backpressure, stamp_queue_wait
 from llmkit.rate_limiting._outcomes import record_gate_outcome
-from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN, TPM_BURST_SECONDS
+from llmkit.rate_limiting._policy import DEFAULT_RATE_LIMIT_POLICY, RateLimitPolicy
+from llmkit.rate_limiting._tuning import TPM_BURST_SECONDS
 
 # Named explicitly rather than via ``__name__`` so every module in this package
 # keeps emitting under the one logger name operators already filter on.
@@ -124,115 +124,93 @@ class GlobalRateLimiter:
     _sync_gates: dict[str, SyncAdaptiveGate] = {}
     _rpm_buckets: dict[str, RateBucket] = {}
     _tpm_buckets: dict[str, RateBucket] = {}
-    _max_concurrent: int = 8
-    _rpm: int | None = None
-    _tpm: int | None = None
+    _policy: RateLimitPolicy = DEFAULT_RATE_LIMIT_POLICY
+    # Per-provider policies keyed by the *normalized* provider name, beside the
+    # display name the snapshot reports. A provider absent from this map runs
+    # under ``_policy``; the two are never merged field by field.
+    _overrides: dict[str, tuple[str, RateLimitPolicy]] = {}
     _enabled: bool = True
     _adaptive: bool = True
     _breaker: bool = False
-    _breaker_cooldown: float = BREAKER_COOLDOWN
 
     @classmethod
     def configure(
         cls,
-        max_concurrent: int | Unset = UNSET,
+        policy: RateLimitPolicy | Unset = UNSET,
+        overrides: Mapping[str, RateLimitPolicy] | Unset = UNSET,
         enabled: bool | Unset = UNSET,
-        rpm: int | None | Unset = UNSET,
-        tpm: int | None | Unset = UNSET,
         adaptive: bool | Unset = UNSET,
         breaker: bool | Unset = UNSET,
-        breaker_cooldown: float | Unset = UNSET,
     ) -> None:
         """Configure the global per-provider rate limit.
 
         Each call changes only the settings it passes: an omitted keyword keeps
-        its current value, so ``configure(rpm=3_500)`` followed by
-        ``configure(breaker=True)`` leaves the RPM ceiling in place. ``None``
-        for ``rpm`` or ``tpm`` turns that dimension off. Every call, including
+        its current value, so ``configure(policy=...)`` followed by
+        ``configure(breaker=True)`` leaves the policy in place. ``overrides``
+        replaces the whole per-provider map when passed. Every call, including
         one that passes nothing, still clears all limiter registries (gates,
         adaptive states, circuit breakers, RPM/TPM buckets), so the resulting
         limits apply to *subsequent* acquires; in-flight callers continue to
         release on the gate object (and debit the TPM bucket) they snapshotted at
         acquire time, so reconfiguration is always safe.
 
+        The public entry point, :func:`llmkit.configure_rate_limit`, validates
+        every argument and resolves override keys before calling this, so a
+        refused call changes nothing.
+
         Args:
-            max_concurrent: Maximum concurrent LLM API calls **per provider**.
-                With ``adaptive`` on (the default) this is the *ceiling* the
-                adaptive limit starts at and recovers toward — never exceeded.
+            policy: The :class:`RateLimitPolicy` every provider without an
+                override runs under.
+            overrides: Per-provider policies keyed by provider name (any case;
+                the name is casefolded here and kept as given for display).
+                Replaces the previous map; ``{}`` removes every override.
             enabled: Whether rate limiting is active. When ``False``,
                 :meth:`acquire_async`/:meth:`acquire_sync` are no-ops on every
                 dimension.
-            rpm: Sustained requests-per-minute **per provider**, or ``None``
-                (the default) to leave the request-rate dimension off.
-            tpm: Sustained tokens-per-minute **per provider**, or ``None``
-                (the default) to leave the token-rate dimension off.
             adaptive: Whether the per-provider concurrency limit adapts (AIMD) to
                 provider overload — on by default. When ``True``, a throttle
                 signal (429/503/529) received while saturated halves the limit
-                (floored at 1) and it recovers toward ``max_concurrent`` over time
-                once throttling stops; with no throttles it sits at the ceiling,
-                identical to a fixed cap. When ``False``, the limit is pinned at
-                ``max_concurrent`` (the pre-feature behaviour).
+                (floored at 1) and it recovers toward the policy's
+                ``max_concurrent`` over time once throttling stops; with no
+                throttles it sits at the ceiling, identical to a fixed cap. When
+                ``False``, the limit is pinned at ``max_concurrent`` (the
+                pre-feature behaviour).
             breaker: Whether the per-provider **circuit breaker** is armed — off
                 by default. When ``True``, once a provider's outage rate over a
                 rolling window crosses the trip threshold the limiter fast-fails
                 that provider's calls with
-                :class:`~llmkit.exceptions.CircuitOpenError` for a cooldown (one
-                HALF_OPEN probe then tests recovery), reading the *same* unwrapped
-                outcomes, but counting connection and transient server errors too.
-                Off by default because it flips
+                :class:`~llmkit.exceptions.CircuitOpenError` for the policy's
+                ``breaker_cooldown`` (one HALF_OPEN probe then tests recovery),
+                reading the *same* unwrapped outcomes, but counting connection
+                and transient server errors too. Off by default because it flips
                 "eventually succeeds" → "fails fast"; the host opts in.
-            breaker_cooldown: Seconds to fail fast before admitting a recovery
-                probe; finite and positive, 30 until set.
-
-        Raises:
-            ValueError: if ``max_concurrent`` is not a positive ``int``, or
-                ``rpm`` / ``tpm`` is set to anything but ``None`` or a positive
-                ``int`` (a ``bool``, a float such as ``3.5e3``, NaN and infinity
-                are all refused), or ``breaker_cooldown`` is a ``bool`` or not
-                finite and positive. A gate with capacity 0 would admit
-                nothing, so without this check a ``max_concurrent=0`` would
-                silently hang every subsequent LLM call. Nothing changes when
-                a call is refused.
         """
-        if not isinstance(max_concurrent, Unset) and (
-            type(max_concurrent) is not int or max_concurrent < 1
-        ):
-            raise ValueError(f"max_concurrent must be a positive integer, got {max_concurrent!r}")
-        if not isinstance(rpm, Unset) and rpm is not None and (type(rpm) is not int or rpm < 1):
-            raise ValueError(f"rpm must be a positive integer or None, got {rpm!r}")
-        if not isinstance(tpm, Unset) and tpm is not None and (type(tpm) is not int or tpm < 1):
-            raise ValueError(f"tpm must be a positive integer or None, got {tpm!r}")
-        if not isinstance(breaker_cooldown, Unset) and (
-            isinstance(breaker_cooldown, bool)
-            or not math.isfinite(breaker_cooldown)
-            or breaker_cooldown <= 0
-        ):
-            raise ValueError(
-                f"breaker_cooldown must be finite and positive, got {breaker_cooldown!r}"
-            )
+        normalized: dict[str, tuple[str, RateLimitPolicy]] | Unset = UNSET
+        if not isinstance(overrides, Unset):
+            normalized = {}
+            for name, override in overrides.items():
+                key = _normalize_key(name)
+                if key in normalized:
+                    raise ValueError(
+                        f"overrides name one provider twice: {normalized[key][0]!r} and {name!r}"
+                    )
+                normalized[key] = (name, override)
         with cls._lock:
-            if not isinstance(max_concurrent, Unset):
-                cls._max_concurrent = max_concurrent
+            if not isinstance(policy, Unset):
+                cls._policy = policy
+            if not isinstance(normalized, Unset):
+                cls._overrides = normalized
             if not isinstance(enabled, Unset):
                 cls._enabled = enabled
-            if not isinstance(rpm, Unset):
-                cls._rpm = rpm
-            if not isinstance(tpm, Unset):
-                cls._tpm = tpm
             if not isinstance(adaptive, Unset):
                 cls._adaptive = adaptive
             if not isinstance(breaker, Unset):
                 cls._breaker = breaker
-            if not isinstance(breaker_cooldown, Unset):
-                cls._breaker_cooldown = breaker_cooldown
-            max_concurrent = cls._max_concurrent
+            policy = cls._policy
+            override_names = sorted(name for name, _ in cls._overrides.values())
             enabled = cls._enabled
-            rpm = cls._rpm
-            tpm = cls._tpm
             adaptive = cls._adaptive
             breaker = cls._breaker
-            breaker_cooldown = cls._breaker_cooldown
             cls._async_gates = {}
             cls._adaptive_states = {}
             cls._breaker_states = {}
@@ -240,15 +218,13 @@ class GlobalRateLimiter:
             cls._rpm_buckets = {}
             cls._tpm_buckets = {}
         logger.info(
-            "Configured LLM rate limit: max_concurrent=%d, rpm=%s, tpm=%s, enabled=%s, "
-            + "adaptive=%s, breaker=%s, breaker_cooldown=%s",
-            max_concurrent,
-            rpm,
-            tpm,
+            "Configured LLM rate limit: policy=%r, overrides=%s, enabled=%s, "
+            + "adaptive=%s, breaker=%s",
+            policy,
+            override_names,
             enabled,
             adaptive,
             breaker,
-            breaker_cooldown,
         )
 
     @classmethod
@@ -260,14 +236,17 @@ class GlobalRateLimiter:
         around each test.
         """
         cls.configure(
-            max_concurrent=8,
+            policy=DEFAULT_RATE_LIMIT_POLICY,
+            overrides={},
             enabled=True,
-            rpm=None,
-            tpm=None,
             adaptive=True,
             breaker=False,
-            breaker_cooldown=BREAKER_COOLDOWN,
         )
+
+    @staticmethod
+    def normalize_key(provider_name: str) -> str:
+        """The registry key for a provider name: its casefolded form."""
+        return _normalize_key(provider_name)
 
     @classmethod
     def is_enabled(cls) -> bool:
@@ -275,22 +254,25 @@ class GlobalRateLimiter:
         return cls._enabled
 
     @classmethod
-    def max_concurrent(cls) -> int:
-        """The current per-provider concurrency cap (the symmetric read of the
-        value ``configure`` sets)."""
-        return cls._max_concurrent
+    def policy(cls) -> RateLimitPolicy:
+        """The default policy: what a provider without an override runs under."""
+        return cls._policy
 
     @classmethod
-    def rpm(cls) -> int | None:
-        """The current per-provider requests-per-minute limit, or ``None`` when
-        the request-rate dimension is off."""
-        return cls._rpm
+    def overrides(cls) -> dict[str, RateLimitPolicy]:
+        """A copy of the per-provider overrides, keyed by provider display name."""
+        return dict(cls._overrides.values())
 
     @classmethod
-    def tpm(cls) -> int | None:
-        """The current per-provider tokens-per-minute limit, or ``None`` when
-        the token-rate dimension is off."""
-        return cls._tpm
+    def policy_for(cls, key: str) -> RateLimitPolicy:
+        """The policy the provider named ``key`` runs under.
+
+        Takes no lock: it reads two attributes that ``configure`` replaces whole,
+        and the lazy constructors call it with the non-reentrant ``cls._lock``
+        already held.
+        """
+        entry = cls._overrides.get(_normalize_key(key))
+        return cls._policy if entry is None else entry[1]
 
     @classmethod
     def adaptive(cls) -> bool:
@@ -303,11 +285,6 @@ class GlobalRateLimiter:
         return cls._breaker
 
     @classmethod
-    def breaker_cooldown(cls) -> float:
-        """Seconds the breaker rejects calls before admitting a recovery probe."""
-        return cls._breaker_cooldown
-
-    @classmethod
     def _get_breaker(cls, key: str) -> CircuitBreaker:
         # One breaker per provider name, shared across loops/threads (the breaker
         # has no loop affinity — only a lock-guarded outcome window). Created at
@@ -316,8 +293,9 @@ class GlobalRateLimiter:
         with cls._lock:
             breaker = cls._breaker_states.get(key)
             if breaker is None:
+                policy = cls.policy_for(key)
                 breaker = CircuitBreaker(
-                    provider=key, ceiling=cls._max_concurrent, cooldown=cls._breaker_cooldown
+                    provider=key, ceiling=policy.max_concurrent, cooldown=policy.breaker_cooldown
                 )
                 cls._breaker_states[key] = breaker
             return breaker
@@ -332,7 +310,7 @@ class GlobalRateLimiter:
         # this registry so a new state picks up a new ceiling.
         state = cls._adaptive_states.get(key)
         if state is None:
-            state = AdaptiveState(provider=key, ceiling=cls._max_concurrent)
+            state = AdaptiveState(provider=key, ceiling=cls.policy_for(key).max_concurrent)
             cls._adaptive_states[key] = state
         return state
 
@@ -379,7 +357,8 @@ class GlobalRateLimiter:
     def _get_rpm_bucket(cls, key: str) -> RateBucket | None:
         """The provider's request-rate bucket, or ``None`` when RPM is off."""
         with cls._lock:
-            rpm = cls._rpm
+            policy = cls.policy_for(key)
+            rpm = policy.rpm
             if rpm is None:
                 return None
             bucket = cls._rpm_buckets.get(key)
@@ -394,7 +373,7 @@ class GlobalRateLimiter:
                 # Starting full at this smaller capacity lets a cold fan-out of up
                 # to ``max_concurrent`` go immediately while an idle bucket can
                 # never bank a whole minute (the ~2x-after-idle bug). See §6.4.
-                capacity = float(min(cls._max_concurrent, rpm))
+                capacity = float(min(policy.max_concurrent, rpm))
                 bucket = RateBucket(rate_per_sec=rpm / 60.0, capacity=capacity)
                 cls._rpm_buckets[key] = bucket
             return bucket
@@ -403,7 +382,7 @@ class GlobalRateLimiter:
     def _get_tpm_bucket(cls, key: str) -> RateBucket | None:
         """The provider's token-rate bucket, or ``None`` when TPM is off."""
         with cls._lock:
-            tpm = cls._tpm
+            tpm = cls.policy_for(key).tpm
             if tpm is None:
                 return None
             bucket = cls._tpm_buckets.get(key)

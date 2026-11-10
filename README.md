@@ -747,16 +747,21 @@ Rate limiting is **on by default**, scoped **per provider** (keyed by the effect
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-`configure_rate_limit(max_concurrent=..., enabled=..., rpm=..., tpm=..., adaptive=..., breaker=..., breaker_cooldown=...)` sets them. Each call changes only the keywords it passes and keeps the rest, so setting `rpm=` at startup and `breaker=True` later leaves both in force; pass `rpm=None` or `tpm=None` to turn that dimension off again. `max_concurrent`, `rpm` and `tpm` must be positive integers (not a bool, and not a float such as `3.5e3`), and `breaker_cooldown` must be finite and positive; any other value raises `ValueError` and leaves the configuration unchanged. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `max_concurrent` / `rpm` / `tpm` / `adaptive` / `breaker` / `breaker_cooldown` (handy to log or assert at startup); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
+The numbers live in a `RateLimitPolicy(max_concurrent=8, rpm=None, tpm=None, breaker_cooldown=30.0)`, and `configure_rate_limit(policy=..., overrides=..., enabled=..., adaptive=..., breaker=...)` sets them. `policy` is the budget every provider runs under; `overrides` maps a provider (a `Provider` member or a provider instance) to the policy that provider runs under instead, for an account whose limits differ. A provider uses its override if it has one and the default policy otherwise; the two are never merged field by field, so build an override from the default with `dataclasses.replace(...)` when you want to change one number. Each call changes only the keywords it passes and keeps the rest, so setting `policy=` at startup and `breaker=True` later leaves both in force. Passing `overrides=` replaces the whole map: `overrides={}` removes every override. Inside a policy, `rpm=None` or `tpm=None` turns that dimension off for the providers running under it. `max_concurrent`, `rpm` and `tpm` must be positive integers (not a bool, and not a float such as `3.5e3`), and `breaker_cooldown` must be finite and positive; `RateLimitPolicy(...)` raises `ValueError` for anything else. An override keyed by a string, a non-policy value, or two keys for one provider raises before anything changes. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `adaptive` / `breaker` switches, the default `policy` and the `overrides` keyed by provider display name (handy to log or assert at startup), and `get_rate_limit_policy(Provider.OPENAI)` returns the policy one provider runs under; `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
-from llmkit import configure_rate_limit
+from llmkit import Provider, RateLimitPolicy, configure_rate_limit
 
 # Stay under a metered account's published per-minute limits:
-configure_rate_limit(rpm=3_500, tpm=2_000_000)
+configure_rate_limit(policy=RateLimitPolicy(rpm=3_500, tpm=2_000_000))
+
+# An account with tighter limits on one provider gets its own policy:
+configure_rate_limit(
+    overrides={Provider.ANTHROPIC: RateLimitPolicy(max_concurrent=4, rpm=50, tpm=40_000)},
+)
 ```
 
-RPM and TPM are **opt-in** because the right per-minute number is the metered limit of *your* account, with no safe default to assume. Concurrency defaults to 8; tune that cap for your account and workload too. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set `rpm=` here — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm=` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. Both streamed lanes request usage and debit TPM when the stream runs out; abandoned streams have no terminal usage to debit.
+RPM and TPM are **opt-in** because the right per-minute number is the metered limit of *your* account, with no safe default to assume. Concurrency defaults to 8; tune that cap for your account and workload too. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set the policy's `rpm` — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. The burst uses the `max_concurrent` of the same policy as the `rpm`, so an override's burst follows the override. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. Both streamed lanes request usage and debit TPM when the stream runs out; abandoned streams have no terminal usage to debit.
 
 ### Adaptive concurrency
 
@@ -789,14 +794,14 @@ Ordinary callback exceptions are caught and logged; cancellation and process int
 
 ### Circuit breaker
 
-Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** stops calls when the provider appears unavailable. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Its rolling window counts successes and outages: throttles (429/503/529), transient server errors (500/502/504), and connection failures. Once at least half of the last 20 counted outcomes are outages, each new call raises `CircuitOpenError` immediately, holding no concurrency slot and deducting no RPM token. The open period lasts `breaker_cooldown` seconds, **30 by default**.
+Adaptive concurrency drives a struggling provider's limit *toward 1*; the **circuit breaker** stops calls when the provider appears unavailable. It is **opt-in and off by default** — arm it with `configure_rate_limit(breaker=True)`. Its rolling window counts successes and outages: throttles (429/503/529), transient server errors (500/502/504), and connection failures. Once at least half of the last 20 counted outcomes are outages, each new call raises `CircuitOpenError` immediately, holding no concurrency slot and deducting no RPM token. The open period lasts the provider's policy's `breaker_cooldown` seconds, **30 by default**.
 
 After that period, one process-wide probe tests recovery. A success closes the breaker; an outage reopens it for another cooldown. Caller deadlines, SDK timeouts without an outage HTTP status, cancellation, authentication and validation failures are neutral: they neither fill the outage window nor claim recovery. A neutral probe releases its claim so the next caller may probe immediately. A short caller-selected deadline is not evidence that a provider is down. A positive outage HTTP status takes precedence over exception inheritance: a provider HTTP 504 counts even though LiteLLM represents it as a timeout.
 
 ```python
-from llmkit import configure_rate_limit, CircuitOpenError, structured_llm_call
+from llmkit import CircuitOpenError, RateLimitPolicy, configure_rate_limit, structured_llm_call
 
-configure_rate_limit(breaker=True, breaker_cooldown=15.0)  # opt in; default cooldown is 30s
+configure_rate_limit(breaker=True, policy=RateLimitPolicy(breaker_cooldown=15.0))  # default cooldown is 30s
 
 try:
     result = await structured_llm_call(prompt, MySchema, feature="extract")
@@ -804,7 +809,7 @@ except CircuitOpenError as exc:
     ...  # the breaker is open for exc.provider — fall back fast, don't hammer it
 ```
 
-It is **off by default** on purpose. Adaptive concurrency reduces load below your cap; the breaker instead refuses calls while it is open, so the host chooses whether to enable it. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` for fallback handling, but the default retry policy never retries it. A caller can explicitly list it in `RetryPolicy.retry_on` to opt in. Each provider has its own breaker. The window and trip fraction are internal mechanisms; `breaker_cooldown` is a caller-owned wait budget, must be finite and positive, and retains its current value when omitted from a later configuration call.
+It is **off by default** on purpose. Adaptive concurrency reduces load below your cap; the breaker instead refuses calls while it is open, so the host chooses whether to enable it. `CircuitOpenError` is in `LLM_RECOVERABLE_ERRORS` for fallback handling, but the default retry policy never retries it. A caller can explicitly list it in `RetryPolicy.retry_on` to opt in. Each provider has its own breaker. The window and trip fraction are internal mechanisms; `breaker_cooldown` is a caller-owned wait budget on the `RateLimitPolicy`, so a provider with an override uses the override's cooldown; it must be finite and positive.
 
 ### Joining the global rate limit directly
 
@@ -838,7 +843,10 @@ joins the budget llmkit's own calls on that provider charge, and an instance,
 including one of your own provider classes, joins the budget of its `name`. A
 plain string such as `"openai"` raises `TypeError`, so a misspelt or outdated
 name cannot quietly start a separate budget. Each provider has an independent
-budget on every dimension. A slot held through `rate_limit_acquire_sync` counts
+budget on every dimension, built from that provider's override if
+`configure_rate_limit(overrides=...)` gave it one and from the default policy
+otherwise, so a hand-joined slot runs under the same numbers as llmkit's own
+calls on that provider. A slot held through `rate_limit_acquire_sync` counts
 against the same RPM/TPM buckets, adaptive limit and circuit breaker as llmkit's
 own calls, but its in-flight slots are counted separately from theirs, like a
 second event loop's (see the concurrency caveat above). Each
@@ -1566,8 +1574,10 @@ new route brings its own structured-output mode, its own translation of
 `reasoning_effort` (`"disable"` raises on a model that cannot stop
 thinking, and `"lowest"` maps to a different native value per route, as
 described above), and its own rate-limit budget, because budgets are per provider. The
-limiter's `rpm`, `tpm` and `max_concurrent` settings, though, are one setting for
-all providers, so they stay as you tuned them for the old account. To
+numbers that budget runs under are the destination's `configure_rate_limit`
+override if you gave it one, and the shared default `policy` otherwise, so a
+switch to a provider without an override inherits the default you tuned rather
+than the old account's override; `get_rate_limit_policy(Provider.X)` shows which. To
 confirm a switch before the first call, run `describe_llm(config)` (from
 `llmkit.providers`). It builds the provider, so a missing key, a missing extra,
 or a rejected field raises there. It reports the provider and model the calls

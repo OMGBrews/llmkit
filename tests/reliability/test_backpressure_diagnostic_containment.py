@@ -34,7 +34,7 @@ import pytest
 from instructor.core import InstructorRetryException
 
 from llmkit import BackpressureEvent, backpressure_callback, configure_rate_limit, text_llm_call
-from llmkit.rate_limiting import GlobalRateLimiter, _tuning
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, _tuning
 from llmkit.rate_limiting._observability import emit_backpressure
 from llmkit.rate_limiting._tuning import AIMD_RECOVERY_INTERVAL
 from llmkit.testing import Reply, install
@@ -101,7 +101,7 @@ def _arm_recovery(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
     """Make the next successful acquire on *key* emit a ``recover`` event."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     gate = GlobalRateLimiter._get_async_gate(key)
     gate._state._limit = 1  # as if AIMD had driven it down
     gate._state._recovery_anchor = clock["t"]
@@ -165,7 +165,7 @@ async def test_throttle_on_outcome_keeps_the_provider_error(
     """A throttle event fired while classifying a 429 leaves that 429 as the error,
     on the first throttle and on a second one in the same process."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     callback = _BrokenCallback()
     before = lost_diagnostics()
     with backpressure_callback(callback), raising_handler(_LOGGER) as handler:

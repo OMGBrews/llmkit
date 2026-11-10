@@ -46,7 +46,7 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.exceptions import LLM_SCHEMA_ERRORS, LLM_TRANSPORT_ERRORS
-from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, _tuning
+from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, RateLimitPolicy, _tuning
 from llmkit.rate_limiting._breaker import Admit, CircuitBreaker, CircuitState
 from llmkit.rate_limiting._tuning import BREAKER_COOLDOWN, BREAKER_MIN_SAMPLES
 from llmkit.retry import RetryPolicy, with_retries
@@ -178,7 +178,7 @@ async def test_opens_after_threshold_then_fails_fast(monkeypatch: pytest.MonkeyP
     acquire path opens the breaker; the next call raises ``CircuitOpenError``
     *before* the provider call, holding no slot (the call counter stays frozen)."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: still cooling
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     key = "openai"
     calls = [0]
     events: list[BackpressureEvent] = []
@@ -211,7 +211,7 @@ async def test_open_breaker_deducts_no_rpm_and_holds_no_slot(
     """A rejected (OPEN) call deducts no RPM token and occupies no concurrency
     slot — it fast-fails before either gate."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=8, rpm=600, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8, rpm=600), breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
     breaker._state = CircuitState.OPEN
@@ -230,7 +230,7 @@ async def test_half_open_probe_closes_on_success(monkeypatch: pytest.MonkeyPatch
     breaker, and normal calls flow again."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
     _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
@@ -260,7 +260,7 @@ async def test_half_open_probe_reopens_on_throttle(monkeypatch: pytest.MonkeyPat
     """A probe that throttles re-opens the breaker and re-arms the cooldown."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
     _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
@@ -282,7 +282,7 @@ async def test_cancelled_probe_in_body_releases_claim(monkeypatch: pytest.Monkey
     no wedged HALF_OPEN — and other calls stay rejected meanwhile (single probe)."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     key = "openai"
     breaker = GlobalRateLimiter._get_breaker(key)
     _fill_throttles(breaker, BREAKER_MIN_SAMPLES)
@@ -320,7 +320,14 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
     claim shares the rpm-refund-on-cancel leak class and is released coherently."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])  # frozen: no refill
-    configure_rate_limit(max_concurrent=8, rpm=480, tpm=6_000, breaker=True)
+    configure_rate_limit(
+        policy=RateLimitPolicy(
+            max_concurrent=8,
+            rpm=480,
+            tpm=6_000,
+        ),
+        breaker=True,
+    )
     key = "openai"
 
     # Exhaust TPM (while CLOSED) so the probe will park on the TPM gate mid-acquire.
@@ -358,7 +365,7 @@ async def test_cancelled_probe_mid_acquire_reverts_and_refunds(
 async def test_breakers_are_per_provider_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
     """Opening one provider's breaker leaves every other provider unaffected."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     _fill_throttles(GlobalRateLimiter._get_breaker("openai"), BREAKER_MIN_SAMPLES)
 
     # openai is open → fast fail.
@@ -375,7 +382,7 @@ async def test_breaker_off_is_a_complete_noop(monkeypatch: pytest.MonkeyPatch) -
     """With ``breaker=False`` (the default) nothing changes: no breaker is created,
     even a flood of throttles never raises ``CircuitOpenError``."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=8)  # breaker defaults off
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8))  # breaker defaults off
     key = "openai"
     for _ in range(BREAKER_MIN_SAMPLES * 2):
         with pytest.raises(InstructorRetryException):
@@ -394,7 +401,7 @@ def test_breaker_is_shared_across_event_loops() -> None:
     """One breaker object per provider name, shared across loops (it has no loop
     affinity — only a lock-guarded window), so an open observed on any loop is
     seen on every loop."""
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     key = "google"
     seen: list[CircuitBreaker] = []
 

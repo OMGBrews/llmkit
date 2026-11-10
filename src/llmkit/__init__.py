@@ -116,13 +116,16 @@ from llmkit.providers import (
     make_provider,
 )
 from llmkit.rate_limiting import (
+    DEFAULT_RATE_LIMIT_POLICY,
     BackpressureCallback,
     BackpressureEvent,
     RateLimitConfig,
+    RateLimitPolicy,
     RateLimitSlot,
     backpressure_callback,
     configure_rate_limit,
     get_rate_limit_config,
+    get_rate_limit_policy,
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
@@ -199,7 +202,10 @@ __all__ = [
     # Rate limiting
     "configure_rate_limit",
     "get_rate_limit_config",
+    "get_rate_limit_policy",
     "RateLimitConfig",
+    "RateLimitPolicy",
+    "DEFAULT_RATE_LIMIT_POLICY",
     "RateLimitSlot",
     "rate_limit_acquire_async",
     "rate_limit_acquire_sync",

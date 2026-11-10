@@ -13,7 +13,7 @@ from typing import Literal
 
 import pytest
 
-from llmkit.rate_limiting import GlobalRateLimiter, _tuning, configure_rate_limit
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, _tuning, configure_rate_limit
 from llmkit.rate_limiting._buckets import RateBucket
 
 _Dimension = Literal["rpm", "tpm"]
@@ -22,9 +22,11 @@ _KEY = "rate-wait"
 
 def _exhaust(dimension: _Dimension) -> RateBucket:
     configure_rate_limit(
-        max_concurrent=1,
-        rpm=60 if dimension == "rpm" else None,
-        tpm=60 if dimension == "tpm" else None,
+        policy=RateLimitPolicy(
+            max_concurrent=1,
+            rpm=60 if dimension == "rpm" else None,
+            tpm=60 if dimension == "tpm" else None,
+        ),
         adaptive=False,
         breaker=False,
     )

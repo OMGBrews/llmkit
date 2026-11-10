@@ -31,7 +31,7 @@ from instructor.core import InstructorRetryException
 from pydantic import ValidationError
 
 from llmkit import configure_rate_limit
-from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, _tuning
+from llmkit.rate_limiting import BackpressureEvent, GlobalRateLimiter, RateLimitPolicy, _tuning
 from llmkit.rate_limiting._adaptive import AdaptiveGate, AdaptiveState, SyncAdaptiveGate
 from llmkit.rate_limiting._outcomes import is_throttle_signal
 from llmkit.rate_limiting._tuning import AIMD_DECREASE_COOLDOWN, AIMD_RECOVERY_INTERVAL
@@ -297,7 +297,7 @@ async def test_saturated_structured_throttle_decreases_shared_limit(
     """A structured-call throttle (wrapped) received at the limit halves it —
     proving the unwrap and the saturation gate on the real acquire path."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     key = "google"
     holder_in = asyncio.Event()
     release_holder = asyncio.Event()
@@ -325,7 +325,7 @@ async def test_unsaturated_throttle_via_acquire_does_not_decrease(
 ) -> None:
     """A throttle with only one call in flight (cap 8) does not move the limit."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=8)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8))
     key = "google"
     with pytest.raises(InstructorRetryException):
         async with GlobalRateLimiter.acquire_async(key):  # in_flight 1 < limit 8
@@ -336,7 +336,7 @@ async def test_unsaturated_throttle_via_acquire_does_not_decrease(
 async def test_adaptive_false_pins_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ``adaptive=False`` a saturated throttle leaves the limit at the cap."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=2, adaptive=False)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2), adaptive=False)
     key = "google"
     holder_in = asyncio.Event()
     release_holder = asyncio.Event()
@@ -362,7 +362,7 @@ async def test_adaptive_false_pins_the_limit(monkeypatch: pytest.MonkeyPatch) ->
 async def test_success_does_not_grow_above_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A never-throttled provider stays exactly at the ceiling (no growth above)."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     key = "google"
     for _ in range(10):
         async with GlobalRateLimiter.acquire_async(key):
@@ -373,7 +373,7 @@ async def test_success_does_not_grow_above_ceiling(monkeypatch: pytest.MonkeyPat
 async def test_gate_enforces_a_reduced_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the shared limit is reduced, the gate admits only that many at once."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     key = "google"
     gate = GlobalRateLimiter._get_async_gate(key)
     gate._state._limit = 1  # as if AIMD had driven it down
@@ -513,7 +513,7 @@ async def test_cancel_during_acquire_refunds_rpm_token(monkeypatch: pytest.Monke
     """A call cancelled after its RPM token is deducted but before it holds a slot
     refunds the token — so a systematically-cancelled workload keeps its RPM."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
-    configure_rate_limit(max_concurrent=8, rpm=480, tpm=6_000)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8, rpm=480, tpm=6_000))
     key = "openai"
 
     # Exhaust the TPM budget so the *next* acquire debits RPM then blocks on TPM.
@@ -545,20 +545,20 @@ async def test_configure_clears_adaptive_state(monkeypatch: pytest.MonkeyPatch) 
     """``configure`` clears the adaptive-state registry, so a reduced limit does
     not leak into the next configuration."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     key = "google"
     gate = GlobalRateLimiter._get_async_gate(key)
     gate._state._limit = 1
     assert GlobalRateLimiter._adaptive_states  # populated
 
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     assert GlobalRateLimiter._adaptive_states == {}
 
 
 def test_adaptive_state_is_shared_across_event_loops() -> None:
     """The per-provider adaptive state is one object across loops (only the gate
     is per-loop), so a throttle on one loop lowers the limit every loop sees."""
-    configure_rate_limit(max_concurrent=4)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4))
     key = "google"
     states: list[AdaptiveState] = []
 
@@ -580,7 +580,7 @@ def test_async_gate_not_reused_across_event_loops() -> None:
     does not ``configure`` between them (that would clear the registry and mask the
     bug). Replaces the old per-loop *semaphore* test for the new gate.
     """
-    GlobalRateLimiter.configure(max_concurrent=1)
+    GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=1))
 
     async def contend(key: str) -> None:
         held = asyncio.Event()

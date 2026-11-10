@@ -47,12 +47,15 @@ from llmkit import CircuitOpenError, _litellm, text_llm_call
 from llmkit import calls as llm_calls
 from llmkit.providers import LLMProviderInterface, Provider, make_provider
 from llmkit.rate_limiting import (
+    DEFAULT_RATE_LIMIT_POLICY,
     GlobalRateLimiter,
     RateLimitConfig,
+    RateLimitPolicy,
     RateLimitSlot,
     _tuning,
     configure_rate_limit,
     get_rate_limit_config,
+    get_rate_limit_policy,
     rate_limit_acquire_async,
     rate_limit_acquire_sync,
 )
@@ -138,7 +141,7 @@ async def test_providers_have_independent_budgets() -> None:
 
 async def test_reconfigure_raises_cap_for_new_acquires() -> None:
     """configure(max_concurrent=5) lets 5 run concurrently on one key."""
-    configure_rate_limit(max_concurrent=5)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=5))
     probe = _ConcurrencyProbe()
     hold = asyncio.Event()
 
@@ -190,7 +193,7 @@ async def test_inflight_caller_not_stranded_by_configure_swap() -> None:
     _ = await entered.wait()
 
     # Swap/clear the registry while the slot is held.
-    configure_rate_limit(max_concurrent=3)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=3))
 
     release.set()
     await asyncio.wait_for(task, timeout=1.0)
@@ -244,21 +247,22 @@ async def test_call_layer_accounts_under_effective_provider_name() -> None:
 
 def test_get_rate_limit_config_reports_effective_values() -> None:
     """``get_rate_limit_config`` reflects the default and any reconfiguration,
-    so a host can read its effective limits without touching ``_max_concurrent``."""
+    so a host can read its effective limits without touching limiter internals."""
     default = get_rate_limit_config()
     assert default.enabled is True
-    assert default.max_concurrent == 8
-    assert default.rpm is None  # opt-in dimensions off by default
-    assert default.tpm is None
+    assert default.policy == RateLimitPolicy(max_concurrent=8, rpm=None, tpm=None)
+    assert default.policy is DEFAULT_RATE_LIMIT_POLICY
+    assert dict(default.overrides) == {}
     assert default.adaptive is True  # adaptive concurrency on by default
     assert default.breaker is False  # circuit breaker opt-in, off by default
 
-    configure_rate_limit(max_concurrent=3, enabled=False, rpm=120, tpm=90_000)
+    configure_rate_limit(
+        policy=RateLimitPolicy(max_concurrent=3, rpm=120, tpm=90_000),
+        enabled=False,
+    )
     updated = get_rate_limit_config()
     assert updated.enabled is False
-    assert updated.max_concurrent == 3
-    assert updated.rpm == 120
-    assert updated.tpm == 90_000
+    assert updated.policy == RateLimitPolicy(max_concurrent=3, rpm=120, tpm=90_000)
     assert updated.adaptive is True  # unset -> stays on
     assert updated.breaker is False  # unset -> stays off
 
@@ -275,56 +279,66 @@ def test_reconfiguration_merges_omitted_keywords() -> None:
 
     The motivating mistake: a host sets its account's RPM at startup and arms
     the breaker later; under the old reset-on-every-call behaviour the second
-    call silently dropped the RPM ceiling.
+    call silently dropped the RPM ceiling. ``policy`` and ``overrides`` are
+    keywords like the switches: omitting either keeps it.
     """
-    configure_rate_limit(max_concurrent=3, rpm=3_500, tpm=90_000)
+    policy = RateLimitPolicy(max_concurrent=3, rpm=3_500, tpm=90_000)
+    override = RateLimitPolicy(rpm=50)
+    configure_rate_limit(policy=policy, overrides={Provider.ANTHROPIC: override})
     configure_rate_limit(breaker=True)
     merged = get_rate_limit_config()
-    assert (merged.max_concurrent, merged.rpm, merged.tpm) == (3, 3_500, 90_000)
+    assert merged.policy == policy
+    assert dict(merged.overrides) == {"Anthropic": override}
     assert merged.breaker is True
     assert merged.enabled is True
     assert merged.adaptive is True
 
+    configure_rate_limit(policy=RateLimitPolicy())
+    assert dict(get_rate_limit_config().overrides) == {"Anthropic": override}
+    configure_rate_limit(overrides={})
+    assert get_rate_limit_config().policy == RateLimitPolicy()
 
-def test_none_turns_a_rate_dimension_off_without_touching_the_rest() -> None:
-    """``None`` still means "dimension off"; only the named dimension changes."""
-    configure_rate_limit(max_concurrent=3, rpm=120, tpm=6_000, breaker=True)
-    configure_rate_limit(rpm=None)
+
+def test_none_turns_a_rate_dimension_off_without_touching_the_switches() -> None:
+    """``None`` in a policy means "dimension off"; the switches stay put."""
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=3, rpm=120, tpm=6_000), breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=3, rpm=None, tpm=6_000))
     config = get_rate_limit_config()
-    assert config.rpm is None
-    assert config.tpm == 6_000
-    assert config.max_concurrent == 3
+    assert config.policy == RateLimitPolicy(max_concurrent=3, rpm=None, tpm=6_000)
     assert config.breaker is True
+    assert GlobalRateLimiter._get_rpm_bucket("openai") is None
+    assert GlobalRateLimiter._get_tpm_bucket("openai") is not None
 
 
 def test_reconfiguration_clears_registries_even_when_it_changes_nothing() -> None:
     """Every call clears the per-provider limiter state, as the docstring says."""
-    configure_rate_limit(rpm=120)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=120))
     assert GlobalRateLimiter._get_rpm_bucket("merge-test") is not None
     assert GlobalRateLimiter._rpm_buckets
     configure_rate_limit()
     assert GlobalRateLimiter._rpm_buckets == {}
-    assert get_rate_limit_config().rpm == 120
-
-
-def test_a_rejected_reconfiguration_changes_nothing() -> None:
-    """Validation runs before any setting changes, so a bad call is atomic."""
-    configure_rate_limit(max_concurrent=3, rpm=120)
-    with pytest.raises(ValueError, match="tpm"):
-        configure_rate_limit(max_concurrent=5, tpm=-1)
-    config = get_rate_limit_config()
-    assert (config.max_concurrent, config.rpm, config.tpm) == (3, 120, None)
+    assert get_rate_limit_config().policy.rpm == 120
 
 
 def test_private_reset_restores_shipped_defaults() -> None:
-    """The test-support reset returns every dimension to its shipped default."""
+    """The test-support reset returns every setting to its shipped default,
+    overrides included (a forgotten ``overrides={}`` would leak between tests)."""
     configure_rate_limit(
-        max_concurrent=3, enabled=False, rpm=120, tpm=6_000, adaptive=False, breaker=True
+        policy=RateLimitPolicy(max_concurrent=3, rpm=120, tpm=6_000),
+        overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=1)},
+        enabled=False,
+        adaptive=False,
+        breaker=True,
     )
     GlobalRateLimiter._reset()
     assert get_rate_limit_config() == RateLimitConfig(
-        enabled=True, max_concurrent=8, rpm=None, tpm=None, adaptive=True, breaker=False
+        enabled=True,
+        adaptive=True,
+        breaker=False,
+        policy=DEFAULT_RATE_LIMIT_POLICY,
+        overrides={},
     )
+    assert get_rate_limit_policy(Provider.OPENAI) == DEFAULT_RATE_LIMIT_POLICY
 
 
 class _AsyncFunctionProbe:
@@ -375,7 +389,7 @@ async def test_rate_limit_acquire_async_acquires_and_releases() -> None:
     Saturate the cap by hand through the public function; a further acquire
     blocks until one holder exits, then runs.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     entered_second = asyncio.Event()
     release_first = asyncio.Event()
 
@@ -422,7 +436,7 @@ def test_rate_limit_acquire_sync_respects_configured_cap() -> None:
     Saturate a cap of 1 from one thread, then assert a second thread cannot
     enter until the first releases — proving the sync function holds the slot.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     entered_second = threading.Event()
     release_first = threading.Event()
     first_holds = threading.Event()
@@ -457,7 +471,7 @@ def test_rate_limit_acquire_sync_disabled_bypass() -> None:
     A cap of 1 would otherwise serialise; disabled, two threads hold the
     "slot" simultaneously.
     """
-    configure_rate_limit(max_concurrent=1, enabled=False)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1), enabled=False)
     # If limiting were active (cap 1) the barrier would never reach 2 and time
     # out; disabled, both threads sit inside the acquire at once and trip it.
     both_in = threading.Barrier(2, timeout=1.0)
@@ -511,7 +525,7 @@ def test_sync_acquire_raises_circuit_open_when_breaker_open(
     throttles); the frozen clock keeps it inside the cooldown so it rejects.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: stays OPEN
-    configure_rate_limit(max_concurrent=8, breaker=True)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8), breaker=True)
     provider = Provider.OPENAI
     key = "openai"  # its casefolded display name, the internal registry key
     breaker = GlobalRateLimiter._get_breaker(key)
@@ -544,7 +558,7 @@ def test_sync_throttle_while_saturated_halves_shared_limit_async_sees_it(
     halved cap — proving the state is genuinely SHARED, not mirrored per path.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     provider = Provider.GOOGLE
     key = "google ai studio"  # its casefolded display name, the internal registry key
     holder_in = threading.Event()
@@ -610,7 +624,7 @@ def test_cross_population_saturated_throttle_decreases_shared_limit(
     judged per gate and the async gate's local 1 < 2 classified the 429 as noise.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     provider = Provider.GOOGLE
     key = "google ai studio"  # its casefolded display name, the internal registry key
     holder_in = threading.Event()
@@ -648,7 +662,7 @@ def test_failed_sync_acquire_refunds_rpm_token(monkeypatch: pytest.MonkeyPatch) 
     async path's cancellation refund.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no refill
-    configure_rate_limit(max_concurrent=8, rpm=480)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8, rpm=480))
     provider = Provider.OPENAI
     key = "openai"  # its casefolded display name, the internal registry key
     rpm_bucket = GlobalRateLimiter._get_rpm_bucket(key)
@@ -677,7 +691,7 @@ def test_exception_during_sync_body_leaks_no_permit() -> None:
     so the full cap is available again — the permit-leak fix over the old
     ``sem.acquire()``-outside-``try`` path.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     provider = Provider.OPENAI
     key = "openai"  # its casefolded display name, the internal registry key
     gate = GlobalRateLimiter._get_sync_gate(key)
@@ -721,7 +735,7 @@ def test_sync_gate_queued_waiters_are_fifo_and_parked_not_spinning(
     None of the pre-existing sync tests drove more than one genuinely-queued waiter,
     so this path — and the spin — was previously untested.
     """
-    configure_rate_limit(max_concurrent=2)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=2))
     provider = Provider.OPENAI
     key = "openai"  # its casefolded display name, the internal registry key
     gate = GlobalRateLimiter._get_sync_gate(key)
@@ -865,7 +879,7 @@ def test_sync_call_wrappers_share_the_cap_across_threads() -> None:
     ``state['peak']`` backs it independently, measuring concurrency observed
     inside the transport rather than the gate's own bookkeeping.
     """
-    configure_rate_limit(max_concurrent=_CAP)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=_CAP))
     lock = threading.Lock()
     state: dict[str, int] = {"current": 0, "peak": 0}
     loop_box: list[asyncio.AbstractEventLoop] = []
@@ -1347,7 +1361,7 @@ async def test_rpm_burst_is_capped_at_concurrency_not_a_full_minute(
     608, ~1.3% over), not ``2 * rpm``.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
-    configure_rate_limit(max_concurrent=8, rpm=600)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=8, rpm=600))
 
     bucket = GlobalRateLimiter._get_rpm_bucket("openai")
     assert bucket is not None
@@ -1377,7 +1391,7 @@ async def test_tpm_burst_reservoir_is_one_second_not_a_full_minute(
     can bank at most ~1.7% of ``tpm`` above the sustained rate.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(tpm=6_000)
+    configure_rate_limit(policy=RateLimitPolicy(tpm=6_000))
 
     bucket = GlobalRateLimiter._get_tpm_bucket("openai")
     assert bucket is not None
@@ -1399,18 +1413,18 @@ def test_rate_limit_slot_record_tokens_is_noop_without_bucket() -> None:
 def test_configure_rejects_nonpositive_rpm_tpm() -> None:
     """``rpm``/``tpm`` must be a positive int or None — zero/negative is a config error."""
     with pytest.raises(ValueError, match="rpm must be a positive integer"):
-        configure_rate_limit(rpm=0)
+        configure_rate_limit(policy=RateLimitPolicy(rpm=0))
     with pytest.raises(ValueError, match="tpm must be a positive integer"):
-        configure_rate_limit(tpm=-5)
+        configure_rate_limit(policy=RateLimitPolicy(tpm=-5))
 
 
 def test_configure_rejects_nonpositive_max_concurrent() -> None:
     """``max_concurrent`` must be positive — ``Semaphore(0)`` is a legal,
     permanently-locked semaphore, so accepting 0 would hang every LLM call."""
     with pytest.raises(ValueError, match="max_concurrent must be a positive integer"):
-        configure_rate_limit(max_concurrent=0)
+        configure_rate_limit(policy=RateLimitPolicy(max_concurrent=0))
     with pytest.raises(ValueError, match="max_concurrent must be a positive integer"):
-        configure_rate_limit(max_concurrent=-1)
+        configure_rate_limit(policy=RateLimitPolicy(max_concurrent=-1))
 
 
 @pytest.mark.parametrize("name", ["max_concurrent", "rpm", "tpm"])
@@ -1418,20 +1432,56 @@ def test_configure_rejects_nonpositive_max_concurrent() -> None:
 def test_configure_rejects_non_int_limits_without_changing_config(name: str, bad: object) -> None:
     """NaN made ``max_concurrent`` wait forever and disabled an ``rpm``/``tpm``
     bucket, infinity overflowed the adaptive limit on the first throttle, and a
-    float or ``bool`` slipped through as a number. Each is refused before any
-    setting changes."""
-    configure_rate_limit(max_concurrent=3, rpm=120, tpm=90_000)
+    float or ``bool`` slipped through as a number. The policy constructor
+    refuses each, so neither a default policy nor an override can carry one."""
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=3, rpm=120, tpm=90_000))
     before = get_rate_limit_config()
     with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
-        configure_rate_limit(**{name: bad})  # pyright: ignore[reportArgumentType]
+        _ = RateLimitPolicy(**{name: bad})  # pyright: ignore[reportArgumentType]
     assert get_rate_limit_config() == before
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"overrides": None}, TypeError, "must be a mapping"),
+        ({"overrides": {Provider.OPENAI: {"rpm": 100}}}, TypeError, "must be a RateLimitPolicy"),
+        ({"overrides": {"openai": RateLimitPolicy(rpm=1)}}, TypeError, "Provider member"),
+        ({"policy": {"rpm": 100}}, TypeError, "must be a RateLimitPolicy"),
+        (
+            {
+                "overrides": {
+                    Provider.VERTEX: RateLimitPolicy(rpm=1),
+                    "placeholder": RateLimitPolicy(rpm=2),
+                }
+            },
+            TypeError,
+            "Provider member",
+        ),
+    ],
+)
+def test_a_refused_override_call_changes_nothing(
+    kwargs: dict[str, object], error: type[Exception], match: str
+) -> None:
+    """Every argument check runs before the limiter is touched: settings,
+    overrides and the built registries all survive a refused call."""
+    configure_rate_limit(
+        policy=RateLimitPolicy(max_concurrent=3, rpm=120),
+        overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=2)},
+    )
+    before = get_rate_limit_config()
+    bucket = GlobalRateLimiter._get_rpm_bucket("openai")
+    with pytest.raises(error, match=match):
+        configure_rate_limit(**kwargs)  # pyright: ignore[reportArgumentType]
+    assert get_rate_limit_config() == before
+    assert GlobalRateLimiter._get_rpm_bucket("openai") is bucket
 
 
 def test_configure_rejects_bool_breaker_cooldown() -> None:
     """``breaker_cooldown=True`` is not one second; it is a configuration error."""
     before = get_rate_limit_config()
     with pytest.raises(ValueError, match="breaker_cooldown"):
-        configure_rate_limit(breaker_cooldown=True)
+        configure_rate_limit(policy=RateLimitPolicy(breaker_cooldown=True))
     assert get_rate_limit_config() == before
 
 
@@ -1450,7 +1500,7 @@ async def test_rpm_acquire_debits_the_request_bucket(
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
     # Burst capacity is the concurrency width min(max_concurrent=8, rpm=120) = 8,
     # NOT a full minute's quota — so the bucket starts at 8, not 120.
-    configure_rate_limit(rpm=120)  # 2 requests/sec sustained; burst 8
+    configure_rate_limit(policy=RateLimitPolicy(rpm=120))  # 2 requests/sec sustained; burst 8
 
     async with GlobalRateLimiter.acquire_async("openai"):
         pass
@@ -1467,7 +1517,7 @@ async def test_tpm_slot_records_against_provider_bucket(
     # so a 2000-token debit drives the level well negative — exactly the
     # smoothing signal that makes the next caller wait. The debit *amount* (2000)
     # is what this test pins; the start level is the small reservoir, not 6000.
-    configure_rate_limit(tpm=6_000)
+    configure_rate_limit(policy=RateLimitPolicy(tpm=6_000))
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(2_000)
@@ -1479,7 +1529,9 @@ async def test_tpm_over_budget_blocks_then_clears(monkeypatch: pytest.MonkeyPatc
     """Spending past the minute budget drives the bucket negative so the gate waits."""
     clock = {"t": 1_000.0}
     monkeypatch.setattr(_tuning, "now", lambda: clock["t"])
-    configure_rate_limit(tpm=6_000)  # 100 tokens/sec sustained; burst 100 (1s)
+    configure_rate_limit(
+        policy=RateLimitPolicy(tpm=6_000)
+    )  # 100 tokens/sec sustained; burst 100 (1s)
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(9_000)  # spends far past the small reservoir
@@ -1497,7 +1549,7 @@ async def test_tpm_budgets_are_independent_per_provider(
 ) -> None:
     """Draining one provider's TPM budget leaves another provider's untouched."""
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(tpm=6_000)  # burst 100 (1s reservoir) per provider
+    configure_rate_limit(policy=RateLimitPolicy(tpm=6_000))  # burst 100 (1s reservoir) per provider
 
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(6_000)  # drain openai
@@ -1512,7 +1564,7 @@ async def test_tpm_budgets_are_independent_per_provider(
 
 async def test_disabled_skips_rpm_and_tpm_dimensions() -> None:
     """When limiting is disabled, acquire creates no rate buckets and the slot is inert."""
-    configure_rate_limit(enabled=False, rpm=1, tpm=1)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=1, tpm=1), enabled=False)
     async with GlobalRateLimiter.acquire_async("openai") as slot:
         slot.record_tokens(10_000)  # no bucket → no-op
     assert GlobalRateLimiter._rpm_buckets == {}
@@ -1528,7 +1580,7 @@ async def test_call_layer_debits_tpm_from_response_usage(
     response, and the clock is frozen so the only level change is the debit.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)
-    configure_rate_limit(tpm=6_000)
+    configure_rate_limit(policy=RateLimitPolicy(tpm=6_000))
 
     provider = MagicMock()
     provider.name = "openai"
@@ -1579,7 +1631,7 @@ async def test_rpm_budget_shared_between_member_and_llmkit_key(
     bucket to zero, and the registry must hold exactly one (casefolded) entry.
     """
     monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # freeze: no refill
-    configure_rate_limit(rpm=2)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=2))
 
     async with rate_limit_acquire_async(Provider.OPENAI):  # host form, public helper
         pass
@@ -1604,7 +1656,7 @@ async def test_tpm_budget_shared_between_member_and_instance(
     # second join's TPM gate would (correctly) block waiting for refill, which
     # under this frozen clock would never come. The sharing invariant, not the
     # gate's blocking, is what this test pins.
-    configure_rate_limit(tpm=240_000)
+    configure_rate_limit(policy=RateLimitPolicy(tpm=240_000))
 
     async with rate_limit_acquire_async(_openai_instance()) as slot:
         slot.record_tokens(2_000)
@@ -1619,7 +1671,7 @@ async def test_tpm_budget_shared_between_member_and_instance(
 
 async def test_concurrency_semaphore_shared_between_instance_and_member() -> None:
     """A slot held through an instance blocks a member's acquire: one semaphore, cap 1."""
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     entered_second = asyncio.Event()
     release_first = asyncio.Event()
 
@@ -1646,7 +1698,7 @@ async def test_concurrency_semaphore_shared_between_instance_and_member() -> Non
 
 def test_sync_gate_shared_between_member_and_llmkit_key() -> None:
     """The sync path shares one concurrency gate between a member and llmkit's key."""
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     entered_second = threading.Event()
     release_first = threading.Event()
     first_holds = threading.Event()
@@ -1703,7 +1755,7 @@ async def test_member_join_blocks_llmkit_call_on_that_provider(member: Provider)
     The fake answers inside the limiter slot, so the call cannot finish until
     the host's slot is released.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     instance = _instance_for(member)
     release = asyncio.Event()
     holding = asyncio.Event()
@@ -1734,7 +1786,7 @@ def test_member_sync_join_blocks_instance_sync_join(member: Provider) -> None:
     The sync join counts in-flight slots separately from llmkit's own calls, so
     its sharing is shown against a second sync join on another thread.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     instance = _instance_for(member)
     release = threading.Event()
     holding = threading.Event()
@@ -1767,7 +1819,7 @@ def test_member_sync_join_blocks_instance_sync_join(member: Provider) -> None:
 
 def test_instance_keys_by_its_name_not_its_member_value() -> None:
     """A ``VertexProvider`` instance charges "google agent platform", not "vertex"."""
-    configure_rate_limit(rpm=10)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=10))
     instance = _instance_for(Provider.VERTEX)
     assert instance.name == "Google Agent Platform"
 
@@ -1787,7 +1839,7 @@ async def test_join_refuses_anything_but_a_member_or_instance(bad: object) -> No
 
     The message names both accepted forms, and no registry gains an entry.
     """
-    configure_rate_limit(rpm=10)
+    configure_rate_limit(policy=RateLimitPolicy(rpm=10))
 
     with pytest.raises(TypeError, match=r"Provider member .* or a provider instance"):
         with rate_limit_acquire_sync(bad):  # pyright: ignore[reportArgumentType]
@@ -1798,3 +1850,232 @@ async def test_join_refuses_anything_but_a_member_or_instance(bad: object) -> No
 
     assert GlobalRateLimiter._rpm_buckets == {}
     assert GlobalRateLimiter._sync_gates == {}
+
+
+# ---------------------------------------------------------------------------
+# Per-provider overrides
+# ---------------------------------------------------------------------------
+
+
+def _registry_key(member: Provider) -> str:
+    """The casefolded display name llmkit's own calls charge for ``member``."""
+    return GlobalRateLimiter.normalize_key(_instance_for(member).name)
+
+
+def _other(member: Provider) -> Provider:
+    """A different shipped provider, to show un-overridden ones keep the default."""
+    return Provider.OLLAMA if member is not Provider.OLLAMA else Provider.OPENAI
+
+
+_DEFAULT = RateLimitPolicy(max_concurrent=6, rpm=600, tpm=60_000, breaker_cooldown=12.0)
+_OVERRIDE = RateLimitPolicy(max_concurrent=2, rpm=120, tpm=6_000, breaker_cooldown=3.0)
+
+
+def _assert_built_from(key: str, policy: RateLimitPolicy) -> None:
+    """Every lazily built object for ``key`` carries ``policy``'s numbers."""
+    with GlobalRateLimiter._lock:
+        state = GlobalRateLimiter._get_adaptive_state_locked(key)
+    assert state._ceiling == policy.max_concurrent
+    breaker = GlobalRateLimiter._get_breaker(key)
+    assert breaker._ceiling == policy.max_concurrent
+    assert breaker._cooldown == policy.breaker_cooldown
+    rpm_bucket = GlobalRateLimiter._get_rpm_bucket(key)
+    tpm_bucket = GlobalRateLimiter._get_tpm_bucket(key)
+    assert rpm_bucket is not None and policy.rpm is not None
+    assert rpm_bucket._rate == policy.rpm / 60.0
+    assert rpm_bucket._capacity == float(min(policy.max_concurrent, policy.rpm))
+    assert tpm_bucket is not None and policy.tpm is not None
+    assert tpm_bucket._rate == policy.tpm / 60.0
+
+
+@pytest.mark.parametrize("member", list(Provider), ids=str)
+@pytest.mark.parametrize("key_form", ["member", "instance"])
+def test_override_builds_that_providers_limiters_and_leaves_others_on_default(
+    member: Provider, key_form: str
+) -> None:
+    """An override keyed by member or by instance governs the budget llmkit's
+    own calls charge for that provider; every other provider keeps the default.
+
+    Catches a construction point that still reads the default policy (for
+    example the RPM burst cap computed from the default ``max_concurrent``).
+    """
+    provider_key = member if key_form == "member" else _instance_for(member)
+    configure_rate_limit(policy=_DEFAULT, overrides={provider_key: _OVERRIDE})
+
+    _assert_built_from(_registry_key(member), _OVERRIDE)
+    _assert_built_from(_registry_key(_other(member)), _DEFAULT)
+
+    assert get_rate_limit_policy(member) == _OVERRIDE
+    assert get_rate_limit_policy(_instance_for(member)) == _OVERRIDE
+    assert get_rate_limit_policy(_other(member)) == _DEFAULT
+    display_name = _instance_for(member).name
+    assert dict(get_rate_limit_config().overrides) == {display_name: _OVERRIDE}
+
+
+@pytest.mark.parametrize("member", list(Provider), ids=str)
+def test_override_refuses_a_display_name_string_key(member: Provider) -> None:
+    """A string key — even the exact display name — is refused before anything
+    changes, matching the hand-join identity contract."""
+    configure_rate_limit(policy=_DEFAULT)
+    before = get_rate_limit_config()
+    with pytest.raises(TypeError, match="configure_rate_limit overrides"):
+        configure_rate_limit(
+            overrides={_instance_for(member).name: _OVERRIDE}  # pyright: ignore[reportArgumentType]
+        )
+    with pytest.raises(TypeError, match="get_rate_limit_policy"):
+        _ = get_rate_limit_policy(member.value)  # pyright: ignore[reportArgumentType]
+    assert get_rate_limit_config() == before
+    assert GlobalRateLimiter._rpm_buckets == {}
+
+
+@pytest.mark.parametrize("member", list(Provider), ids=str)
+def test_member_and_instance_of_one_provider_collide(member: Provider) -> None:
+    """Two keys for one provider are ambiguous: ``ValueError`` naming both, and
+    nothing changes. Catches a dictionary-order tie-break that silently keeps
+    whichever key came last."""
+    configure_rate_limit(overrides={Provider.OPENAI: _OVERRIDE})
+    before = get_rate_limit_config()
+    instance = _instance_for(member)
+    with pytest.raises(ValueError, match="twice") as caught:
+        configure_rate_limit(
+            overrides={member: RateLimitPolicy(rpm=1), instance: RateLimitPolicy(rpm=2)}
+        )
+    assert repr(member) in str(caught.value)
+    assert get_rate_limit_config() == before
+
+
+def test_overrides_replace_the_whole_map() -> None:
+    """``overrides=`` replaces the map: a provider left out goes back to the
+    default, and ``{}`` removes every override."""
+    configure_rate_limit(
+        policy=_DEFAULT,
+        overrides={Provider.OPENAI: _OVERRIDE, Provider.ANTHROPIC: _OVERRIDE},
+    )
+    configure_rate_limit(overrides={Provider.ANTHROPIC: _OVERRIDE})
+    assert get_rate_limit_policy(Provider.OPENAI) == _DEFAULT
+    assert get_rate_limit_policy(Provider.ANTHROPIC) == _OVERRIDE
+    _assert_built_from("openai", _DEFAULT)
+
+    configure_rate_limit(overrides={})
+    assert dict(get_rate_limit_config().overrides) == {}
+    assert get_rate_limit_policy(Provider.ANTHROPIC) == _DEFAULT
+    _assert_built_from("anthropic", _DEFAULT)
+
+
+def test_none_in_an_override_turns_a_dimension_off_for_that_provider_only() -> None:
+    """``tpm=None`` inside an override is "off", not "inherit the default"."""
+    configure_rate_limit(
+        policy=_DEFAULT,
+        overrides={Provider.DEEPSEEK: RateLimitPolicy(rpm=120, tpm=None)},
+    )
+    assert GlobalRateLimiter._get_tpm_bucket("deepseek") is None
+    assert GlobalRateLimiter._get_rpm_bucket("deepseek") is not None
+    assert GlobalRateLimiter._get_tpm_bucket("openai") is not None
+
+
+async def test_switching_provider_applies_the_destination_budget() -> None:
+    """A program that moves its calls from one provider to another runs under
+    the destination's policy, and the two providers' state stays independent:
+    saturating the overridden provider leaves the other untouched."""
+    configure_rate_limit(
+        policy=RateLimitPolicy(max_concurrent=3),
+        overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=1)},
+    )
+    probe = _ConcurrencyProbe()
+    hold = asyncio.Event()
+    tasks = [asyncio.create_task(probe.run("openai", hold)) for _ in range(3)]
+    tasks += [asyncio.create_task(probe.run("anthropic", hold)) for _ in range(5)]
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert GlobalRateLimiter._get_async_gate("openai")._in_flight == 1
+    assert GlobalRateLimiter._get_async_gate("anthropic")._in_flight == 3
+    hold.set()
+    _ = await asyncio.gather(*tasks)
+
+
+async def test_inflight_caller_not_stranded_by_an_override_change() -> None:
+    """A slot held under an override releases onto its snapshot after a call
+    that changes the override, and the next acquire uses the new policy."""
+    configure_rate_limit(overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=1)})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with rate_limit_acquire_async(Provider.OPENAI):
+            entered.set()
+            _ = await release.wait()
+
+    task = asyncio.create_task(holder())
+    _ = await entered.wait()
+    old_gate = GlobalRateLimiter._get_async_gate("openai")
+    configure_rate_limit(overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=4)})
+    new_gate = GlobalRateLimiter._get_async_gate("openai")
+    assert new_gate is not old_gate
+    assert new_gate._state._ceiling == 4
+    release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+    assert old_gate._in_flight == 0
+    async with rate_limit_acquire_async(Provider.OPENAI):
+        assert new_gate._in_flight == 1
+
+
+def test_override_is_shared_by_the_sync_join_and_every_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync hand-join and two separate event loops all run under the
+    provider's override, and a throttle on the sync path lowers the limit the
+    async loops then honour.
+
+    With the default's ceiling of 8 the halved limit would be 4; seeing 1 on
+    both loops shows every path built from the override's ceiling of 2.
+    """
+    monkeypatch.setattr(_tuning, "now", lambda: 1_000.0)  # frozen: no recovery
+    configure_rate_limit(
+        policy=RateLimitPolicy(max_concurrent=8),
+        overrides={Provider.VERTEX: RateLimitPolicy(max_concurrent=2)},
+    )
+    key = "google agent platform"
+    holder_in = threading.Event()
+    release_holder = threading.Event()
+
+    def holder() -> None:
+        with rate_limit_acquire_sync(Provider.VERTEX):
+            holder_in.set()
+            _ = release_holder.wait(timeout=2.0)
+
+    hthread = threading.Thread(target=holder)
+    hthread.start()
+    assert holder_in.wait(timeout=1.0)
+    assert GlobalRateLimiter._get_sync_gate(key)._state._ceiling == 2
+    with pytest.raises(InstructorRetryException):
+        with rate_limit_acquire_sync(_instance_for(Provider.VERTEX)):
+            raise _wrapped_throttle(429)
+    assert GlobalRateLimiter._adaptive_states[key].limit() == 1
+    release_holder.set()
+    hthread.join(timeout=1.0)
+
+    async def peak_on_a_fresh_loop() -> int:
+        current = 0
+        peak = 0
+        hold = asyncio.Event()
+
+        async def run() -> None:
+            nonlocal current, peak
+            async with rate_limit_acquire_async(Provider.VERTEX):
+                current += 1
+                peak = max(peak, current)
+                try:
+                    _ = await hold.wait()
+                finally:
+                    current -= 1
+
+        tasks = [asyncio.create_task(run()) for _ in range(3)]
+        for _ in range(30):
+            await asyncio.sleep(0)
+        observed = peak
+        hold.set()
+        _ = await asyncio.gather(*tasks)
+        return observed
+
+    assert asyncio.run(peak_on_a_fresh_loop()) == 1
+    assert asyncio.run(peak_on_a_fresh_loop()) == 1

@@ -56,9 +56,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_backoff_seconds` and `retry_after_cap` to be finite and not bools. NaN
   used to slip past every comparison, so it skipped the computed backoff or
   disabled a cap, and a fractional count ran a different number of passes on
-  the buffered and streaming loops. `configure_rate_limit` applies the same
+  the buffered and streaming loops. `RateLimitPolicy` applies the same
   rule to `max_concurrent`, `rpm` and `tpm`, and rejects a bool
-  `breaker_cooldown`; a refused call changes nothing. A `Retry-After` value
+  `breaker_cooldown`, in its constructor. A `Retry-After` value
   that parses to NaN or infinity, from the attribute or either header, is
   now treated as unparseable, so the next source is read and otherwise the
   computed exponential runs, where `Retry-After: inf` used to sleep the full
@@ -146,10 +146,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   response cache does not key on the allowance, and allowances above one are
   verified offline only.
 
-- **Configurable circuit-breaker cooldown.** `configure_rate_limit` accepts
-  `breaker_cooldown`, finite positive seconds, defaulting to 30. The effective
-  value is available on `get_rate_limit_config()`; an omitted keyword keeps
-  the previous value, while reconfiguration still clears limiter state.
+- **Configurable circuit-breaker cooldown.** `RateLimitPolicy` carries
+  `breaker_cooldown`, finite positive seconds, defaulting to 30, so each
+  provider's breaker uses the cooldown of the policy it runs under. The
+  effective value is available on `get_rate_limit_policy(provider)`.
+
+- **Per-provider rate limits.** `RateLimitPolicy` holds every number the rate
+  limiter uses (`max_concurrent`, `rpm`, `tpm`, `breaker_cooldown`;
+  `DEFAULT_RATE_LIMIT_POLICY` is the shipped one), and
+  `configure_rate_limit(overrides={Provider.ANTHROPIC: RateLimitPolicy(...)})`
+  gives a provider whose account has different limits its own policy. A
+  provider runs under its override if it has one and under the default
+  `policy=` otherwise, with no field-level merging, so switching a program to
+  another provider applies that provider's budget instead of reusing the
+  numbers tuned for the previous account. Override keys are `Provider` members
+  or provider instances, resolved to the provider name llmkit's own calls and
+  the hand-join functions charge; a string key, a non-policy value, or two keys
+  for one provider raises before anything changes. `overrides=` replaces the
+  whole map (`{}` removes every override); omitting it keeps the current one.
+  `get_rate_limit_policy(provider)` returns the policy one provider runs under.
 
 - **`describe_llm` describes a per-call provider and reports the route's
   decisions.** `describe_llm(provider=...)` takes what a call's `provider=`
@@ -298,6 +313,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   streams still never replay an item already yielded. Instructor repair,
   temperature re-issues and SDK retries remain additional provider requests
   within an outer attempt, so the ceiling is not a request, cost or time cap.
+
+- **Breaking: `configure_rate_limit` takes `policy=` instead of scalar limit
+  keywords, and `RateLimitConfig` reports a policy.** The `max_concurrent`,
+  `rpm` and `tpm` keywords are removed; replace
+  `configure_rate_limit(max_concurrent=4, rpm=3_500)` with
+  `configure_rate_limit(policy=RateLimitPolicy(max_concurrent=4, rpm=3_500))`.
+  A `policy=` replaces the whole default policy, so carry fields forward with
+  `dataclasses.replace(get_rate_limit_config().policy, rpm=...)` where a later
+  call used to change one number. `RateLimitConfig` drops its `max_concurrent`,
+  `rpm` and `tpm` fields for `policy` (read `get_rate_limit_config().policy.rpm`)
+  and gains `overrides`, keyed by provider display name. The `enabled`,
+  `adaptive` and `breaker` switches are unchanged.
 
 - **Breaking: `with_retries` takes `policy=` instead of scalar retry keywords.**
   The composable helper now uses `DEFAULT_RETRY_POLICY`, matching ordinary
@@ -551,8 +578,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `configure_rate_limit(rpm=3_500)` at startup and
   `configure_rate_limit(breaker=True)` later silently lost its RPM ceiling. Now
   every parameter defaults to `UNSET`, and a call changes only the keywords it
-  passes. `None` still turns `rpm` or `tpm` off, and every call still clears
-  the per-provider limiter state. **Migration:** a call that relied on the
+  passes: `policy=`, `overrides=` and each switch are kept when omitted (a
+  `policy=` replaces the whole default policy; see the `RateLimitPolicy` entry
+  above). Every call still clears the per-provider limiter state. **Migration:** a call that relied on the
   reset to restore a default now passes that value explicitly, for example
   `configure_rate_limit(adaptive=True, breaker=False)`.
 

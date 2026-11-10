@@ -42,7 +42,7 @@ from pydantic import BaseModel
 from llmkit import ToolCallResult, ToolDefinition, flush_llm_logs_async
 from llmkit import calls as llm_calls
 from llmkit.calls import STREAM_ABANDONED_ERROR
-from llmkit.rate_limiting import GlobalRateLimiter, configure_rate_limit
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, configure_rate_limit
 from tests._support import capturing_sink, quiet_logging
 
 
@@ -99,7 +99,7 @@ async def _pump(iterations: int = 100) -> None:
 
 async def test_abandoned_stream_releases_rate_limit_slot() -> None:
     """A consumer that breaks out of the stream releases the slot it held."""
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     provider = _stream_provider()
 
     async def _fake_acompletion(**_kwargs: object) -> _FakeStream:
@@ -132,7 +132,7 @@ async def test_abandoned_stream_releases_rate_limit_slot() -> None:
 async def test_cancelled_stream_consumer_releases_rate_limit_slot() -> None:
     """A cancelled stream *consumer* releases the slot and records the
     abandonment via the ``CancelledError`` arm of ``_stream_once``."""
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     provider = _stream_provider()
     park = asyncio.Event()
     first_arrived = asyncio.Event()
@@ -238,7 +238,7 @@ async def test_tool_stream_releases_the_slot_before_the_terminal_result() -> Non
     must not wedge. Assert that rather than the mere absence of a leak, because
     a stream that never acquired at all would satisfy the negative form.
     """
-    configure_rate_limit(max_concurrent=1)
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
     provider = _stream_provider()
     add = ToolDefinition.from_model("add", _AdditionArgs, "Add two integer values.")
 
