@@ -61,6 +61,7 @@ class OpenRouterProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "OpenRouter"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "openrouter/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     #: Gemini 3.1 Flash-Lite — cheap, fast, and served through the strict
@@ -87,7 +88,7 @@ class OpenRouterProvider(BaseProvider):
     ):
         super().__init__(model, reasoning_effort)
         self._api_key: str = api_key
-        self._base_url: str = base_url
+        self._base_url: str | None = base_url
 
     @override
     def completion_kwargs(self) -> dict[str, object]:

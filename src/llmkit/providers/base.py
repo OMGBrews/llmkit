@@ -38,7 +38,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields
 from enum import StrEnum
+from functools import lru_cache
 from typing import ClassVar, Literal, Protocol, cast, overload, override, runtime_checkable
+from urllib.parse import urlsplit
 
 import instructor
 
@@ -283,6 +285,65 @@ def resolve_base_url(
         if from_env:
             return from_env
     return default
+
+
+_SCHEME_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _endpoint_host(url: str) -> str | None:
+    """The lower-cased host of ``url``, plus ``:port`` when it is not the scheme's default.
+
+    The comparable identity of an endpoint for :func:`route_name`: scheme,
+    path, query and any userinfo are left out, so credentials embedded in a URL
+    never reach a name. Returns ``None`` when no host can be read.
+    """
+    try:
+        parts = urlsplit(url if "://" in url else f"//{url}")
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if ":" in host:  # an IPv6 literal; urlsplit strips its brackets
+        host = f"[{host}]"
+    if port is None or port == _SCHEME_DEFAULT_PORTS.get(parts.scheme.lower()):
+        return host
+    return f"{host}:{port}"
+
+
+@lru_cache(maxsize=256)
+def route_name(provider_name: str, base_url: str | None, default_base_url: str | None) -> str:
+    """Name a provider route: the class's name, plus the endpoint host when it is not the default.
+
+    ``base_url`` is the endpoint passed explicitly at construction, never one
+    read from the environment. With none, or with one whose host and port equal
+    ``default_base_url``'s, the route is the provider's own and the name is
+    ``provider_name`` unchanged. Any other endpoint is a different route and is
+    named ``"<provider_name> (<host>)"``, with ``:port`` appended when the URL
+    carries a port other than its scheme's default::
+
+        route_name("OpenAI", None, "https://api.openai.com/v1")  # "OpenAI"
+        route_name("OpenAI", "https://api.openai.com:443/", "https://api.openai.com/v1")  # "OpenAI"
+        route_name("OpenAI", "https://api.moonshot.ai/v1", "https://api.openai.com/v1")
+        # "OpenAI (api.moonshot.ai)"
+        route_name("Ollama", "http://gpu-box:11434", "http://localhost:11434")
+        # "Ollama (gpu-box:11434)"
+
+    Only host and port are compared, because they are all the name shows: two
+    URLs on one host that differ by path share a name. Hosts are compared as
+    written, with no name resolution, so ``127.0.0.1`` and ``localhost`` are
+    different routes. A ``default_base_url`` of ``None`` (Google AI Studio)
+    makes every explicit endpoint a named route. A ``base_url`` with no
+    readable host keeps the plain name.
+    """
+    if not base_url:
+        return provider_name
+    host = _endpoint_host(base_url)
+    if host is None:
+        return provider_name
+    if default_base_url is not None and host == _endpoint_host(default_base_url):
+        return provider_name
+    return f"{provider_name} ({host})"
 
 
 class Provider(StrEnum):
@@ -533,7 +594,13 @@ class LLMProviderInterface(Protocol):
 
     @property
     def name(self) -> str:
-        """Provider name."""
+        """The name this provider's calls are rate limited and logged under.
+
+        For the shipped providers this is the provider's name, or a route name
+        such as ``"OpenAI (api.moonshot.ai)"`` when the instance was built with
+        an explicit ``base_url`` other than the provider's own endpoint (see
+        :attr:`BaseProvider.name`).
+        """
         ...
 
     @property
@@ -683,6 +750,17 @@ class BaseProvider(ABC):
     #: false so callers receive a loud steer to the portable two-step pattern.
     _compose_tools_schema: ClassVar[bool] = False
     _supports_tool_choice: ClassVar[bool] = True
+    #: The provider's own endpoint, for the providers that accept a ``base_url``.
+    #: :attr:`name` compares the instance's explicitly configured ``_base_url``
+    #: with it, so an instance pointed somewhere else reports, and is rate
+    #: limited under, its own route name. ``None`` with a ``_base_url`` set
+    #: means every explicit endpoint is a named route (Google AI Studio, whose
+    #: endpoint LiteLLM derives). A subclass that stores no ``_base_url`` keeps
+    #: the plain provider name whatever this is.
+    _default_base_url: ClassVar[str | None] = None
+    #: The endpoint passed explicitly at construction, if any; never one read
+    #: from the environment. Set by the providers that accept a ``base_url``.
+    _base_url: str | None = None
 
     #: The routing-contract hooks validated for every concrete subclass.
     _required_hooks: ClassVar[tuple[str, ...]] = ("_provider_name", "_mode", "_default_model")
@@ -750,16 +828,35 @@ class BaseProvider(ABC):
 
     @property
     def name(self) -> str:
-        """Provider name."""
-        return self._provider_name
+        """The route this instance calls: its rate-limit key and its name in the logs.
+
+        The provider's name (``"OpenAI"``) for an instance on the provider's
+        own endpoint. An instance built with an explicit ``base_url`` whose
+        host or port differs from that endpoint is a different route, named
+        with the host in brackets: ``"OpenAI (api.moonshot.ai)"``, or
+        ``"Ollama (gpu-box:11434)"`` when the URL carries a port. The URL path
+        is left out. See :func:`route_name` for the comparison.
+
+        Only a ``base_url`` passed at construction counts. An endpoint taken
+        from an environment variable keeps the plain provider name, because it
+        is resolved per call, after the name is already in use as a rate-limit
+        key. The name is therefore fixed once the instance is built, which
+        keeps the limiter key, the call record's ``provider``, the cache key
+        and a rate-limit override resolved at startup in agreement.
+        """
+        return route_name(self._provider_name, self._base_url, self._default_base_url)
 
     @classmethod
     def display_name(cls) -> str:
-        """The provider name every instance of this class reports as :attr:`name`.
+        """The name an instance of this class on the provider's own endpoint reports.
 
-        The class-level read of the same value, for code that holds a
-        :class:`Provider` member rather than a built instance (the rate
-        limiter's hand-join functions key their budget by it).
+        The class-level read of :attr:`name`, for code that holds a
+        :class:`Provider` member rather than a built instance. A member
+        therefore means the provider's default endpoint: the rate limiter's
+        overrides, :func:`~llmkit.get_rate_limit_policy` and the hand-join
+        functions key a member by this value. An instance built with an
+        explicit ``base_url`` elsewhere reports a route name instead and is
+        addressed by passing the instance.
         """
         return cls._provider_name
 
@@ -917,6 +1014,12 @@ class LLMInfo:
     :func:`~llmkit.providers.describe_llm` for a config, a :class:`Provider`
     member or a built shipped provider — distinct from :class:`LLMClientConfig`,
     which carries the credentials used to *construct* a provider.
+
+    ``provider_name`` is the built instance's
+    :attr:`~BaseProvider.name`: the name its calls are rate limited and logged
+    under, which carries the endpoint's host in brackets
+    (``"OpenAI (api.moonshot.ai)"``) when the config or instance names a
+    ``base_url`` other than the provider's own endpoint.
 
     Beyond the provider, display name, model and locality, it reports the
     route's correctness decisions, the ones that travel with a switch of

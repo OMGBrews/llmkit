@@ -1,7 +1,10 @@
 """Global, per-provider rate limiting for LLM API calls.
 
 Bounds the LLM calls a process makes to each provider along three
-independent, per-provider dimensions:
+independent, per-provider dimensions. "Provider" throughout this module means
+a *route*: a provider and the endpoint it is called at, so the same provider
+class pointed at two endpoints is two budgets (see "On by default, scoped per
+provider" below):
 
 * **Concurrency** — the maximum number of *in-flight* calls per provider
   (a semaphore). On by default, cap 8.
@@ -12,7 +15,8 @@ independent, per-provider dimensions:
   off by default.
 
 The LiteLLM call layer (:mod:`llmkit._litellm`) wraps every provider call in
-:meth:`GlobalRateLimiter.acquire_async`, keyed by the **provider name**. The
+:meth:`GlobalRateLimiter.acquire_async`, keyed by the provider's **route name**
+(``provider.name``). The
 sync call wrappers drive that same async coroutine through
 :func:`llmkit.sync.run_sync`, which routes every sync call onto **one
 persistent event loop**. Because all sync calls share that loop, the
@@ -59,12 +63,21 @@ On by default, scoped per provider
 ----------------------------------
 Rate limiting is **enabled out of the box** (``_enabled`` defaults to
 ``True``) — zero configuration needed. Every dimension is accounted **per
-provider**, where the key is the provider *name* string (``provider.name`` /
-:pyattr:`BaseProvider._provider_name`, e.g. ``"OpenAI"``, ``"Ollama"``). That
-is exactly the value logging records as the *effective* provider (see
+provider route**, where the key is the string ``provider.name`` reports. For a
+provider on its own endpoint that is the provider's name (``"OpenAI"``,
+``"Ollama"``). A provider built with an explicit ``base_url`` whose host or
+port differs from the provider's own endpoint is a different route with its
+own key, the name followed by the host in brackets
+(``"OpenAI (api.moonshot.ai)"``, ``"Ollama (gpu-box:11434)"``; see
+:attr:`~llmkit.providers.BaseProvider.name`). So a compatible endpoint reached
+through a provider's class, a proxy in front of a provider, and an Ollama
+server at another address each get their own budget and neither starve nor are
+starved by the provider's own calls. Two URLs on one host share a route, and an
+endpoint set only by environment variable keeps the provider's plain name. The
+key is exactly the value logging records as the *effective* provider (see
 :func:`llmkit.calls._shared.resolve_model_and_provider`), so a held slot —
-and any token debit — is always accounted to the provider that actually runs
-the call.
+and any token debit — is always accounted to the route that actually runs the
+call.
 
 Provider keys are matched **case-insensitively**: every key is casefolded at
 the limiter boundary (see :func:`_normalize_key`), so ``"openai"``,
@@ -72,11 +85,13 @@ the limiter boundary (see :func:`_normalize_key`), so ``"openai"``,
 the limit by hand via :func:`rate_limit_acquire_async` /
 :func:`rate_limit_acquire_sync` names the provider with a
 :class:`~llmkit.providers.Provider` member or a provider instance, never a
-string: a member is translated to the provider name llmkit's own calls report
-(``Provider.VERTEX`` charges ``"Google Agent Platform"``, not ``"vertex"``) and
-an instance keys by its ``name``. A host therefore cannot fork itself onto a
-separate budget by spelling the provider name differently from llmkit's own
-call sites, because it never spells the name at all.
+string: a member is translated to the provider name llmkit's own calls on that
+provider's own endpoint report (``Provider.VERTEX`` charges ``"Google Agent
+Platform"``, not ``"vertex"``) and an instance keys by its ``name``. A member
+therefore always means the provider's default endpoint; a route on another
+endpoint is joined by passing the instance built with that ``base_url``. A
+host cannot fork itself onto a separate budget by spelling a name differently
+from llmkit's own call sites, because it never spells the name at all.
 
 **Concurrency** defaults to a cap of **8 concurrent calls per provider**: eight
 favours the common access pattern — fan-out — out of the box, bounding a
@@ -106,7 +121,9 @@ one and under the default otherwise — no field-level merging — so switching 
 program from one provider to another picks up the destination's budget, and
 each provider's gates, buckets and breaker are built from its own policy.
 Override keys are ``Provider`` members or provider instances, resolved to the
-same provider name the hand-join functions and llmkit's own calls charge.
+same key the hand-join functions and llmkit's own calls charge: a member's
+override applies to that provider's own endpoint only, and an instance's to
+that instance's route only.
 
 Token bucket, not sliding window
 --------------------------------
@@ -142,16 +159,19 @@ llmkit is designed for **single-tenant** applications: one credential per
 provider. Two deliberate non-goals follow:
 
 * **No per-credential scoping (deferred, not rejected).** Two configs of the
-  same provider family that differ only by ``api_key`` / ``base_url`` share one
-  budget, because the key is the provider *name*, not the credential. For a
-  single-tenant app that is exact — there is only one credential per provider,
-  so name-keying and credential-keying are identical. A genuine *multi-tenant*
-  host (many accounts of one provider family in one process) would see them
-  collapse into a shared budget; isolating those would require keying the slot
-  by a credential hash, which would diverge it from how logging resolves the
-  provider (by name). That multi-tenant direction is a possible future-version
-  optimisation, recorded in ``docs/planning/opinions.md`` §6.4 — not built
-  today, and a maintainer who needs it must opt into it explicitly.
+  same provider that differ only by ``api_key`` share one budget, because the
+  key is the route (provider and endpoint), not the credential. For a
+  single-tenant app that is exact — there is only one credential per route, so
+  route-keying and credential-keying are identical. A genuine *multi-tenant*
+  host (many accounts of one provider in one process) would see them collapse
+  into a shared budget; isolating those would require keying the slot by a
+  credential hash, which would diverge it from how logging names the route.
+  That multi-tenant direction is a possible future-version optimisation,
+  recorded in ``docs/planning/opinions.md`` §6.4 — not built today, and a
+  maintainer who needs it must opt into it explicitly. (Scoping by
+  ``base_url`` was deferred under the same heading until a host fanning out
+  over several OpenAI-compatible endpoints showed them queueing behind one
+  another; an explicit ``base_url`` now selects its own route.)
 * **No extra global ceiling.** There is no aggregate cap on top of the
   per-provider limits; total concurrency/rate is just the sum of the
   per-provider budgets. Per-provider only.
@@ -231,10 +251,12 @@ class RateLimitConfig:
     ``adaptive`` is whether the concurrency limit adapts to provider overload;
     ``breaker`` is whether the per-provider circuit breaker is armed (opt-in).
     ``policy`` is the :class:`RateLimitPolicy` every provider without an
-    override runs under, and ``overrides`` maps each overridden provider's
-    display name (the value the call log's ``provider`` field records, e.g.
-    ``"Google Agent Platform"`` for ``Provider.VERTEX``) to its policy. To ask
-    which policy one provider runs under, use :func:`get_rate_limit_policy`.
+    override runs under, and ``overrides`` maps each overridden route's name
+    (the value the call log's ``provider`` field records, e.g.
+    ``"Google Agent Platform"`` for ``Provider.VERTEX``, or
+    ``"OpenAI (api.moonshot.ai)"`` for an instance built with that
+    ``base_url``) to its policy. To ask which policy one provider runs under,
+    use :func:`get_rate_limit_policy`.
     """
 
     enabled: bool
@@ -261,9 +283,13 @@ def configure_rate_limit(
       override (:data:`DEFAULT_RATE_LIMIT_POLICY` until set).
     * ``overrides`` — a map from provider (a :class:`~llmkit.providers.Provider`
       member or a provider instance) to the policy that provider runs under
-      instead, for accounts whose limits differ. A provider's effective policy is
-      its override if it has one, otherwise ``policy``; the two are never merged
-      field by field, so derive an override with :func:`dataclasses.replace`.
+      instead, for accounts whose limits differ. A member's override applies
+      to that provider's own endpoint only; an instance's applies to that
+      instance's route only, so an instance built with a ``base_url``
+      elsewhere is overridden by passing that instance, not the member. A
+      provider's effective policy is its override if it has one, otherwise
+      ``policy``; the two are never merged field by field, so derive an
+      override with :func:`dataclasses.replace`.
     * ``enabled`` / ``adaptive`` / ``breaker`` — the on/off switches.
 
     Each call changes only the keywords it passes; an omitted keyword keeps its
@@ -331,8 +357,8 @@ def configure_rate_limit(
             :class:`RateLimitPolicy`, ``overrides`` is not a mapping (``None``
             included), or an override key is neither a ``Provider`` member nor
             a provider instance (a plain string such as ``"openai"`` is refused).
-        ValueError: if two override keys name the same provider (for example a
-            member and an instance of it).
+        ValueError: if two override keys name the same route (for example a
+            member and an instance of it on the provider's own endpoint).
 
         A refused call changes nothing. Invalid numbers are refused earlier, by
         the :class:`RateLimitPolicy` constructor.
@@ -356,7 +382,7 @@ def configure_rate_limit(
 
 
 def _resolve_overrides(overrides: object) -> dict[str, RateLimitPolicy]:
-    """Check an ``overrides=`` argument and key it by provider display name.
+    """Check an ``overrides=`` argument and key it by route name.
 
     Runs before the limiter is touched, so every refusal leaves it unchanged.
     """
@@ -397,7 +423,7 @@ def get_rate_limit_config() -> RateLimitConfig:
     Returns:
         A :class:`RateLimitConfig` snapshot of the ``enabled``, ``adaptive``
         and ``breaker`` switches, the default ``policy``, and the
-        ``overrides`` keyed by provider display name.
+        ``overrides`` keyed by route name.
     """
     return RateLimitConfig(
         enabled=GlobalRateLimiter.is_enabled(),
@@ -413,7 +439,10 @@ def get_rate_limit_policy(provider: Provider | LLMProviderInterface) -> RateLimi
 
     Resolves ``provider`` exactly as :func:`configure_rate_limit` resolves an
     override key and as the hand-join functions resolve theirs, and returns its
-    override if it has one, otherwise the default policy.
+    override if it has one, otherwise the default policy. A ``Provider`` member
+    asks about that provider's own endpoint; an instance asks about its own
+    route, which differs from the member's when it was built with a
+    ``base_url`` elsewhere.
 
     Raises:
         TypeError: if ``provider`` is neither a ``Provider`` member nor a
@@ -425,7 +454,10 @@ def get_rate_limit_policy(provider: Provider | LLMProviderInterface) -> RateLimi
 def _limiter_key(provider_key: object, caller: str) -> str:
     """Resolve a provider argument to the key llmkit's own calls charge.
 
-    A :class:`Provider` member is checked first: it is a ``StrEnum``, so any
+    A :class:`Provider` member resolves to the name of that provider's own
+    endpoint, and an instance to its route name (``provider.name``), which is
+    the same value unless the instance was built with a ``base_url`` elsewhere.
+    The member is checked first: it is a ``StrEnum``, so any
     string handling ahead of it would pass the member through as its value,
     which differs from the provider name for some members. Anything that is
     neither a member nor a provider instance is refused, strings included;
@@ -455,7 +487,9 @@ async def rate_limit_acquire_async(
     :class:`~llmkit.providers.Provider` member (e.g. ``Provider.OPENAI``) or a
     provider instance (a host's own provider class joins by passing its
     instance); either joins the same budget llmkit's own calls on that provider
-    debit. Each provider has an independent budget. Yields a :class:`RateLimitSlot`; call its
+    debit. A member means the provider's own endpoint; pass the instance to
+    join a route built with a ``base_url`` elsewhere. Each route has an
+    independent budget. Yields a :class:`RateLimitSlot`; call its
     :meth:`~RateLimitSlot.record_tokens` once you know the call's token usage to
     debit the TPM budget (a no-op when TPM is off). A no-op when limiting is
     disabled.
@@ -488,8 +522,9 @@ def rate_limit_acquire_sync(
     joining the global per-provider limit from a sync code path (e.g. a
     synchronous LangChain ``_generate``/``_stream`` wrapper). ``provider_key``
     is a :class:`~llmkit.providers.Provider` member or a provider instance,
-    as for the async form; either joins the same budget llmkit's own calls on
-    that provider debit. The sync join counts its in-flight slots separately
+    as for the async form (a member means the provider's own endpoint); either
+    joins the same budget llmkit's own calls on that provider debit. The sync
+    join counts its in-flight slots separately
     from llmkit's own calls (see the module docstring's caveat), but shares
     their adaptive limit, circuit breaker and RPM/TPM buckets. Each provider has an independent budget across all three
     dimensions. Yields a :class:`RateLimitSlot` whose

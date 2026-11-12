@@ -79,6 +79,7 @@ class CerebrasProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Cerebras"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "cerebras/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-oss-120b"

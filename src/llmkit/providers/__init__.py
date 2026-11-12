@@ -86,7 +86,11 @@ _MEMBER_BY_CLASS: dict[type[BaseProvider], Provider] = {_provider_class(m): m fo
 
 
 def provider_display_name(provider: Provider) -> str:
-    """Return the provider name llmkit's own calls report for ``provider``.
+    """Return the name llmkit's calls on ``provider``'s own endpoint report.
+
+    A member names the provider's default endpoint. An instance built with an
+    explicit ``base_url`` elsewhere reports its own route name instead (see
+    :attr:`~llmkit.providers.base.BaseProvider.name`).
 
     The name differs from the member's value for some members
     (``Provider.VERTEX`` is ``"vertex"`` but reports ``"Google Agent

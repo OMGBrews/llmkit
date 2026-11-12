@@ -24,7 +24,11 @@ queue wait they see is the real limiter slot's. One test stays on the private
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
+import threading
+import time
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -41,7 +45,7 @@ from llmkit import (
 from llmkit import (
     calls as llm_calls,
 )
-from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy
+from llmkit.rate_limiting import GlobalRateLimiter, RateLimitPolicy, configure_rate_limit
 from llmkit.rate_limiting._observability import _queue_wait_ms
 from llmkit.testing import Reply, TransportRequest, install
 from tests._support import OkSchema, provider_mock
@@ -218,6 +222,119 @@ async def test_queue_wait_measures_contended_wait() -> None:
         assert wait_ms >= 25.0
     finally:
         GlobalRateLimiter.configure(policy=RateLimitPolicy(max_concurrent=8), enabled=True)
+
+
+# A contended call's *record* carries the wait. The holder's fake keeps the one
+# slot until the test releases it; the waiter is given ``_SETTLE_SECONDS`` to
+# reach the limiter before the measured ``_HOLD_SECONDS`` starts, so its real
+# wait is at least the hold. Both fakes poll thread-safe events because the
+# sync wrappers answer on llmkit's own loop, not the test's.
+_HOLD_SECONDS = 0.1
+_SETTLE_SECONDS = 0.2
+
+
+class _HeldSlot:
+    """A fake whose ``holder`` call keeps its limiter slot until released."""
+
+    def __init__(self, reply: Reply) -> None:
+        self._reply: Reply = reply
+        self.holding: threading.Event = threading.Event()
+        self.release: threading.Event = threading.Event()
+
+    async def __call__(self, request: TransportRequest) -> Reply:
+        if request.feature == "holder":
+            self.holding.set()
+            while not self.release.is_set():
+                await asyncio.sleep(0.002)
+        return self._reply
+
+
+def _assert_waiter_record_carries_the_wait(records: list[LLMCallRecord]) -> None:
+    by_feature = {record.feature: record for record in records}
+    assert set(by_feature) == {"holder", "waiter"}
+    holder, waiter = by_feature["holder"], by_feature["waiter"]
+    assert waiter.queue_wait_ms is not None
+    assert waiter.queue_wait_ms >= _HOLD_SECONDS * 1000.0
+    assert waiter.duration_ms >= waiter.queue_wait_ms
+    # The holder took the free slot at once: the wait is the waiter's alone.
+    assert holder.queue_wait_ms is not None
+    assert holder.queue_wait_ms < _HOLD_SECONDS * 1000.0
+    assert holder.duration_ms >= (_HOLD_SECONDS + _SETTLE_SECONDS) * 1000.0
+
+
+_TEXT_REPLY = Reply.text("ok")
+_JSON_REPLY = Reply.json(OkSchema(ok=True))
+
+
+async def _text(feature: str) -> object:
+    return await llm_calls.text_llm_call("hi", feature=feature)
+
+
+async def _structured(feature: str) -> object:
+    return await llm_calls.structured_llm_call("hi", OkSchema, feature=feature)
+
+
+def _text_sync(feature: str) -> object:
+    return llm_calls.text_llm_call_sync("hi", feature=feature)
+
+
+def _structured_sync(feature: str) -> object:
+    return llm_calls.structured_llm_call_sync("hi", OkSchema, feature=feature)
+
+
+@pytest.mark.parametrize(
+    ("call", "reply"),
+    [(_text, _TEXT_REPLY), (_structured, _JSON_REPLY)],
+    ids=["text", "structured"],
+)
+async def test_contended_async_call_record_carries_its_limiter_wait(
+    call: Callable[[str], Coroutine[object, object, object]], reply: Reply
+) -> None:
+    """With one slot, the queued call's record reports the time it queued in
+    ``queue_wait_ms``, and its ``duration_ms`` includes that wait."""
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
+    fake = _HeldSlot(reply)
+    with install(fake), capture_llm_records() as records:
+        holder = asyncio.create_task(call("holder"))
+        while not fake.holding.is_set():
+            await asyncio.sleep(0.002)
+        waiter = asyncio.create_task(call("waiter"))
+        await asyncio.sleep(_SETTLE_SECONDS + _HOLD_SECONDS)
+        assert not waiter.done()
+        fake.release.set()
+        _ = await asyncio.wait_for(asyncio.gather(holder, waiter), timeout=5.0)
+    _assert_waiter_record_carries_the_wait(records)
+
+
+@pytest.mark.parametrize(
+    ("call", "reply"),
+    [(_text_sync, _TEXT_REPLY), (_structured_sync, _JSON_REPLY)],
+    ids=["text", "structured"],
+)
+def test_contended_sync_call_record_carries_its_limiter_wait(
+    call: Callable[[str], object], reply: Reply
+) -> None:
+    """The same through the sync wrappers, called from two threads: both run on
+    llmkit's one persistent loop, so they contend for the same slot."""
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
+    fake = _HeldSlot(reply)
+    with install(fake), capture_llm_records() as records:
+        # A new thread starts with an empty context; copy this one so the
+        # capture list and the installed fake are visible to the call.
+        threads = [
+            threading.Thread(target=contextvars.copy_context().run, args=(call, feature))
+            for feature in ("holder", "waiter")
+        ]
+        threads[0].start()
+        assert fake.holding.wait(timeout=5.0)
+        threads[1].start()
+        time.sleep(_SETTLE_SECONDS + _HOLD_SECONDS)
+        assert threads[1].is_alive()
+        fake.release.set()
+        for thread in threads:
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+    _assert_waiter_record_carries_the_wait(records)
 
 
 @pytest.mark.asyncio

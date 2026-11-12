@@ -348,6 +348,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Rate limits are keyed by route: a provider built with a `base_url`
+  elsewhere gets its own budget and its own name.** Budgets were keyed by the
+  provider's name alone, so a compatible endpoint reached through a provider's
+  class shared one budget with that provider: Moonshot or Cerebras through
+  `OpenAIProvider` queued behind OpenAI's own calls, eight at a time between
+  them by default, and all of them were logged as `OpenAI`. A provider built
+  with an explicit `base_url` whose host or port differs from the provider's
+  own endpoint is now a separate route. Its `name` is the provider's name
+  followed by the endpoint's host in brackets, for example
+  `OpenAI (api.moonshot.ai)`, with the port included when the URL carries one
+  other than its scheme's default (`Ollama (gpu-box:11434)`) and the URL path
+  left out. That name is its rate-limit key, so each route has its own
+  concurrency, RPM and TPM budgets, adaptive limit and circuit breaker. This
+  applies to the seven providers that accept a `base_url`: OpenAI, Anthropic,
+  Cerebras, DeepSeek, Google AI Studio, OpenRouter and Ollama. The provider's
+  own endpoint keeps the plain name, however the URL is spelled
+  (`https://api.openai.com`, `https://api.openai.com:443/v1/`), and so does an
+  endpoint set only by environment variable such as `OPENAI_BASE_URL`. Hosts
+  are compared as written, with no name resolution. Two URLs on one host that
+  differ only by path share a route. Google AI Studio has no default endpoint
+  of its own, so any `base_url` passed to it is a named route. See "One budget
+  per endpoint" in the README.
+
+  **Compatibility**, for a provider built with an explicit `base_url` on
+  another host or port than the provider's own. Nothing changes for a
+  provider on its default endpoint.
+
+  - **The `provider` value changes.** Call records (`LLMCallRecord.provider`,
+    in the YAML log body and `index.jsonl`), `describe_llm(...).provider_name`, `TransportRequest.provider` in `llmkit.testing`, and
+    llmkit's error messages carry the route name, `OpenAI (api.moonshot.ai)`
+    where they carried `OpenAI`. `BackpressureEvent.provider` and
+    `CircuitOpenError` carry it lower-cased. Log queries and dashboards that
+    match the old value need the new one, and a metric name built from
+    `event.provider` now receives spaces, brackets and dots.
+  - **Budgets are separate.** A proxy or gateway in front of a provider, a
+    compatible endpoint used through another provider's class (Cerebras or
+    Moonshot through `OpenAIProvider`, for example), and an Ollama server at
+    a non-default address each hold their own budget, apart from the default
+    endpoint's. A process that calls both the default endpoint and another
+    one through the same class can now have up to `max_concurrent` calls in
+    flight on *each*, where it had `max_concurrent` between them. An Ollama
+    `base_url` of `http://127.0.0.1:11434` is a different route from the
+    default `http://localhost:11434`, because hosts are not resolved.
+  - **A member-keyed override no longer covers other endpoints used through
+    the same class.** `configure_rate_limit(overrides={Provider.OPENAI: ...})`,
+    `get_rate_limit_policy(Provider.OPENAI)` and the hand-join functions
+    called with a member now mean OpenAI's own endpoint only. A provider
+    built with a `base_url` elsewhere runs under the default `policy` until
+    it is given an override keyed by that instance, and is joined by hand by
+    passing that instance. A member and an instance on another endpoint may
+    appear in one `overrides` map; a member and an instance on the default
+    endpoint are still refused as naming one route twice.
+  - **One-time cache misses.** The cache key includes the provider's name, so
+    answers cached for an affected route under the old name are not found
+    after upgrading and are fetched once more. The key already included the
+    endpoint, so no answers were shared across endpoints before.
+
 - **Breaking: one overall outer-attempt ceiling.** `RetryPolicy.max_attempts`
   now bounds every outer pass, including mixed transport and validation
   failures. `validation_max_attempts - 1` limits validation-caused retries

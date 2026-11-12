@@ -781,13 +781,13 @@ cost, and potential failures to the weekly live check.
 
 ## Rate limiting
 
-Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions:
+Rate limiting is **on by default**, scoped **per provider** (keyed by the effective provider name, matching how logging records it), across three independent dimensions. A provider built with an explicit `base_url` on another host or port than the provider's own endpoint is its own route, with its own budget and its own name: see [One budget per endpoint](#one-budget-per-endpoint).
 
 - **Concurrency** — **on by default**, default cap **8 concurrent calls per provider**: enough headroom for the fan-out workloads consumers actually run, while still bounding a self-inflicted burst; lower it for a tightly-metered account, raise it for a local Ollama server. This cap is also **adaptive by default** — it backs off when a provider signals overload and recovers automatically (see [Adaptive concurrency](#adaptive-concurrency) below). The cap binds async callers and the `*_sync` wrappers alike — and because every `*_sync` call runs on llmkit's single persistent event loop, a thread-pool fan-out of sync calls shares one per-provider cap. One caveat follows from the concurrency gate being bound to a single loop: a process that drives calls on more than one loop (e.g. running the async call functions on its own event loop *and* the `*_sync` wrappers on the persistent loop) caps each loop's population independently, so it can momentarily hold up to *loops* × the cap per provider; the adaptive limit and the RPM/TPM budgets are shared across all of them.
 - **Requests per minute (RPM)** — **opt-in**, off by default. A per-provider request-rate ceiling.
 - **Tokens per minute (TPM)** — **opt-in**, off by default. A per-provider token-rate ceiling, debited by each call's measured token usage.
 
-The numbers live in a `RateLimitPolicy(max_concurrent=8, rpm=None, tpm=None, breaker_cooldown=30.0)`, and `configure_rate_limit(policy=..., overrides=..., enabled=..., adaptive=..., breaker=...)` sets them. `policy` is the budget every provider runs under; `overrides` maps a provider (a `Provider` member or a provider instance) to the policy that provider runs under instead, for an account whose limits differ. A provider uses its override if it has one and the default policy otherwise; the two are never merged field by field, so build an override from the default with `dataclasses.replace(...)` when you want to change one number. Each call changes only the keywords it passes and keeps the rest, so setting `policy=` at startup and `breaker=True` later leaves both in force. Passing `overrides=` replaces the whole map: `overrides={}` removes every override. Inside a policy, `rpm=None` or `tpm=None` turns that dimension off for the providers running under it. `max_concurrent`, `rpm` and `tpm` must be positive integers (not a bool, and not a float such as `3.5e3`), and `breaker_cooldown` must be finite and positive; `RateLimitPolicy(...)` raises `ValueError` for anything else. An override keyed by a string, a non-policy value, or two keys for one provider raises before anything changes. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `adaptive` / `breaker` switches, the default `policy` and the `overrides` keyed by provider display name (handy to log or assert at startup), and `get_rate_limit_policy(Provider.OPENAI)` returns the policy one provider runs under; `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
+The numbers live in a `RateLimitPolicy(max_concurrent=8, rpm=None, tpm=None, breaker_cooldown=30.0)`, and `configure_rate_limit(policy=..., overrides=..., enabled=..., adaptive=..., breaker=...)` sets them. `policy` is the budget every provider runs under; `overrides` maps a provider (a `Provider` member or a provider instance) to the policy that provider runs under instead, for an account whose limits differ. A provider uses its override if it has one and the default policy otherwise; the two are never merged field by field, so build an override from the default with `dataclasses.replace(...)` when you want to change one number. Each call changes only the keywords it passes and keeps the rest, so setting `policy=` at startup and `breaker=True` later leaves both in force. Passing `overrides=` replaces the whole map: `overrides={}` removes every override. Inside a policy, `rpm=None` or `tpm=None` turns that dimension off for the providers running under it. `max_concurrent`, `rpm` and `tpm` must be positive integers (not a bool, and not a float such as `3.5e3`), and `breaker_cooldown` must be finite and positive; `RateLimitPolicy(...)` raises `ValueError` for anything else. A `Provider` member keys the provider's own endpoint and an instance keys its own route, so a provider built with a `base_url` elsewhere is overridden by passing that instance ([One budget per endpoint](#one-budget-per-endpoint)). An override keyed by a string, a non-policy value, or two keys for one route raises before anything changes. Every call also clears the per-provider limiter state, so configure at startup rather than mid-run. `get_rate_limit_config()` reads back the effective `enabled` / `adaptive` / `breaker` switches, the default `policy` and the `overrides` keyed by the name each route logs under (handy to log or assert at startup), and `get_rate_limit_policy(Provider.OPENAI)` returns the policy one provider runs under on its own endpoint (pass a provider instance to ask about that instance's route); `configure_llm_logging(sink)` swaps the log sink (below). The `breaker` switch arms the opt-in per-provider [circuit breaker](#circuit-breaker).
 
 ```python
 from llmkit import Provider, RateLimitPolicy, configure_rate_limit
@@ -800,6 +800,34 @@ configure_rate_limit(
     overrides={Provider.ANTHROPIC: RateLimitPolicy(max_concurrent=4, rpm=50, tpm=40_000)},
 )
 ```
+
+### One budget per endpoint
+
+A budget belongs to a **route**: a provider and the endpoint it is called at. A provider built with an explicit `base_url` whose host or port differs from the provider's own endpoint is a different route. It is rate limited apart from the provider's own calls, and it reports a name made of the provider's name and the endpoint's host in brackets:
+
+```python
+from llmkit import Provider, RateLimitPolicy, configure_rate_limit, get_rate_limit_policy
+from llmkit.providers import make_provider
+
+openai = make_provider(Provider.OPENAI, api_key=openai_key)
+moonshot = make_provider(Provider.OPENAI, api_key=moonshot_key, base_url="https://api.moonshot.ai/v1")
+openai.name    # "OpenAI"
+moonshot.name  # "OpenAI (api.moonshot.ai)"
+
+configure_rate_limit(overrides={
+    Provider.OPENAI: RateLimitPolicy(max_concurrent=4),  # OpenAI's own endpoint only
+    moonshot: RateLimitPolicy(max_concurrent=16),        # that route only
+})
+get_rate_limit_policy(moonshot).max_concurrent  # 16
+```
+
+That name is the `provider` in call records, in `describe_llm(...).provider_name`, in `CircuitOpenError` and `BackpressureEvent.provider` (lower-cased there), and in llmkit's error messages. The same holds for every provider that accepts a `base_url`: a proxy in front of Anthropic is `Anthropic (proxy.example)`, and an Ollama server at another address is `Ollama (gpu-box:11434)`.
+
+- **Only host and port select a route.** The path is left out, so two URLs on one host share a budget. The port appears in the name only when the URL carries one other than its scheme's default. `https://api.openai.com`, `https://api.openai.com/v1/` and `https://api.openai.com:443/v1` are all plain `OpenAI`.
+- **Hosts are compared as written**, with no name resolution: `http://127.0.0.1:11434` is `Ollama (127.0.0.1:11434)`, a different route from the default `http://localhost:11434`.
+- **Only a `base_url` you pass counts.** An endpoint taken from an environment variable such as `OPENAI_BASE_URL` keeps the plain provider name and the provider's own budget.
+- **A `Provider` member means the provider's own endpoint**, wherever a member is accepted for the limiter: `overrides`, `get_rate_limit_policy` and the [hand-join functions](#joining-the-global-rate-limit-directly). Pass the instance to address another route.
+- **`GOOGLE` has no default endpoint** of its own, so any `base_url` passed to it is a named route.
 
 RPM and TPM are **opt-in** because the right per-minute number is the metered limit of *your* account, with no safe default to assume. Concurrency defaults to 8; tune that cap for your account and workload too. Leaving them unset applies **no throttle** on those dimensions. The binding limit on a metered cloud account is usually RPM/TPM rather than concurrency, so a migrator coming from a requests-per-minute knob should set the policy's `rpm` — **the concurrency cap does not stand in for an RPM limit** (the two limit different things, and an old RPM tuning otherwise goes inert). Both use a per-provider **token bucket**, which tolerates a small burst above the configured ceiling and then smooths to the sustained rate. That burst is deliberately small — `min(max_concurrent, rpm)` requests for RPM, roughly one second of tokens for TPM — *not* a full minute's quota. The burst uses the `max_concurrent` of the same policy as the `rpm`, so an override's burst follows the override. Against a provider that enforces a strict fixed minute window, the burst is the worst-case overshoot, so its *relative* size scales with your limits: with the default `max_concurrent=8` it is negligible at `rpm=3_500` (~0.2%) but a meaningful fraction of a small limit (8 extra requests on `rpm=50` is 16%). A tightly-metered account should lower `max_concurrent` (which shrinks the RPM burst with it) or set `rpm` a little below the published number to leave headroom. When the RPM ceiling does make calls wait, they are admitted in **arrival order** (FIFO): a late arrival cannot jump the queue ahead of a caller already waiting *on the same event loop*, so no caller on that loop is starved under sustained saturation. The queue is **per loop**, exactly like the per-loop concurrency caveat above — a process that drives the same provider across more than one loop (the async call functions on its own loop *and* the `*_sync` wrappers on the persistent loop) gets per-loop FIFO rather than one global arrival order across them. (Host code that [joins the limiter directly](#joining-the-global-rate-limit-directly) through the synchronous `rate_limit_acquire_sync` orders on its own independent ticket queue as well.) The aggregate rate stays exact regardless of how the queues interleave. Both streamed lanes request usage and debit TPM when the stream runs out; abandoned streams have no terminal usage to debit.
 
@@ -818,7 +846,7 @@ configure_rate_limit(adaptive=True)   # adaptive again (the default)
 
 ### Observing backpressure
 
-Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` each time a provider's limit changes (`reason` is `"throttle"` or `"recover"`) or — when the circuit breaker is armed, [below](#circuit-breaker) — the breaker changes state (`"breaker_open"`, `"breaker_half_open"`, `"breaker_closed"`). It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
+Install a `backpressure_callback` to *see* the adaptive limiter move in real time — for metrics, a budget-visibility dashboard, or just logging. `event.provider` is the lower-cased name the budget is keyed by, which for [a route on another endpoint](#one-budget-per-endpoint) contains spaces, brackets and dots (`openai (api.moonshot.ai)`), so pass it to a metrics system as a tag value, not as part of a metric name. The callback receives a `BackpressureEvent(provider, old_limit, new_limit, reason)` each time a provider's limit changes (`reason` is `"throttle"` or `"recover"`) or — when the circuit breaker is armed, [below](#circuit-breaker) — the breaker changes state (`"breaker_open"`, `"breaker_half_open"`, `"breaker_closed"`). It is read from a context variable — like `retry_progress_callback` — so it propagates across the `run_sync` boundary; install it once around your fan-out.
 
 ```python
 from llmkit import backpressure_callback, BackpressureEvent
@@ -858,7 +886,9 @@ global, per-provider limit (concurrency on by default; RPM/TPM when
 configured). If your app issues provider calls **outside** those functions —
 for example a LangChain chat-model wrapper that calls the provider itself — you
 can join the same per-provider budget by hand with the module-level acquire
-functions:
+functions. A `Provider` member joins the budget of that provider's own
+endpoint; to join [a route on another endpoint](#one-budget-per-endpoint), pass
+the provider instance built with that `base_url`:
 
 ```python
 from llmkit import Provider
@@ -1619,11 +1649,14 @@ What llmkit decides changes with the provider, not with the model's name: the
 new route brings its own structured-output mode, its own translation of
 `reasoning_effort` (`"disable"` raises on a model that cannot stop
 thinking, and `"lowest"` maps to a different native value per route, as
-described above), and its own rate-limit budget, because budgets are per provider. The
+described above), and its own rate-limit budget, because budgets are per provider. A
+switch to a compatible endpoint through the same provider class, by passing a
+`base_url`, is a switch of route too and gets [its own budget](#one-budget-per-endpoint). The
 numbers that budget runs under are the destination's `configure_rate_limit`
 override if you gave it one, and the shared default `policy` otherwise, so a
 switch to a provider without an override inherits the default you tuned rather
-than the old account's override; `get_rate_limit_policy(Provider.X)` shows which. To
+than the old account's override; `get_rate_limit_policy(Provider.X)` shows which
+(pass the built provider instead of the member when it has a `base_url` of its own). To
 confirm a switch before the first call, run `describe_llm(config)` (from
 `llmkit.providers`). It builds the provider, so a missing key, a missing extra,
 or a rejected field raises there. It reports the provider and model the calls
@@ -1715,7 +1748,8 @@ translation, rate-limit budget, circuit breaker (when enabled), and log
 identity, so one vendor's rate limit or open breaker never slows the calls to
 another, and the `label` tells the records apart. Budgets are keyed by provider, not by credential: two
 `make_provider(Provider.OPENAI, api_key=...)` instances with different keys
-share one OpenAI budget. With a [response cache](#response-cache) installed they
+share one OpenAI budget (an instance built with a `base_url` on another host
+is [its own route](#one-budget-per-endpoint) and has its own). With a [response cache](#response-cache) installed they
 also share cached answers, because the cache key leaves credentials out, so pass
 `cache=False` when comparing accounts or run-to-run variation.
 

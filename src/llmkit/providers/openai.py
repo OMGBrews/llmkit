@@ -53,6 +53,7 @@ class OpenAIProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "OpenAI"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "openai/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
