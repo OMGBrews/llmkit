@@ -159,6 +159,10 @@ class TokenUsage:
 class ToolCallResult:
     """The text and/or requested calls from a single completion turn.
 
+    ``stop_reason`` holds only complete mapped reasons; truncated, failed and
+    filtered turns raise before parsing. ``native_stop_reason`` preserves the
+    provider's own reason wherever the transport delivered it.
+
     ``tool_calls`` holds every call that parsed and validated. When a turn
     requests several calls in parallel and only *some* of them are malformed,
     the well-formed ones survive here and each failure is reported on
@@ -183,6 +187,7 @@ class ToolCallResult:
     stop_reason: str | None
     usage: TokenUsage
     invalid_calls: list[ToolArgumentError] = field(default_factory=list)
+    native_stop_reason: str | None = None
 
     def to_message(self) -> AssistantToolMessage:
         return {

@@ -36,7 +36,7 @@ from llmkit.calls._shared import (
     resolve_model_and_provider,
 )
 from llmkit.capture import record_call_async, submit_record_call
-from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
+from llmkit.exceptions import FinishReasonError, OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait
@@ -360,6 +360,8 @@ async def _stream_once(
     accumulated: list[str] = []
     error: str | None = None
     diagnostics: OutputLimitDiagnostics | None = None
+    partial_text: str | None = None
+    native_finish_reason: str | None = None
     usage: TokenUsage | None = None
     approximate_cost: float | None = None
     # What the transport actually sent, copied once, before the first yield:
@@ -400,6 +402,7 @@ async def _stream_once(
                 # Record data, never a delta: it stays out of the transcript.
                 usage = TokenUsage(*chunk.usage)
                 approximate_cost = chunk.approximate_cost
+                native_finish_reason = chunk.native_finish_reason
                 continue
             if chunk:
                 accumulated.append(chunk)
@@ -421,6 +424,11 @@ async def _stream_once(
             # Unlike the buffered lane, ``response`` keeps the transcript the
             # consumer already received; ``partial_text`` repeats it.
             diagnostics = exc.diagnostics
+            native_finish_reason = exc.native_finish_reason
+        elif isinstance(exc, FinishReasonError):
+            partial_text = exc.partial_text
+            native_finish_reason = exc.native_finish_reason
+            usage = TokenUsage(*exc.usage.counts())
         raise
     finally:
         if not captured:
@@ -445,6 +453,8 @@ async def _stream_once(
             attempt=attempt,
             usage=usage,
             output_limit=diagnostics,
+            partial_text=partial_text,
+            native_finish_reason=native_finish_reason,
             first_chunk_at=first_chunk_at,
         )
         if error == STREAM_ABANDONED_ERROR:

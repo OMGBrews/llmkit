@@ -156,7 +156,7 @@ def test_structured_configured_and_per_call_disable_reach_transport(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", complete):
-        parsed, _, _, _ = asyncio.run(
+        parsed, _, _, _, _ = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 _Answer,
@@ -213,7 +213,7 @@ def test_native_per_call_effort_overrides_configured_disable() -> None:
         patch("llmkit._litellm.litellm.acompletion", complete),
         patch("litellm.get_model_info") as lookup,
     ):
-        answer, _, _ = asyncio.run(
+        answer, _, _, _ = asyncio.run(
             _litellm.acompletion_text(
                 "hi",
                 temperature=None,

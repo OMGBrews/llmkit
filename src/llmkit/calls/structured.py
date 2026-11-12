@@ -30,7 +30,12 @@ from llmkit.calls._shared import (
     usage_log_dict,
 )
 from llmkit.capture import record_call_async
-from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
+from llmkit.exceptions import (
+    FinishReasonError,
+    OutputLimitDiagnostics,
+    OutputLimitError,
+    StructuredOutputError,
+)
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
@@ -247,12 +252,20 @@ async def structured_llm_call[T: BaseModel](
         usage: TokenUsage | None = None
         error: str | None = None
         diagnostics: OutputLimitDiagnostics | None = None
+        partial_text: str | None = None
+        native_finish_reason: str | None = None
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
         try:
-            response, cost, counts, text = await _litellm.acompletion_structured(
+            (
+                response,
+                cost,
+                counts,
+                text,
+                native_finish_reason,
+            ) = await _litellm.acompletion_structured(
                 prompt,
                 output_schema,
                 temperature=args.temperature,
@@ -284,6 +297,7 @@ async def structured_llm_call[T: BaseModel](
             if isinstance(exc, OutputLimitError):
                 # ``None`` for a directly constructed error: no fields logged.
                 diagnostics = exc.diagnostics
+                native_finish_reason = exc.native_finish_reason
                 if diagnostics is not None:
                     # The truncated completion's counts also go in ``usage``,
                     # so every attempt that reported usage logs it there.
@@ -292,6 +306,12 @@ async def structured_llm_call[T: BaseModel](
                         diagnostics.completion_tokens,
                         diagnostics.total_tokens,
                     )
+            elif isinstance(exc, FinishReasonError):
+                partial_text = exc.partial_text
+                native_finish_reason = exc.native_finish_reason
+                usage = TokenUsage(*exc.usage.counts())
+            elif isinstance(exc, StructuredOutputError):
+                native_finish_reason = exc.native_finish_reason
             raise
         except BaseException as exc:
             # A cancellation (a host's ``asyncio.timeout`` around the call, a
@@ -329,7 +349,10 @@ async def structured_llm_call[T: BaseModel](
                     run_id=get_run_id(),
                     usage=usage_log_dict(usage),
                     output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
-                    partial_text=diagnostics.partial_text if diagnostics is not None else None,
+                    partial_text=diagnostics.partial_text
+                    if diagnostics is not None
+                    else partial_text,
+                    native_finish_reason=native_finish_reason,
                 )
             )
 

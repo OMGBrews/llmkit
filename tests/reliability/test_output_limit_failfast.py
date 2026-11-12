@@ -327,7 +327,7 @@ async def test_schema_repair_reask_still_works() -> None:
         return responses[calls - 1]
 
     with patch("llmkit._litellm.litellm.acompletion", side_effect=fake_acompletion):
-        parsed, _cost, _usage, _text = await _litellm.acompletion_structured(
+        parsed, _cost, _usage, _text, _native = await _litellm.acompletion_structured(
             "hi", OkSchema, temperature=0.0, model=None, provider=_fake_provider()
         )
     assert parsed.ok is True

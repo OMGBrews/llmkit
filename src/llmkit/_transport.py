@@ -24,36 +24,10 @@ from typing import Literal, Protocol
 from pydantic import BaseModel
 
 from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import WireUsage as WireUsage
 from llmkit.tools import ToolChoice, ToolDefinition
 
 CallKind = Literal["structured", "text", "tool", "text_stream", "tool_stream"]
-
-
-@dataclass(frozen=True)
-class WireUsage:
-    """Token counts as the provider reported them; each ``None`` when absent."""
-
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    total_tokens: int | None = None
-    reasoning_tokens: int | None = None
-
-    def counts(self) -> tuple[int | None, int | None, int | None]:
-        """The ``(prompt, completion, total)`` triple the call log records."""
-        return self.prompt_tokens, self.completion_tokens, self.total_tokens
-
-    def debit(self) -> int | None:
-        """Tokens for the tokens-per-minute limiter to debit.
-
-        ``total_tokens`` when reported, else the sum of the two halves with a
-        missing one counted as 0, else ``None``. Best-effort, like all TPM
-        accounting.
-        """
-        if self.total_tokens is not None:
-            return self.total_tokens
-        if self.prompt_tokens is not None or self.completion_tokens is not None:
-            return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
-        return None
 
 
 @dataclass(frozen=True)
@@ -90,6 +64,7 @@ class WireResponse:
     text: str | None = None
     tool_calls: tuple[WireToolCall, ...] = ()
     finish_reason: str | None = None
+    native_finish_reason: str | None = None
     usage: WireUsage = field(default_factory=WireUsage)
     cost: float | None = None
 
@@ -115,6 +90,7 @@ class WireChunk:
     text: str | None = None
     tool_fragments: tuple[WireToolFragment, ...] = ()
     finish_reason: str | None = None
+    native_finish_reason: str | None = None
     usage: WireUsage | None = None
     cost: float | None = None
 

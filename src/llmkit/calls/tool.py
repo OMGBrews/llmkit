@@ -21,6 +21,7 @@ from typing import cast, overload
 from pydantic import BaseModel, ValidationError
 
 from llmkit._diagnostics import report
+from llmkit._transport import WireUsage
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     compose_validation_budget,
@@ -38,6 +39,7 @@ from llmkit.calls._shared import (
 from llmkit.capture import record_call_async
 from llmkit.exceptions import (
     ComposeUnsupportedError,
+    FinishReasonError,
     OutputLimitDiagnostics,
     OutputLimitError,
     SchemaEngineError,
@@ -143,8 +145,11 @@ async def tool_llm_call[T: BaseModel](
     With ``output_schema``, a final answer (a turn that requested no tools)
     that does not validate, or a turn with neither tool calls nor text, raises
     :class:`~llmkit.StructuredOutputError` and is re-asked on the same
-    validation budget; a final answer cut off by the output-token limit raises
-    :class:`~llmkit.OutputLimitError` and is not re-asked.
+    validation budget. Every turn, including one requesting tools, raises
+    :class:`~llmkit.OutputLimitError` on ``length`` before parsing arguments.
+    ``content_filter`` raises :class:`~llmkit.ContentFilterError`; demonstrated
+    native failures raise :class:`~llmkit.ProviderFailureError`. Missing and
+    unknown reasons remain complete. Only provider failures retry by default.
     """
     args, provider, call_id, attempt_offset = prepare_call(
         options,
@@ -188,6 +193,7 @@ async def tool_llm_call[T: BaseModel](
     async def _attempt() -> ToolCallResult | ToolComposeResult[T]:
         # Function-local + module-bound; see :mod:`llmkit._litellm`.
         import llmkit._litellm as _litellm
+        from llmkit.providers import build_provider
 
         nonlocal attempt_count, repair
         attempt_count += 1
@@ -203,12 +209,22 @@ async def tool_llm_call[T: BaseModel](
         cost: float | None = None
         error: str | None = None
         diagnostics: OutputLimitDiagnostics | None = None
+        partial_text: str | None = None
+        native_finish_reason: str | None = None
+        usage: TokenUsage | None = None
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
         try:
-            text, raw_calls, stop_reason, counts, cost = await _litellm.acompletion_tools(
+            (
+                text,
+                raw_calls,
+                stop_reason,
+                counts,
+                cost,
+                native_finish_reason,
+            ) = await _litellm.acompletion_tools(
                 prompt,
                 tools,
                 repair=repair,
@@ -240,6 +256,15 @@ async def tool_llm_call[T: BaseModel](
             # Only a received all-malformed round replaces repair. Transport
             # failures above retain it; all other received outcomes clear it.
             repair = []
+            usage = TokenUsage(*counts)
+            _litellm.raise_for_finish(
+                stop_reason,
+                native_finish_reason,
+                partial_text=text,
+                model=(provider or build_provider()).litellm_model(args.model),
+                max_tokens=args.max_tokens,
+                usage=WireUsage(*counts),
+            )
             try:
                 parsed_calls, invalid_calls = parse_tool_calls(raw_calls, definitions)
             except ToolArgumentError as exc:
@@ -251,6 +276,7 @@ async def tool_llm_call[T: BaseModel](
                 stop_reason if isinstance(stop_reason, str) else None,
                 TokenUsage(*counts),
                 invalid_calls,
+                native_finish_reason,
             )
             if output_schema is None:
                 result = ToolCallResult(*base)
@@ -263,25 +289,6 @@ async def tool_llm_call[T: BaseModel](
                     provider.litellm_model(args.model) if provider is not None else args.model
                 )
                 provider_name = provider.name if provider is not None else None
-                if stop_reason == "length":
-                    # A final answer cut off by the output-token limit fails
-                    # fast like the structured lane's: a re-ask with an
-                    # identical budget can only truncate again. A turn that
-                    # requested tools is unaffected (its reason rides on
-                    # ``stop_reason``).
-                    diagnostics = OutputLimitDiagnostics(
-                        partial_text=text,
-                        finish_reason=stop_reason,
-                        prompt_tokens=counts[0],
-                        completion_tokens=counts[1],
-                        total_tokens=counts[2],
-                    )
-                    raise OutputLimitError(
-                        model=routed_model or "unknown",
-                        max_tokens=args.max_tokens,
-                        completion_tokens=counts[1],
-                        diagnostics=diagnostics,
-                    )
                 if text is None:
                     raise StructuredOutputError(
                         f"compose response for {output_schema.__name__} had neither "
@@ -332,6 +339,12 @@ async def tool_llm_call[T: BaseModel](
             # ``str(exc)`` is empty for a bare ``CancelledError``, so the
             # message is dropped rather than logged as ``"CancelledError: "``.
             error = error_text(exc)
+            if isinstance(exc, OutputLimitError):
+                diagnostics = exc.diagnostics
+            elif isinstance(exc, FinishReasonError):
+                partial_text = exc.partial_text
+                native_finish_reason = exc.native_finish_reason
+                usage = TokenUsage(*exc.usage.counts())
             raise
         finally:
             resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
@@ -370,10 +383,13 @@ async def tool_llm_call[T: BaseModel](
                             diagnostics.total_tokens,
                         )
                         if diagnostics is not None
-                        else None
+                        else usage
                     ),
                     output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
-                    partial_text=diagnostics.partial_text if diagnostics is not None else None,
+                    partial_text=diagnostics.partial_text
+                    if diagnostics is not None
+                    else partial_text,
+                    native_finish_reason=native_finish_reason,
                 )
             )
 

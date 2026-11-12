@@ -57,11 +57,19 @@ import functools
 import logging
 import threading
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import cast
+from typing import Literal, cast
 
 import instructor
 import litellm
@@ -94,8 +102,11 @@ from llmkit._transport import (
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
+    ContentFilterError,
+    FinishReasonError,
     OutputLimitDiagnostics,
     OutputLimitError,
+    ProviderFailureError,
     StructuredOutputError,
     UnsupportedSchemaError,
     normalize_transient_provider_error,
@@ -525,6 +536,13 @@ def _wire_tool_call(raw: object) -> WireToolCall:
     )
 
 
+def _native_finish_reason(choice: object) -> str | None:
+    fields = getattr(choice, "provider_specific_fields", None)
+    if isinstance(fields, Mapping):
+        return _str_or_none(cast("Mapping[object, object]", fields).get("native_finish_reason"))
+    return None
+
+
 def _wire_response(raw: object) -> WireResponse:
     """Convert a LiteLLM completion to :class:`WireResponse`.
 
@@ -552,6 +570,7 @@ def _wire_response(raw: object) -> WireResponse:
             else ()
         ),
         finish_reason=_str_or_none(getattr(choice, "finish_reason", None)),
+        native_finish_reason=_native_finish_reason(choice),
         usage=usage,
         cost=cost,
     )
@@ -564,6 +583,7 @@ def _wire_chunk(chunk: ModelResponseStream) -> WireChunk:
         text=delta if isinstance(delta, str) else None,
         tool_fragments=_chunk_tool_fragments(chunk),
         finish_reason=_chunk_finish_reason(chunk),
+        native_finish_reason=_native_finish_reason(chunk.choices[0]) if chunk.choices else None,
         # ``include_usage`` puts usage on a *final* frame that usually carries
         # no choices; a frame without any usage reports ``None``.
         usage=_wire_usage(chunk) if getattr(chunk, "usage", None) is not None else None,
@@ -593,7 +613,14 @@ def _render_model_response(response: WireResponse) -> ModelResponse:
             for call in response.tool_calls
         ]
     choices: list[dict[str, object]] = (
-        [{"index": 0, "finish_reason": response.finish_reason, "message": message}]
+        [
+            {
+                "index": 0,
+                "finish_reason": response.finish_reason,
+                "message": message,
+                "provider_specific_fields": {"native_finish_reason": response.native_finish_reason},
+            }
+        ]
         if response.has_choice
         else []
     )
@@ -620,9 +647,10 @@ def _render_model_response(response: WireResponse) -> ModelResponse:
 
 @dataclass
 class _Invocations:
-    """How many times instructor has called the completion callable this attempt."""
+    """Invocation count and the last delivered native reason for this attempt."""
 
     count: int = 0
+    native_finish_reason: str | None = None
 
 
 async def _instructor_completion(
@@ -653,7 +681,18 @@ async def _instructor_completion(
         ),
         repair=invocations.count > 1,
     )
-    return _render_model_response(await _send(WireRequest(kwargs=kwargs, call=call)))
+    response = await _send(WireRequest(kwargs=kwargs, call=call))
+    invocations.native_finish_reason = response.native_finish_reason
+    raise_for_finish(
+        response.finish_reason,
+        response.native_finish_reason,
+        partial_text=response.text,
+        model=call.model,
+        max_tokens=call.max_tokens,
+        usage=response.usage,
+        include_truncation=False,
+    )
+    return _render_model_response(response)
 
 
 def _stricten_json_schema_response_format(kwargs: dict[str, object]) -> None:
@@ -920,6 +959,63 @@ def _output_limit_diagnostics(last_completion: object) -> OutputLimitDiagnostics
 #: completion off (LiteLLM maps Gemini's ``MAX_TOKENS`` onto it).
 _LENGTH = "length"
 
+# Provider enums: Gemini GenerateContent FinishReason and Cohere Chat/Generate.
+# network_error is deliberately excluded until a provider documents its meaning.
+FAILURE_NATIVES = frozenset(
+    {
+        "error",
+        "ERROR",
+        "MALFORMED_RESPONSE",
+        "MALFORMED_FUNCTION_CALL",
+        "UNEXPECTED_TOOL_CALL",
+        "MISSING_THOUGHT_SIGNATURE",
+        "TOO_MANY_TOOL_CALLS",
+    }
+)
+
+
+def classify_finish(
+    finish_reason: str | None,
+    native: str | None,
+) -> Literal["complete", "truncated", "failed", "filtered"]:
+    """Classify only explicit provider signals; unknowns remain compatible."""
+    if finish_reason == "length":
+        return "truncated"
+    if finish_reason == "content_filter":
+        return "filtered"
+    if finish_reason == "stop" and native in FAILURE_NATIVES:
+        return "failed"
+    return "complete"
+
+
+def raise_for_finish(
+    finish_reason: str | None,
+    native_finish_reason: str | None,
+    *,
+    partial_text: str | None,
+    model: str,
+    max_tokens: int | None,
+    usage: WireUsage,
+    include_truncation: bool = True,
+) -> None:
+    """Reject incomplete turns before parsing or caching their content."""
+    kind = classify_finish(finish_reason, native_finish_reason)
+    if kind == "truncated" and include_truncation:
+        exc = _text_output_limit_error(
+            model=model, max_tokens=max_tokens, partial_text=partial_text, usage=usage
+        )
+        exc.native_finish_reason = native_finish_reason
+        raise exc
+    if kind in {"failed", "filtered"}:
+        error = ProviderFailureError if kind == "failed" else ContentFilterError
+        raise error(
+            finish_reason=finish_reason,
+            native_finish_reason=native_finish_reason,
+            partial_text=partial_text,
+            model=model,
+            usage=usage,
+        )
+
 
 def _text_output_limit_error(
     *,
@@ -1129,7 +1225,7 @@ async def acompletion_structured[T: BaseModel](
     call_id: str | None = None,
     attempt: int | None = None,
     schema_repairs: int = DEFAULT_SCHEMA_REPAIRS,
-) -> tuple[T, float | None, tuple[int | None, int | None, int | None], str]:
+) -> tuple[T, float | None, tuple[int | None, int | None, int | None], str, str | None]:
     """Structured completion via instructor pinned to the provider's mode.
 
     Uses ``create_with_completion`` so the parsed model *and* the raw
@@ -1207,11 +1303,12 @@ async def acompletion_structured[T: BaseModel](
         attempt=attempt,
         output_schema=output_schema,
     )
+    invocations = _Invocations()
     completion = functools.partial(
         _instructor_completion,
         strict=provider.strict_json_schema,
         call=call,
-        invocations=_Invocations(),
+        invocations=invocations,
     )
     # instructor's ``from_litellm`` is overloaded on whether the completion is
     # sync or async; basedpyright has been seen to resolve the *sync* overload
@@ -1271,13 +1368,17 @@ async def acompletion_structured[T: BaseModel](
                 max_tokens=max_tokens,
                 completion_tokens=_completion_tokens(e.last_completion),
                 diagnostics=_output_limit_diagnostics(e.last_completion),
+                native_finish_reason=invocations.native_finish_reason,
             ) from e
         except InstructorRetryException as e:
-            # An exhausted *parse* failure is the contract's one failure: re-own
-            # it as llmkit's type carrying what failed. A declined transport or
+            # Re-own explicit finish failures and exhausted parse failures.
+            # A declined transport or
             # permanent cause keeps instructor's wrap, which the retry layer and
             # the rate limiter unwrap via underlying_provider_error.
             cause = underlying_provider_error(e)
+            if isinstance(cause, FinishReasonError):
+                slot.record_tokens(cause.usage.debit())
+                raise cause from e
             last_completion = getattr(e, "last_completion", None)
             if _is_no_choice_crash(cause, last_completion):
                 # instructor raised its repairable "No choices" parse error,
@@ -1293,6 +1394,7 @@ async def acompletion_structured[T: BaseModel](
                     attempt=attempt,
                     model=litellm_model,
                     provider=provider.name,
+                    native_finish_reason=invocations.native_finish_reason,
                 ) from e
             if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
                 raise
@@ -1316,6 +1418,7 @@ async def acompletion_structured[T: BaseModel](
                 attempt=attempt,
                 model=litellm_model,
                 provider=provider.name,
+                native_finish_reason=invocations.native_finish_reason,
             ) from e
         # instructor types the raw completion half of the tuple as Any. It is
         # the last rendered response, whose usage instructor's tally has
@@ -1332,6 +1435,7 @@ async def acompletion_structured[T: BaseModel](
         response.cost,
         response.usage.counts(),
         text,
+        invocations.native_finish_reason,
     )
 
 
@@ -1420,7 +1524,7 @@ async def acompletion_text(
     label: str | None = None,
     call_id: str | None = None,
     attempt: int | None = None,
-) -> tuple[str, float | None, tuple[int | None, int | None, int | None]]:
+) -> tuple[str, float | None, tuple[int | None, int | None, int | None], str | None]:
     """Plain-text completion via LiteLLM.
 
     ``reasoning_effort`` controls provider thinking tokens, resolved against
@@ -1431,7 +1535,7 @@ async def acompletion_text(
     default sampling applies). ``provider`` is the provider this
     call runs on (``None`` builds the registered one).
 
-    Returns ``(text, approximate_cost, usage)``, ``usage`` being the
+    Returns ``(text, approximate_cost, usage, native_finish_reason)``, ``usage`` being the
     :class:`~llmkit._transport.WireUsage` triple the call log records. The text is the first
     choice's message content coerced to a string via
     :func:`_coerce_text_content` (list content blocks joined; an empty string
@@ -1440,8 +1544,8 @@ async def acompletion_text(
     Raises :class:`~llmkit.exceptions.OutputLimitError` when the provider
     reports ``finish_reason="length"``, after the slot has debited the
     response's usage: the cut-off text travels in its diagnostics rather than
-    being returned as a complete answer. A missing or any other finish reason
-    returns normally.
+    being returned as a complete answer. Known provider failures and content
+    filters raise owned errors; unknown or missing reasons return normally.
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1485,16 +1589,26 @@ async def acompletion_text(
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
         slot.record_tokens(response.usage.debit())
-    if response.finish_reason == _LENGTH:
-        raise _text_output_limit_error(
+        raise_for_finish(
+            response.finish_reason,
+            response.native_finish_reason,
+            partial_text=response.text,
             model=litellm_model,
             max_tokens=max_tokens,
-            partial_text=response.text,
             usage=response.usage,
+            include_truncation=False,
         )
+    raise_for_finish(
+        response.finish_reason,
+        response.native_finish_reason,
+        partial_text=response.text,
+        model=litellm_model,
+        max_tokens=max_tokens,
+        usage=response.usage,
+    )
     # A response with no choice, or no content, is an empty answer.
     text = response.text if response.text is not None else ""
-    return text, response.cost, response.usage.counts()
+    return text, response.cost, response.usage.counts(), response.native_finish_reason
 
 
 async def acompletion_tools(
@@ -1516,9 +1630,14 @@ async def acompletion_tools(
     call_id: str | None = None,
     attempt: int | None = None,
 ) -> tuple[
-    str | None, list[object], str | None, tuple[int | None, int | None, int | None], float | None
+    str | None,
+    list[object],
+    str | None,
+    tuple[int | None, int | None, int | None],
+    float | None,
+    str | None,
 ]:
-    """One raw-LiteLLM tool completion, with the usual limiter and TPM debit."""
+    """One tool completion, including mapped/native reasons, with limiter and TPM debit."""
     provider = provider if provider is not None else build_provider()
     guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
@@ -1566,12 +1685,22 @@ async def acompletion_tools(
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
         slot.record_tokens(response.usage.debit())
+        raise_for_finish(
+            response.finish_reason,
+            response.native_finish_reason,
+            partial_text=response.text,
+            model=litellm_model,
+            max_tokens=max_tokens,
+            usage=response.usage,
+            include_truncation=False,
+        )
     return (
         response.text,
         list[object](response.tool_calls),
         response.finish_reason,
         response.usage.counts(),
         response.cost,
+        response.native_finish_reason,
     )
 
 
@@ -1626,6 +1755,7 @@ class StreamedToolTurn:
     stop_reason: str | None
     usage: tuple[int | None, int | None, int | None]
     approximate_cost: float | None
+    native_stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1640,6 +1770,7 @@ class StreamedTextEnd:
 
     usage: tuple[int | None, int | None, int | None]
     approximate_cost: float | None
+    native_finish_reason: str | None = None
 
 
 def _chunk_tool_fragments(chunk: ModelResponseStream) -> tuple[WireToolFragment, ...]:
@@ -1813,7 +1944,9 @@ async def astream_tools(
         call=call,
     )
     fragments: dict[int, _ToolCallFragments] = {}
+    transcript: list[str] = []
     stop_reason: str | None = None
+    native_stop_reason: str | None = None
     usage: WireUsage | None = None
     cost: float | None = None
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
@@ -1835,6 +1968,8 @@ async def astream_tools(
                 _absorb_tool_fragments(item.tool_fragments, fragments)
                 if item.finish_reason is not None:
                     stop_reason = item.finish_reason
+                if item.native_finish_reason is not None:
+                    native_stop_reason = item.native_finish_reason
                 # ``include_usage`` puts usage on a *final* frame that usually
                 # carries no choices; keep the last frame that has any.
                 if item.usage is not None:
@@ -1842,12 +1977,23 @@ async def astream_tools(
                 if item.cost is not None:
                     cost = item.cost
                 if item.text:
+                    transcript.append(item.text)
                     yield item.text
         usage = usage if usage is not None else WireUsage()
         slot.record_tokens(usage.debit())
+        raise_for_finish(
+            stop_reason,
+            native_stop_reason,
+            partial_text="".join(transcript) or None,
+            model=litellm_model,
+            max_tokens=max_tokens,
+            usage=usage,
+            include_truncation=False,
+        )
     yield StreamedToolTurn(
         raw_calls=_assemble_tool_calls(fragments),
         stop_reason=stop_reason,
+        native_stop_reason=native_stop_reason,
         usage=usage.counts(),
         approximate_cost=cost,
     )
@@ -1891,8 +2037,8 @@ async def astream_text(
     usage is debited, the slot released and the terminal item yielded, and
     then raises
     :class:`~llmkit.exceptions.OutputLimitError` carrying the yielded
-    transcript as its partial text. A missing or any other finish reason ends
-    the stream normally.
+    transcript as its partial text. Known provider failures and content filters
+    raise owned errors after the transcript; unknown or missing reasons end normally.
 
     *on_first_frame* is as on :func:`astream_tools`: called once with the
     monotonic instant the first wire frame of any kind arrived.
@@ -1940,6 +2086,7 @@ async def astream_text(
     )
     transcript: list[str] = []
     stop_reason: str | None = None
+    native_stop_reason: str | None = None
     usage: WireUsage | None = None
     cost: float | None = None
     async with (
@@ -1963,6 +2110,8 @@ async def astream_text(
             # The stop reason can ride a frame with text, or a frame of its own.
             if item.finish_reason is not None:
                 stop_reason = item.finish_reason
+            if item.native_finish_reason is not None:
+                native_stop_reason = item.native_finish_reason
             # ``include_usage`` puts usage on a *final* frame that usually
             # carries no choices, and so no text; keep the last frame that has
             # any.
@@ -1976,15 +2125,27 @@ async def astream_text(
         usage = usage if usage is not None else WireUsage()
         # Debited before the slot is released, as the tool lane does.
         slot.record_tokens(usage.debit())
-    # The terminal item precedes a truncation's raise, so a truncated attempt
-    # records the same counts its error reports.
-    yield StreamedTextEnd(usage=usage.counts(), approximate_cost=cost)
-    # Raised only once the stream ran out on its own, so its usage is already
-    # debited; the text it carries has already reached the consumer.
-    if stop_reason == _LENGTH:
-        raise _text_output_limit_error(
+        raise_for_finish(
+            stop_reason,
+            native_stop_reason,
+            partial_text="".join(transcript),
             model=litellm_model,
             max_tokens=max_tokens,
-            partial_text="".join(transcript),
             usage=usage,
+            include_truncation=False,
         )
+    # The terminal item precedes a truncation's raise, so a truncated attempt
+    # records the same counts its error reports.
+    yield StreamedTextEnd(
+        usage=usage.counts(), approximate_cost=cost, native_finish_reason=native_stop_reason
+    )
+    # Raised only once the stream ran out on its own, so its usage is already
+    # debited; the text it carries has already reached the consumer.
+    raise_for_finish(
+        stop_reason,
+        native_stop_reason,
+        partial_text="".join(transcript),
+        model=litellm_model,
+        max_tokens=max_tokens,
+        usage=usage,
+    )

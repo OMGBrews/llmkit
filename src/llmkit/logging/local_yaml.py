@@ -294,8 +294,8 @@ class LocalYamlLogSink:
 
             # Verdict-first order: cheap, high-signal metadata up top; the
             # large ``partial_text``/``response``/``prompt`` blobs last
-            # (``partial_text`` — null unless an output limit cut the answer
-            # off — then ``response``, what a debugger usually wants), so the
+            # (``partial_text`` for truncated, filtered or failed answers,
+            # then ``response``, what a debugger usually wants), so the
             # head of the file is the whole story for most reads.
             doc: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # raw-llm — YAML log body dict
                 "timestamp": record.started_at.isoformat(),
@@ -316,6 +316,7 @@ class LocalYamlLogSink:
                 "tool_calls": record.tool_calls,
                 "usage": record.usage,
                 "output_limit": record.output_limit,
+                "native_finish_reason": record.native_finish_reason,
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None

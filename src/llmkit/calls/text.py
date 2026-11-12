@@ -24,7 +24,7 @@ from llmkit.calls._shared import (
     run_with_policy,
 )
 from llmkit.capture import record_call_async
-from llmkit.exceptions import OutputLimitDiagnostics, OutputLimitError
+from llmkit.exceptions import FinishReasonError, OutputLimitDiagnostics, OutputLimitError
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait
@@ -121,7 +121,9 @@ async def text_llm_call(
         OutputLimitError: The provider reported ``finish_reason="length"``.
             The cut-off text is in ``exc.diagnostics.partial_text``, never
             returned as the answer, never cached, and not retried by
-            default. A missing or any other finish reason returns normally.
+            default. ``content_filter`` raises :class:`~llmkit.ContentFilterError`;
+            demonstrated native failures raise :class:`~llmkit.ProviderFailureError`.
+            Missing and unknown reasons return normally without inspecting text.
         Any exception from the LLM provider — transient ones
         (``LLM_RECOVERABLE_ERRORS``) are retried per *retry*, others
         propagate immediately. The log is still written on every attempt
@@ -162,12 +164,14 @@ async def text_llm_call(
         usage: TokenUsage | None = None
         error: str | None = None
         diagnostics: OutputLimitDiagnostics | None = None
+        partial_text: str | None = None
+        native_finish_reason: str | None = None
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
         try:
-            text, cost, counts = await _litellm.acompletion_text(
+            text, cost, counts, native_finish_reason = await _litellm.acompletion_text(
                 prompt,
                 temperature=args.temperature,
                 model=args.model,
@@ -196,6 +200,11 @@ async def text_llm_call(
                 # ``response`` stays None: the cut-off text is not an answer,
                 # and is logged as ``partial_text`` instead.
                 diagnostics = exc.diagnostics
+                native_finish_reason = exc.native_finish_reason
+            elif isinstance(exc, FinishReasonError):
+                partial_text = exc.partial_text
+                native_finish_reason = exc.native_finish_reason
+                usage = TokenUsage(*exc.usage.counts())
             raise
         except BaseException as exc:
             # A cancellation (a host's ``asyncio.timeout`` around the call, a
@@ -228,6 +237,8 @@ async def text_llm_call(
                     attempt=attempt,
                     usage=usage,
                     output_limit=diagnostics,
+                    partial_text=partial_text,
+                    native_finish_reason=native_finish_reason,
                 )
             )
 

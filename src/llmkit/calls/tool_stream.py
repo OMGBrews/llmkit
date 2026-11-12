@@ -34,6 +34,7 @@ from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from contextlib import aclosing
 from datetime import UTC, datetime
 
+from llmkit._transport import WireUsage
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     error_text,
@@ -46,10 +47,15 @@ from llmkit.calls._shared import (
 )
 from llmkit.calls.stream import STREAM_ABANDONED_ERROR
 from llmkit.capture import record_call_async, submit_record_call
-from llmkit.exceptions import ToolArgumentError
+from llmkit.exceptions import (
+    FinishReasonError,
+    OutputLimitDiagnostics,
+    OutputLimitError,
+    ToolArgumentError,
+)
 from llmkit.logging import LLMCallRecord
 from llmkit.options import UNSET, LLMCallOptions, Unset
-from llmkit.providers import LLMProviderInterface, Provider
+from llmkit.providers import LLMProviderInterface, Provider, build_provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
 from llmkit.retry import RetryPolicy, with_retries_stream
 from llmkit.run_scope import get_run_id
@@ -98,7 +104,7 @@ async def tool_llm_call_stream(
     default in effect.
 
     Yields a :class:`~llmkit.TextDeltaEvent` per chunk of assistant prose as it
-    arrives, and finally exactly one :class:`~llmkit.ToolCallResult` — the same
+    arrives, and on a complete turn finally one :class:`~llmkit.ToolCallResult` — the same
     object :func:`~llmkit.tool_llm_call` returns, carrying ``text``,
     ``tool_calls``, ``invalid_calls``, ``stop_reason`` and ``usage``. The result
     is the **last** item, so a loop that stops there has the complete turn::
@@ -108,6 +114,10 @@ async def tool_llm_call_stream(
                 render(event.text)
             else:
                 result = event  # the completed turn; the stream is done
+
+    A truncated, filtered or failed turn raises after any text deltas,
+    before parsing tool arguments, and yields no terminal result. Once a
+    delta reached the consumer the stream is never replayed by retries.
 
     Takes the same ``tools`` / ``tool_choice`` surface as
     :func:`~llmkit.tool_llm_call`, and the same per-call keywords, with one
@@ -325,6 +335,10 @@ async def _stream_tools_once(
     result: ToolCallResult | None = None
     cost: float | None = None
     error: str | None = None
+    diagnostics: OutputLimitDiagnostics | None = None
+    partial_text: str | None = None
+    native_finish_reason: str | None = None
+    usage: TokenUsage | None = None
     # The latch that separates "abandoned mid-flight" from "took the result and
     # stopped". Set *before* the terminal yield, because that is where an
     # idiomatic consumer's ``break`` throws ``GeneratorExit`` into this frame.
@@ -379,6 +393,17 @@ async def _stream_tools_once(
                 # before parsing, as on the buffered lane; only an
                 # all-malformed round sets a new one.
                 on_repair([])
+                cost = item.approximate_cost
+                native_finish_reason = item.native_stop_reason
+                usage = TokenUsage(*item.usage)
+                _litellm.raise_for_finish(
+                    item.stop_reason,
+                    native_finish_reason,
+                    partial_text="".join(accumulated) or None,
+                    model=(provider or build_provider()).litellm_model(model),
+                    max_tokens=max_tokens,
+                    usage=WireUsage(*item.usage),
+                )
                 try:
                     parsed_calls, invalid_calls = parse_tool_calls(item.raw_calls, definitions)
                 except ToolArgumentError as exc:
@@ -391,6 +416,7 @@ async def _stream_tools_once(
                     item.stop_reason,
                     TokenUsage(*item.usage),
                     invalid_calls,
+                    native_finish_reason,
                 )
                 completed = True
                 yield result
@@ -411,6 +437,12 @@ async def _stream_tools_once(
         raise
     except Exception as exc:
         error = error_text(exc)
+        if isinstance(exc, OutputLimitError):
+            diagnostics = exc.diagnostics
+        elif isinstance(exc, FinishReasonError):
+            partial_text = exc.partial_text
+            native_finish_reason = exc.native_finish_reason
+            usage = TokenUsage(*exc.usage.counts())
         raise
     finally:
         if not captured:
@@ -447,7 +479,10 @@ async def _stream_tools_once(
             tool_calls=[call.to_wire() for call in result.tool_calls]
             if result is not None
             else None,
-            usage=usage_log_dict(result.usage if result is not None else None),
+            usage=usage_log_dict(result.usage if result is not None else usage),
+            output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
+            partial_text=diagnostics.partial_text if diagnostics is not None else partial_text,
+            native_finish_reason=native_finish_reason,
             first_chunk_ms=(
                 (first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None
             ),

@@ -63,10 +63,12 @@ class _Counting:
         self.calls += 1
         return Reply.text(f"answer-{self.calls}")
 
-    async def text(self, *_a: object, **_k: object) -> tuple[str, float | None, UsageCounts]:
+    async def text(
+        self, *_a: object, **_k: object
+    ) -> tuple[str, float | None, UsageCounts, str | None]:
         """The same answers through the private ``acompletion_text`` seam."""
         self.calls += 1
-        return f"answer-{self.calls}", None, (None, None, None)
+        return f"answer-{self.calls}", None, (None, None, None), None
 
 
 # --- configure_llm_cache ---------------------------------------------------

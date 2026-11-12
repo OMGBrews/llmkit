@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Provider finish reasons are preserved and classified before success.**
+  Native reasons that LiteLLM delivers now reach call records as
+  `native_finish_reason` (YAML body only), and tool results as
+  `native_stop_reason`. Every lane raises `ContentFilterError` on
+  `content_filter`, `ProviderFailureError` on a demonstrated native failure
+  mapped to `stop`, and `OutputLimitError` on `length`, before parsing tool
+  arguments. Filters and failures spend no structured schema-repair request;
+  provider failures use the transient retry allowance, while filters and
+  truncations fail fast by default. These answers are never cached. Streams
+  deliver their text before raising and are never replayed after a delta.
+  Missing and unknown reasons remain complete without message-text guessing.
+  Synthetic transform measurements at LiteLLM 1.104.0 and 1.106.6 show native
+  preservation on buffered OpenAI-compatible and Google routes; every stream
+  and buffered Anthropic, Bedrock and Ollama lose the native before llmkit.
+  The README records the per-route coverage; this is not live evidence.
+
+  **Compatibility:** tool turns that previously returned
+  `stop_reason="length"` now raise `OutputLimitError`, including turns with
+  well-formed tool calls. `content_filter` now raises `ContentFilterError`
+  instead of returning or parsing filtered text. Custom `retry_on` tuples
+  must name `ProviderFailureError` to retry native failures; the default
+  policy already includes it. An explicit `retry_on` naming
+  `ContentFilterError` opts into filter retries.
+
 - **A stalled cache store no longer holds a call.** `configure_llm_cache`
   takes a keyword-only `timeout`, the seconds one store `get` or `set` may
   take, 1.0 by default. llmkit cancels an operation that overruns it: a read

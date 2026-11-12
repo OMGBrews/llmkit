@@ -90,7 +90,7 @@ def test_sync_wrapper_raises_too() -> None:
     assert caught.value.diagnostics.partial_text == "cut"
 
 
-@pytest.mark.parametrize("reason", ["stop", "content_filter", "tool_calls", None])
+@pytest.mark.parametrize("reason", ["stop", "tool_calls", "function_call", None])
 async def test_other_finish_reasons_return_normally(reason: str | None) -> None:
     reply = Reply.text("whole", finish_reason=reason)
     with install(lambda _request: reply):

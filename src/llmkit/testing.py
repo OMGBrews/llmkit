@@ -175,13 +175,14 @@ class Reply:
             runs the real parsing and schema repair. ``None`` when ``chunks``
             supplies it, or when the answer is tool calls alone.
         tool_calls: Tool calls to request (tool kinds).
-        finish_reason: The provider's finish reason. ``None`` means
+        finish_reason: LiteLLM's mapped finish reason. ``None`` means
             ``"tool_calls"`` when tool calls are present, otherwise ``"stop"``.
-            ``"length"`` gets each kind's real truncation behavior: a
-            structured call, a text call and a text stream raise
-            :class:`~llmkit.OutputLimitError` (the stream after delivering
-            its chunks), as does a compose call's final answer, and any other
-            tool call reports it as ``stop_reason``.
+            ``"length"`` raises :class:`~llmkit.OutputLimitError` on every
+            call kind; ``"content_filter"`` raises
+            :class:`~llmkit.ContentFilterError`. Streams deliver text first.
+        native_finish_reason: The provider's original reason, after LiteLLM's
+            normalization boundary. Set explicitly to test preserved natives;
+            the fake does not perform LiteLLM's provider mapping.
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
         cost: Approximate cost to report, or ``None``.
@@ -195,7 +196,7 @@ class Reply:
             structured call, and a tool call with ``output_schema=``, raises
             :class:`~llmkit.StructuredOutputError`; a text call and a plain
             tool call treat it as an empty answer. Requires no ``content``,
-            ``tool_calls`` or ``chunks``.
+            ``tool_calls``, ``chunks`` or ``native_finish_reason``.
     """
 
     content: str | None = None
@@ -206,14 +207,20 @@ class Reply:
     delay: float = 0.0
     chunks: Sequence[str] | None = None
     no_choice: bool = False
+    native_finish_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.delay < 0:
             raise ValueError("Reply.delay must not be negative")
         if self.no_choice and (
-            self.content is not None or self.tool_calls or self.chunks is not None
+            self.content is not None
+            or self.tool_calls
+            or self.chunks is not None
+            or self.native_finish_reason is not None
         ):
-            raise ValueError("Reply.no_choice carries no content, tool_calls or chunks")
+            raise ValueError(
+                "Reply.no_choice carries no content, tool_calls, chunks or native finish reason"
+            )
         if (
             self.chunks is not None
             and self.content is not None
@@ -227,12 +234,20 @@ class Reply:
         text: str,
         *,
         finish_reason: str | None = None,
+        native_finish_reason: str | None = None,
         usage: TokenUsage | None = None,
         cost: float | None = None,
         delay: float = 0.0,
     ) -> Reply:
         """A plain-text answer, also the way to send raw JSON to a structured call."""
-        return cls(content=text, finish_reason=finish_reason, usage=usage, cost=cost, delay=delay)
+        return cls(
+            content=text,
+            finish_reason=finish_reason,
+            native_finish_reason=native_finish_reason,
+            usage=usage,
+            cost=cost,
+            delay=delay,
+        )
 
     @classmethod
     def json(
@@ -240,6 +255,7 @@ class Reply:
         instance: BaseModel,
         *,
         finish_reason: str | None = None,
+        native_finish_reason: str | None = None,
         usage: TokenUsage | None = None,
         cost: float | None = None,
         delay: float = 0.0,
@@ -257,6 +273,7 @@ class Reply:
         return cls.text(
             instance.model_dump_json(by_alias=True),
             finish_reason=finish_reason,
+            native_finish_reason=native_finish_reason,
             usage=usage,
             cost=cost,
             delay=delay,
@@ -368,6 +385,7 @@ class _Double:
             text=_reply_text(reply),
             tool_calls=_reply_tool_calls(reply),
             finish_reason=_reply_finish_reason(reply),
+            native_finish_reason=reply.native_finish_reason,
             usage=_reply_usage(reply),
             cost=reply.cost,
         )
@@ -387,7 +405,11 @@ class _Double:
                     ),
                 )
             )
-        yield WireChunk(finish_reason=_reply_finish_reason(reply), cost=reply.cost)
+        yield WireChunk(
+            finish_reason=_reply_finish_reason(reply),
+            native_finish_reason=reply.native_finish_reason,
+            cost=reply.cost,
+        )
         yield WireStreamEnd(usage=_reply_usage(reply), cost=reply.cost)
 
 

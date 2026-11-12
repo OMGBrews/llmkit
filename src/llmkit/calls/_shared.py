@@ -659,6 +659,8 @@ def build_text_record(
     cache_hit: bool = False,
     source_call_id: str | None = None,
     output_limit: OutputLimitDiagnostics | None = None,
+    partial_text: str | None = None,
+    native_finish_reason: str | None = None,
     first_chunk_at: float | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
@@ -686,6 +688,8 @@ def build_text_record(
     :class:`~llmkit.OutputLimitDiagnostics`: it fills the record's
     ``output_limit`` and ``partial_text`` fields, and its token counts become
     ``usage`` when the caller passes none, as on the structured path.
+    ``partial_text`` also carries filtered or failed text when no output limit
+    occurred; ``native_finish_reason`` preserves the provider reason where delivered.
     ``first_chunk_at`` is the :func:`time.monotonic` instant a streamed
     attempt's first wire frame arrived, recorded as ``first_chunk_ms`` from
     ``start_t``; ``None`` (every buffered call, every hit) records ``None``.
@@ -726,7 +730,8 @@ def build_text_record(
         cache_hit=cache_hit,
         source_call_id=source_call_id,
         output_limit=output_limit.to_log_dict() if output_limit is not None else None,
-        partial_text=output_limit.partial_text if output_limit is not None else None,
+        partial_text=output_limit.partial_text if output_limit is not None else partial_text,
+        native_finish_reason=native_finish_reason,
         first_chunk_ms=(first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None,
     )
 

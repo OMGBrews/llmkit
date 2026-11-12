@@ -245,7 +245,7 @@ async def test_compose_requests_a_json_schema_response_format() -> None:
     definition = ToolDefinition.from_model("weather", _WeatherArgs, "Look up weather")
     with patch(
         "llmkit._litellm.acompletion_tools",
-        return_value=('{"summary":"sunny"}', [], "stop", (3, 4, 7), 0.01),
+        return_value=('{"summary":"sunny"}', [], "stop", (3, 4, 7), 0.01, None),
     ) as transport:
         _ = await tool_llm_call(
             "weather?",

@@ -140,7 +140,7 @@ def test_parallel_tool_calls_survives_instructor_to_litellm(provider_enum: Provi
         return _ok_response()
 
     with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
-        parsed, _cost, _usage, _text = asyncio.run(
+        parsed, _cost, _usage, _text, _native = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 OkSchema,

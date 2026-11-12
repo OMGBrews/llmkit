@@ -170,16 +170,17 @@ async def test_truncated_compose_final_answer_fails_fast_as_an_output_limit() ->
     assert record.usage == {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
 
 
-async def test_a_truncated_turn_that_requested_tools_is_unchanged() -> None:
+async def test_a_truncated_turn_that_requested_tools_raises_before_parsing() -> None:
     tool = ToolDefinition.from_model("add", _Args, "Add")
     reply = Reply(tool_calls=[FakeToolCall("add", '{"x": 1}', id="c1")], finish_reason="length")
-    with install(lambda _request: reply):
-        result = await tool_llm_call(
+    with install(lambda _request: reply) as fake, pytest.raises(OutputLimitError) as caught:
+        _ = await tool_llm_call(
             "q", [tool], output_schema=_Positive, feature="f", provider=_PROVIDER
         )
-    assert result.parsed is None
-    assert [call.name for call in result.tool_calls] == ["add"]
-    assert result.stop_reason == "length"
+    assert caught.value.diagnostics is not None
+    assert caught.value.diagnostics.finish_reason == "length"
+    assert caught.value.diagnostics.partial_text is None
+    assert len(fake.requests) == 1
 
 
 class _Secretive(BaseModel):

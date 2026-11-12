@@ -932,8 +932,13 @@ async def test_a_raising_serializer_still_returns_the_validated_compose_answer(
 
 @pytest.mark.parametrize(
     "fields",
-    [{"content": "x"}, {"tool_calls": [FakeToolCall("count")]}, {"chunks": ["x"]}],
-    ids=["content", "tool_calls", "chunks"],
+    [
+        {"content": "x"},
+        {"tool_calls": [FakeToolCall("count")]},
+        {"chunks": ["x"]},
+        {"native_finish_reason": "ERROR"},
+    ],
+    ids=["content", "tool_calls", "chunks", "native_finish_reason"],
 )
 def test_no_choice_carries_nothing_else(fields: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="no_choice"):

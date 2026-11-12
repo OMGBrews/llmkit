@@ -7,11 +7,12 @@ programming errors (TypeError, AttributeError) — and *permanent* request
 errors such as authentication (401) and bad-request (400) failures —
 propagate.
 
-The recoverable set is split into five subsets the retry layer classifies
+The recoverable set is split into six subsets the retry layer classifies
 within one overall attempt ceiling (see :mod:`llmkit.retry`):
 
 * :data:`LLM_TRANSPORT_ERRORS` — transient *transport* failures (rate
-  limits, transient 5xx, network/timeout). These may retry up to the overall
+  limits, transient 5xx, network/timeout, and demonstrated native provider
+  failure finish reasons). These may retry up to the overall
   attempt ceiling, since a retry on a fresh connection routinely succeeds.
 * :data:`LLM_SCHEMA_ERRORS` — *schema-validation* failures (llmkit's
   :class:`StructuredOutputError`, raised when a structured answer fails
@@ -42,11 +43,14 @@ within one overall attempt ceiling (see :mod:`llmkit.retry`):
   the union) ever re-asks a circuit the breaker already knows is open — unless
   a caller explicitly lists the type in ``retry_on``.
 * :data:`LLM_OUTPUT_LIMIT_ERRORS` — llmkit's *own* fail-fast truncation signal
-  (:class:`OutputLimitError`, raised when a structured or text completion, or
-  a compose call's final answer, is cut off by the output-token limit). Recoverable in the same catch-set sense as the
+  (:class:`OutputLimitError`, raised when any completion turn is cut off
+  by the output-token limit). Recoverable in the same catch-set sense as the
   breaker, but **never retried** on either budget by default:
   re-asking with an identical token budget can only truncate again — unless
   a caller explicitly lists the type in ``retry_on``.
+* :data:`LLM_CONTENT_FILTER_ERRORS` — provider safety/filter stops
+  (:class:`ContentFilterError`), with zero retry budget unless explicitly
+  listed in ``retry_on``.
 * :data:`LLM_TOOL_ERRORS` — a tool round the model got wrong
   (:class:`ToolArgumentError`: an unknown tool, or arguments that are not
   valid JSON or fail the tool's model). The tool lanes charge it to the
@@ -54,7 +58,7 @@ within one overall attempt ceiling (see :mod:`llmkit.retry`):
   like a malformed schema response — on the streaming lane only while nothing
   has been yielded.
 
-``LLM_RECOVERABLE_ERRORS`` is the **union** of the five, preserved as the
+``LLM_RECOVERABLE_ERRORS`` is the **union** of the six, preserved as the
 single documented ``except``-clause catch-set. At llmkit's provider boundaries,
 uncovered OpenAI/LiteLLM API errors carrying mapped 500/502/529 become
 :class:`TransientProviderError`, a plain member of the transport tuple.
@@ -73,8 +77,9 @@ additionally keeps *raw* litellm 503s classifying as transport in
 ``with_retries()`` (see :mod:`llmkit.retry`) is the transient-retry
 layer; in-call schema repair is handled separately by instructor's retry
 loop (``schema_repairs`` re-asks per attempt, one by default, in
-:mod:`llmkit._litellm` — with the one carve-out that a length truncation is never re-asked and surfaces as
-:class:`OutputLimitError` instead).
+:mod:`llmkit._litellm` — only parse failures are re-asked. Length truncations surface as
+:class:`OutputLimitError`, content filters as :class:`ContentFilterError`, and
+known native failures as :class:`ProviderFailureError`).
 """
 
 import functools
@@ -93,6 +98,8 @@ from instructor.core.exceptions import (
 from pydantic import ValidationError
 from pydantic_core import ErrorDetails
 from tenacity import RetryError
+
+from llmkit._types import WireUsage
 
 # Transient *transport* failures — the default transport retry budget retries
 # this exact set. We name the specific transient ``openai`` subclasses rather
@@ -178,7 +185,8 @@ class LlmkitError(Exception):
     provider outage it normalized (:class:`ServiceUnavailableError` or
     :class:`TransientProviderError`), its
     own fail-fast signals (:class:`CircuitOpenError`,
-    :class:`OutputLimitError`), validation it ran or re-owned
+    :class:`OutputLimitError`, :class:`ContentFilterError`), provider finish
+    failures (:class:`ProviderFailureError`), validation it ran or re-owned
     (:class:`StructuredOutputError`, :class:`ToolArgumentError`,
     :class:`ResultValidationError`), and its configuration errors
     (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
@@ -194,7 +202,8 @@ class LlmkitError(Exception):
     Do not list this class in :attr:`~llmkit.RetryPolicy.retry_on`: retry
     matching is ``isinstance``, so it would re-enable retries for every
     subclass that is deliberately given no budget, such as
-    :class:`CircuitOpenError` and :class:`OutputLimitError`.
+    :class:`CircuitOpenError`, :class:`OutputLimitError` and
+    :class:`ContentFilterError`.
     """
 
 
@@ -289,6 +298,52 @@ class TransientProviderError(LlmkitError):
         self.retry_after: int | float | None = retry_after
 
 
+class FinishReasonError(LlmkitError):
+    """A provider marked a completion as failed or filtered.
+
+    Carries the mapped and native reasons that reached llmkit, the unaccepted
+    partial text, model and reported usage. Text is never included in the
+    exception message. A finish reason is not an HTTP outage signal: these
+    errors deliberately carry no ``status_code``.
+    """
+
+    def __init__(
+        self,
+        *,
+        finish_reason: str | None,
+        native_finish_reason: str | None,
+        partial_text: str | None,
+        model: str,
+        usage: WireUsage,
+    ) -> None:
+        super().__init__(
+            f"completion for model {model!r} ended with "
+            + f"finish_reason={finish_reason!r}, native_finish_reason={native_finish_reason!r}"
+        )
+        self.finish_reason: str | None = finish_reason
+        self.native_finish_reason: str | None = native_finish_reason
+        self.partial_text: str | None = partial_text
+        self.model: str = model
+        self.usage: WireUsage = usage
+
+
+class ProviderFailureError(FinishReasonError):
+    """A demonstrated native failure reason survived LiteLLM's mapping to stop.
+
+    Uses the transient retry budget by default. Custom ``retry_on`` policies
+    must include this type to retry it. Streams already yielded are never
+    replayed.
+    """
+
+
+class ContentFilterError(FinishReasonError):
+    """The mapped reason was ``content_filter``; no retry budget by default.
+
+    Explicitly listing this type in ``retry_on`` enables retries while the
+    call remains replayable. The filtered text is never an accepted answer.
+    """
+
+
 def normalize_transient_provider_error(exc: Exception) -> Exception:
     """Own native LiteLLM 503s and uncovered API errors with mapped 500/502/529.
 
@@ -331,6 +386,7 @@ LLM_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     # litellm-native 503, so ``except`` clauses over this tuple catch it.
     ServiceUnavailableError,
     TransientProviderError,
+    ProviderFailureError,
     # Raw litellm-native 503 — matches in ``isinstance`` classification only
     # (see the stand-in's docstring); kept so a host's own litellm call
     # wrapped in ``with_retries`` still retries its 503s. The lazy stand-in
@@ -387,6 +443,7 @@ class StructuredOutputError(LlmkitError):
         model: The routed LiteLLM model id the call ran against (such as
             ``openai/gpt-4.1-mini``), or ``None``.
         provider: The provider name the call ran against, or ``None``.
+        native_finish_reason: The last completion's native reason, where delivered.
     """
 
     def __init__(
@@ -399,6 +456,7 @@ class StructuredOutputError(LlmkitError):
         attempt: int | None,
         model: str | None,
         provider: str | None,
+        native_finish_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.schema_name: str = schema_name
@@ -407,6 +465,7 @@ class StructuredOutputError(LlmkitError):
         self.attempt: int | None = attempt
         self.model: str | None = model
         self.provider: str | None = provider
+        self.native_finish_reason: str | None = native_finish_reason
 
     @override
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
@@ -422,6 +481,7 @@ class StructuredOutputError(LlmkitError):
                 attempt=self.attempt,
                 model=self.model,
                 provider=self.provider,
+                native_finish_reason=self.native_finish_reason,
             ),
             (),
         )
@@ -572,7 +632,7 @@ LLM_BACKPRESSURE_ERRORS: tuple[type[Exception], ...] = (CircuitOpenError,)
 
 @dataclass(frozen=True)
 class OutputLimitDiagnostics:
-    """What a truncated structured or text completion reported, best-effort.
+    """What a truncated completion turn reported, best-effort.
 
     Carried by :attr:`OutputLimitError.diagnostics` and written to the call
     log: ``partial_text`` as the record's ``partial_text`` field, the rest as
@@ -613,7 +673,7 @@ class OutputLimitDiagnostics:
 
 
 class OutputLimitError(LlmkitError):
-    """A structured, text or compose final-answer completion was truncated by the output limit.
+    """A completion turn was truncated by the output limit.
 
     Raised by the structured path when the provider stopped generating at the
     token ceiling (``finish_reason='length'`` / Gemini ``MAX_TOKENS``) before a
@@ -621,9 +681,9 @@ class OutputLimitError(LlmkitError):
     paths when the provider explicitly reports ``finish_reason='length'`` — a
     text stream raises it after its last chunk, so the text already yielded
     is the partial answer. A missing finish reason is never read as a
-    truncation. A compose call's final answer (:func:`~llmkit.tool_llm_call`
-    with ``output_schema=``) raises it too; every other tool call reports the
-    reason as ``stop_reason`` instead.
+    truncation. Both tool lanes raise it before parsing arguments on every
+    turn, including turns that requested tools. A tool stream raises after
+    delivering its text deltas and yields no terminal result.
     Deliberately **never retried**:
     re-asking with an identical token budget can only truncate again — the
     motivating production failure was a degenerate repetition loop that burned
@@ -674,6 +734,7 @@ class OutputLimitError(LlmkitError):
         max_tokens: int | None,
         completion_tokens: int | None,
         diagnostics: OutputLimitDiagnostics | None = None,
+        native_finish_reason: str | None = None,
     ) -> None:
         cap = "provider ceiling" if max_tokens is None else f"max_tokens={max_tokens}"
         super().__init__(
@@ -684,6 +745,7 @@ class OutputLimitError(LlmkitError):
         self.model: str = model
         self.max_tokens: int | None = max_tokens
         self.completion_tokens: int | None = completion_tokens
+        self.native_finish_reason: str | None = native_finish_reason
         self.diagnostics: OutputLimitDiagnostics | None = diagnostics
 
 
@@ -692,16 +754,19 @@ class OutputLimitError(LlmkitError):
 # degrading gracefully) while the retry layer never retries it on any budget.
 LLM_OUTPUT_LIMIT_ERRORS: tuple[type[Exception], ...] = (OutputLimitError,)
 
-# The full recoverable set is the union of the five subsets — preserved as the
+LLM_CONTENT_FILTER_ERRORS: tuple[type[Exception], ...] = (ContentFilterError,)
+
+# The full recoverable set is the union of the six subsets — preserved as the
 # documented single catch-set for ``except`` clauses, so callers keep catching
 # exactly what they did before even though the retry layer now budgets the
 # subsets within one ceiling (and, unless a caller opts in through
-# ``retry_on``, never retries the backpressure/output-limit subsets).
+# ``retry_on``, never retries the backpressure/output-limit/content-filter subsets).
 LLM_RECOVERABLE_ERRORS: tuple[type[Exception], ...] = (
     *LLM_TRANSPORT_ERRORS,
     *LLM_SCHEMA_ERRORS,
     *LLM_BACKPRESSURE_ERRORS,
     *LLM_OUTPUT_LIMIT_ERRORS,
+    *LLM_CONTENT_FILTER_ERRORS,
     *LLM_TOOL_ERRORS,
 )
 

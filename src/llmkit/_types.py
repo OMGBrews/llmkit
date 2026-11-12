@@ -1,4 +1,4 @@
-"""Shared public call-surface types: the message shapes and the effort levels.
+"""Shared call-surface types: messages, effort levels and transport usage.
 
 A true leaf module — it imports nothing from ``llmkit`` and nothing outside the
 standard library — so every layer that names these types can do so without an
@@ -21,6 +21,7 @@ imports these two back for :meth:`~llmkit.ToolCallResult.to_message` and
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 
@@ -144,3 +145,30 @@ type ReasoningEffort = Literal["disable", "lowest", "low", "medium", "high"] | s
 # this union, which retains ordinary messages and adds the OpenAI-normalized
 # assistant-call / tool-result wire shapes.
 type ChatMessage = Message | AssistantToolMessage | ToolResultMessage
+
+
+@dataclass(frozen=True)
+class WireUsage:
+    """Token counts as the provider reported them; each ``None`` when absent."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def counts(self) -> tuple[int | None, int | None, int | None]:
+        """The ``(prompt, completion, total)`` triple the call log records."""
+        return self.prompt_tokens, self.completion_tokens, self.total_tokens
+
+    def debit(self) -> int | None:
+        """Tokens for the tokens-per-minute limiter to debit.
+
+        ``total_tokens`` when reported, else the sum of the two halves with a
+        missing one counted as 0, else ``None``. Best-effort, like all TPM
+        accounting.
+        """
+        if self.total_tokens is not None:
+            return self.total_tokens
+        if self.prompt_tokens is not None or self.completion_tokens is not None:
+            return (self.prompt_tokens or 0) + (self.completion_tokens or 0)
+        return None

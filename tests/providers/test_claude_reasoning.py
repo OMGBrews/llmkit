@@ -94,7 +94,7 @@ def test_structured_config_and_override_reach_transport(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", complete):
-        parsed, _, _, _ = asyncio.run(
+        parsed, _, _, _, _ = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 _Answer,

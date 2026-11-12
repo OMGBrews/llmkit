@@ -46,7 +46,8 @@ class LLMCallRecord:
     visibility — NOT a billing figure. It is sourced from LiteLLM's
     per-response cost or its calculator over streamed token usage (no local
     price table), preferring a provider-reported cost. It is ``None`` when
-    pricing is unavailable, including nonlocal zero-price table placeholders.
+    pricing is unavailable, including nonlocal zero-price table placeholders,
+    or an error prevents the transport metadata from returning.
     A cache hit records ``0.0``: nothing was paid for it.
 
     ``call_id`` is one ``uuid4`` hex per *logical* call and ``attempt`` the
@@ -127,34 +128,24 @@ class LLMCallRecord:
     :meth:`~llmkit.ToolDefinition.to_litellm` produces) and ``tool_calls`` is
     the calls the model requested (:meth:`~llmkit.ToolCall.to_wire` shape).
 
-    ``usage`` is the attempt's provider-reported token counts
-    (``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, any of which
-    may be ``None`` when the provider did not report it). It is filled on
-    every successful provider attempt (a cache hit spent no tokens and logs
-    ``None``), on a structured or text attempt whose result an
-    ``on_result`` hook then rejected (the tokens were spent, as its
-    ``approximate_cost`` already shows), and on a truncated structured,
-    text or compose final-answer attempt, whose counts it shares with
-    ``output_limit``; any other
-    failed attempt logs ``None``. Both streams, plain text and tool, ask
-    the provider for usage and log it on every attempt that runs out, completed
-    or truncated. The YAML body carries ``tools``, ``tool_calls`` and ``usage``; ``index.jsonl``
-    deliberately does not, so the compact scan line keeps its fixed shape.
+    ``usage`` carries provider-reported token counts on successful, truncated,
+    filtered and native-failed completions. Schema and transport failures
+    may log ``None``.
+    A cache hit spent no tokens and logs ``None``. Both stream lanes ask for
+    usage and retain the counts on every stream that runs out.
 
-    Two fields carry a **structured or text call, or a compose call's final
-    answer, cut off by its output limit**
-    and are ``None`` on every other attempt: ``output_limit`` is the truncated
-    completion's ``finish_reason`` / ``prompt_tokens`` /
-    ``completion_tokens`` / ``total_tokens`` / ``reasoning_tokens``
-    (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`; any value may be
-    ``None`` when the completion did not report it, so a truncation that
-    reported nothing is a mapping of nulls, never a ``None`` mapping), and
-    ``partial_text`` is the unfinished answer text. ``response`` stays
-    ``None`` on such a buffered attempt — unfinished text is not a finished
-    answer — while a text stream keeps the transcript it already yielded
-    there; and ``completion_tokens`` may include reasoning tokens that never
-    appear in ``partial_text``. The YAML body carries both;
-    ``index.jsonl`` carries neither.
+    ``output_limit`` is truncation-only: the completion's finish reason and
+    token counts (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`). A
+    truncation with no reported counts is a mapping of nulls, not ``None``.
+    ``partial_text`` carries the unfinished, filtered or failed answer text.
+    Buffered attempts keep ``response=None``; streams keep the transcript
+    already delivered to the consumer. Reasoning tokens may contribute to
+    counts without appearing in the partial text.
+
+    ``native_finish_reason`` is the provider's reason where the transport
+    delivered it; ``None`` does not prove the provider supplied no reason.
+    The YAML body carries these diagnostics, tools and usage; ``index.jsonl``
+    omits them to keep its compact scan shape.
     """
 
     started_at: datetime
@@ -183,3 +174,4 @@ class LLMCallRecord:
     cache_hit: bool = False
     source_call_id: str | None = None
     first_chunk_ms: float | None = None
+    native_finish_reason: str | None = None

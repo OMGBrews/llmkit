@@ -55,6 +55,7 @@ import httpx
 from llmkit._diagnostics import report
 from llmkit.exceptions import (
     LLM_BACKPRESSURE_ERRORS,
+    LLM_CONTENT_FILTER_ERRORS,
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TRANSPORT_ERRORS,
@@ -192,8 +193,10 @@ _SCHEMA_SHAPED_CAUSES: tuple[type[Exception], ...] = REPAIRABLE_PARSE_ERRORS
 # Zero-budget fail-fast signals: never retried under the default policy.
 # Backpressure (an open circuit must
 # never be re-asked) and output-limit truncation (an identical token budget
-# can only truncate again). An explicit retry_on listing the type opts back in.
+# can only truncate again), and provider content filters. An explicit
+# retry_on listing the type opts back in.
 _ZERO_BUDGET_ERRORS: tuple[type[Exception], ...] = (
+    *LLM_CONTENT_FILTER_ERRORS,
     *LLM_OUTPUT_LIMIT_ERRORS,
     *LLM_BACKPRESSURE_ERRORS,
 )

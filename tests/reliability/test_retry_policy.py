@@ -78,6 +78,7 @@ from llmkit import (
 from llmkit.capture import capture_llm_log_paths
 from llmkit.exceptions import (
     LLM_BACKPRESSURE_ERRORS,
+    LLM_CONTENT_FILTER_ERRORS,
     LLM_OUTPUT_LIMIT_ERRORS,
     LLM_SCHEMA_ERRORS,
     LLM_TOOL_ERRORS,
@@ -469,22 +470,19 @@ def test_instructor_in_call_budget_is_two_attempts_one_parse_repair() -> None:
 
 
 def test_recoverable_set_union_invariant_still_holds() -> None:
-    """``LLM_RECOVERABLE_ERRORS`` is exactly the union of the subsets
-    (transport + schema + tool + backpressure + output-limit), so the documented
-    single catch-set contract is preserved as each fail-fast type
-    (``CircuitOpenError``, ``OutputLimitError``) joins it."""
-    assert set(LLM_RECOVERABLE_ERRORS) == set(LLM_TRANSPORT_ERRORS) | set(LLM_SCHEMA_ERRORS) | set(
-        LLM_BACKPRESSURE_ERRORS
-    ) | set(LLM_OUTPUT_LIMIT_ERRORS) | set(LLM_TOOL_ERRORS)
-    # The four subsets are pairwise disjoint and each carries its expected members.
-    assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
-    assert set(LLM_TRANSPORT_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
-    assert set(LLM_SCHEMA_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
-    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_TRANSPORT_ERRORS)
-    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
-    assert set(LLM_OUTPUT_LIMIT_ERRORS).isdisjoint(LLM_BACKPRESSURE_ERRORS)
-    assert set(LLM_TOOL_ERRORS).isdisjoint(LLM_TRANSPORT_ERRORS)
-    assert set(LLM_TOOL_ERRORS).isdisjoint(LLM_SCHEMA_ERRORS)
+    """The catch-set is exactly the union of disjoint policy subsets."""
+    subsets = [
+        LLM_TRANSPORT_ERRORS,
+        LLM_SCHEMA_ERRORS,
+        LLM_TOOL_ERRORS,
+        LLM_BACKPRESSURE_ERRORS,
+        LLM_OUTPUT_LIMIT_ERRORS,
+        LLM_CONTENT_FILTER_ERRORS,
+    ]
+    assert set(LLM_RECOVERABLE_ERRORS) == set[type[Exception]]().union(*subsets)
+    for index, subset in enumerate(subsets):
+        for other in subsets[index + 1 :]:
+            assert set(subset).isdisjoint(other)
     assert ValidationError in LLM_SCHEMA_ERRORS
     assert TimeoutError in LLM_TRANSPORT_ERRORS
     assert ValidationError not in LLM_TRANSPORT_ERRORS

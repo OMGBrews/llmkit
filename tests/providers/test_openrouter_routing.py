@@ -151,7 +151,7 @@ def test_routing_preference_threads_into_litellm_call() -> None:
 
     provider = OpenRouterProvider(api_key="k", model="x/y")
     with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
-        text, _cost, _usage = asyncio.run(
+        text, _cost, _usage, _native = asyncio.run(
             _litellm.acompletion_text("hi", temperature=0.0, model=None, provider=provider)
         )
 
@@ -191,7 +191,7 @@ def _drive_structured_call(
         )
 
     with patch("llmkit._litellm.litellm.acompletion", _fake_acompletion):
-        parsed, _cost, _usage, _text = asyncio.run(
+        parsed, _cost, _usage, _text, _native = asyncio.run(
             _litellm.acompletion_structured(
                 "hi",
                 _OkSchema,
@@ -249,7 +249,7 @@ def test_text_and_stream_reasoning_use_native_body() -> None:
 
     async def _drive() -> None:
         for provider, effort in ((configured, None), (override, "lowest")):
-            text, _cost, _usage = await _litellm.acompletion_text(
+            text, _cost, _usage, _native = await _litellm.acompletion_text(
                 "hi", temperature=0.0, model=None, reasoning_effort=effort, provider=provider
             )
             assert text == "hi"

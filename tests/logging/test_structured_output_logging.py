@@ -98,9 +98,9 @@ def test_structured_call_forwards_provider_override_to_transport() -> None:
 
     async def _fake_transport(
         *_args: object, **kwargs: object
-    ) -> tuple[_Schema, float | None, UsageCounts, str]:
+    ) -> tuple[_Schema, float | None, UsageCounts, str, str | None]:
         assert kwargs["provider"] is override
-        return _Schema(ok=True), None, NO_USAGE, '{"ok": true}'
+        return _Schema(ok=True), None, NO_USAGE, '{"ok": true}', None
 
     with patch("llmkit._litellm.acompletion_structured", side_effect=_fake_transport):
         result = asyncio.run(
