@@ -36,8 +36,6 @@ real round-trip lives in
 
 from __future__ import annotations
 
-from typing import cast
-
 import instructor
 import pytest
 
@@ -154,14 +152,10 @@ def test_disable_reaches_litellm_as_thinking_disabled() -> None:
     from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
 
     provider = DeepSeekProvider(api_key="sk-test")
-    # raw-llm: LiteLLM's transform is loosely typed; the boundary is cast once, here.
-    optional_params = cast(
-        "dict[str, object]",
-        DeepSeekChatConfig().map_openai_params(  # pyright: ignore[reportUnknownMemberType]
-            non_default_params=provider.reasoning_kwargs("disable", "deepseek-chat"),
-            optional_params={},
-            model="deepseek-chat",
-            drop_params=False,
-        ),
+    optional_params = DeepSeekChatConfig().map_openai_params(  # pyright: ignore[reportUnknownMemberType]
+        non_default_params=provider.reasoning_kwargs("disable", "deepseek-chat"),
+        optional_params={},
+        model="deepseek-chat",
+        drop_params=False,
     )
     assert optional_params.get("thinking") == {"type": "disabled"}

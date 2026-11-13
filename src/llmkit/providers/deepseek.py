@@ -65,6 +65,7 @@ class DeepSeekProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "DeepSeek"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "deepseek/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON
     _default_model: ClassVar[str] = "deepseek-chat"

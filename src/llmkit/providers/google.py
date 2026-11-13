@@ -91,6 +91,7 @@ class GoogleProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Google AI Studio"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "gemini/"
     # Default strategy + the contract value ``__init_subclass__`` requires; the effective mode is
     # resolved per instance and returned by ``instructor_mode`` (see Google's Agent Platform

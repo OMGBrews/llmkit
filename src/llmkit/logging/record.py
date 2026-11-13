@@ -25,8 +25,11 @@ class LLMCallRecord:
 
     ``model`` is the *resolved effective* model (the provider default
     substituted when the caller passed ``None``) and ``provider`` names
-    the active provider, so cost attribution is a ``grep`` over the logs
-    rather than a code trace. ``schema`` is the output schema name for a
+    the active provider's route — the provider's name (``"OpenAI"``), or the
+    name with the endpoint's host in brackets (``"OpenAI (api.moonshot.ai)"``)
+    for a provider built with an explicit ``base_url`` elsewhere; it is the
+    key the call was rate limited under — so cost attribution is a ``grep``
+    over the logs rather than a code trace. ``schema`` is the output schema name for a
     structured call; the literal ``"text"`` / ``"stream"`` for a buffered or
     streamed plain-text call; and ``"tools"`` / ``"tools-stream"`` for a
     buffered or streamed tool turn (``"tools+<Name>"`` when a compose schema

@@ -63,7 +63,7 @@ from llmkit.rate_limiting._adaptive import AdaptiveState, SyncAdaptiveGate
 from llmkit.rate_limiting._breaker import CircuitState
 from llmkit.rate_limiting._buckets import RateBucket
 from llmkit.rate_limiting._tuning import BREAKER_MIN_SAMPLES
-from llmkit.testing import Reply, install
+from llmkit.testing import Reply, TransportRequest, install
 from tests._support import quiet_logging
 
 
@@ -2079,3 +2079,174 @@ def test_override_is_shared_by_the_sync_join_and_every_event_loop(
 
     assert asyncio.run(peak_on_a_fresh_loop()) == 1
     assert asyncio.run(peak_on_a_fresh_loop()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Route keys: an explicit non-default base_url is its own budget
+# ---------------------------------------------------------------------------
+
+#: The providers that accept a ``base_url``, each of which keys a non-default
+#: endpoint apart from the provider's own.
+_BASE_URL_MEMBERS = [
+    Provider.OPENAI,
+    Provider.ANTHROPIC,
+    Provider.CEREBRAS,
+    Provider.DEEPSEEK,
+    Provider.GOOGLE,
+    Provider.OPENROUTER,
+    Provider.OLLAMA,
+]
+_ELSEWHERE = "https://gateway.example/v1"
+
+_base_url_members = pytest.mark.parametrize("member", _BASE_URL_MEMBERS, ids=str)
+
+
+def _elsewhere(member: Provider, base_url: str = _ELSEWHERE) -> LLMProviderInterface:
+    """``member``'s provider built offline and pointed at another endpoint."""
+    if member is Provider.OLLAMA:
+        return make_provider(member, base_url=base_url)
+    return make_provider(member, api_key="k", base_url=base_url)
+
+
+@_base_url_members
+async def test_another_endpoint_holds_slots_apart_from_the_default(member: Provider) -> None:
+    """With one slot per key, a held default-endpoint slot blocks a call on the
+    default endpoint and not a call on another endpoint through the same class.
+
+    The fake answers inside the limiter slot, so a blocked call cannot finish
+    and an unblocked one does. Under name keying both calls block.
+    """
+    configure_rate_limit(policy=RateLimitPolicy(max_concurrent=1))
+    default = _instance_for(member)
+    elsewhere = _elsewhere(member)
+    assert elsewhere.name == f"{default.name} (gateway.example)"
+    release = asyncio.Event()
+    holding = asyncio.Event()
+
+    async def host() -> None:
+        async with rate_limit_acquire_async(member):
+            holding.set()
+            _ = await release.wait()
+
+    with install(lambda _request: Reply.text("hi")):
+        host_task = asyncio.create_task(host())
+        _ = await holding.wait()
+        blocked = asyncio.create_task(text_llm_call("hi", feature="route-key", provider=default))
+        free = await asyncio.wait_for(
+            text_llm_call("hi", feature="route-key", provider=elsewhere), timeout=5.0
+        )
+        assert free == "hi"
+        done, _pending = await asyncio.wait({blocked}, timeout=0.2)
+        assert not done, f"{member!r} did not hold the default endpoint's slot"
+
+        release.set()
+        assert await asyncio.wait_for(blocked, timeout=5.0) == "hi"
+        await host_task
+
+
+async def test_openai_and_a_moonshot_pointed_openai_fan_out_independently() -> None:
+    """The reported case: twelve calls each to OpenAI and to Moonshot through
+    the OpenAI class run eight at a time *each*, not eight between them."""
+    openai_provider = make_provider(Provider.OPENAI, api_key="k")
+    moonshot = make_provider(Provider.OPENAI, api_key="k", base_url="https://api.moonshot.ai/v1")
+    in_flight: collections.Counter[str] = collections.Counter()
+    peak: collections.Counter[str] = collections.Counter()
+    hold = asyncio.Event()
+
+    async def fake(request: TransportRequest) -> Reply:
+        in_flight[request.provider] += 1
+        peak[request.provider] = max(peak[request.provider], in_flight[request.provider])
+        try:
+            _ = await hold.wait()
+        finally:
+            in_flight[request.provider] -= 1
+        return Reply.text("hi")
+
+    with install(fake):
+        tasks = [
+            asyncio.create_task(text_llm_call("hi", feature="route-key", provider=provider))
+            for provider in (openai_provider, moonshot)
+            for _ in range(12)
+        ]
+        for _ in range(200):
+            await asyncio.sleep(0)
+        observed = dict(in_flight)
+        hold.set()
+        _ = await asyncio.gather(*tasks)
+
+    assert observed == {"OpenAI": 8, "OpenAI (api.moonshot.ai)": 8}
+    assert dict(peak) == {"OpenAI": 8, "OpenAI (api.moonshot.ai)": 8}
+
+
+@_base_url_members
+def test_instance_keyed_override_applies_only_to_that_instances_route(member: Provider) -> None:
+    """An override keyed by an instance on another endpoint governs that route
+    and nothing else: the provider's own endpoint, reached by member or by a
+    default instance, and a third endpoint all stay on the default policy."""
+    elsewhere = _elsewhere(member)
+    configure_rate_limit(policy=_DEFAULT, overrides={elsewhere: _OVERRIDE})
+
+    assert get_rate_limit_policy(elsewhere) == _OVERRIDE
+    assert get_rate_limit_policy(_elsewhere(member)) == _OVERRIDE  # same route, another object
+    assert get_rate_limit_policy(member) == _DEFAULT
+    assert get_rate_limit_policy(_instance_for(member)) == _DEFAULT
+    assert get_rate_limit_policy(_elsewhere(member, "https://other.example/v1")) == _DEFAULT
+    assert dict(get_rate_limit_config().overrides) == {elsewhere.name: _OVERRIDE}
+
+    _assert_built_from(GlobalRateLimiter.normalize_key(elsewhere.name), _OVERRIDE)
+    _assert_built_from(_registry_key(member), _DEFAULT)
+
+
+@_base_url_members
+def test_member_keyed_override_applies_only_to_the_default_endpoint(member: Provider) -> None:
+    """An override keyed by a member governs the provider's own endpoint, by
+    member and by default instance, and does not reach another endpoint used
+    through the same class."""
+    elsewhere = _elsewhere(member)
+    configure_rate_limit(policy=_DEFAULT, overrides={member: _OVERRIDE})
+
+    assert get_rate_limit_policy(member) == _OVERRIDE
+    assert get_rate_limit_policy(_instance_for(member)) == _OVERRIDE
+    assert get_rate_limit_policy(elsewhere) == _DEFAULT
+
+    _assert_built_from(_registry_key(member), _OVERRIDE)
+    _assert_built_from(GlobalRateLimiter.normalize_key(elsewhere.name), _DEFAULT)
+
+
+@_base_url_members
+def test_member_and_another_endpoints_instance_are_two_override_keys(member: Provider) -> None:
+    """A member and an instance on another endpoint name different routes, so
+    one map may carry both; two instances on one route still collide."""
+    elsewhere = _elsewhere(member)
+    other = RateLimitPolicy(max_concurrent=3)
+    configure_rate_limit(policy=_DEFAULT, overrides={member: _OVERRIDE, elsewhere: other})
+    assert get_rate_limit_policy(member) == _OVERRIDE
+    assert get_rate_limit_policy(elsewhere) == other
+
+    before = get_rate_limit_config()
+    with pytest.raises(ValueError, match="twice"):
+        configure_rate_limit(overrides={elsewhere: _OVERRIDE, _elsewhere(member): other})
+    assert get_rate_limit_config() == before
+
+
+async def test_member_keyed_override_does_not_cap_another_endpoint_at_runtime() -> None:
+    """A one-slot override on ``Provider.OPENAI`` serialises OpenAI's own
+    endpoint while a Moonshot-pointed instance runs under the default policy."""
+    configure_rate_limit(
+        policy=RateLimitPolicy(max_concurrent=3),
+        overrides={Provider.OPENAI: RateLimitPolicy(max_concurrent=1)},
+    )
+    moonshot = make_provider(Provider.OPENAI, api_key="k", base_url="https://api.moonshot.ai/v1")
+    probe = _ConcurrencyProbe()
+    hold = asyncio.Event()
+    tasks = [
+        asyncio.create_task(probe.run(make_provider(Provider.OPENAI, api_key="k").name, hold))
+        for _ in range(3)
+    ]
+    tasks += [asyncio.create_task(probe.run(moonshot.name, hold)) for _ in range(5)]
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert GlobalRateLimiter._get_async_gate("openai")._in_flight == 1
+    assert GlobalRateLimiter._get_async_gate("openai (api.moonshot.ai)")._in_flight == 3
+    hold.set()
+    _ = await asyncio.gather(*tasks)

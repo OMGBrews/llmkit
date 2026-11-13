@@ -51,8 +51,12 @@ class BackpressureEvent:
     instead of reconstructing it from call logs.
 
     Attributes:
-        provider: The normalized (casefolded) provider key the budget is keyed by
-            — the same identity the limiter accounts every dimension under.
+        provider: The normalized (casefolded) key the budget is keyed by
+            — the same identity the limiter accounts every dimension under. It
+            is the provider's route name, so it reads ``"openai"`` for
+            OpenAI's own endpoint and ``"openai (api.moonshot.ai)"`` for an
+            instance built with that ``base_url``: it can contain spaces,
+            brackets, dots and a colon.
         old_limit: The effective per-provider concurrency limit before the change.
         new_limit: The effective limit after the change.
         reason: which transition this is —
@@ -194,7 +198,10 @@ def backpressure_callback(callback: BackpressureCallback | None) -> Generator[No
     Usage::
 
         def on_event(event: BackpressureEvent) -> None:
-            metrics.gauge(f"llm.concurrency.{event.provider}", event.new_limit)
+            # A route name can hold spaces, brackets, dots and a colon
+            # ("openai (api.moonshot.ai)"), so pass it as a tag, not as part
+            # of a metric name.
+            metrics.gauge("llm.concurrency", event.new_limit, tags={"provider": event.provider})
 
 
         with backpressure_callback(on_event):

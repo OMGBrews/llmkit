@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, cast, override
+from typing import ClassVar, override
 
 import instructor
 
@@ -53,6 +53,7 @@ class OpenAIProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "OpenAI"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "openai/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "gpt-4.1-mini"
@@ -126,9 +127,7 @@ class OpenAIProvider(BaseProvider):
                 # Older non-reasoning catalogue entries omit the reasoning flag.
                 # Require both catalogue identity and a config excluding effort;
                 # generic/unknown OpenAI-compatible aliases prove neither.
-                catalog = cast(
-                    "set[str]", litellm.open_ai_chat_completion_models
-                )  # raw-llm: unparameterized catalogue set
+                catalog = litellm.open_ai_chat_completion_models
                 if (
                     model in catalog
                     and info.get("key") in (model, f"openai/{model}")

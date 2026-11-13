@@ -405,9 +405,10 @@ class GlobalRateLimiter:
     async def acquire_async(cls, provider_key: str) -> AsyncGenerator[RateLimitSlot]:
         """Hold an async slot for ``provider_key`` for the ``async with`` block.
 
-        ``provider_key`` is the provider name (``provider.name``, e.g.
-        ``"OpenAI"``), matched case-insensitively (casefolded via
-        :func:`_normalize_key` before touching any registry); each provider
+        ``provider_key`` is the provider's route name (``provider.name``, e.g.
+        ``"OpenAI"``, or ``"OpenAI (api.moonshot.ai)"`` for an instance built
+        with that ``base_url``), matched case-insensitively (casefolded via
+        :func:`_normalize_key` before touching any registry); each route
         has an independent budget on every dimension. When the **circuit breaker**
         is armed it is consulted *first* — before any gate — so a known-open
         provider raises :class:`~llmkit.exceptions.CircuitOpenError` immediately,
@@ -510,8 +511,8 @@ class GlobalRateLimiter:
         """Hold a sync slot for ``provider_key`` for the ``with`` block.
 
         The synchronous counterpart to :meth:`acquire_async`, with the *same*
-        per-provider backpressure semantics. ``provider_key`` is the provider name
-        (``provider.name``, e.g. ``"OpenAI"``), matched case-insensitively
+        per-provider backpressure semantics. ``provider_key`` is the provider's
+        route name (``provider.name``, e.g. ``"OpenAI"``), matched case-insensitively
         (casefolded via :func:`_normalize_key`). When the **circuit breaker** is
         armed it is consulted *first* — before any gate, exactly as on the async
         path — so a known-open provider raises

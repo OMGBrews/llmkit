@@ -77,6 +77,7 @@ class AnthropicProvider(BaseProvider):
     """
 
     _provider_name: ClassVar[str] = "Anthropic"
+    _default_base_url: ClassVar[str | None] = _DEFAULT_BASE_URL
     _model_prefix: ClassVar[str] = "anthropic/"
     _mode: ClassVar[instructor.Mode] = instructor.Mode.JSON_SCHEMA
     _default_model: ClassVar[str] = "claude-sonnet-4-6"
