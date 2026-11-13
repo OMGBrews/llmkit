@@ -216,6 +216,7 @@ async def tool_llm_call[T: BaseModel](
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
+        tiers = _litellm.begin_service_tiers()
         try:
             (
                 text,
@@ -390,6 +391,8 @@ async def tool_llm_call[T: BaseModel](
                     if diagnostics is not None
                     else partial_text,
                     native_finish_reason=native_finish_reason,
+                    requested_service_tier=tiers.requested,
+                    served_service_tier=tiers.served,
                 )
             )
 

@@ -17,7 +17,7 @@ installs a :class:`TransportDouble`.
 from __future__ import annotations
 
 import threading
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -58,6 +58,8 @@ class WireResponse:
     ``has_choice`` is false for a degenerate response with no choices, which
     the text and tool lanes treat as an empty answer. ``text`` is ``None`` when
     the message carried no text content, distinct from an empty string.
+    ``service_tier`` is the tier the provider reported serving, verbatim, or
+    ``None`` when the response reported none.
     """
 
     has_choice: bool = True
@@ -67,6 +69,34 @@ class WireResponse:
     native_finish_reason: str | None = None
     usage: WireUsage = field(default_factory=WireUsage)
     cost: float | None = None
+    service_tier: str | None = None
+
+
+@dataclass
+class ServiceTiers:
+    """One attempt's requested and served service tier, for its call record.
+
+    Mutable on purpose: the call layer holds the instance it got from
+    :func:`llmkit._litellm.begin_service_tiers` as a plain local, and the
+    adapter fills the same instance in — ``requested`` once the request
+    arguments are merged, ``served`` as each response or stream frame
+    reports one. A record built in a ``finally`` therefore sees whatever the
+    attempt got as far as delivering, whether it returned, raised, or was
+    cancelled, and a stream's record is unaffected by the consumer's own
+    llmkit calls between chunks.
+    """
+
+    requested: str | None = None
+    served: str | None = None
+
+
+def requested_service_tier(request_kwargs: Mapping[str, object]) -> str | None:
+    """The top-level ``service_tier`` a request asked for, when a non-empty string.
+
+    A value nested inside ``extra_body`` is not read.
+    """
+    tier = request_kwargs.get("service_tier")
+    return tier if isinstance(tier, str) and tier else None
 
 
 @dataclass(frozen=True)
@@ -85,6 +115,8 @@ class WireChunk:
 
     ``usage`` is ``None`` when the frame carried no usage at all; a frame that
     carried a usage object reports it even when every count is missing.
+    ``service_tier`` is the served tier the frame reported, if any; the stream
+    transports keep the last one any frame reported.
     """
 
     text: str | None = None
@@ -93,6 +125,7 @@ class WireChunk:
     native_finish_reason: str | None = None
     usage: WireUsage | None = None
     cost: float | None = None
+    service_tier: str | None = None
 
 
 @dataclass(frozen=True)

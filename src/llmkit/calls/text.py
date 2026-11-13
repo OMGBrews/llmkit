@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     build_text_record,
+    cache_hit_requested_service_tier,
     error_text,
     prepare_call,
     result_validation_budget,
@@ -170,6 +171,7 @@ async def text_llm_call(
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
+        tiers = _litellm.begin_service_tiers()
         try:
             text, cost, counts, native_finish_reason = await _litellm.acompletion_text(
                 prompt,
@@ -239,6 +241,8 @@ async def text_llm_call(
                     output_limit=diagnostics,
                     partial_text=partial_text,
                     native_finish_reason=native_finish_reason,
+                    requested_service_tier=tiers.requested,
+                    served_service_tier=tiers.served,
                 )
             )
 
@@ -274,6 +278,7 @@ async def text_llm_call(
                 attempt=attempt_offset + 1,
                 cache_hit=True,
                 source_call_id=source_call_id,
+                requested_service_tier=cache_hit_requested_service_tier(provider),
             )
         )
 

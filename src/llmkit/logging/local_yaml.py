@@ -71,7 +71,10 @@ class LocalYamlLogSink:
     expensive / served from cache / the last call for feature X" —
     are a single small scan instead of globbing and parsing every YAML. The
     index is deliberately compact: per-call request knobs (temperature,
-    max_tokens, reasoning_effort) live only in the per-call YAML.
+    max_tokens, reasoning_effort) live only in the per-call YAML. The one
+    exception is the requested service tier, which the index carries beside
+    the served one as its comparison key, so a single scan finds every call
+    whose provider served a different tier than the one asked for.
 
     ``log_dir=None`` (the default) resolves via :func:`default_log_dir` at
     the first write and freezes the answer for the sink's lifetime, so a
@@ -317,6 +320,8 @@ class LocalYamlLogSink:
                 "usage": record.usage,
                 "output_limit": record.output_limit,
                 "native_finish_reason": record.native_finish_reason,
+                "requested_service_tier": record.requested_service_tier,
+                "served_service_tier": record.served_service_tier,
                 "duration_ms": round(record.duration_ms, 1),
                 "queue_wait_ms": (
                     round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
@@ -477,10 +482,12 @@ class LocalYamlLogSink:
         POSIX, so concurrent calls don't interleave lines.
 
         The line carries only the cross-call triage fields, ``cache_hit`` and a
-        stream's ``first_chunk_ms`` among them; request-shaping knobs
-        (temperature, max_tokens, reasoning_effort) and ``source_call_id`` are
-        deliberately omitted to keep the index compact — they live in the
-        per-call YAML.
+        stream's ``first_chunk_ms`` and the served service tier among them;
+        request-shaping knobs (temperature, max_tokens, reasoning_effort) and
+        ``source_call_id`` are deliberately omitted to keep the index compact —
+        they live in the per-call YAML. The requested service tier is the one
+        request setting the line carries, as the comparison key for the served
+        tier.
         """
         try:
             line: dict[str, str | float | bool | None] = {
@@ -504,6 +511,8 @@ class LocalYamlLogSink:
                 ),
                 "approximate_cost": record.approximate_cost,
                 "error": record.error,
+                "requested_service_tier": record.requested_service_tier,
+                "served_service_tier": record.served_service_tier,
             }
             # Serialize before opening so a serialization failure can't even
             # create/touch the index file.

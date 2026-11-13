@@ -108,6 +108,8 @@ def test_index_jsonl_appends_one_documented_line_per_write(tmp_path: Path) -> No
         "first_chunk_ms",
         "approximate_cost",
         "error",
+        "requested_service_tier",
+        "served_service_tier",
     }
     assert set(first.keys()) == expected_keys
     assert first["file"] == p1.name
@@ -165,14 +167,29 @@ def test_omitted_temperature_round_trips_as_null(tmp_path: Path) -> None:
 
 def test_max_tokens_and_reasoning_effort_stay_out_of_the_index(tmp_path: Path) -> None:
     """The index is deliberately compact (cross-call triage fields only):
-    request-shaping knobs live in the per-call YAML, not ``index.jsonl``."""
+    request-shaping knobs live in the per-call YAML, not ``index.jsonl``. The
+    requested service tier is the one exception, as the served tier's
+    comparison key."""
     sink = LocalYamlLogSink(tmp_path)
-    assert sink.write_returning_path(_record(max_tokens=512, reasoning_effort="high")) is not None
+    assert (
+        sink.write_returning_path(
+            _record(
+                max_tokens=512,
+                reasoning_effort="high",
+                requested_service_tier="priority",
+                served_service_tier="default",
+            )
+        )
+        is not None
+    )
     line = cast(
         "dict[str, object]", json.loads((tmp_path / "index.jsonl").read_text().splitlines()[0])
     )
     assert "max_tokens" not in line
     assert "reasoning_effort" not in line
+    assert "temperature" not in line
+    assert line["requested_service_tier"] == "priority"
+    assert line["served_service_tier"] == "default"
 
 
 class _Color(Enum):

@@ -164,6 +164,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Call records carry the requested and the served service tier.**
+  `LLMCallRecord` gains `requested_service_tier` and `served_service_tier`,
+  both `str | None` and defaulted, written in the YAML body and on the
+  `index.jsonl` line. The requested tier is the top-level `service_tier` a
+  provider's `completion_kwargs()` returns, recorded on every attempt that
+  built a request, failed ones included; LiteLLM may still rewrite or drop it
+  on the wire. The served tier is what the response, or the last stream frame
+  that reported one, said was served: its `service_tier`, its usage block's
+  `service_tier`, or Google's `trafficType`, verbatim, on failed attempts that
+  received a response too. `null` means no tier reached llmkit, not that the
+  requested tier was served. A cache hit records the requested tier and a
+  null served tier. The requested tier is the one request setting the index
+  carries, as the served tier's comparison key. `Reply`, `Reply.text` and
+  `Reply.json` accept `service_tier` so a test can fake a served tier;
+  `Reply(no_choice=True)` rejects it. Synthetic measurements through
+  LiteLLM's OpenAI handler at 1.109.1 and 1.104.0 deliver the tier on
+  buffered responses and on streams whose frames carry it, and not when only
+  the final usage frame reports it; the README records the coverage. This is
+  not live evidence.
+
 - **`get_diagnostics_health()` — see whether llmkit's own warnings were
   lost.** Returns a frozen `DiagnosticsHealth` snapshot: `lost`, the
   diagnostics whose logging call raised and was contained since the process

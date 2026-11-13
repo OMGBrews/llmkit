@@ -49,6 +49,7 @@ from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 from pydantic import BaseModel
 
 from llmkit._diagnostics import report
+from llmkit._transport import requested_service_tier
 from llmkit._types import AssistantToolMessage, ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import CacheDecodeError, cache_key_or_none, read_through
@@ -662,6 +663,8 @@ def build_text_record(
     partial_text: str | None = None,
     native_finish_reason: str | None = None,
     first_chunk_at: float | None = None,
+    requested_service_tier: str | None = None,
+    served_service_tier: str | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -693,6 +696,8 @@ def build_text_record(
     ``first_chunk_at`` is the :func:`time.monotonic` instant a streamed
     attempt's first wire frame arrived, recorded as ``first_chunk_ms`` from
     ``start_t``; ``None`` (every buffered call, every hit) records ``None``.
+    ``requested_service_tier`` and ``served_service_tier`` are the attempt's
+    tiers (see :class:`~llmkit.logging.LLMCallRecord`).
 
     Building is separate from recording on purpose: the buffered path hands
     the record to :func:`~llmkit.capture.record_call_async` for bounded waiting,
@@ -733,7 +738,30 @@ def build_text_record(
         partial_text=output_limit.partial_text if output_limit is not None else partial_text,
         native_finish_reason=native_finish_reason,
         first_chunk_ms=(first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None,
+        requested_service_tier=requested_service_tier,
+        served_service_tier=served_service_tier,
     )
+
+
+def cache_hit_requested_service_tier(provider: LLMProviderInterface | None) -> str | None:
+    """The tier a cache hit's request would have asked for, best-effort.
+
+    A hit builds no request, so the provider's request arguments are read here
+    once more; the cache key has just read them successfully. Any failure
+    records ``None`` rather than failing a call the cache already answered.
+    """
+    if provider is None:
+        return None
+    try:
+        return requested_service_tier(provider.completion_kwargs())
+    except Exception:
+        _ = report(
+            logger,
+            logging.DEBUG,
+            "Could not read the requested service tier for a cache hit",
+            exc_info=True,
+        )
+        return None
 
 
 def tool_repair_messages(

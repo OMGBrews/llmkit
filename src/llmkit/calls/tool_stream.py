@@ -359,6 +359,8 @@ async def _stream_tools_once(
         first_chunk_at = at
 
     _litellm.begin_sent_temperature()
+    # Kept as a local: the adapter fills this instance in (see ``calls/stream.py``).
+    tiers = _litellm.begin_service_tiers()
     try:
         async with aclosing(
             _litellm.astream_tools(
@@ -483,6 +485,8 @@ async def _stream_tools_once(
             output_limit=diagnostics.to_log_dict() if diagnostics is not None else None,
             partial_text=diagnostics.partial_text if diagnostics is not None else partial_text,
             native_finish_reason=native_finish_reason,
+            requested_service_tier=tiers.requested,
+            served_service_tier=tiers.served,
             first_chunk_ms=(
                 (first_chunk_at - start_t) * 1000 if first_chunk_at is not None else None
             ),
