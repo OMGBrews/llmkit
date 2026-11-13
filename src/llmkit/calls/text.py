@@ -77,7 +77,9 @@ async def text_llm_call(
         model: Optional model override. Unset defers to ``options``, then
             to the default model of the provider the call runs on (see
             :func:`structured_llm_call`).
-        timeout: Seconds for one provider round trip, a deadline llmkit
+        timeout: A finite nonnegative number (not bool), or ``None``; invalid
+            values raise ``ValueError`` before call admission. Seconds for
+            one provider round trip, a deadline llmkit
             enforces: a round trip still waiting at it is cut off with a
             ``TimeoutError``, which the default retry policy retries with a
             fresh deadline. The value is forwarded to LiteLLM too. ``0.0`` is
@@ -319,7 +321,9 @@ def text_llm_call_sync(
     persistent loop, with no separate calling-thread semaphore (see
     :func:`structured_llm_call_sync`).
 
-    ``timeout`` is seconds for one provider round trip, enforced by llmkit as
+    ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
+    invalid values raise ``ValueError`` before call admission (at first
+    iteration for streams). It is seconds for one provider round trip, enforced by llmkit as
     on the async form; unset or ``None`` sets no deadline. The sync bridge adds
     no whole-call ceiling: as on the async form, the per-request timeout and
     the retry budget bound the call, with the configured cache ``timeout`` on

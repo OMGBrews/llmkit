@@ -570,6 +570,12 @@ async def extract(prompt: str) -> RiskRegister:
 
 The bundle sets `provider` beside `model` because a model id is spelled for one route (`gemini-2.5-flash` is the Google AI Studio and Google's Agent Platform spelling), so the route and its id travel together. A member is built for each call from `GEMINI_API_KEY`, read then, so a key kept in `.env` is found; see [Switching provider per call](#switching-provider-per-call).
 
+`max_tokens` must be a positive non-bool integer or `None`. `temperature`
+must be a finite non-bool `int` or `float`, or `None`; llmkit imposes no
+sampling range. These values and `timeout` are validated when a call resolves
+its options, not when an `LLMCallOptions` bundle is constructed. Invalid
+values raise `ValueError` before a request or cache read.
+
 `feature` is intentionally **not** part of `LLMCallOptions`. It stays a required per-call keyword as a telemetry forcing function: it scopes the per-call log filename and the `index.jsonl` grouping operators grep, so it must be a conscious choice at each call site rather than something defaulted-away into a shared object.
 
 The flat-keyword path is unchanged — pass no `options` and nothing about existing calls changes.
@@ -607,6 +613,14 @@ where LiteLLM adds a temperature of its own — see the Gemini caveat below.
 **Gemini caveat.** Google has announced that its upcoming Gemini models will reject requests that include `temperature`, `top_p`, or `top_k` with an error (custom sampling values have had no effect since Gemini 3.6 Flash). llmkit never sends `top_p`/`top_k` and, by default, no `temperature` either. An explicit temperature is forwarded on every provider, Gemini included, and a Gemini model that rejects it with an error naming `temperature` gets the request re-issued once without it, as above. One wrinkle remains on the Google AI Studio and Google's Agent Platform routes: through LiteLLM 1.104.0 (the supported floor), `VertexGeminiConfig.map_openai_params` re-inserts `temperature = 1.0` (Google's recommended value) for Gemini 3 models when the request carries none, so a default Gemini 3 call still sends `temperature: 1.0` on the wire. Removing that injection is an upstream LiteLLM change ([BerriAI/litellm#38663](https://github.com/BerriAI/litellm/issues/38663)); until llmkit consumes a release containing it, a default Gemini 3 call means "no warning, wire value `1.0`". OpenRouter adds no temperature when none is sent.
 
 ### Per-request timeout
+
+A caller's `timeout` must be `None` or a finite, nonnegative `int` or `float`,
+excluding booleans. Invalid values raise `ValueError` during option resolution,
+before logging, cache access or a provider request (at first iteration for a
+stream). A provider subclass may still supply an `httpx.Timeout` through
+`completion_kwargs()` for LiteLLM alone to apply. Numeric provider timeouts
+are checked at send time; invalid values raise `ValueError`, wrapped in
+`InstructorRetryException` on the structured lane.
 
 Every call function, including the sync wrappers, accepts `timeout` in
 seconds, directly or through
@@ -1057,7 +1071,7 @@ LocalYamlLogSink(retention_days=0)                     # ValueError — see belo
 
 ⚠️ **The sink owns its directory's `*.yaml` and `index-*.jsonl` namespace.** Pruning is a glob over `log_dir`, not a list of files the sink remembers writing: **any** `*.yaml` or rotated-index `index-*.jsonl` file in that directory whose mtime is older than `retention_days` is deleted, whoever wrote it. That is deliberate — a consumer who parks cross-reference YAML beside the per-call logs usually wants the two to rot on the same clock — but it makes `log_dir` llmkit's directory rather than shared storage. If you keep your own files there and want them to outlive the policy, give llmkit a directory of its own (`LocalYamlLogSink(log_dir=...)` or `LLMKIT_LOG_DIR`), or turn pruning off with `retention_days=None`. The active `index.jsonl` is never age-pruned — only its rotated `index-<timestamp>.jsonl` generations are.
 
-Each bound takes a **positive** integer or `None`; `0` and negatives raise `ValueError` at construction. `0` is rejected rather than quietly interpreted because it has two opposite plausible meanings — "keep nothing" (`logrotate`'s `rotate 0`) and "no limit" (many SaaS retention settings) — and the destructive reading is what the mechanics would actually do: the prune cutoff would be *now*, so the first write would delete every log in the directory, including the file it had just written and whose path it returns. `None` is the only opt-out, for both bounds.
+Each bound takes a **positive non-bool integer** or `None`; invalid values, including floats, booleans, `0` and negatives, raise `ValueError` at construction before sink state is initialized. The bounds remain mutable attributes after construction. `0` is rejected rather than quietly interpreted because it has two opposite plausible meanings — "keep nothing" (`logrotate`'s `rotate 0`) and "no limit" (many SaaS retention settings) — and the destructive reading is what the mechanics would actually do: the prune cutoff would be *now*, so the first write would delete every log in the directory, including the file it had just written and whose path it returns. `None` is the only opt-out, for both bounds.
 
 Managed call logging sends sink I/O to one dedicated daemon thread, including abandoned streams. Calls wait at most 100 ms for delivery by default; stream abandonment captures and submits without waiting. See the delivery policy below.
 
@@ -1197,6 +1211,11 @@ Inspect health to distinguish persistence, handoff and failure. Later submission
 do not extend a flush; a timed-out flush retains pending work, and cancellation
 of an async flush cancels only its wait.
 
+`run_sync(timeout=...)` and `shutdown(timeout=...)` accept finite nonnegative
+numbers up to `threading.TIMEOUT_MAX`, excluding booleans; invalid waits raise
+`ValueError` before submission or teardown. Use `None` for an unbounded sync wait; shutdown still applies the managed logging drain budget.
+`run_sync` closes an unsubmitted coroutine when rejecting its timeout.
+
 `llmkit.sync.shutdown()` flushes logging even for async-only applications and
 keeps the delivery worker available for later calls. An explicit smaller shutdown
 timeout also limits its logging wait. Normal process exit performs one final
@@ -1272,6 +1291,9 @@ from llmkit import InMemoryLLMCache, configure_llm_cache
 configure_llm_cache(InMemoryLLMCache(max_entries=1024))   # None (the default) turns it off
 configure_llm_cache(my_store, timeout=0.25)                # seconds per store read or write; 1.0 by default
 ```
+
+`InMemoryLLMCache(max_entries=...)` requires a positive non-bool integer;
+invalid values raise `ValueError` before cache state is initialized.
 
 The cache is read by `structured_llm_call`, `text_llm_call` and their sync wrappers, and by `text_llm_call_stream` and its sync form; the tool families do not read it. A streamed and a buffered text request for the same prompt are the same request, so either one answers the other. With no cache configured — the default — nothing changes: every request is byte-identical to one sent before this feature existed.
 
@@ -2065,7 +2087,7 @@ The failure helpers build the exceptions providers really raise, so llmkit's ret
 | `server_error()` | `openai.InternalServerError` (500) | yes | no |
 | `timeout_error()` | `openai.APITimeoutError` | yes | no |
 
-Raise one from the fake. `Reply(..., delay=seconds)` answers late, and the wait is spent inside the rate-limiter slot, as a slow provider's would be. The call's [`timeout`](#per-request-timeout) applies to the fake as to a provider: a delay longer than it is cut off with a `TimeoutError` and retried like a stalled request, so a host's timeout handling can be tested offline. On a stream the delay comes before the first chunk. Fault scripts compose from the request: refuse the first N attempts of one feature with `request.attempt`, or keep refusing one feature until its retry budget is spent. Tell a readiness probe from real work by its `feature` or `label`.
+Raise one from the fake. `Reply(cost=...)` accepts `None` or a finite nonnegative non-bool number; invalid cost or delay values raise `ValueError` at construction. `Reply(..., delay=seconds)` requires a finite nonnegative number, excluding booleans, and answers late, and the wait is spent inside the rate-limiter slot, as a slow provider's would be. The call's [`timeout`](#per-request-timeout) applies to the fake as to a provider: a delay longer than it is cut off with a `TimeoutError` and retried like a stalled request, so a host's timeout handling can be tested offline. On a stream the delay comes before the first chunk. Fault scripts compose from the request: refuse the first N attempts of one feature with `request.attempt`, or keep refusing one feature until its retry budget is spent. Tell a readiness probe from real work by its `feature` or `label`.
 
 ### What the fake does not see
 

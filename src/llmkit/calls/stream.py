@@ -69,7 +69,9 @@ async def text_llm_call_stream(
 ) -> AsyncGenerator[str]:
     """Stream raw text from the LLM, logging the full transcript on completion.
 
-    ``timeout`` is seconds for one provider round trip, a deadline llmkit
+    ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
+    invalid values raise ``ValueError`` before call admission (at first
+    iteration for streams). It is seconds for one provider round trip, a deadline llmkit
     enforces. For a stream it bounds opening the request, the wait for the
     first chunk and each later wait for the next chunk, never the stream's
     whole duration or your time between chunks. A breach raises
@@ -296,7 +298,9 @@ def text_llm_call_stream_sync(
     per ``next()`` on llmkit's persistent sync loop (see
     :func:`~llmkit.sync.iterate_sync`), so no chunk is fetched before it is
     asked for. ``timeout`` bounds each wait for the next chunk, as on the async
-    form; the sync bridge adds no whole-stream ceiling.
+    form; the sync bridge adds no whole-stream ceiling. It must be a finite
+    nonnegative number (not bool), or ``None``; invalid values raise
+    ``ValueError`` on first iteration before call admission.
 
     The caller's :mod:`contextvars` context is captured when this function is
     called, not when iteration starts, so enter :func:`~llmkit.capture_llm_records`

@@ -79,6 +79,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Gene
 from types import TracebackType
 from typing import cast, final, overload, override
 
+from llmkit._durations import duration
 from llmkit.options import UNSET, Unset
 
 logger = logging.getLogger(__name__)
@@ -411,7 +412,9 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None | U
     :class:`TimeoutError` mid-flight on a slow-but-valid call. The global rate
     limiter (:class:`~llmkit.rate_limiting.GlobalRateLimiter`) is the real
     concurrency backpressure; this ceiling exists only to bound a *hung*
-    coroutine. Pass ``None`` to wait unbounded. The call functions' sync forms
+    coroutine. Pass ``None`` to wait unbounded. Explicit waits must be finite,
+    nonnegative numbers (not bools) no greater than ``threading.TIMEOUT_MAX``;
+    invalid waits raise ``ValueError`` and close the supplied coroutine. The call functions' sync forms
     pass ``None``: like their async forms, they are bounded by the per-request
     ``timeout``, the retry budget and the cache's own ``timeout`` on each store
     read and write, not by a whole-call ceiling.
@@ -436,7 +439,11 @@ def run_sync[T](coro: Coroutine[object, object, T], *, timeout: float | None | U
        is generous: timing out is a last-resort signal that something is wrong,
        not a routine control-flow path.
     """
-    wait = _DEFAULT_TIMEOUT_SECONDS if isinstance(timeout, Unset) else timeout
+    try:
+        wait = _check_wait(_DEFAULT_TIMEOUT_SECONDS if isinstance(timeout, Unset) else timeout)
+    except ValueError:
+        coro.close()
+        raise
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
@@ -798,6 +805,8 @@ def shutdown(*, timeout: float | None = 10.0) -> None:
     explicit smaller *timeout* caps the entire wait across loop teardown and
     logging; each phase spends the remaining budget. ``None`` leaves loop
     teardown uncapped, but never removes the managed logging drain bound.
+    Other values must be finite nonnegative numbers (not bools), at most
+    ``threading.TIMEOUT_MAX``. Invalid waits raise ``ValueError`` before teardown.
 
     Even when the sync loop never started, logging is flushed. A timeout keeps
     pending records available for later delivery; it does not close logging or
@@ -809,7 +818,8 @@ def shutdown(*, timeout: float | None = 10.0) -> None:
     from llmkit.logging._delivery import flush_llm_logs
     from llmkit.logging._policy import get_delivery_policy
 
-    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    timeout = _check_wait(timeout)
+    deadline = None if timeout is None else time.monotonic() + timeout
     _shutdown_loop(deadline)
     remaining = _remaining(deadline)
     budget = get_delivery_policy().drain_timeout
@@ -832,3 +842,14 @@ def _shutdown_at_exit() -> None:
 
 
 _ = atexit.register(_shutdown_at_exit)
+
+
+def _check_wait(value: object) -> float | None:
+    if value is None:
+        return None
+    wait = duration(value, "timeout")
+    if wait > threading.TIMEOUT_MAX:
+        raise ValueError(
+            "timeout must be <= threading.TIMEOUT_MAX; use None to wait without a limit"
+        )
+    return wait

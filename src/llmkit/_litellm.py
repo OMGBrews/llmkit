@@ -85,6 +85,7 @@ from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt
 
 from llmkit._diagnostics import report
+from llmkit._durations import duration
 from llmkit._messages import resolve_reasoning_effort, wire_messages
 from llmkit._transport import (
     CallContext,
@@ -288,12 +289,13 @@ def _deadline(kwargs: dict[str, object]) -> float | None:
     option, because a provider's ``completion_kwargs`` can carry a timeout the
     call did not set, and that is the value the request is sent with. A value
     that is not a number (an ``httpx.Timeout``, say) is LiteLLM's alone to
-    apply; llmkit enforces only seconds.
+    apply; llmkit enforces only seconds. Numeric values must be finite and
+    nonnegative; bools and invalid numbers raise ``ValueError``.
     """
     value = kwargs.get("timeout")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not isinstance(value, (int, float)):
         return None
-    return float(value)
+    return float(duration(value, "timeout"))
 
 
 async def _within[T](timeout: float | None, awaitable: Awaitable[T]) -> T:

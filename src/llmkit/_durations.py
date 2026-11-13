@@ -3,12 +3,19 @@
 import math
 
 
-def duration(value: float, name: str) -> float:
+def duration(value: object, name: str) -> float:
     """Return *value* if it is a finite, nonnegative number of seconds.
 
     Raises:
-        ValueError: if *value* is a ``bool``, nonfinite or negative.
+        ValueError: if *value* is not a number, is a ``bool``, nonfinite or negative.
     """
-    if isinstance(value, bool) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be finite and nonnegative")
+    message = f"{name} must be finite and nonnegative (a number, not a bool)"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        valid = math.isfinite(value) and value >= 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(message)
     return value

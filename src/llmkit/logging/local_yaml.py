@@ -130,7 +130,7 @@ class LocalYamlLogSink:
 
         Raises:
             ValueError: if ``retention_days`` or ``max_index_bytes`` is set to
-                a non-positive value. ``0`` is rejected rather than read as
+                anything other than a positive non-bool integer or ``None``. ``0`` is rejected rather than read as
                 "unlimited": the prune cutoff would be *now*, so the first
                 write deletes every log in the directory — including the file
                 that write just produced, whose path it still returns.
@@ -144,12 +144,14 @@ class LocalYamlLogSink:
                 write, where the best-effort swallow turns "every log is
                 lost" into one warning.
         """
-        if retention_days is not None and retention_days < 1:
+        if retention_days is not None and (type(retention_days) is not int or retention_days < 1):
             raise ValueError(
                 "retention_days must be an integer >= 1 or None "
                 + f"(None keeps every log forever), got {retention_days!r}"
             )
-        if max_index_bytes is not None and max_index_bytes < 1:
+        if max_index_bytes is not None and (
+            type(max_index_bytes) is not int or max_index_bytes < 1
+        ):
             raise ValueError(
                 "max_index_bytes must be an integer >= 1 or None "
                 + f"(None never rotates index.jsonl), got {max_index_bytes!r}"

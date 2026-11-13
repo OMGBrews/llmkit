@@ -123,7 +123,9 @@ async def tool_llm_call[T: BaseModel](
 ) -> ToolCallResult | ToolComposeResult[T]:
     """Run one tool-enabled turn, optionally accepting a schema-validated final answer.
 
-    ``timeout`` is seconds for one provider round trip, a deadline llmkit
+    ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
+    invalid values raise ``ValueError`` before call admission (at first
+    iteration for streams). It is seconds for one provider round trip, a deadline llmkit
     enforces: a round trip still waiting at it is cut off with a
     ``TimeoutError``, which the default retry policy retries with a fresh
     deadline. The value is forwarded to LiteLLM too; ``0.0`` is accepted and
@@ -499,7 +501,9 @@ def tool_llm_call_sync[T: BaseModel](
     :func:`run_sync`: same arguments, same retries, logging, rate limits and
     result. Every argument is forwarded untouched.
 
-    ``timeout`` is seconds for one provider round trip, enforced by llmkit as
+    ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
+    invalid values raise ``ValueError`` before call admission (at first
+    iteration for streams). It is seconds for one provider round trip, enforced by llmkit as
     on the async form; unset or ``None`` sets no deadline. The sync bridge adds
     no whole-call ceiling: as on the async form, the per-request timeout and
     the retry budget bound the call.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 
 import instructor
 
@@ -127,7 +127,7 @@ class OpenAIProvider(BaseProvider):
                 # Older non-reasoning catalogue entries omit the reasoning flag.
                 # Require both catalogue identity and a config excluding effort;
                 # generic/unknown OpenAI-compatible aliases prove neither.
-                catalog = litellm.open_ai_chat_completion_models
+                catalog = cast(set[object], litellm.open_ai_chat_completion_models)
                 if (
                     model in catalog
                     and info.get("key") in (model, f"openai/{model}")

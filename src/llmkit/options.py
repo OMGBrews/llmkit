@@ -21,10 +21,12 @@ compares values to infer intent.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from enum import Enum
 from typing import override
 
+from llmkit._durations import duration
 from llmkit._types import ReasoningEffort
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.retry import DEFAULT_RETRY_POLICY, RetryPolicy
@@ -78,6 +80,12 @@ class LLMCallOptions:
     ``LLMCallOptions`` once and passes it as ``options=`` to every call,
     instead of repeating the same keyword block at each site. The flat
     keyword path is untouched — pass no ``options`` and nothing changes.
+
+    Numeric settings are validated when a call uses this bundle: ``timeout``
+    is finite and nonnegative, ``max_tokens`` is a positive integer, and
+    ``temperature`` is finite with no range restriction. Each accepts ``None``;
+    bools and values outside these domains raise ``ValueError``. Streams
+    validate on first iteration.
 
     Every field is **optional and unset by default** (the :data:`UNSET`
     sentinel, not ``None``): an unset field defers to the per-call keyword,
@@ -232,6 +240,11 @@ def resolve_call_args(
     model refusing it as unsupported gets the request re-issued once without
     it (see :func:`llmkit._litellm._acompletion`).
 
+    Resolved ``timeout`` must be a finite nonnegative number, ``max_tokens``
+    a positive integer, and ``temperature`` a finite number with no range
+    restriction. Each accepts ``None`` and rejects bools with ``ValueError``.
+    These checks occur when a call uses the options, before any request.
+
     The resolved ``schema_repairs`` is checked here, before the call is
     claimed from an enclosing retry loop and before any request: anything
     but a non-negative ``int`` raises ``ValueError``. There is no upper bound.
@@ -243,14 +256,14 @@ def resolve_call_args(
     """
     opts = options if options is not None else _ALL_UNSET_OPTIONS
     return ResolvedCallArgs(
-        temperature=_pick(temperature, opts.temperature, DEFAULT_TEMPERATURE),
+        temperature=_check_temperature(_pick(temperature, opts.temperature, DEFAULT_TEMPERATURE)),
         model=_pick(model, opts.model, None),
-        max_tokens=_pick(max_tokens, opts.max_tokens, None),
+        max_tokens=_check_max_tokens(_pick(max_tokens, opts.max_tokens, None)),
         reasoning_effort=_pick(reasoning_effort, opts.reasoning_effort, None),
         retry=_pick(retry, opts.retry, DEFAULT_RETRY_POLICY),
         provider=_pick(provider, opts.provider, None),
         cache=_pick(cache, opts.cache, True),
-        timeout=_pick(timeout, opts.timeout, None),
+        timeout=_check_timeout(_pick(timeout, opts.timeout, None)),
         schema_repairs=_check_schema_repairs(
             _pick(schema_repairs, opts.schema_repairs, DEFAULT_SCHEMA_REPAIRS)
         ),
@@ -306,3 +319,30 @@ DEFAULT_SCHEMA_REPAIRS: int = 1
 # Shared all-unset instance for the ``options=None`` path, so resolving the
 # flat-keyword call doesn't allocate a throwaway options object per call.
 _ALL_UNSET_OPTIONS = LLMCallOptions()
+
+
+def _check_timeout(value: object) -> float | None:
+    return None if value is None else duration(value, "timeout")
+
+
+def _check_max_tokens(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise ValueError("max_tokens must be a positive integer (not a bool) or None")
+    return value
+
+
+def _check_temperature(value: object) -> float | None:
+    if value is None:
+        return None
+    message = "temperature must be a finite number (not a bool) or None"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        valid = math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(message)
+    return value

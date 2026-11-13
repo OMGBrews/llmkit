@@ -26,9 +26,9 @@ class InMemoryLLMCache:
         """Create an empty store.
 
         Raises:
-            ValueError: if ``max_entries`` is less than 1.
+            ValueError: if ``max_entries`` is not a positive non-bool integer.
         """
-        if max_entries < 1:
+        if type(max_entries) is not int or max_entries < 1:
             raise ValueError(f"max_entries must be an integer >= 1, got {max_entries!r}")
         self.max_entries: int = max_entries
         self._entries: OrderedDict[str, LLMCacheEntry] = OrderedDict()

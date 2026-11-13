@@ -66,6 +66,7 @@ import httpx
 import openai
 from pydantic import BaseModel
 
+from llmkit._durations import duration
 from llmkit._transport import (
     CallContext,
     CallKind,
@@ -189,9 +190,11 @@ class Reply:
             frame.
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
-        cost: Approximate cost to report, or ``None``.
+        cost: Finite nonnegative cost to report, or ``None``; bools are invalid.
         delay: Seconds to wait before answering, inside the rate-limiter slot
             and under the request's ``timeout``, which cuts a longer wait off.
+            Must be finite and nonnegative, and cannot be a bool. Invalid
+            delay or cost raises ``ValueError`` at construction.
         chunks: Explicit text deltas for a streaming call. When omitted,
             ``content`` is split into word-sized deltas. Buffered calls answer
             with their concatenation.
@@ -216,8 +219,9 @@ class Reply:
     service_tier: str | None = None
 
     def __post_init__(self) -> None:
-        if self.delay < 0:
-            raise ValueError("Reply.delay must not be negative")
+        _ = duration(self.delay, "Reply.delay")
+        if self.cost is not None:
+            _ = duration(self.cost, "Reply.cost")
         if self.no_choice and (
             self.content is not None
             or self.tool_calls

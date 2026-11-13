@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Numeric settings reject invalid values before they disable bounds or harm
+  the shared sync loop.** Caller timeouts, token caps and temperatures are
+  validated during option resolution, including cache hits. Provider-supplied
+  numeric timeouts are checked at send time. Sync waits, cache capacity, YAML
+  retention bounds and fake reply delays and costs are checked at entry.
+
+  **Compatibility:** NaN, infinities, booleans and non-numbers now raise
+  `ValueError`; negative timeouts, waits, reply delays and costs do too.
+  Token caps, cache capacity and retention bounds require positive integers,
+  rejecting floats and zero. Temperature has no range restriction. Sync waits
+  above `threading.TIMEOUT_MAX` raise; use `None` for an unlimited wait.
+  Supply `httpx.Timeout` through a provider subclass's `completion_kwargs()`,
+  rather than a call keyword or options bundle. Shared duration validation
+  also changes incidental `TypeError` for non-numbers in cache configuration,
+  `LogDeliveryPolicy` and `flush_llm_logs` to `ValueError`.
+
 - **Provider finish reasons are preserved and classified before success.**
   Native reasons that LiteLLM delivers now reach call records as
   `native_finish_reason` (YAML body only), and tool results as
