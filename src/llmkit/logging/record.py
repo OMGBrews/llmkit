@@ -149,6 +149,24 @@ class LLMCallRecord:
     delivered it; ``None`` does not prove the provider supplied no reason.
     The YAML body carries these diagnostics, tools and usage; ``index.jsonl``
     omits them to keep its compact scan shape.
+
+    ``requested_service_tier`` is the top-level ``service_tier`` the request
+    carried, which a host sets only through its provider's
+    ``completion_kwargs()`` (a value nested in ``extra_body`` is not read);
+    ``None`` when the request set none or the attempt failed before building
+    one. It is what the host asked for, not what reached the provider:
+    LiteLLM may alter or drop it on the wire (for Anthropic models it
+    rewrites ``default`` to ``standard_only``, and it drops the key on routes
+    that reject it, such as Vertex AI). ``served_service_tier`` is the tier
+    reported as served on the attempt's last response, or on the last stream
+    frame that reported one, as LiteLLM delivered it and unmapped by llmkit:
+    the response's own ``service_tier``, its usage block's ``service_tier``,
+    or Google's ``trafficType`` as LiteLLM keeps it. ``None`` means no tier
+    reached llmkit, never that the requested tier was served. Because the
+    value is the provider's own word, the two compare only where the
+    response answers in the request's vocabulary: Google's ``ON_DEMAND``
+    never equals a requested tier name. A cache hit records the requested tier and a
+    ``None`` served tier. Both fields are in the YAML body and the index line.
     """
 
     started_at: datetime
@@ -178,3 +196,5 @@ class LLMCallRecord:
     source_call_id: str | None = None
     first_chunk_ms: float | None = None
     native_finish_reason: str | None = None
+    requested_service_tier: str | None = None
+    served_service_tier: str | None = None

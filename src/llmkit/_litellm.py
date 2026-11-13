@@ -89,6 +89,7 @@ from llmkit._messages import resolve_reasoning_effort, wire_messages
 from llmkit._transport import (
     CallContext,
     CallKind,
+    ServiceTiers,
     WireChunk,
     WireFunction,
     WireRequest,
@@ -98,6 +99,7 @@ from llmkit._transport import (
     WireToolFragment,
     WireUsage,
     active_double,
+    requested_service_tier,
 )
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.exceptions import (
@@ -155,6 +157,36 @@ def begin_sent_temperature() -> None:
     reached :func:`_acompletion`, would inherit an earlier call's stamp.
     """
     _ = _sent_temperature.set(_NOT_SENT)
+
+
+# The current attempt's service-tier holder. The call layer installs a fresh
+# :class:`ServiceTiers` with :func:`begin_service_tiers` where it calls
+# :func:`begin_sent_temperature`, and keeps the returned instance as a plain
+# local. Each adapter looks the holder up exactly once, right after merging
+# the request arguments (before any await or yield), and writes into that
+# instance from then on; it never re-reads the variable, so a stream whose
+# consumer runs its own llmkit calls between chunks cannot write into theirs.
+_service_tiers: ContextVar[ServiceTiers | None] = ContextVar("_llmkit_service_tiers", default=None)
+
+
+def begin_service_tiers() -> ServiceTiers:
+    """Install and return a fresh service-tier holder for the attempt about to run."""
+    tiers = ServiceTiers()
+    _ = _service_tiers.set(tiers)
+    return tiers
+
+
+def _attempt_service_tiers(request_kwargs: dict[str, object]) -> ServiceTiers:
+    """The attempt's holder, with the requested tier the merged request carries.
+
+    Falls back to a detached holder when no call layer began one (a direct
+    transport caller), so the adapters never branch on it.
+    """
+    tiers = _service_tiers.get()
+    if tiers is None:
+        tiers = ServiceTiers()
+    tiers.requested = requested_service_tier(request_kwargs)
+    return tiers
 
 
 def sent_temperature(requested: float | None) -> float | None:
@@ -543,6 +575,33 @@ def _native_finish_reason(choice: object) -> str | None:
     return None
 
 
+def _served_service_tier(raw: object) -> str | None:
+    """The service tier *raw* reports serving, verbatim, or ``None``.
+
+    The three places LiteLLM itself consults, in its order: the top-level
+    ``service_tier`` (a pydantic extra on ``ModelResponse`` and
+    ``ModelResponseStream``, not a declared field), the usage block's
+    ``service_tier``, then ``_hidden_params["provider_specific_fields"]
+    ["traffic_type"]``, where LiteLLM's Gemini transform keeps Google's
+    ``trafficType``. The first non-empty string wins; nothing is mapped, so
+    Google's ``ON_DEMAND`` stays ``ON_DEMAND``. Total ``getattr``: nothing here
+    raises.
+    """
+    candidates: list[object] = [
+        getattr(raw, "service_tier", None),
+        getattr(getattr(raw, "usage", None), "service_tier", None),
+    ]
+    hidden = getattr(raw, "_hidden_params", None)
+    if isinstance(hidden, Mapping):
+        fields = cast("Mapping[object, object]", hidden).get("provider_specific_fields")
+        if isinstance(fields, Mapping):
+            candidates.append(cast("Mapping[object, object]", fields).get("traffic_type"))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
 def _wire_response(raw: object) -> WireResponse:
     """Convert a LiteLLM completion to :class:`WireResponse`.
 
@@ -553,11 +612,12 @@ def _wire_response(raw: object) -> WireResponse:
     """
     usage = _wire_usage(raw)
     cost = _response_cost(raw)
+    service_tier = _served_service_tier(raw)
     choices = cast("object", getattr(raw, "choices", None))
     if not choices:
         # A degenerate empty-``choices`` response (e.g. a malformed
         # OpenAI-compatible proxy returning ``{"choices": []}``).
-        return WireResponse(has_choice=False, usage=usage, cost=cost)
+        return WireResponse(has_choice=False, usage=usage, cost=cost, service_tier=service_tier)
     choice = cast("Sequence[object]", choices)[0]
     message = getattr(choice, "message", None)
     content = cast("object", getattr(message, "content", None))
@@ -573,6 +633,7 @@ def _wire_response(raw: object) -> WireResponse:
         native_finish_reason=_native_finish_reason(choice),
         usage=usage,
         cost=cost,
+        service_tier=service_tier,
     )
 
 
@@ -588,6 +649,7 @@ def _wire_chunk(chunk: ModelResponseStream) -> WireChunk:
         # no choices; a frame without any usage reports ``None``.
         usage=_wire_usage(chunk) if getattr(chunk, "usage", None) is not None else None,
         cost=_response_cost(chunk),
+        service_tier=_served_service_tier(chunk),
     )
 
 
@@ -647,10 +709,11 @@ def _render_model_response(response: WireResponse) -> ModelResponse:
 
 @dataclass
 class _Invocations:
-    """Invocation count and the last delivered native reason for this attempt."""
+    """Invocation count, the last delivered native reason, and the attempt's tiers."""
 
     count: int = 0
     native_finish_reason: str | None = None
+    tiers: ServiceTiers = field(default_factory=ServiceTiers)
 
 
 async def _instructor_completion(
@@ -683,6 +746,9 @@ async def _instructor_completion(
     )
     response = await _send(WireRequest(kwargs=kwargs, call=call))
     invocations.native_finish_reason = response.native_finish_reason
+    # Each response overwrites: the record describes the last completion, as
+    # it does for the native reason.
+    invocations.tiers.served = response.service_tier
     raise_for_finish(
         response.finish_reason,
         response.native_finish_reason,
@@ -1281,6 +1347,7 @@ async def acompletion_structured[T: BaseModel](
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     litellm_model = provider.litellm_model(model)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    tiers = _attempt_service_tiers(request_kwargs)
     # The completion callable is the library's seam under instructor: it sends
     # through the transport boundary, and providers that opt in via
     # ``strict_json_schema`` (OpenRouter) get their ``response_format``
@@ -1303,7 +1370,7 @@ async def acompletion_structured[T: BaseModel](
         attempt=attempt,
         output_schema=output_schema,
     )
-    invocations = _Invocations()
+    invocations = _Invocations(tiers=tiers)
     completion = functools.partial(
         _instructor_completion,
         strict=provider.strict_json_schema,
@@ -1550,6 +1617,7 @@ async def acompletion_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    tiers = _attempt_service_tiers(request_kwargs)
     litellm_model = provider.litellm_model(model)
     messages = wire_messages(prompt)
     call = _call_context(
@@ -1588,6 +1656,7 @@ async def acompletion_text(
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
+        tiers.served = response.service_tier
         slot.record_tokens(response.usage.debit())
         raise_for_finish(
             response.finish_reason,
@@ -1642,6 +1711,7 @@ async def acompletion_tools(
     guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    tiers = _attempt_service_tiers(request_kwargs)
     if response_format is not None and provider.strict_json_schema:
         _stricten_json_schema_response_format({"response_format": response_format})
     choice: object = tool_choice
@@ -1684,6 +1754,7 @@ async def acompletion_tools(
     )
     async with GlobalRateLimiter.acquire_async(provider.name) as slot:
         response = await _send(request)
+        tiers.served = response.service_tier
         slot.record_tokens(response.usage.debit())
         raise_for_finish(
             response.finish_reason,
@@ -1905,6 +1976,7 @@ async def astream_tools(
     guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    tiers = _attempt_service_tiers(request_kwargs)
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
@@ -1970,6 +2042,8 @@ async def astream_tools(
                     stop_reason = item.finish_reason
                 if item.native_finish_reason is not None:
                     native_stop_reason = item.native_finish_reason
+                if item.service_tier is not None:
+                    tiers.served = item.service_tier
                 # ``include_usage`` puts usage on a *final* frame that usually
                 # carries no choices; keep the last frame that has any.
                 if item.usage is not None:
@@ -2046,6 +2120,7 @@ async def astream_text(
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     request_kwargs = _completion_request_kwargs(provider, effort, model)
+    tiers = _attempt_service_tiers(request_kwargs)
     litellm_model = provider.litellm_model(model)
     messages = wire_messages(prompt)
     call = _call_context(
@@ -2112,6 +2187,9 @@ async def astream_text(
                 stop_reason = item.finish_reason
             if item.native_finish_reason is not None:
                 native_stop_reason = item.native_finish_reason
+            # Kept across frames: a provider may report it on one frame only.
+            if item.service_tier is not None:
+                tiers.served = item.service_tier
             # ``include_usage`` puts usage on a *final* frame that usually
             # carries no choices, and so no text; keep the last frame that has
             # any.

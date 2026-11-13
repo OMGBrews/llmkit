@@ -937,8 +937,9 @@ async def test_a_raising_serializer_still_returns_the_validated_compose_answer(
         {"tool_calls": [FakeToolCall("count")]},
         {"chunks": ["x"]},
         {"native_finish_reason": "ERROR"},
+        {"service_tier": "default"},
     ],
-    ids=["content", "tool_calls", "chunks", "native_finish_reason"],
+    ids=["content", "tool_calls", "chunks", "native_finish_reason", "service_tier"],
 )
 def test_no_choice_carries_nothing_else(fields: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="no_choice"):

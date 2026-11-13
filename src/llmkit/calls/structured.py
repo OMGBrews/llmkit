@@ -18,6 +18,7 @@ from pydantic import BaseModel, JsonValue
 from llmkit._diagnostics import report
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
+    cache_hit_requested_service_tier,
     error_text,
     guard_output_schema,
     logger,
@@ -258,6 +259,7 @@ async def structured_llm_call[T: BaseModel](
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
         _litellm.begin_sent_temperature()
+        tiers = _litellm.begin_service_tiers()
         try:
             (
                 response,
@@ -353,6 +355,8 @@ async def structured_llm_call[T: BaseModel](
                     if diagnostics is not None
                     else partial_text,
                     native_finish_reason=native_finish_reason,
+                    requested_service_tier=tiers.requested,
+                    served_service_tier=tiers.served,
                 )
             )
 
@@ -395,6 +399,7 @@ async def structured_llm_call[T: BaseModel](
                 usage=None,
                 cache_hit=True,
                 source_call_id=source_call_id,
+                requested_service_tier=cache_hit_requested_service_tier(provider),
             )
         )
 

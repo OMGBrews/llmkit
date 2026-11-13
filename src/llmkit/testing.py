@@ -183,6 +183,10 @@ class Reply:
         native_finish_reason: The provider's original reason, after LiteLLM's
             normalization boundary. Set explicitly to test preserved natives;
             the fake does not perform LiteLLM's provider mapping.
+        service_tier: The service tier the provider reports serving, as the
+            call record's ``served_service_tier`` records it, or ``None`` for
+            a response that reports none. A stream reports it on its final
+            frame.
         usage: Token usage to report, or ``None``. It is debited from the
             tokens-per-minute limiter like a provider's.
         cost: Approximate cost to report, or ``None``.
@@ -196,7 +200,8 @@ class Reply:
             structured call, and a tool call with ``output_schema=``, raises
             :class:`~llmkit.StructuredOutputError`; a text call and a plain
             tool call treat it as an empty answer. Requires no ``content``,
-            ``tool_calls``, ``chunks`` or ``native_finish_reason``.
+            ``tool_calls``, ``chunks``, ``native_finish_reason`` or
+            ``service_tier``.
     """
 
     content: str | None = None
@@ -208,6 +213,7 @@ class Reply:
     chunks: Sequence[str] | None = None
     no_choice: bool = False
     native_finish_reason: str | None = None
+    service_tier: str | None = None
 
     def __post_init__(self) -> None:
         if self.delay < 0:
@@ -217,9 +223,11 @@ class Reply:
             or self.tool_calls
             or self.chunks is not None
             or self.native_finish_reason is not None
+            or self.service_tier is not None
         ):
             raise ValueError(
-                "Reply.no_choice carries no content, tool_calls, chunks or native finish reason"
+                "Reply.no_choice carries no content, tool_calls, chunks, native finish reason "
+                + "or service tier"
             )
         if (
             self.chunks is not None
@@ -235,6 +243,7 @@ class Reply:
         *,
         finish_reason: str | None = None,
         native_finish_reason: str | None = None,
+        service_tier: str | None = None,
         usage: TokenUsage | None = None,
         cost: float | None = None,
         delay: float = 0.0,
@@ -244,6 +253,7 @@ class Reply:
             content=text,
             finish_reason=finish_reason,
             native_finish_reason=native_finish_reason,
+            service_tier=service_tier,
             usage=usage,
             cost=cost,
             delay=delay,
@@ -256,6 +266,7 @@ class Reply:
         *,
         finish_reason: str | None = None,
         native_finish_reason: str | None = None,
+        service_tier: str | None = None,
         usage: TokenUsage | None = None,
         cost: float | None = None,
         delay: float = 0.0,
@@ -274,6 +285,7 @@ class Reply:
             instance.model_dump_json(by_alias=True),
             finish_reason=finish_reason,
             native_finish_reason=native_finish_reason,
+            service_tier=service_tier,
             usage=usage,
             cost=cost,
             delay=delay,
@@ -388,6 +400,7 @@ class _Double:
             native_finish_reason=reply.native_finish_reason,
             usage=_reply_usage(reply),
             cost=reply.cost,
+            service_tier=reply.service_tier,
         )
 
     async def stream(self, call: CallContext) -> AsyncIterator[WireChunk | WireStreamEnd]:
@@ -409,6 +422,7 @@ class _Double:
             finish_reason=_reply_finish_reason(reply),
             native_finish_reason=reply.native_finish_reason,
             cost=reply.cost,
+            service_tier=reply.service_tier,
         )
         yield WireStreamEnd(usage=_reply_usage(reply), cost=reply.cost)
 

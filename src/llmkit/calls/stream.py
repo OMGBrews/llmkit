@@ -31,6 +31,7 @@ from llmkit.cache.read_through import cached_entry, store_entry
 from llmkit.calls._shared import (
     build_text_record,
     cache_and_key,
+    cache_hit_requested_service_tier,
     error_text,
     prepare_call,
     resolve_model_and_provider,
@@ -201,6 +202,7 @@ async def text_llm_call_stream(
                     attempt=attempt_offset + 1,
                     cache_hit=True,
                     source_call_id=entry.call_id,
+                    requested_service_tier=cache_hit_requested_service_tier(provider),
                 )
                 # The same record-step split as ``_stream_once``, for the same
                 # reason: never suspend while abandonment is unwinding.
@@ -380,6 +382,9 @@ async def _stream_once(
         first_chunk_at = at
 
     _litellm.begin_sent_temperature()
+    # Kept as a local: the adapter fills this instance in, so the record reads
+    # it whatever context the ``finally`` below runs in.
+    tiers = _litellm.begin_service_tiers()
     try:
         async for chunk in _litellm.astream_text(
             prompt,
@@ -456,6 +461,8 @@ async def _stream_once(
             partial_text=partial_text,
             native_finish_reason=native_finish_reason,
             first_chunk_at=first_chunk_at,
+            requested_service_tier=tiers.requested,
+            served_service_tier=tiers.served,
         )
         if error == STREAM_ABANDONED_ERROR:
             # Capture and submit without awaiting or running sink I/O while
