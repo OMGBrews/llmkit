@@ -28,9 +28,11 @@ provider classes, so a changed pin fails here:
 The expected modes and strict flags come from the per-route table in the
 structured-output contract audit record (wrapper
 ``docs/planning/structured-output-contract-audit-2026-11-02.md``), which
-agrees with the code at the time of writing: ``Mode.JSON`` on DeepSeek,
-``Mode.JSON_SCHEMA`` everywhere else (Gemini routes on their default
-``"schema"`` strategy), and the strict upgrade on OpenRouter only.
+agrees with the code at the time of writing: ``Mode.JSON`` on DeepSeek and
+Moonshot, ``Mode.JSON_SCHEMA`` everywhere else (Gemini routes on their default
+``"schema"`` strategy), and the strict upgrade on OpenRouter only. The Moonshot
+and Alibaba rows postdate that audit and come from the measurements recorded in
+their provider class docstrings.
 
 Bedrock and Vertex need no route field to construct: ``aws_region_name``,
 ``vertex_project`` and ``vertex_location`` are optional. Unset, Bedrock's

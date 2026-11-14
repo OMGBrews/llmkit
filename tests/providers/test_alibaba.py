@@ -195,11 +195,33 @@ def test_an_endpoint_from_the_environment_keeps_the_plain_name(
 
 
 @pytest.mark.parametrize("effort", ["disable", "lowest"])
-@pytest.mark.parametrize("model", ["qwen3.7-plus", "qwen-flash", "qwencloud/qwen3.7-plus"])
+@pytest.mark.parametrize(
+    "model", ["qwen3.7-plus", "qwen-flash", "qwencloud/qwen3.7-plus", "qwen-unlisted-9"]
+)
 def test_disable_and_lowest_turn_thinking_off(effort: str, model: str) -> None:
-    """Both portable values are sent as ``"none"``; QwenCloud rejects ``"disable"``."""
+    """Both portable values are sent as ``"none"``; QwenCloud rejects ``"disable"``.
+
+    Unlike Moonshot's, LiteLLM's ``qwencloud/`` route forwards ``reasoning_effort``
+    for any model, so the translation does not depend on LiteLLM listing the model
+    (``qwen-unlisted-9`` is in no map).
+    """
     provider = AlibabaProvider(api_key="sk-test")
     assert provider.reasoning_kwargs(effort, model) == {"reasoning_effort": "none"}
+
+
+def test_the_translation_never_consults_litellms_model_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata gate like Moonshot's would make an unlisted Qwen model raise."""
+    import litellm
+
+    def _no_lookup(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("AlibabaProvider consulted litellm.get_model_info")
+
+    monkeypatch.setattr(litellm, "get_model_info", _no_lookup)
+    provider = AlibabaProvider(api_key="sk-test")
+    for effort in ("disable", "lowest"):
+        assert provider.reasoning_kwargs(effort, provider.model) == {"reasoning_effort": "none"}
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "minimal", "xhigh"])

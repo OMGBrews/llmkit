@@ -17,6 +17,8 @@ assertions; real round-trips live in ``tests/integration/test_live_providers.py`
 
 from __future__ import annotations
 
+import re
+
 import instructor
 import pytest
 
@@ -64,7 +66,7 @@ def test_litellm_model_override_keeps_the_prefix() -> None:
 
 
 def test_measured_traits() -> None:
-    """Schema mode without strict; named tool_choice supported; compose not measured, so off."""
+    """JSON-object mode (schema in the prompt), no strict upgrade; tool_choice supported; no compose."""
     provider = MoonshotProvider(api_key="sk-test")
     assert provider.instructor_mode is instructor.Mode.JSON
     assert provider.strict_json_schema is False
@@ -182,6 +184,7 @@ def test_an_endpoint_from_the_environment_keeps_the_plain_name(
 
 @pytest.mark.parametrize("effort", ["disable", "lowest"])
 @pytest.mark.parametrize("model", ["kimi-k3.1-pro", "kimi-k2.6", "moonshot/kimi-k3.1-pro"])
+@pytest.mark.usefixtures("moonshot_default_listed")
 def test_disable_and_lowest_turn_thinking_off(effort: str, model: str) -> None:
     """Both portable values are sent as ``"none"``; a forwarded ``"disable"`` kept thinking."""
     provider = MoonshotProvider(api_key="sk-test")
@@ -210,7 +213,9 @@ def test_disable_and_lowest_raise_on_an_unlisted_model(effort: str, model: str) 
 
 
 @pytest.mark.parametrize("effort", ["disable", "lowest"])
-@pytest.mark.parametrize(("model", "sent"), [("kimi-k3.1-pro", True), ("moonshot-v1-8k", False)])
+# kimi-k2.6, not the default: LiteLLM's mapping reads the map that loaded, and
+# kimi-k2.6 is listed as reasoning in every map this suite can run against.
+@pytest.mark.parametrize(("model", "sent"), [("kimi-k2.6", True), ("moonshot-v1-8k", False)])
 def test_the_translation_is_accepted_by_litellms_moonshot_route(
     effort: str, model: str, sent: bool
 ) -> None:
@@ -226,6 +231,19 @@ def test_the_translation_is_accepted_by_litellms_moonshot_route(
     )
     assert params.get("reasoning_effort") == ("none" if sent else None)
     assert kwargs == ({"reasoning_effort": "none"} if sent else {})
+
+
+@pytest.mark.parametrize("effort", ["disable", "lowest"])
+@pytest.mark.usefixtures("moonshot_default_unlisted")
+def test_the_default_raises_where_litellm_does_not_list_it(effort: str) -> None:
+    """The floor's bundled map, loaded offline, does not list ``kimi-k3.1-pro``.
+
+    LiteLLM then refuses any ``reasoning_effort`` on the default, so the portable
+    values raise before transport rather than reach that refusal.
+    """
+    provider = MoonshotProvider(api_key="sk-test")
+    with pytest.raises(ReasoningEffortUnsupportedError, match=re.escape("kimi-k3.1-pro")):
+        _ = provider.reasoning_kwargs(effort, provider.model)
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "minimal", "max"])

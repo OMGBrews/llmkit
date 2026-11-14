@@ -98,7 +98,11 @@ _DISABLE: dict[Provider, list[tuple[str | None, object]]] = {
         ("moonshot-v1-8k", {}),
         ("kimi-unlisted-9", _RAISES),
     ],
-    Provider.ALIBABA: [(None, _OFF_FLAT), ("qwen-flash", _OFF_FLAT)],  # qwen3.7-plus
+    Provider.ALIBABA: [  # qwen3.7-plus; unlisted models too: the route forwards for any model
+        (None, _OFF_FLAT),
+        ("qwen-flash", _OFF_FLAT),
+        ("qwen-unlisted-9", _OFF_FLAT),
+    ],
 }
 
 #: ``lowest`` on each route: off where the model can stop thinking, else its lowest effort.
@@ -146,7 +150,11 @@ _LOWEST: dict[Provider, list[tuple[str | None, object]]] = {
         ("moonshot-v1-8k", {}),
         ("kimi-unlisted-9", _RAISES),
     ],
-    Provider.ALIBABA: [(None, _OFF_FLAT), ("qwen-flash", _OFF_FLAT)],
+    Provider.ALIBABA: [
+        (None, _OFF_FLAT),
+        ("qwen-flash", _OFF_FLAT),
+        ("qwen-unlisted-9", _OFF_FLAT),
+    ],
 }
 
 
@@ -201,6 +209,7 @@ def _assert_litellm_turns_thinking_off(member: Provider, model: str) -> None:
 
 
 @pytest.mark.parametrize(("member", "model", "expected"), _cases(_DISABLE))
+@pytest.mark.usefixtures("moonshot_default_listed")
 def test_disable_turns_thinking_off_or_raises(
     member: Provider, model: str | None, expected: object
 ) -> None:
@@ -219,6 +228,7 @@ def test_disable_turns_thinking_off_or_raises(
 
 
 @pytest.mark.parametrize(("member", "model", "expected"), _cases(_LOWEST))
+@pytest.mark.usefixtures("moonshot_default_listed")
 def test_lowest_sends_the_least_reasoning_the_route_supports(
     member: Provider, model: str | None, expected: object
 ) -> None:

@@ -22,8 +22,8 @@ What the provider axis buys, honestly: the fake answers below LiteLLM, so
 LiteLLM's per-provider response handling never runs here, and for these
 replies every provider behaves identically today. The axis is a tripwire. It
 crosses both instructor parse paths llmkit ships (``Mode.JSON_SCHEMA`` on
-most providers, ``Mode.JSON`` on DeepSeek and on Gemini's ``"json"``
-strategy), so a provider re-pinned to a mode that parses differently (a
+most providers, ``Mode.JSON`` on DeepSeek and Moonshot and on Gemini's
+``"json"`` strategy), so a provider re-pinned to a mode that parses differently (a
 tool-call mode, say) fails the control row; and it runs each provider's
 request-side traits on the way to the fake (its mode's request shaping,
 OpenRouter's strict ``response_format`` upgrade, the Claude routes'

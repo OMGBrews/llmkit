@@ -69,14 +69,20 @@ class MoonshotProvider(BaseProvider):
       values send nothing, since it already does not think, and on a model the
       metadata does not list they raise
       :class:`~llmkit.exceptions.ReasoningEffortUnsupportedError` before
-      transport. Other values pass through unchanged, for LiteLLM and Moonshot
+      transport. Which models are listed depends on the map LiteLLM loaded:
+      the default ``kimi-k3.1-pro`` is in LiteLLM's remote map, which it
+      fetches at import, and in the map bundled from 1.109.1, but not in the
+      maps bundled with 1.104.0 or 1.106.6. With no network or
+      ``LITELLM_LOCAL_MODEL_COST_MAP=True`` on those releases LiteLLM refuses
+      every ``reasoning_effort`` on the default, and the portable values raise.
+      Other values pass through unchanged, for LiteLLM and Moonshot
       to accept or reject. On reasoning models LiteLLM also drops any
       ``temperature``.
-    * **Thinking-on tool loops** were measured only as single turns. A later
-      turn that resends an assistant tool call relies on LiteLLM inserting a
-      placeholder ``reasoning_content``, which Moonshot requires on those
-      messages, because llmkit's tool messages carry none; that path is not
-      measured. The measured multi-turn loop ran with thinking off.
+    * **Thinking-on tool loops**: llmkit's assistant tool-call message carries
+      no ``reasoning_content``, which Moonshot requires on such messages from a
+      reasoning model; LiteLLM inserts a placeholder. A two-turn loop with
+      thinking on (an unforced first turn, then ``tool_choice="none"``)
+      answered from the tool result at litellm 1.104.0 and 1.109.1.
 
     An optional ``base_url`` points the provider at a Moonshot-compatible
     endpoint, such as Moonshot's China endpoint. ``api_base`` is **always**

@@ -197,7 +197,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reason otherwise. On Moonshot that applies to models LiteLLM marks as
   reasoning: a listed non-reasoning model (`moonshot-v1`) is sent nothing, and
   an unlisted model raises `ReasoningEffortUnsupportedError`, because LiteLLM
-  refuses the parameter on both. Alibaba pins structured output to
+  refuses the parameter on both. The default is unlisted in the maps bundled
+  with LiteLLM 1.104.0 and 1.106.6, so there, without LiteLLM's remote map,
+  the portable values raise on it. Alibaba pins structured output to
   `instructor.Mode.JSON_SCHEMA` without the strict upgrade; Moonshot pins
   `instructor.Mode.JSON`, because with thinking on `kimi-k2.6` ignored a
   `json_schema` response format, while `Mode.JSON` validated on the first
