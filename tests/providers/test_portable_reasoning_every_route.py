@@ -35,6 +35,8 @@ _KEY: dict[Provider, str | None] = {
     Provider.OPENAI: "k",
     Provider.DEEPSEEK: "k",
     Provider.CEREBRAS: "k",
+    Provider.MOONSHOT: "k",
+    Provider.ALIBABA: "k",
     Provider.BEDROCK: None,
     Provider.VERTEX: None,
 }
@@ -86,6 +88,17 @@ _DISABLE: dict[Provider, list[tuple[str | None, object]]] = {
         (None, _RAISES),  # gpt-oss-120b
         ("qwen-3.8-27b", _OFF_FLAT),
     ],
+    # Moonshot keeps thinking on a forwarded "disable"; QwenCloud rejects it.
+    # Both turn thinking off on "none". LiteLLM's Moonshot route refuses the
+    # parameter on a model its metadata lists without reasoning (omitted: it
+    # does not think) and on an unlisted model (raises before transport).
+    Provider.MOONSHOT: [
+        (None, _OFF_FLAT),  # kimi-k3.1-pro
+        ("kimi-k2.6", _OFF_FLAT),
+        ("moonshot-v1-8k", {}),
+        ("kimi-unlisted-9", _RAISES),
+    ],
+    Provider.ALIBABA: [(None, _OFF_FLAT), ("qwen-flash", _OFF_FLAT)],  # qwen3.7-plus
 }
 
 #: ``lowest`` on each route: off where the model can stop thinking, else its lowest effort.
@@ -127,6 +140,13 @@ _LOWEST: dict[Provider, list[tuple[str | None, object]]] = {
         (None, {"reasoning_effort": "low"}),
         ("qwen-3.8-27b", _OFF_FLAT),
     ],
+    Provider.MOONSHOT: [
+        (None, _OFF_FLAT),
+        ("kimi-k2.6", _OFF_FLAT),
+        ("moonshot-v1-8k", {}),
+        ("kimi-unlisted-9", _RAISES),
+    ],
+    Provider.ALIBABA: [(None, _OFF_FLAT), ("qwen-flash", _OFF_FLAT)],
 }
 
 
@@ -203,7 +223,16 @@ def test_lowest_sends_the_least_reasoning_the_route_supports(
     member: Provider, model: str | None, expected: object
 ) -> None:
     provider = _provider(member)
-    assert provider.reasoning_kwargs("lowest", model or provider.model) == expected
+    effective = model or provider.model
+    if expected == _RAISES:
+        # Only where nothing establishes the route's lowest effort (Moonshot's
+        # unlisted models); it is never sent blind.
+        with pytest.raises(ReasoningEffortUnsupportedError) as caught:
+            _ = provider.reasoning_kwargs("lowest", effective)
+        assert effective in str(caught.value)
+        assert not isinstance(caught.value, LLM_RECOVERABLE_ERRORS)
+        return
+    assert provider.reasoning_kwargs("lowest", effective) == expected
 
 
 def test_gemini_3_lowest_keeps_thought_summaries_off() -> None:

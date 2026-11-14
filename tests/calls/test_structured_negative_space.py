@@ -194,6 +194,8 @@ _PROVIDER_BUILDERS: dict[str, Callable[[], LLMProviderInterface]] = {
     Provider.BEDROCK.value: lambda: make_provider(Provider.BEDROCK, aws_region_name="us-east-1"),
     Provider.CEREBRAS.value: lambda: make_provider(Provider.CEREBRAS, api_key="k"),
     Provider.DEEPSEEK.value: lambda: make_provider(Provider.DEEPSEEK, api_key="k"),
+    Provider.MOONSHOT.value: lambda: make_provider(Provider.MOONSHOT, api_key="k"),
+    Provider.ALIBABA.value: lambda: make_provider(Provider.ALIBABA, api_key="k"),
     Provider.GOOGLE.value: lambda: make_provider(Provider.GOOGLE, api_key="k"),
     Provider.OLLAMA.value: lambda: make_provider(Provider.OLLAMA),
     Provider.OPENAI.value: lambda: make_provider(Provider.OPENAI, api_key="k"),

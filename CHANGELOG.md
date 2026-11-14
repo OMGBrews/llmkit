@@ -180,6 +180,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Moonshot and Alibaba are first-class providers.** `Provider.MOONSHOT`
+  (`MoonshotProvider`) calls Moonshot's Kimi models through LiteLLM's native
+  `moonshot/` route, defaulting to `kimi-k3.1-pro`; its key comes from
+  `MOONSHOT_API_KEY` and its endpoint from `base_url`, else
+  `MOONSHOT_API_BASE`, else `https://api.moonshot.ai/v1`. `Provider.ALIBABA`
+  (`AlibabaProvider`) calls the Qwen models on QwenCloud through LiteLLM's
+  native `qwencloud/` route, defaulting to `qwen3.7-plus`; its key comes from
+  `QWENCLOUD_API_KEY` and its endpoint from `base_url`, else
+  `QWENCLOUD_API_BASE`, else QwenCloud's Singapore pay-as-you-go endpoint,
+  `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1`.
+  QwenCloud keys are regional, so an account elsewhere sets its own region's
+  endpoint. Both accept only `api_key` and `base_url`, always send their
+  endpoint as `api_base`, and translate the portable `"disable"` and
+  `"lowest"` to `"none"`, which turns thinking off; both default models
+  reason otherwise. On Moonshot that applies to models LiteLLM marks as
+  reasoning: a listed non-reasoning model (`moonshot-v1`) is sent nothing, and
+  an unlisted model raises `ReasoningEffortUnsupportedError`, because LiteLLM
+  refuses the parameter on both. Alibaba pins structured output to
+  `instructor.Mode.JSON_SCHEMA` without the strict upgrade; Moonshot pins
+  `instructor.Mode.JSON`, because with thinking on `kimi-k2.6` ignored a
+  `json_schema` response format, while `Mode.JSON` validated on the first
+  attempt on `kimi-k2.6`, `kimi-k3` and `kimi-k3.1-pro`. Both are measured live on 2026-11-14 at LiteLLM 1.104.0,
+  1.106.6 and 1.109.1: structured output validates with thinking on and off, and both
+  streams report usage and a cost estimate. Limits measured on the same runs:
+  Moonshot answers a named `tool_choice` with a 400 while thinking is on, so a
+  call that names its tool needs `reasoning_effort="disable"`, and LiteLLM
+  turns its `"required"` into an appended user message rather than enforcing
+  it; Moonshot accepts a literal `"disable"` but keeps thinking, and QwenCloud
+  rejects a literal `"disable"` and `"max"` with a 400, which is why both are
+  translated. With thinking on, an Alibaba tool stream sent no prose before
+  its call. Tools plus a response schema were not measured on either, so
+  `output_schema=` on a tool call raises `ComposeUnsupportedError` there.
 - **Call records carry the requested and the served service tier.**
   `LLMCallRecord` gains `requested_service_tier` and `served_service_tier`,
   both `str | None` and defaulted, written in the YAML body and on the
@@ -397,8 +429,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other than its scheme's default (`Ollama (gpu-box:11434)`) and the URL path
   left out. That name is its rate-limit key, so each route has its own
   concurrency, RPM and TPM budgets, adaptive limit and circuit breaker. This
-  applies to the seven providers that accept a `base_url`: OpenAI, Anthropic,
-  Cerebras, DeepSeek, Google AI Studio, OpenRouter and Ollama. The provider's
+  applies to every provider that accepts a `base_url`: OpenAI, Anthropic,
+  Cerebras, DeepSeek, Google AI Studio, Moonshot, Alibaba, OpenRouter and
+  Ollama. The provider's
   own endpoint keeps the plain name, however the URL is spelled
   (`https://api.openai.com`, `https://api.openai.com:443/v1/`), and so does an
   endpoint set only by environment variable such as `OPENAI_BASE_URL`. Hosts

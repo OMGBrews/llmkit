@@ -1,6 +1,6 @@
 # llmkit
 
-A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
+A thin, opinionated, **local-first** layer over [LiteLLM](https://github.com/BerriAI/litellm) (with [instructor](https://github.com/567-labs/instructor) for structured output). It gives an application one provider-agnostic call surface across **OpenRouter, Google AI Studio, Gemini Enterprise Agent Platform (formerly Vertex AI), Anthropic, OpenAI, DeepSeek, Cerebras, Moonshot (Kimi), Alibaba (Qwen, via QwenCloud), AWS Bedrock, and local Ollama**, with validated structured output, per-provider rate limiting (concurrency on by default; optional requests-/tokens-per-minute), **agent-readable per-call logging**, and **transient-error retries on by default** — all out of the box — plus an opt-in, host-pluggable response cache.
 
 LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic call surface, the structured-output mode pinning, the rate-limit policy, and the logging convention. It is **not** a gateway and does not reimplement transport — that is solved, and reimplementing it is the thing this library deliberately does not do.
 
@@ -58,7 +58,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
 ## Why llmkit
 
 - **Structured output that actually validates.** Each provider is pinned to an explicit, live-measured structured-output mode (never instructor's auto-`Mode.TOOLS`, which silently regresses Gemini to empty shapes), and instructor's in-call validation-retry repairs malformed JSON. You pass a Pydantic model; you get a validated instance back. (Truncations, content filters and provider-reported failures receive their own errors before parsing; see [Retries](#retries).)
-- **Switching providers and models is easy.** OpenRouter / Google AI Studio / Google's Agent Platform / Anthropic / OpenAI / DeepSeek / Cerebras / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Switching the provider for a whole program is a config edit, and switching it for one call is one argument on that call, the same as switching the model, so comparing vendors in one program is an ordinary use. Call sites that do not care which vendor answers never name one. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Google's Agent Platform (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
+- **Switching providers and models is easy.** OpenRouter / Google AI Studio / Google's Agent Platform / Anthropic / OpenAI / DeepSeek / Cerebras / Moonshot / Alibaba / AWS Bedrock / Ollama behind one `Provider` enum and one `LLMClientConfig`. Switching the provider for a whole program is a config edit, and switching it for one call is one argument on that call, the same as switching the model, so comparing vendors in one program is an ordinary use. Call sites that do not care which vendor answers never name one. The same Gemini models are reachable two ways — AI Studio (a bearer key) or Google's Agent Platform (Google Cloud, with a `vertex_location` data-residency control) — just like Claude is reachable direct or via Bedrock.
 - **Logging tuned for coding agents.** Every call is logged verdict-first (see [Logging](#logging-agent-readable-by-default)) — the design assumption is that the reader is usually an LLM coding agent debugging a run, not a dashboard.
 - **Local-first, zero infra.** The default sink writes plain files to a directory. No collector, no account, no network. A pluggable `LogSink` lets you ship records anywhere later without touching call sites.
 
@@ -98,7 +98,7 @@ The supported OpenAI SDK range is `>=2.20.0,<3`;
 SDK 3 uses `httpx2` and is not yet supported by llmkit's error handling.
 
 The core install routes OpenRouter, Google AI Studio, Anthropic, OpenAI,
-DeepSeek, Cerebras, and Ollama with no extra dependencies. Two providers gate their
+DeepSeek, Cerebras, Moonshot, Alibaba, and Ollama with no extra dependencies. Two providers gate their
 dependencies behind opt-in extras so hosts pay only for what they call:
 
 ```bash
@@ -343,6 +343,8 @@ A lost native cannot be recovered by llmkit, although mapped
 | AWS Bedrock | Lost before llmkit | Lost before llmkit |
 | Ollama | Lost before llmkit | Lost before llmkit |
 
+The Moonshot and Alibaba routes have not been measured for native preservation.
+
 ```python
 from llmkit import OutputLimitError, text_llm_call
 
@@ -424,7 +426,10 @@ route whose provider does not support `tool_choice` — Ollama — accepts `"aut
 which is what it does anyway, and raises `ToolChoiceUnsupportedError` (an
 `LlmkitError` and a `ValueError`) for `"none"`, `"required"` and `ToolName(...)`
 before the first attempt, so no request is sent and no call record is written,
-rather than silently ignoring the setting.
+rather than silently ignoring the setting. Moonshot accepts `tool_choice` with
+two measured limits: `ToolName(...)` needs `reasoning_effort="disable"`, and
+`"required"` is a request rather than a guarantee (see
+[`MOONSHOT` and `ALIBABA`](#moonshot-and-alibaba)).
 
 ### Streaming a tool turn
 
@@ -472,8 +477,8 @@ Three differences from `tool_llm_call`, all deliberate:
 - **Usage is real, not null.** Like the plain text stream, this lane requests
   `stream_options={"include_usage": True}`, so `result.usage`, the log record's
   `usage`, and the token-rate limiter's debit are all populated. Measured on
-  Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio and DeepSeek, and on
-  Cerebras, whose LiteLLM route drops `stream_options` but which reports usage
+  Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Moonshot
+  and Alibaba, and on Cerebras, whose LiteLLM route drops `stream_options` but which reports usage
   on the stream regardless; Bedrock and Ollama are covered by the same code path
   but that measurement is still outstanding.
 
@@ -1004,7 +1009,7 @@ response: ...
 prompt: ...
 ```
 
-`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable or an error prevents metadata from returning; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `first_chunk_ms` is, for a streamed attempt, the time from the attempt's start to the first frame of any kind the provider sent, a role-only or reasoning frame included. It is measured like `duration_ms`, so it includes `queue_wait_ms`, and `first_chunk_ms - queue_wait_ms` is the provider's own time to first chunk. A stream that waited 100 seconds and then streamed for 2 reads `first_chunk_ms` near 100000 against a `duration_ms` near 102000. It is `null` on every buffered call, on a cache hit, and on a streamed attempt that received nothing, which is how a stream cut off before its first chunk reads. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on any truncated, filtered or provider-failed attempt that reported usage; attempts that received no usage write `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed, truncated, filtered or failed; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit`, `partial_text` and `native_finish_reason` are always present too. `output_limit` is `null` except on a truncation in any lane, when it holds the completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported). `partial_text` holds unfinished, filtered or failed text; buffered failures keep `response=null`, while streamed failures retain the transcript already delivered. `completion_tokens` may include reasoning tokens absent from the partial text, and `reasoning_tokens=0` can mean the provider did not break them out. `native_finish_reason` holds the provider's original reason wherever LiteLLM delivered it; `null` does not prove the provider omitted it. These fields stay outside `index.jsonl`: find failed attempts there by `error`, then open their YAML files. Truncation diagnostics are also on `OutputLimitError.diagnostics`; failed or filtered text and reasons are on `FinishReasonError`. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt (the bare type name when the exception has no message) and `null` for a clean one. A **cancelled** structured, text or tool attempt records `CancelledError` there, for instance when your own `asyncio.timeout` cancels the call, rather than the `null` that would make it indistinguishable from an attempt that succeeded and returned nothing. An attempt cut off by its [`timeout`](#per-request-timeout) records `TimeoutError: no provider response within <n>s` (a structured attempt records the same message inside `InstructorRetryException`), and a stream cut that way records the same rather than the abandoned-stream marker, which stays reserved for a stream your own code stopped consuming.
+`approximate_cost` is LiteLLM's per-response estimate for budget visibility — **not** a billing figure (and `None` when pricing is unavailable or an error prevents metadata from returning; `0.0` on a cache hit). `call_id` is one id per *logical* call and `attempt` the 1-based attempt within it, so the N records a retried call produces join on `call_id` — whether llmkit retried it or your own `with_retries` loop re-ran it (each pass rejoins the call it belongs to, matched by `feature`/`label`; a call from another task never joins). `duration_ms` measures the whole attempt **including** `queue_wait_ms` — the time spent queued behind llmkit's own rate limiter — so provider latency is approximately `duration_ms - queue_wait_ms` (hook time and in-call schema-repair re-asks are also inside `duration_ms`). `queue_wait_ms` is `float | None`, not always a float: it is `0.0` when the limiter is disabled and `None` when the attempt failed *before* acquiring a slot or was answered by the response cache (`cache_hit` tells the two apart), so a custom sink or `index.jsonl` parser has to handle the null rather than subtract it blindly. `first_chunk_ms` is, for a streamed attempt, the time from the attempt's start to the first frame of any kind the provider sent, a role-only or reasoning frame included. It is measured like `duration_ms`, so it includes `queue_wait_ms`, and `first_chunk_ms - queue_wait_ms` is the provider's own time to first chunk. A stream that waited 100 seconds and then streamed for 2 reads `first_chunk_ms` near 100000 against a `duration_ms` near 102000. It is `null` on every buffered call, on a cache hit, and on a streamed attempt that received nothing, which is how a stream cut off before its first chunk reads. `temperature` is the same kind of field: a call that sent no temperature (the default, `temperature=None`, or a value the model refused and llmkit omitted) records as `null`, so a typed custom sink reading `record.temperature` must handle `None` (a `float` format spec, for instance, will raise). `tools`, `tool_calls`, and `usage` are always present. The tool lanes fill `tools` and `tool_calls` with the offered tools and the returned calls, and every other call writes `null`. `usage` is the provider's own `prompt_tokens`, `completion_tokens` and `total_tokens` (each `null` when not reported) on every lane: it is filled on each successful provider attempt (a cache hit spent no tokens and writes `null`), on a structured or text attempt whose result your `on_result` hook rejected, and on any truncated, filtered or provider-failed attempt that reported usage; attempts that received no usage write `null`. Both streams, `text_llm_call_stream` and `tool_llm_call_stream` (and their sync forms), ask the provider for usage and fill it on every attempt that runs out, completed, truncated, filtered or failed; an abandoned stream writes `null`. The text stream's usage is measured on Google's Agent Platform, Anthropic, OpenAI, OpenRouter, Google AI Studio, DeepSeek, Cerebras, Moonshot, Alibaba and Ollama; the Bedrock measurement is still outstanding. At stream end, `approximate_cost` uses a provider-reported cost or LiteLLM's calculator over the reported token counts, including cached-token details. Unmapped models and nonlocal zero-price table placeholders record `null`; local Ollama streams record `0.0`. Pricing failures never fail the stream. `output_limit`, `partial_text` and `native_finish_reason` are always present too. `output_limit` is `null` except on a truncation in any lane, when it holds the completion's `finish_reason`, `prompt_tokens`, `completion_tokens`, `total_tokens` and `reasoning_tokens` (each `null` when not reported). `partial_text` holds unfinished, filtered or failed text; buffered failures keep `response=null`, while streamed failures retain the transcript already delivered. `completion_tokens` may include reasoning tokens absent from the partial text, and `reasoning_tokens=0` can mean the provider did not break them out. `native_finish_reason` holds the provider's original reason wherever LiteLLM delivered it; `null` does not prove the provider omitted it. These fields stay outside `index.jsonl`: find failed attempts there by `error`, then open their YAML files. Truncation diagnostics are also on `OutputLimitError.diagnostics`; failed or filtered text and reasons are on `FinishReasonError`. `cache_hit` is `true` when the [response cache](#response-cache) answered the call instead of a provider, and `source_call_id` then names the paid call whose answer it returned (`null` otherwise); `index.jsonl` carries `cache_hit` but not `source_call_id`. `run_id` is the *outer* scope `call_id` does not give you — see below — and is `null` unless you set one. `error` is `"<ExceptionType>: <message>"` for a failed attempt (the bare type name when the exception has no message) and `null` for a clean one. A **cancelled** structured, text or tool attempt records `CancelledError` there, for instance when your own `asyncio.timeout` cancels the call, rather than the `null` that would make it indistinguishable from an attempt that succeeded and returned nothing. An attempt cut off by its [`timeout`](#per-request-timeout) records `TimeoutError: no provider response within <n>s` (a structured attempt records the same message inside `InstructorRetryException`), and a stream cut that way records the same rather than the abandoned-stream marker, which stays reserved for a stream your own code stopped consuming.
 
 `requested_service_tier` and `served_service_tier` are always present, in the YAML body and on the `index.jsonl` line. The requested tier is the top-level `service_tier` your provider's `completion_kwargs()` returns — llmkit has no request setting for it — and `null` when it returns none or the attempt failed before building a request; a value nested in `extra_body` is not read. It is what you asked for, not necessarily what was sent: LiteLLM may rewrite or drop it on the wire (for Anthropic models it sends `default` as `standard_only`, and it drops the key on routes that reject it, such as Vertex AI). The served tier is what the provider reported serving on the attempt's last response, or on the last stream frame that reported one, as LiteLLM delivered it and unmapped by llmkit: the response's `service_tier`, else its usage block's `service_tier`, else Google's `trafficType` (`ON_DEMAND` and the like). A failed attempt that received a response records it too. `null` means no tier reached llmkit, never that the requested tier was served, so a silent response is distinguishable from one that confirmed the tier you asked for. The two compare only where the provider answers in the request's vocabulary: Google's traffic type never equals a requested tier name. Request settings otherwise stay out of the index; the requested tier is there as the served tier's comparison key, so one scan finds every call that did not confirm the tier it asked for:
 
@@ -1371,7 +1376,7 @@ A store owes llmkit two things beyond the two methods: it bounds its own I/O, an
 ```python
 @dataclass(frozen=True)
 class LLMClientConfig:
-    provider: Provider               # a member: OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS
+    provider: Provider               # a member: OPENROUTER | OLLAMA | GOOGLE | ANTHROPIC | OPENAI | DEEPSEEK | BEDROCK | VERTEX | CEREBRAS | MOONSHOT | ALIBABA
     model: str | None = None         # None -> the provider's own default model
     api_key: str | None = None       # bearer providers only; masked in repr; else the provider env var, else raises
     base_url: str | None = None      # endpoint: config, else the provider's env var if it reads one, else its default if it has one (sent as api_base; see below); not accepted by Bedrock or Google's Agent Platform
@@ -1396,6 +1401,8 @@ list; *(none)* marks OpenRouter's own row and Ollama's local model:
 | `OPENAI` | `gpt-4.1-mini` | `openai/gpt-4.1-mini` |
 | `DEEPSEEK` | `deepseek-chat` | `deepseek/deepseek-chat` |
 | `CEREBRAS` | `gpt-oss-120b` | `openai/gpt-oss-120b` |
+| `MOONSHOT` | `kimi-k3.1-pro` | `moonshotai/kimi-k3.1-pro` |
+| `ALIBABA` | `qwen3.7-plus` | `qwen/qwen3.7-plus` |
 | `BEDROCK` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | `anthropic/claude-haiku-4.5` |
 | `OLLAMA` | `llama3.2` | *(none)* |
 
@@ -1443,6 +1450,8 @@ fallback to an ambient key:
 | `DEEPSEEK` | `DEEPSEEK_API_KEY` |
 | `GOOGLE` (AI Studio) | `GEMINI_API_KEY` |
 | `CEREBRAS` | `CEREBRAS_API_KEY` |
+| `MOONSHOT` | `MOONSHOT_API_KEY` |
+| `ALIBABA` (QwenCloud) | `QWENCLOUD_API_KEY` |
 
 `OLLAMA` needs no key; `BEDROCK` and `VERTEX` authenticate through their ambient
 AWS / Google credential chains ([see below](#bedrock-and-vertex-do-not-own-their-endpoints)), so none of the three accepts an
@@ -1470,6 +1479,8 @@ the host's `.env` had not been read into yet.
 | `OPENAI` | `OPENAI_BASE_URL`, then `OPENAI_API_BASE` | `https://api.openai.com/v1` |
 | `DEEPSEEK` | `DEEPSEEK_API_BASE` | `https://api.deepseek.com/beta` |
 | `CEREBRAS` | `CEREBRAS_API_BASE` | `https://api.cerebras.ai/v1` |
+| `MOONSHOT` | `MOONSHOT_API_BASE` | `https://api.moonshot.ai/v1` |
+| `ALIBABA` (QwenCloud) | `QWENCLOUD_API_BASE` | `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1` (Singapore) |
 | `GOOGLE` (AI Studio) | `GEMINI_API_BASE` | *(none — LiteLLM picks, see below)* |
 | `OLLAMA` | *(none)* | `http://localhost:11434` |
 | `BEDROCK` | `AWS_BEDROCK_RUNTIME_ENDPOINT` — read by **LiteLLM**, not llmkit | derived from `aws_region_name` by LiteLLM |
@@ -1501,7 +1512,7 @@ endpoint can still come from a source llmkit does not read — notably the
 
 **llmkit reads the listed variables itself**, in the order shown (LiteLLM's own
 measured precedence), so a host can point its endpoint with one of them. The
-resolution is *closed* for `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, `CEREBRAS`, and a `GOOGLE`
+resolution is *closed* for `OPENAI`, `ANTHROPIC`, `DEEPSEEK`, `CEREBRAS`, `MOONSHOT`, `ALIBABA`, and a `GOOGLE`
 that has a `base_url` or `GEMINI_API_BASE`: for those, sources llmkit does not
 read cannot choose the endpoint — the `litellm.api_base` module global, a
 LiteLLM key-management backend serving one of these names, or an alias some
@@ -1525,6 +1536,52 @@ closing it would mean reaching into a dependency's globals.
 already named their endpoint in every configuration (a default that is a real
 URL, overridable via `base_url`), so honouring extra variables would widen the
 ambient surface for no gain.
+
+### `MOONSHOT` and `ALIBABA`
+
+Both call the vendor's OpenAI-compatible API directly, through LiteLLM's native
+`moonshot/` and `qwencloud/` routes, on a first-party key. Alibaba pins structured
+output to `instructor.Mode.JSON_SCHEMA` without the strict upgrade. Moonshot pins
+`instructor.Mode.JSON` (a JSON-object response format with the schema in the
+prompt, validated locally), because Moonshot does not reliably enforce a JSON
+schema: with thinking on, `kimi-k2.6` answered requests carrying one with fenced
+JSON under other keys, while `Mode.JSON` validated on the first attempt on
+`kimi-k2.6`, `kimi-k3` and `kimi-k3.1-pro`. Both default models reason unless
+told not to. Measured live on 2026-11-14 against
+litellm 1.104.0 (the floor), 1.106.6 and 1.109.1, on the default models:
+
+- **Moonshot (Kimi)** reads `MOONSHOT_API_KEY` (keys from
+  [platform.kimi.ai](https://platform.kimi.ai)) and `MOONSHOT_API_BASE`, else
+  `https://api.moonshot.ai/v1`; a `base_url` such as Moonshot's China endpoint
+  reports its host in the route name (`Moonshot (api.moonshot.cn)`). **A named
+  `tool_choice` needs thinking off**: with thinking on, the default and at
+  `"low"` too, Moonshot answers a 400 (`tool_choice 'specified' is incompatible
+  with thinking enabled`). llmkit does not turn thinking off for you, which would
+  change what the call does; pass `reasoning_effort="disable"` on a call that
+  names its tool. `"required"` is not enforced: LiteLLM removes it and appends a
+  user message asking the model to pick a tool. An unforced turn, `"none"` and
+  nested tool schemas work, and a streamed tool turn interleaves prose and the
+  call.
+- **Alibaba (Qwen, via QwenCloud)** reads `QWENCLOUD_API_KEY` (keys from
+  [qwencloud.com](https://www.qwencloud.com)) and `QWENCLOUD_API_BASE`, else
+  QwenCloud's Singapore pay-as-you-go endpoint,
+  `https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1`. **Keys are
+  regional**: an account in another region sets `base_url` or
+  `QWENCLOUD_API_BASE` to its own region's endpoint. llmkit always sends an
+  endpoint and a key, so LiteLLM's own `qwencloud/` default
+  (`dashscope-intl.aliyuncs.com`) and its `DASHSCOPE_API_KEY` fallback are never
+  reached. An unforced turn, a named `tool_choice`, `"required"`, `"none"` and
+  nested tool schemas all work with thinking on. **With thinking on, a streamed
+  tool turn sent no prose before its call** (observed twice), so a chat panel
+  gets nothing to render until the call arrives; with thinking off, prose and
+  the call interleaved.
+
+Tools plus a response schema in one request were measured on neither, so
+`compose_tools_schema` is off and `output_schema=` on a tool call raises
+`ComposeUnsupportedError`; use the [two-step pattern](#tool-calls-with-a-structured-final-answer).
+Both report usage on the text and tool streams, and their cost estimates come
+from LiteLLM's cost map, which prices `qwen3.7-plus` by token tier. Their
+`reasoning_effort` translation is listed per route with the others, below.
 
 ### `BEDROCK` and `VERTEX` do not own their endpoints
 
@@ -1629,6 +1686,8 @@ Two portable values are translated per route. **`"disable"`** means thinking off
 - **OpenAI.** `"disable"` omits the reasoning parameter for known non-reasoning models (including the default `gpt-4.1-mini`) and sends `"none"` where model capabilities establish support (for example, `gpt-5.1`). If the model cannot disable reasoning or its capabilities are unknown, it raises. `"lowest"` follows the same capability lookup; where off is unsupported it sends `"minimal"` or `"low"` when the model's metadata flags one (for example, `"minimal"` on `gpt-5`), and it raises everywhere else `"disable"` raises, so nothing is sent blind. For unknown capabilities, choose a provider-native effort value explicitly. Other OpenAI effort values pass through without capability lookup.
 - **Cerebras.** `"disable"` sends `"none"`, and raises on gpt-oss models (including the default `gpt-oss-120b`), which cannot turn reasoning off; `"lowest"` sends `"low"` on gpt-oss and `"none"` elsewhere. Reasoning tokens count against `max_tokens` on both served models.
 - **DeepSeek.** Both values send `"none"`, which turns thinking off on `deepseek-chat` and `deepseek-reasoner` alike.
+- **Moonshot.** Both values send `"none"` on models LiteLLM marks as reasoning (including the default `kimi-k3.1-pro`), which turns thinking off. Moonshot accepts a literal `"disable"` but keeps thinking, so llmkit never forwards it unchanged. LiteLLM refuses `reasoning_effort` on any other Moonshot model before sending, so on a model its metadata lists without reasoning (the `moonshot-v1` family) both values send nothing, since that model does not think, and on a model the metadata does not list they raise. Other values pass through; `"minimal"`, `"low"`, `"medium"`, `"high"` and `"max"` were accepted.
+- **Alibaba.** Both values send `"none"`, which turns thinking off. QwenCloud accepts `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"` and `"xhigh"` and rejects anything else with a 400, a literal `"disable"` and `"max"` included; other values pass through for QwenCloud to accept or reject.
 - **Ollama.** `"disable"` raises on gpt-oss models, which cannot turn reasoning off; on every other model llmkit sends the server's off control (`think: false`). The server is the authority there, and a model that cannot stop thinking may ignore it: `deepseek-r1:8b` returned reasoning with `think: false` (measured 2026-11-02). `"lowest"` sends `"low"` on gpt-oss and the off control elsewhere.
 - **Third-party providers** that do not override `reasoning_kwargs` are not made strict: `"disable"` reaches LiteLLM unchanged, and `"lowest"` is sent as `"disable"`.
 

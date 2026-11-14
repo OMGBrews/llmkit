@@ -238,7 +238,7 @@ def resolve_base_url(
     would be a blocklist against an unversioned dependency; returning a value the
     caller's provider then always sends is closed instead, because an explicit
     ``api_base`` outranks every other entry in the chains of the routes this
-    serves (Anthropic, Cerebras, DeepSeek, Google AI Studio, OpenAI). (Ollama's
+    serves (Alibaba, Anthropic, Cerebras, DeepSeek, Google AI Studio, Moonshot, OpenAI). (Ollama's
     chain is inverted and is *not* one of them — see
     :class:`~llmkit.providers.ollama.OllamaProvider`.)
 
@@ -364,6 +364,8 @@ class Provider(StrEnum):
     BEDROCK = "bedrock"
     VERTEX = "vertex"
     CEREBRAS = "cerebras"
+    MOONSHOT = "moonshot"
+    ALIBABA = "alibaba"
 
     @classmethod
     @override
@@ -395,15 +397,16 @@ class LLMClientConfig:
     the selected provider does **not** read is rejected at
     :func:`~llmkit.providers.build_provider`, not silently ignored (each provider declares the
     knobs it honours; see ``_accepted_config_fields``). ``api_key`` is a bearer credential for the
-    key-authenticated providers (OpenRouter, OpenAI, Anthropic, Google, DeepSeek, Cerebras); it
+    key-authenticated providers (OpenRouter, OpenAI, Anthropic, Google, DeepSeek, Cerebras,
+    Moonshot, Alibaba); it
     resolves from this value, else the provider's environment variable (``ANTHROPIC_API_KEY`` and
     friends), else the provider raises at construction. It is not accepted by Ollama (local) or
     Bedrock or Google's Agent Platform (ambient AWS/Google chains). The credential is masked in
     this config's ``repr`` — a set key shows as ``api_key=<redacted>`` — so a stray ``print`` or
     traceback never leaks it. ``base_url`` sets the endpoint for the key-authenticated providers
     and Ollama, and llmkit, not LiteLLM's own chain, decides it (readable from
-    ``completion_kwargs()``). Anthropic, OpenAI, DeepSeek, Cerebras and Google AI Studio resolve
-    it per call from this value, else the provider's own endpoint variable(s)
+    ``completion_kwargs()``). Anthropic, OpenAI, DeepSeek, Cerebras, Moonshot, Alibaba and Google
+    AI Studio resolve it per call from this value, else the provider's own endpoint variable(s)
     (``OPENAI_BASE_URL`` / ``OPENAI_API_BASE``, ``ANTHROPIC_API_BASE``, ``GEMINI_API_BASE`` and
     friends), else a measured default (see :func:`resolve_base_url`). Google AI Studio has no
     default: with neither this value nor ``GEMINI_API_BASE`` set it sends no ``api_base`` and lets
@@ -732,7 +735,7 @@ class BaseProvider(ABC):
     #: advisory — weak models then drift (measured: the schema echoed back with values nested
     #: inside ``properties``). A provider trait, not a global: providers whose enforcement was
     #: measured fine without it (OpenAI, Anthropic, Bedrock, Google, Ollama, Google's Agent
-    #: Platform, Cerebras) keep their measured wire shape untouched. Exposed via the
+    #: Platform, Cerebras, Alibaba) keep their measured wire shape untouched. Exposed via the
     #: ``strict_json_schema`` property (the ``_mode`` → ``instructor_mode`` pattern).
     _strict_json_schema: ClassVar[bool] = False
     #: Whether structured requests send ``parallel_tool_calls=False`` so the

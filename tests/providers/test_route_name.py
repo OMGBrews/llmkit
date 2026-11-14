@@ -1,11 +1,12 @@
 """A provider built with an explicit non-default ``base_url`` reports a route name.
 
 ``BaseProvider.name`` is the rate-limit key and the ``provider`` value in call
-records. Each of the seven classes that accept a ``base_url`` reports its plain
-provider name on its own endpoint and ``"<name> (<host>)"`` on any other, so a
-compatible endpoint reached through a provider's class (Moonshot through
-``OpenAIProvider``, a proxy in front of Anthropic, a remote Ollama server) is
-limited and logged apart from the provider itself.
+records. Each class that accepts a ``base_url`` (the ``_ROUTES`` table below,
+checked against every ``Provider`` member) reports its plain provider name on its
+own endpoint and ``"<name> (<host>)"`` on any other, so a compatible endpoint
+reached through another provider's class (Moonshot through ``OpenAIProvider``, a
+proxy in front of Anthropic, a remote Ollama server) is limited and logged apart
+from the provider itself.
 
 Only a ``base_url`` passed at construction counts: an endpoint taken from an
 environment variable keeps the plain name. The limiter-side consequences
@@ -21,12 +22,14 @@ import pytest
 
 from llmkit import capture_llm_records, text_llm_call
 from llmkit.providers import (
+    AlibabaProvider,
     AnthropicProvider,
     BaseProvider,
     CerebrasProvider,
     DeepSeekProvider,
     GoogleProvider,
     LLMClientConfig,
+    MoonshotProvider,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
@@ -62,6 +65,13 @@ _ROUTES = [
         ("ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"),
     ),
     _Route(Provider.CEREBRAS, "Cerebras", "https://api.cerebras.ai/v1", ("CEREBRAS_API_BASE",)),
+    _Route(Provider.MOONSHOT, "Moonshot", "https://api.moonshot.ai/v1", ("MOONSHOT_API_BASE",)),
+    _Route(
+        Provider.ALIBABA,
+        "Alibaba",
+        "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1",
+        ("QWENCLOUD_API_BASE",),
+    ),
     _Route(Provider.DEEPSEEK, "DeepSeek", "https://api.deepseek.com/beta", ("DEEPSEEK_API_BASE",)),
     _Route(Provider.GOOGLE, "Google AI Studio", None, ("GEMINI_API_BASE",)),
     _Route(Provider.OPENROUTER, "OpenRouter", "https://openrouter.ai/api/v1", ()),
@@ -70,7 +80,7 @@ _ROUTES = [
 _ROUTE_IDS = [str(route.member) for route in _ROUTES]
 _ALL_ENV_VARS = [env_var for route in _ROUTES for env_var in route.env_vars]
 
-_seven = pytest.mark.parametrize("route", _ROUTES, ids=_ROUTE_IDS)
+_every_route = pytest.mark.parametrize("route", _ROUTES, ids=_ROUTE_IDS)
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +98,7 @@ def _build(route: _Route, base_url: str | None = None) -> BaseProvider:
 
 
 def test_the_table_covers_every_class_that_accepts_base_url() -> None:
-    """The seven routes above are exactly the providers whose config reads ``base_url``."""
+    """The routes above are exactly the providers whose config reads ``base_url``."""
     accepting = {
         member
         for member in Provider
@@ -107,12 +117,12 @@ def _build_any(member: Provider) -> BaseProvider:
     return make_provider(member, api_key="k")
 
 
-@_seven
+@_every_route
 def test_no_base_url_keeps_the_plain_name(route: _Route) -> None:
     assert _build(route).name == route.name
 
 
-@_seven
+@_every_route
 def test_the_declared_default_is_the_endpoint_the_provider_sends(route: _Route) -> None:
     """The endpoint ``name`` compares against is the one a default build calls."""
     provider = _build(route)
@@ -120,7 +130,7 @@ def test_the_declared_default_is_the_endpoint_the_provider_sends(route: _Route) 
     assert provider.completion_kwargs().get("api_base") == route.default_base_url
 
 
-@_seven
+@_every_route
 def test_an_explicit_default_endpoint_keeps_the_plain_name(route: _Route) -> None:
     """The default passed explicitly, in any spelling of its host and port, is the same route."""
     if route.default_base_url is None:
@@ -140,7 +150,7 @@ def test_an_explicit_default_endpoint_keeps_the_plain_name(route: _Route) -> Non
         assert _build(route, base_url).name == route.name, base_url
 
 
-@_seven
+@_every_route
 def test_another_host_gets_a_route_name(route: _Route) -> None:
     """A different host is a different route; the URL path is left out of its name."""
     provider = _build(route, "https://Gateway.Example/v1/chat")
@@ -148,7 +158,7 @@ def test_another_host_gets_a_route_name(route: _Route) -> None:
     assert provider.completion_kwargs()["api_base"] == "https://Gateway.Example/v1/chat"
 
 
-@_seven
+@_every_route
 def test_a_port_in_the_url_is_part_of_the_route_name(route: _Route) -> None:
     assert _build(route, "http://gateway.example:8080/v1").name == (
         f"{route.name} (gateway.example:8080)"
@@ -158,7 +168,7 @@ def test_a_port_in_the_url_is_part_of_the_route_name(route: _Route) -> None:
     assert _build(route, "http://gateway.example:80/v1").name == f"{route.name} (gateway.example)"
 
 
-@_seven
+@_every_route
 def test_the_default_host_on_another_port_is_a_different_route(route: _Route) -> None:
     if route.default_base_url is None:
         pytest.skip("Google AI Studio has no default endpoint")
@@ -167,7 +177,7 @@ def test_the_default_host_on_another_port_is_a_different_route(route: _Route) ->
     assert _build(route, f"{scheme}://{host}:8443/v1").name == f"{route.name} ({host}:8443)"
 
 
-@_seven
+@_every_route
 def test_an_endpoint_set_only_by_environment_keeps_the_plain_name(
     route: _Route, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -182,7 +192,7 @@ def test_an_endpoint_set_only_by_environment_keeps_the_plain_name(
         monkeypatch.delenv(env_var)
 
 
-@_seven
+@_every_route
 def test_the_member_names_the_default_endpoint(route: _Route) -> None:
     """``display_name`` and the member's name stay the class constant on any instance."""
     provider = _build(route, "https://gateway.example/v1")
@@ -190,7 +200,7 @@ def test_the_member_names_the_default_endpoint(route: _Route) -> None:
     assert provider_display_name(route.member) == route.name
 
 
-@_seven
+@_every_route
 def test_describe_llm_reports_the_route_name(route: _Route) -> None:
     assert describe_llm(provider=_build(route)).provider_name == route.name
     info = describe_llm(provider=_build(route, "https://gateway.example/v1"))
@@ -198,7 +208,7 @@ def test_describe_llm_reports_the_route_name(route: _Route) -> None:
     assert info.provider is route.member
 
 
-@_seven
+@_every_route
 async def test_a_call_is_logged_under_the_route_name(route: _Route) -> None:
     """The call record's ``provider`` and the fake's request both carry the route name."""
     provider = _build(route, "https://gateway.example/v1")
@@ -210,13 +220,26 @@ async def test_a_call_is_logged_under_the_route_name(route: _Route) -> None:
     assert [request.provider for request in installed.requests] == expected
 
 
-def test_openai_class_pointed_at_moonshot_and_cerebras() -> None:
+def test_openai_class_pointed_at_compatible_vendors() -> None:
     """The cases the change exists for: compatible endpoints through the OpenAI class."""
     moonshot = OpenAIProvider(api_key="k", base_url="https://api.moonshot.ai/v1")
     cerebras = OpenAIProvider(api_key="k", base_url="https://api.cerebras.ai/v1")
     assert moonshot.name == "OpenAI (api.moonshot.ai)"
     assert cerebras.name == "OpenAI (api.cerebras.ai)"
     assert CerebrasProvider(api_key="k").name == "Cerebras"
+    assert MoonshotProvider(api_key="k").name == "Moonshot"
+    qwencloud = OpenAIProvider(
+        api_key="k", base_url="https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1"
+    )
+    assert qwencloud.name == "OpenAI (ap-southeast-1.maas.qwencloudapi.com)"
+    assert AlibabaProvider(api_key="k").name == "Alibaba"
+
+
+def test_moonshot_china_endpoint_is_its_own_route() -> None:
+    """Moonshot's China endpoint, reached through its own class, is limited apart."""
+    china = MoonshotProvider(api_key="k", base_url="https://api.moonshot.cn/v1")
+    assert china.name == "Moonshot (api.moonshot.cn)"
+    assert MoonshotProvider(api_key="k", base_url="https://api.moonshot.ai/v1").name == "Moonshot"
 
 
 def test_deepseek_host_without_the_beta_path_is_the_default_route() -> None:

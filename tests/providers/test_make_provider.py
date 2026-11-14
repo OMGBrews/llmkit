@@ -137,7 +137,14 @@ def test_make_provider_openai_no_base_url_uses_library_default(
 
 @pytest.mark.parametrize(
     "provider_enum",
-    [Provider.ANTHROPIC, Provider.GOOGLE, Provider.DEEPSEEK, Provider.CEREBRAS],
+    [
+        Provider.ANTHROPIC,
+        Provider.GOOGLE,
+        Provider.DEEPSEEK,
+        Provider.CEREBRAS,
+        Provider.MOONSHOT,
+        Provider.ALIBABA,
+    ],
 )
 def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) -> None:
     """A ``base_url`` reaches LiteLLM as ``api_base`` — never silently dropped.
@@ -146,8 +153,9 @@ def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) ->
     "endpoints are fixed" rationale, so a gateway-routed config silently sent
     every request to the public endpoint — a data-egress surprise for exactly
     the users who set an endpoint override. LiteLLM accepts ``api_base`` on
-    the ``anthropic/`` / ``gemini/`` / ``deepseek/`` / ``cerebras/`` routes, so
-    the override must land on the wire kwargs.
+    the ``anthropic/`` / ``gemini/`` / ``deepseek/`` / ``cerebras/`` /
+    ``moonshot/`` / ``qwencloud/`` routes, so the override must land on the
+    wire kwargs.
     """
     provider = make_provider(
         provider_enum, api_key="sk-test", base_url="https://gateway.example/v1"
@@ -168,6 +176,12 @@ def test_make_provider_forwards_base_url_as_api_base(provider_enum: Provider) ->
         ),
         (Provider.DEEPSEEK, "https://api.deepseek.com/beta", ("DEEPSEEK_API_BASE",)),
         (Provider.CEREBRAS, "https://api.cerebras.ai/v1", ("CEREBRAS_API_BASE",)),
+        (Provider.MOONSHOT, "https://api.moonshot.ai/v1", ("MOONSHOT_API_BASE",)),
+        (
+            Provider.ALIBABA,
+            "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1",
+            ("QWENCLOUD_API_BASE",),
+        ),
     ],
 )
 def test_make_provider_no_base_url_uses_library_default_api_base(
@@ -180,14 +194,19 @@ def test_make_provider_no_base_url_uses_library_default_api_base(
 
     This used to assert the opposite — that these providers leave the endpoint
     unset so LiteLLM uses each provider's real default. llmkit now names that
-    same endpoint itself, measured byte-for-byte off the wire against LiteLLM
-    1.92.0, so the request is unchanged but the *choice* is owned here and
+    same endpoint itself, measured byte-for-byte off the wire (against LiteLLM
+    1.92.0 for Anthropic and DeepSeek; the later providers' measurements are
+    recorded in ``tests/providers/test_endpoint_routing.py``), so the request is
+    unchanged but the *choice* is owned here and
     readable off ``completion_kwargs()`` instead of being inferred from a
     dependency's internal chain. The practical gain is closure: a source llmkit
     does not read — the ``litellm.api_base`` module global, a LiteLLM
     key-management backend serving these names, an alias a future release adds —
     can no longer select the endpoint, without llmkit maintaining a blocklist
-    against an unversioned dependency.
+    against an unversioned dependency. Alibaba is the exception to "the request
+    is unchanged": its default is QwenCloud's Singapore endpoint, not the
+    ``dashscope-intl.aliyuncs.com`` endpoint LiteLLM's ``qwencloud/`` route picks
+    with nothing configured.
 
     Each provider's documented aliases still select the endpoint when set (that
     fallback is kept on purpose: deleting it would silently redirect hosts that
@@ -263,6 +282,8 @@ def test_make_provider_bedrock_eager_sdk_checks_pass_in_dev_env() -> None:
         (Provider.BEDROCK, "bedrock/", "us.anthropic.claude-haiku-4-5-20251001-v1:0", None),
         (Provider.VERTEX, "vertex_ai/", "gemini-3.1-flash-lite", None),
         (Provider.CEREBRAS, "cerebras/", "gpt-oss-120b", "k"),
+        (Provider.MOONSHOT, "moonshot/", "kimi-k3.1-pro", "k"),
+        (Provider.ALIBABA, "qwencloud/", "qwen3.7-plus", "k"),
     ],
 )
 def test_make_provider_none_model_uses_provider_default(

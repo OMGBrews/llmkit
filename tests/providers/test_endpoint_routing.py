@@ -38,8 +38,9 @@ because its base carries a model-derived API version — see
 An explicit ``api_base`` outranks every other entry in the chains of the routes
 this covers, so sending one makes the endpoint llmkit's decision. What that
 *removes* is every source llmkit does not read — the module global, the
-secret-manager backend, future aliases — for OpenAI, Anthropic, DeepSeek and
-Cerebras (added later, on the same pattern from the start).
+secret-manager backend, future aliases — for OpenAI, Anthropic, DeepSeek,
+Cerebras, Moonshot and Alibaba (the last three added later, on the same pattern
+from the start).
 Google keeps that exposure in the one case where it sends nothing (no
 ``base_url``, no ``GEMINI_API_BASE``), and Ollama keeps it always, its chain
 being inverted; both are documented carve-outs, not silent ones.
@@ -53,7 +54,9 @@ steers — by llmkit's own decision, observable in ``completion_kwargs()`` — a
 the tests below assert exactly that, rather than pretending otherwise.
 
 The literals below were measured on the wire against litellm 1.92.0 on
-2026-07-21 (Cerebras's against litellm 1.106.2 on 2026-10-22), not read out of
+2026-07-21 (Cerebras's against litellm 1.106.2 on 2026-10-22; Moonshot's and
+Alibaba's at this transport seam against litellm 1.104.0, 1.106.6 and 1.109.1
+on 2026-11-14), not read out of
 LiteLLM's source: each provider's route derives its
 URL differently. Anthropic appends its own ``/v1``, so a default pinned to
 ``https://api.anthropic.com/v1`` yields ``/v1/v1/messages``. Gemini's version
@@ -103,11 +106,13 @@ _ALL_ENDPOINT_ENV_VARS: Final[tuple[str, ...]] = (
     "GEMINI_API_BASE",
     "DEEPSEEK_API_BASE",
     "CEREBRAS_API_BASE",
+    "MOONSHOT_API_BASE",
+    "QWENCLOUD_API_BASE",
 )
 
 #: The measured base each provider's route resolves when nothing else names one.
-#: For OpenAI, Anthropic, DeepSeek and Cerebras these are the values the providers'
-#: ``_DEFAULT_BASE_URL`` constants must reproduce exactly. **Google's entry is
+#: For OpenAI, Anthropic, DeepSeek, Cerebras, Moonshot and Alibaba these are the
+#: values the providers' ``_DEFAULT_BASE_URL`` constants must reproduce exactly. **Google's entry is
 #: not a library constant** — that provider owns no default; it is recorded here
 #: only as the base LiteLLM happens to derive for the *default* model, which is
 #: what ``_MEASURED_DEFAULT_URL`` asserts against.
@@ -117,6 +122,8 @@ _MEASURED_DEFAULT_BASE: Final[dict[Provider, str]] = {
     Provider.GOOGLE: "https://generativelanguage.googleapis.com/v1alpha",
     Provider.DEEPSEEK: "https://api.deepseek.com/beta",
     Provider.CEREBRAS: "https://api.cerebras.ai/v1",
+    Provider.MOONSHOT: "https://api.moonshot.ai/v1",
+    Provider.ALIBABA: "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1",
 }
 
 #: The full request URL each provider's route builds from that default — path
@@ -132,6 +139,10 @@ _MEASURED_DEFAULT_URL: Final[dict[Provider, str]] = {
     ),
     Provider.DEEPSEEK: "https://api.deepseek.com/beta/chat/completions",
     Provider.CEREBRAS: "https://api.cerebras.ai/v1/chat/completions",
+    Provider.MOONSHOT: "https://api.moonshot.ai/v1/chat/completions",
+    Provider.ALIBABA: (
+        "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
+    ),
 }
 
 #: (provider, endpoint env var) for every alias each provider's LiteLLM route
@@ -149,6 +160,8 @@ _ALIAS_PAIRS: Final[tuple[tuple[Provider, str], ...]] = (
     (Provider.GOOGLE, "GEMINI_API_BASE"),
     (Provider.DEEPSEEK, "DEEPSEEK_API_BASE"),
     (Provider.CEREBRAS, "CEREBRAS_API_BASE"),
+    (Provider.MOONSHOT, "MOONSHOT_API_BASE"),
+    (Provider.ALIBABA, "QWENCLOUD_API_BASE"),
 )
 
 #: A host that cannot resolve (RFC 6761 reserves ``.invalid``), standing in for
@@ -270,7 +283,15 @@ def _clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "provider", [Provider.OPENAI, Provider.ANTHROPIC, Provider.DEEPSEEK, Provider.CEREBRAS]
+    "provider",
+    [
+        Provider.OPENAI,
+        Provider.ANTHROPIC,
+        Provider.DEEPSEEK,
+        Provider.CEREBRAS,
+        Provider.MOONSHOT,
+        Provider.ALIBABA,
+    ],
 )
 def test_litellm_global_api_base_no_longer_steers_the_request(
     provider: Provider, monkeypatch: pytest.MonkeyPatch
@@ -301,7 +322,11 @@ def test_litellm_global_api_base_no_longer_steers_the_request(
     the global (Cerebras: litellm 1.106.2, 2026-10-22), so their cases pass
     with or without an explicit ``api_base``. They are parametrized anyway so
     that a future LiteLLM that *does* route either through the global finds this
-    test already standing.
+    test already standing. Moonshot and Alibaba are pins for the same reason:
+    with ``api_base`` withheld, neither route followed the global (litellm
+    1.109.1, 2026-11-14, offline at this seam). Alibaba's case still fails
+    without an explicit ``api_base``, because LiteLLM's own ``qwencloud/``
+    default is ``dashscope-intl.aliyuncs.com``, not llmkit's default.
 
     **Google is deliberately absent**, and its absence is a documented
     limitation rather than an oversight. With nothing configured it sends no

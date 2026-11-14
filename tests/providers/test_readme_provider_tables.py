@@ -28,7 +28,8 @@ _ENV_VAR_HEADER = "| Provider | Environment variable |"
 _NO_TWIN = "*(none)*"
 
 # OpenRouter's catalogue id for each default model, keyed by the default model
-# id itself and checked by hand against OpenRouter's model list (2026-11-02).
+# id itself and checked by hand against OpenRouter's model list (2026-11-02;
+# the Moonshot and Alibaba defaults on 2026-11-14).
 # OpenRouter's name can differ from the vendor's own (Claude versions use dots),
 # so no rule derives it. Changing any ``_default_model`` makes the lookup below
 # fail until someone re-checks the twin and records it here. ``_NO_TWIN`` marks a
@@ -41,6 +42,8 @@ _OPENROUTER_TWIN = {
     "gpt-4.1-mini": "openai/gpt-4.1-mini",
     "deepseek-chat": "deepseek/deepseek-chat",
     "gpt-oss-120b": "openai/gpt-oss-120b",
+    "kimi-k3.1-pro": "moonshotai/kimi-k3.1-pro",
+    "qwen3.7-plus": "qwen/qwen3.7-plus",
     "us.anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic/claude-haiku-4.5",
     "llama3.2": _NO_TWIN,
 }

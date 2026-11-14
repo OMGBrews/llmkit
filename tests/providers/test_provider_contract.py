@@ -25,11 +25,13 @@ import instructor
 import pytest
 
 from llmkit.providers import (
+    AlibabaProvider,
     AnthropicProvider,
     BedrockProvider,
     CerebrasProvider,
     DeepSeekProvider,
     GoogleProvider,
+    MoonshotProvider,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
@@ -42,11 +44,13 @@ from llmkit.providers.base import BaseProvider, Provider
 # ``Provider`` enum) so a real subclass that silently lost a hook is caught
 # here independent of the dispatch wiring.
 _SHIPPED_PROVIDERS = [
+    AlibabaProvider,
     AnthropicProvider,
     BedrockProvider,
     CerebrasProvider,
     DeepSeekProvider,
     GoogleProvider,
+    MoonshotProvider,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,

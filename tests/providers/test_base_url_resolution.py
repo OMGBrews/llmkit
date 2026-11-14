@@ -8,7 +8,8 @@ reads its own environment aliases (``OPENAI_BASE_URL``, ``ANTHROPIC_API_BASE``,
 ``GEMINI_API_BASE``, ``DEEPSEEK_API_BASE``). A stray variable could therefore
 redirect every request to another host with nothing in the library naming the
 endpoint: the same invisible swap the key work closed, one layer down. Cerebras,
-added later, resolves the same way from the start (``CEREBRAS_API_BASE``).
+Moonshot and Alibaba, added later, resolve the same way from the start
+(``CEREBRAS_API_BASE``, ``MOONSHOT_API_BASE``, ``QWENCLOUD_API_BASE``).
 
 Endpoint resolution is now explicit library behavior: the configured
 ``base_url`` wins; otherwise the provider's own environment aliases are
@@ -26,7 +27,8 @@ configured. The others always send one.
 
 The defaults below are not transcribed from LiteLLM's source: each was measured
 byte-for-byte on the wire against litellm 1.92.0 (2026-07-21; Cerebras's against
-1.106.2 on 2026-10-22), which is the only
+1.106.2 on 2026-10-22; Moonshot's and Alibaba's were pinned on 2026-11-14 and
+their provenance is recorded in their provider modules), which is the only
 way to catch the shape traps they encode — Anthropic's default must *omit*
 ``/v1`` (LiteLLM appends its own, so a pinned ``/v1`` yields ``/v1/v1/messages``),
 and Gemini turned out not to admit a constant at all. The alias precedence was
@@ -44,7 +46,7 @@ from __future__ import annotations
 import pytest
 
 from llmkit import LLMClientConfig, Provider
-from llmkit.providers import build_provider
+from llmkit.providers import _provider_class, build_provider
 
 # (provider, endpoint env aliases in measured precedence order, library default).
 #
@@ -64,6 +66,12 @@ _ENDPOINT_PROVIDERS: list[tuple[Provider, tuple[str, ...], str | None]] = [
     (Provider.GOOGLE, ("GEMINI_API_BASE",), None),
     (Provider.DEEPSEEK, ("DEEPSEEK_API_BASE",), "https://api.deepseek.com/beta"),
     (Provider.CEREBRAS, ("CEREBRAS_API_BASE",), "https://api.cerebras.ai/v1"),
+    (Provider.MOONSHOT, ("MOONSHOT_API_BASE",), "https://api.moonshot.ai/v1"),
+    (
+        Provider.ALIBABA,
+        ("QWENCLOUD_API_BASE",),
+        "https://ap-southeast-1.maas.qwencloudapi.com/compatible-mode/v1",
+    ),
 ]
 
 # Flattened to one case per alias, since OpenAI and Anthropic each answer to
@@ -113,6 +121,17 @@ def _clear_endpoint_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for alias in _ALL_ALIASES:
         monkeypatch.delenv(alias, raising=False)
+
+
+def test_the_endpoint_list_covers_every_provider_that_reads_an_endpoint_variable() -> None:
+    """A new provider that reads an endpoint variable must join the list above."""
+    declared = {
+        member: tuple(getattr(_provider_class(member), "_base_url_env_vars", ()))
+        for member in Provider
+    }
+    assert {member: aliases for member, aliases in declared.items() if aliases} == {
+        provider: aliases for provider, aliases, _ in _ENDPOINT_PROVIDERS
+    }
 
 
 @pytest.mark.parametrize(("provider", "default"), _PROVIDER_DEFAULTS)

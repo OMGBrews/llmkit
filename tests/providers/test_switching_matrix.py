@@ -5,7 +5,7 @@ offline: the same call site, ``structured_llm_call("q", _Answer, feature="f")``,
 runs once per :class:`~llmkit.Provider` member through the
 :mod:`llmkit.testing` fake, and the only thing that changes between rows is
 the ``provider`` field of the registered :class:`~llmkit.LLMClientConfig`.
-The environment is the same for every row (all six bearer keys set), the
+The environment is the same for every row (every bearer key set), the
 model is left unset so each route resolves its own default, and
 ``reasoning_effort`` is left unset because ``"disable"`` raises on four
 routes' default models; per-route reasoning translation is pinned in
@@ -37,8 +37,8 @@ Bedrock and Vertex need no route field to construct: ``aws_region_name``,
 region comes from ``AWS_REGION_NAME`` or ``AWS_REGION`` through the AWS
 credential chain; Vertex's project comes from ``VERTEXAI_PROJECT``, else the
 Application Default Credentials project, and its location from
-``VERTEXAI_LOCATION``, else LiteLLM's ``us-central1``. So the nine
-provider-only rows are the literal "only ``provider`` changed" switch, and two
+``VERTEXAI_LOCATION``, else LiteLLM's ``us-central1``. So the one
+provider-only row per member is the literal "only ``provider`` changed" switch, and two
 extra rows set those fields as a deployed host usually would, to show they
 change nothing the switch is meant to carry. A guard on the rows,
 ``test_the_matrix_covers_every_provider``, holds both halves of that: every
@@ -114,6 +114,12 @@ _EXPECTED: dict[Provider, _Route] = {
     Provider.DEEPSEEK: _Route(
         "DeepSeek", "deepseek/", "deepseek-chat", instructor.Mode.JSON, False
     ),
+    Provider.MOONSHOT: _Route(
+        "Moonshot", "moonshot/", "kimi-k3.1-pro", instructor.Mode.JSON, False
+    ),
+    Provider.ALIBABA: _Route(
+        "Alibaba", "qwencloud/", "qwen3.7-plus", instructor.Mode.JSON_SCHEMA, False
+    ),
     Provider.GOOGLE: _Route(
         "Google AI Studio", "gemini/", "gemini-3.1-flash-lite", instructor.Mode.JSON_SCHEMA, False
     ),
@@ -139,15 +145,17 @@ _EXPECTED: dict[Provider, _Route] = {
     ),
 }
 
-#: The program-wide switch, one row per registered config. The first nine
-#: differ only in ``provider``; the last two add the route fields a deployed
-#: Bedrock or Vertex host usually sets.
+#: The program-wide switch, one row per registered config. One row per
+#: ``Provider`` member differs only in ``provider``; the last two add the route
+#: fields a deployed Bedrock or Vertex host usually sets.
 _SWITCHES: dict[str, LLMClientConfig] = {
     Provider.ANTHROPIC.value: LLMClientConfig(provider=Provider.ANTHROPIC),
     Provider.BEDROCK.value: LLMClientConfig(provider=Provider.BEDROCK),
     Provider.CEREBRAS.value: LLMClientConfig(provider=Provider.CEREBRAS),
     Provider.DEEPSEEK.value: LLMClientConfig(provider=Provider.DEEPSEEK),
     Provider.GOOGLE.value: LLMClientConfig(provider=Provider.GOOGLE),
+    Provider.MOONSHOT.value: LLMClientConfig(provider=Provider.MOONSHOT),
+    Provider.ALIBABA.value: LLMClientConfig(provider=Provider.ALIBABA),
     Provider.OLLAMA.value: LLMClientConfig(provider=Provider.OLLAMA),
     Provider.OPENAI.value: LLMClientConfig(provider=Provider.OPENAI),
     Provider.OPENROUTER.value: LLMClientConfig(provider=Provider.OPENROUTER),
@@ -158,15 +166,17 @@ _SWITCHES: dict[str, LLMClientConfig] = {
     ),
 }
 
-#: The six bearer-key variables llmkit reads, one per keyed route. Set for
+#: The bearer-key variables llmkit reads, one per keyed route. Set for
 #: every row, so the environment never varies with the switch.
 _BEARER_KEY_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "CEREBRAS_API_KEY",
     "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY",
+    "MOONSHOT_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
+    "QWENCLOUD_API_KEY",
 )
 
 

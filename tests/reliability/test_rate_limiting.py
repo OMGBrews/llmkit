@@ -45,7 +45,7 @@ from instructor.core import InstructorRetryException
 
 from llmkit import CircuitOpenError, _litellm, text_llm_call
 from llmkit import calls as llm_calls
-from llmkit.providers import LLMProviderInterface, Provider, make_provider
+from llmkit.providers import LLMProviderInterface, Provider, _provider_class, make_provider
 from llmkit.rate_limiting import (
     DEFAULT_RATE_LIMIT_POLICY,
     GlobalRateLimiter,
@@ -2091,6 +2091,8 @@ _BASE_URL_MEMBERS = [
     Provider.OPENAI,
     Provider.ANTHROPIC,
     Provider.CEREBRAS,
+    Provider.MOONSHOT,
+    Provider.ALIBABA,
     Provider.DEEPSEEK,
     Provider.GOOGLE,
     Provider.OPENROUTER,
@@ -2099,6 +2101,16 @@ _BASE_URL_MEMBERS = [
 _ELSEWHERE = "https://gateway.example/v1"
 
 _base_url_members = pytest.mark.parametrize("member", _BASE_URL_MEMBERS, ids=str)
+
+
+def test_the_base_url_members_are_every_provider_that_reads_base_url() -> None:
+    """A new provider that accepts a ``base_url`` must join the route-key cases."""
+    accepting = {
+        member
+        for member in Provider
+        if "base_url" in _provider_class(member)._accepted_config_fields
+    }
+    assert accepting == set(_BASE_URL_MEMBERS)
 
 
 def _elsewhere(member: Provider, base_url: str = _ELSEWHERE) -> LLMProviderInterface:

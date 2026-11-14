@@ -62,6 +62,8 @@ _DECISIONS: dict[Provider, _Decisions] = {
     Provider.BEDROCK: _Decisions(instructor.Mode.JSON_SCHEMA, False, True, True, False, False),
     Provider.VERTEX: _Decisions(instructor.Mode.JSON_SCHEMA, False, False, True, False, False),
     Provider.CEREBRAS: _Decisions(instructor.Mode.JSON_SCHEMA, False, False, True, False, False),
+    Provider.MOONSHOT: _Decisions(instructor.Mode.JSON, False, False, True, False, False),
+    Provider.ALIBABA: _Decisions(instructor.Mode.JSON_SCHEMA, False, False, True, False, False),
 }
 
 

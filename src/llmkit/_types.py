@@ -124,6 +124,11 @@ class Message(TypedDict):
 #: - Cerebras: ``disable`` raises on gpt-oss, else ``none``; ``lowest`` sends
 #:   ``low`` on gpt-oss, else ``none``.
 #: - DeepSeek: both send ``none``, the one value LiteLLM turns into thinking off.
+#: - Moonshot: both send ``none`` on models LiteLLM marks as reasoning, which turns
+#:   thinking off (Moonshot accepts a literal ``disable`` but keeps thinking);
+#:   both send nothing on a listed non-reasoning model and raise on an unlisted one.
+#: - Alibaba: both send ``none``, which turns thinking off; QwenCloud rejects a
+#:   literal ``disable`` (and ``max``) with a 400.
 #: - Ollama: ``disable`` raises on gpt-oss, else sends the server's off control,
 #:   which a model that cannot stop thinking may ignore; ``lowest`` sends ``low``
 #:   on gpt-oss, else the off control.

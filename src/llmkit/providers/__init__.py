@@ -3,7 +3,8 @@
 Public facade for the provider layer. The provider-agnostic core lives in
 :mod:`llmkit.providers.base`; each concrete provider lives in its own
 sibling module (``openrouter``, ``ollama``, ``google``, ``anthropic``,
-``openai``, ``deepseek``, ``bedrock``, ``vertex``, ``cerebras``). This package is the
+``openai``, ``deepseek``, ``bedrock``, ``vertex``, ``cerebras``, ``moonshot``,
+``alibaba``). This package is the
 **single place** that imports every provider module and maps a
 :class:`Provider` to its implementation.
 
@@ -22,6 +23,7 @@ import importlib
 from typing import Literal, assert_never
 
 from llmkit._types import ReasoningEffort
+from llmkit.providers.alibaba import AlibabaProvider
 from llmkit.providers.anthropic import AnthropicProvider
 from llmkit.providers.base import (
     BaseProvider,
@@ -36,6 +38,7 @@ from llmkit.providers.bedrock import BedrockProvider
 from llmkit.providers.cerebras import CerebrasProvider
 from llmkit.providers.deepseek import DeepSeekProvider
 from llmkit.providers.google import GoogleProvider
+from llmkit.providers.moonshot import MoonshotProvider
 from llmkit.providers.ollama import OllamaProvider
 from llmkit.providers.openai import OpenAIProvider
 from llmkit.providers.openrouter import OpenRouterProvider
@@ -71,6 +74,10 @@ def _provider_class(provider: Provider) -> type[BaseProvider]:
             return VertexProvider
         case Provider.CEREBRAS:
             return CerebrasProvider
+        case Provider.MOONSHOT:
+            return MoonshotProvider
+        case Provider.ALIBABA:
+            return AlibabaProvider
     # Every Provider member is handled above, so the subject narrows to Never
     # here. assert_never makes that a *static* guarantee: basedpyright reports
     # a type error if a newly-added Provider member is missing its case, and it
@@ -80,8 +87,8 @@ def _provider_class(provider: Provider) -> type[BaseProvider]:
 
 # The inverse of :func:`_provider_class`, for :func:`describe_llm`: a built
 # instance does not record its member, so the member is recovered from the
-# instance's exact class. The exhaustiveness test guarantees the nine classes
-# are distinct, so the inverse is unambiguous.
+# instance's exact class. The exhaustiveness test guarantees the classes, one
+# per member, are distinct, so the inverse is unambiguous.
 _MEMBER_BY_CLASS: dict[type[BaseProvider], Provider] = {_provider_class(m): m for m in Provider}
 
 
@@ -184,7 +191,8 @@ def make_provider(
     Args:
         provider: Which provider to construct.
         api_key: Bearer credential for the key-authenticated providers
-            (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras); resolves from
+            (OpenRouter, Google AI Studio, Anthropic, OpenAI, DeepSeek, Cerebras, Moonshot,
+            Alibaba); resolves from
             this value, else the provider's environment variable as ``os.environ`` holds it when
             this function runs (a key kept only in a ``.env`` file is not loaded until the first
             call imports LiteLLM, so load the file first), else raises. Not accepted by
@@ -194,9 +202,9 @@ def make_provider(
             built-in default.
         base_url: Endpoint (gateway, proxy, compatible endpoint) for every
             key-authenticated provider and Ollama, forwarded to LiteLLM as ``api_base``.
-            Anthropic, OpenAI, DeepSeek, Cerebras and Google AI Studio resolve it per call from
-            this value, else their endpoint variable(s) (``OPENAI_BASE_URL``, ``GEMINI_API_BASE``
-            and friends), else a measured default. Google AI Studio has no default and sends
+            Anthropic, OpenAI, DeepSeek, Cerebras, Moonshot, Alibaba and Google AI Studio resolve
+            it per call from this value, else their endpoint variable(s) (``OPENAI_BASE_URL``,
+            ``GEMINI_API_BASE`` and friends), else a measured default. Google AI Studio has no default and sends
             nothing when neither this value nor ``GEMINI_API_BASE`` is set (its base carries a
             model-derived API version). OpenRouter and Ollama read no variable: this value, else
             llmkit's default, fixed when the provider is built. Ollama's LiteLLM route ranks
@@ -416,6 +424,8 @@ __all__ = [
     "BedrockProvider",
     "VertexProvider",
     "CerebrasProvider",
+    "MoonshotProvider",
+    "AlibabaProvider",
     "Provider",
     "LLMClientConfig",
     "LLMInfo",

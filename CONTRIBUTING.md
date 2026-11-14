@@ -80,6 +80,8 @@ export ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/k
 export OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
 export DEEPSEEK_API_KEY=...           # https://platform.deepseek.com/api_keys
 export CEREBRAS_API_KEY=...           # https://cloud.cerebras.ai
+export MOONSHOT_API_KEY=...           # https://platform.kimi.ai
+export QWENCLOUD_API_KEY=...          # https://www.qwencloud.com (a Singapore-region key, or set QWENCLOUD_API_BASE)
 uv run pytest tests/integration --run-live -v
 ```
 

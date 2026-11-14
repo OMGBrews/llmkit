@@ -40,6 +40,8 @@ start a local Ollama server first (this is the release gate; see
     OPENAI_API_KEY=sk-...         \
     DEEPSEEK_API_KEY=sk-...       \
     CEREBRAS_API_KEY=csk-...      \
+    MOONSHOT_API_KEY=sk-...       \
+    QWENCLOUD_API_KEY=sk-...      \
     uv run pytest tests/integration --run-live -v
 
 To exercise a single provider you have a key for, select it explicitly rather
@@ -54,6 +56,9 @@ Provider -> credential it reads:
     OpenAI      OPENAI_API_KEY              https://platform.openai.com/api-keys
     DeepSeek    DEEPSEEK_API_KEY            https://platform.deepseek.com/api_keys
     Cerebras    CEREBRAS_API_KEY            https://cloud.cerebras.ai
+    Moonshot    MOONSHOT_API_KEY            https://platform.kimi.ai
+    Alibaba     QWENCLOUD_API_KEY           https://www.qwencloud.com  (Singapore key by
+                                            default; QWENCLOUD_API_BASE for another region)
     Ollama      (local server on :11434)    https://ollama.com  (no key)
     Bedrock     AWS chain + AWS_REGION_NAME https://console.aws.amazon.com  (see below)
     Google's Agent Platform
@@ -100,6 +105,7 @@ from unittest.mock import patch
 import instructor
 import litellm
 import pytest
+from litellm.exceptions import BadRequestError
 from pydantic import BaseModel, field_validator
 
 from llmkit import (
@@ -237,6 +243,10 @@ _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_SMOKE_MODEL", "deepseek-chat")
 # The second of Cerebras's two shared-inference models; the default
 # (gpt-oss-120b) is covered by ``test_live_default_model``.
 _CEREBRAS_MODEL = os.getenv("CEREBRAS_SMOKE_MODEL", "qwen-3.8-27b")
+# Older, cheaper siblings of the Moonshot and Alibaba defaults (kimi-k3.1-pro and
+# qwen3.7-plus, covered by ``test_live_default_model``). Both reason by default.
+_MOONSHOT_MODEL = os.getenv("MOONSHOT_SMOKE_MODEL", "kimi-k2.6")
+_ALIBABA_MODEL = os.getenv("ALIBABA_SMOKE_MODEL", "qwen-flash")
 # The provider's default: Claude Haiku 4.5 via its cross-region inference
 # profile. Override with another profile- or partition-prefixed id (e.g.
 # ``eu.anthropic.claude-...``) when the account routes elsewhere.
@@ -381,6 +391,13 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
             return {"api_key": _require_env("DEEPSEEK_API_KEY")}
         case Provider.CEREBRAS:
             return {"api_key": _require_env("CEREBRAS_API_KEY")}
+        case Provider.MOONSHOT:
+            return {"api_key": _require_env("MOONSHOT_API_KEY")}
+        case Provider.ALIBABA:
+            # The default endpoint is QwenCloud's Singapore region and keys are
+            # regional, so QWENCLOUD_API_BASE (read by the provider itself) is
+            # how an account in another region runs this suite.
+            return {"api_key": _require_env("QWENCLOUD_API_KEY")}
         case Provider.BEDROCK:
             # boto3 ships only with the optional `omg-llmkit[bedrock]` extra.
             # Skipping when it's absent is a *structural* gate (the dependency
@@ -427,11 +444,15 @@ def _live_credentials(provider: Provider) -> _LiveCredentials:
 # Gemini (AI Studio *and* Google's Agent Platform) thinks by default, and the Gemini 3.1
 # defaults cannot turn it off, so "disable" raises there: send the portable "lowest" so the
 # smoke call doesn't burn reasoning tokens on a trivial extraction. Claude routes exercise
-# the portable disable translation, honoured on their defaults. Other providers send nothing
-# because some models reject the knob outright.
+# the portable disable translation, honoured on their defaults, as do Moonshot and Alibaba, whose
+# vendors would otherwise silently keep thinking on (Moonshot) or reject the value (Alibaba)
+# without the translation to "none". Other providers send nothing because some models reject
+# the knob outright.
 _REASONING_EFFORT: dict[Provider, str] = {
     Provider.ANTHROPIC: "disable",
     Provider.BEDROCK: "disable",
+    Provider.MOONSHOT: "disable",
+    Provider.ALIBABA: "disable",
     Provider.GOOGLE: "lowest",
     Provider.VERTEX: "lowest",
 }
@@ -984,6 +1005,16 @@ async def test_deepseek_reasoning_disable_live(model: str) -> None:
     (measured 2026-11-02). The responses are read at the transport, so this
     checks the reasoning itself, not only that a valid answer came back.
     """
+    provider = make_provider(Provider.DEEPSEEK, model=model, **_live_credentials(Provider.DEEPSEEK))
+    await _assert_disable_suppresses_reasoning(provider)
+
+
+async def _assert_disable_suppresses_reasoning(provider: LLMProviderInterface) -> None:
+    """A structured call at ``"disable"`` validates and returns no reasoning.
+
+    The responses are read at the transport, so this checks the reasoning
+    itself, not only that a valid answer came back.
+    """
     real_acompletion = cast("Callable[..., Awaitable[object]]", litellm.acompletion)
     responses: list[object] = []
 
@@ -992,7 +1023,6 @@ async def test_deepseek_reasoning_disable_live(model: str) -> None:
         responses.append(response)
         return response
 
-    provider = make_provider(Provider.DEEPSEEK, model=model, **_live_credentials(Provider.DEEPSEEK))
     with patch("llmkit._litellm.litellm.acompletion", _keep_response):
         await _assert_structured_roundtrip(provider, reasoning_effort="disable")
     assert responses, "no request reached litellm.acompletion"
@@ -1012,6 +1042,137 @@ async def test_deepseek_reasoning_disable_live(model: str) -> None:
 @pytest.mark.asyncio
 async def test_cerebras_live() -> None:
     await _override_roundtrip(Provider.CEREBRAS, _CEREBRAS_MODEL)
+
+
+@pytest.mark.asyncio
+async def test_moonshot_live() -> None:
+    # No reasoning_effort: the smoke model thinks by default, so this is the
+    # thinking-on structured path; the defaults run with "disable".
+    built = make_provider(
+        Provider.MOONSHOT, model=_MOONSHOT_MODEL, **_live_credentials(Provider.MOONSHOT)
+    )
+    await _assert_structured_roundtrip(built)
+
+
+@pytest.mark.asyncio
+async def test_alibaba_live() -> None:
+    # Thinking-on structured path on the smoke model, as for Moonshot above.
+    built = make_provider(
+        Provider.ALIBABA, model=_ALIBABA_MODEL, **_live_credentials(Provider.ALIBABA)
+    )
+    await _assert_structured_roundtrip(built)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", [Provider.MOONSHOT, Provider.ALIBABA])
+async def test_moonshot_alibaba_reasoning_disable_live(provider: Provider) -> None:
+    """``"disable"`` reaches both vendors as ``"none"`` and turns thinking off.
+
+    Measured 2026-11-14 on the defaults: Moonshot accepted ``"disable"``
+    forwarded unchanged and kept thinking, and Alibaba rejected it with a 400;
+    ``"none"`` turned thinking off on both.
+    """
+    await _assert_disable_suppresses_reasoning(
+        make_provider(provider, **_live_credentials(provider))
+    )
+
+
+@pytest.mark.asyncio
+async def test_moonshot_forced_tool_needs_thinking_off_live() -> None:
+    """A named ``tool_choice`` works on Moonshot only with thinking off.
+
+    The default model thinks unless told otherwise, and Moonshot answers a
+    named tool with thinking on with a 400 (``tool_choice 'specified' is
+    incompatible with thinking enabled``, measured 2026-11-14). The provider
+    leaves that refusal to the vendor rather than turning thinking off behind
+    the caller's back; this pins both halves so a change in either is seen.
+    """
+    credentials = _live_credentials(Provider.MOONSHOT)
+    await _assert_tool_roundtrip(
+        make_provider(Provider.MOONSHOT, reasoning_effort="disable", **credentials)
+    )
+    await _assert_unnormalised_schema_roundtrip(
+        make_provider(Provider.MOONSHOT, reasoning_effort="disable", **credentials)
+    )
+    lookup = ToolDefinition.from_model("lookup", _LookupArgs, "Look up a stored value by its key.")
+    with pytest.raises(BadRequestError, match="incompatible with thinking"):
+        _ = await tool_llm_call(
+            "Use the lookup tool to fetch the stored value for key 'answer'.",
+            [lookup],
+            feature="integration-tool-smoke",
+            provider=make_provider(Provider.MOONSHOT, **credentials),
+            tool_choice=ToolName("lookup"),
+            max_tokens=256,
+            retry=NO_RETRY,
+        )
+
+
+@pytest.mark.asyncio
+async def test_moonshot_thinking_on_tool_loop_live() -> None:
+    """A thinking-on Moonshot tool loop finishes on the tool's result.
+
+    llmkit's assistant tool-call message carries no ``reasoning_content``, which
+    Moonshot requires on such messages from a reasoning model; LiteLLM inserts a
+    placeholder. This measures that the second turn is accepted and answers
+    from the tool result. The first turn is unforced, because a named
+    ``tool_choice`` needs thinking off on this route.
+    """
+    provider = make_provider(Provider.MOONSHOT, **_live_credentials(Provider.MOONSHOT))
+    lookup = ToolDefinition.from_model("lookup", _LookupArgs, "Look up a stored value by its key.")
+    history: list[ChatMessage] = [
+        {
+            "role": "user",
+            "content": "Use the lookup tool to fetch the stored value for key 'answer'.",
+        }
+    ]
+    requested = await tool_llm_call(
+        history, [lookup], feature="integration-tool-smoke", provider=provider, max_tokens=1024
+    )
+    assert len(requested.tool_calls) == 1, requested
+    call = requested.tool_calls[0]
+    assert call.validated == _LookupArgs(key="answer")
+    history.extend([requested.to_message(), tool_result_message(call.id, "6560")])
+    history.append({"role": "user", "content": "State the result in one short sentence."})
+    finished = await tool_llm_call(
+        history,
+        [lookup],
+        feature="integration-tool-smoke",
+        provider=provider,
+        tool_choice="none",
+        max_tokens=1024,
+    )
+    assert finished.tool_calls == []
+    assert finished.text is not None
+    assert "6560" in finished.text
+
+
+@pytest.mark.asyncio
+async def test_alibaba_tool_roundtrip_live() -> None:
+    # The default model, thinking on: a named tool_choice is accepted.
+    provider = make_provider(Provider.ALIBABA, **_live_credentials(Provider.ALIBABA))
+    await _assert_tool_roundtrip(provider)
+    await _assert_unnormalised_schema_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_moonshot_tool_stream_roundtrip_live() -> None:
+    provider = make_provider(Provider.MOONSHOT, **_live_credentials(Provider.MOONSHOT))
+    await _assert_tool_stream_roundtrip(provider)
+
+
+@pytest.mark.asyncio
+async def test_alibaba_tool_stream_roundtrip_live() -> None:
+    """Run with thinking off: with it on, the default streamed no prose before its call.
+
+    Measured 2026-11-14 on qwen3.7-plus (twice): with thinking on, an unforced
+    streamed tool turn sent no prose deltas before its call, which the shared
+    helper's interleaving claim would fail on for reasons unrelated to the
+    transport. With thinking off, prose and the call interleaved.
+    """
+    provider = make_provider(
+        Provider.ALIBABA, reasoning_effort="disable", **_live_credentials(Provider.ALIBABA)
+    )
+    await _assert_tool_stream_roundtrip(provider)
 
 
 @pytest.mark.asyncio

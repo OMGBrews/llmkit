@@ -1,7 +1,7 @@
 """Bearer providers resolve their API key config-first, then env, else raise.
 
-The key-authenticated providers (Cerebras aside, which was added later on this
-pattern) used to coerce a missing ``api_key`` to
+The key-authenticated providers (Cerebras, Moonshot and Alibaba aside, which
+were added later on this pattern) used to coerce a missing ``api_key`` to
 ``""`` and let LiteLLM silently fall back to the ambient environment key — an
 invisible identity/billing swap. Resolution is now explicit library behavior:
 the configured value wins; otherwise the provider's own environment variable is
@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from llmkit import LLMClientConfig, Provider
-from llmkit.providers import build_provider, make_provider
+from llmkit.providers import _provider_class, build_provider, make_provider
 
 # (provider, env var the litellm route reads, provider name in the error).
 _BEARER_PROVIDERS = [
@@ -28,11 +28,24 @@ _BEARER_PROVIDERS = [
     (Provider.DEEPSEEK, "DEEPSEEK_API_KEY", "DeepSeek"),
     (Provider.GOOGLE, "GEMINI_API_KEY", "Google AI Studio"),
     (Provider.CEREBRAS, "CEREBRAS_API_KEY", "Cerebras"),
+    (Provider.MOONSHOT, "MOONSHOT_API_KEY", "Moonshot"),
+    (Provider.ALIBABA, "QWENCLOUD_API_KEY", "Alibaba"),
 ]
 
 # The subset the resolution-value tests need — they assert on the resolved key,
 # not the error text, so the provider name is irrelevant.
 _BEARER_PROVIDER_ENVS = [(provider, env_var) for provider, env_var, _ in _BEARER_PROVIDERS]
+
+
+def test_the_bearer_list_covers_every_provider_that_reads_a_key_variable() -> None:
+    """A new bearer provider must join the list above, with the variable it reads."""
+    declared = {
+        member: getattr(_provider_class(member), "_api_key_env_var", None) for member in Provider
+    }
+    assert {member: env for member, env in declared.items() if env is not None} == {
+        provider: env_var for provider, env_var, _ in _BEARER_PROVIDERS
+    }
+    assert all(_provider_class(p).display_name() == name for p, _, name in _BEARER_PROVIDERS)
 
 
 @pytest.mark.parametrize(("provider", "env_var", "name"), _BEARER_PROVIDERS)

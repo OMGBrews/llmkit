@@ -30,6 +30,8 @@ _MINIMAL_KEY: dict[Provider, str | None] = {
     Provider.OPENAI: "k",
     Provider.DEEPSEEK: "k",
     Provider.CEREBRAS: "k",
+    Provider.MOONSHOT: "k",
+    Provider.ALIBABA: "k",
     Provider.BEDROCK: None,
     Provider.VERTEX: None,
 }

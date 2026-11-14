@@ -31,6 +31,8 @@ _ROUTES = {
     Provider.BEDROCK: "bedrock",
     Provider.DEEPSEEK: "deepseek",
     Provider.CEREBRAS: "cerebras",
+    Provider.MOONSHOT: "moonshot",
+    Provider.ALIBABA: "qwencloud",
     Provider.OLLAMA: "ollama_chat",
 }
 
