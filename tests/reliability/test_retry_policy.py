@@ -85,6 +85,7 @@ from llmkit.exceptions import (
     LLM_TRANSPORT_ERRORS,
     REPAIRABLE_PARSE_ERRORS,
 )
+from llmkit.logging import flush_llm_logs_async
 from llmkit.retry import with_retries
 from llmkit.testing import (
     Fake,
@@ -637,11 +638,17 @@ async def test_nested_guard_preserves_one_log_per_attempt(tmp_path: Path) -> Non
                 ),
             )
     finally:
+        delivered = await flush_llm_logs_async(timeout=10.0)
         configure_llm_logging(LocalYamlLogSink())
 
     assert result.ok is True
     assert len(installed.requests) == 2
-    assert len(paths) == 2
+    # Count the files written, not the paths captured: a path is captured only when its
+    # write lands within the 0.1 s delivery wait, which a slow filesystem (the Windows
+    # runner) can overrun without anything being lost.
+    assert delivered
+    assert len(list(tmp_path.glob("*.yaml"))) == 2
+    assert len(paths) <= 2
     assert all(p.exists() for p in paths)
     assert [r.attempt for r in records] == [1, 2]
     assert records[0].call_id == records[1].call_id is not None
@@ -1134,10 +1141,16 @@ async def test_validation_retries_are_each_their_own_logged_call(tmp_path: Path)
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF
             )
     finally:
+        delivered = await flush_llm_logs_async(timeout=10.0)
         configure_llm_logging(LocalYamlLogSink())
 
     assert _attempts(_first_asks(installed.requests)) == [1, 2]
-    assert len(paths) == 2
+    # Count the files written, not the paths captured: a path is captured only when its
+    # write lands within the 0.1 s delivery wait, which a slow filesystem (the Windows
+    # runner) can overrun without anything being lost.
+    assert delivered
+    assert len(list(tmp_path.glob("*.yaml"))) == 2
+    assert len(paths) <= 2
     assert all(p.exists() for p in paths)
 
 

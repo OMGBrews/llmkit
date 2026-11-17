@@ -23,7 +23,7 @@ from pydantic import BaseModel, ValidationError
 from llmkit._diagnostics import report
 from llmkit._snapshot import snapshot_data, snapshot_prompt, snapshot_tools
 from llmkit._transport import WireUsage
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
     compose_validation_budget,
     error_text,
@@ -79,6 +79,7 @@ async def tool_llm_call(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -99,6 +100,7 @@ async def tool_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -118,6 +120,7 @@ async def tool_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -133,6 +136,13 @@ async def tool_llm_call[T: BaseModel](
     deadline. The value is forwarded to LiteLLM too; ``0.0`` is accepted and
     fires at the first wait. Unset or ``None`` sets no deadline and sends no
     timeout keyword, leaving LiteLLM's default in effect.
+
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`~llmkit.structured_llm_call`): unset defers to ``options``, then to
+    the ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` before any request.
 
     A round in which only *some* requested calls are malformed keeps the
     well-formed ones on ``tool_calls`` and reports the rest on
@@ -165,6 +175,7 @@ async def tool_llm_call[T: BaseModel](
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -238,6 +249,7 @@ async def tool_llm_call[T: BaseModel](
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
+                service_tier=args.tier_request,
                 provider=provider,
                 response_format=(
                     {
@@ -453,6 +465,7 @@ def tool_llm_call_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -473,6 +486,7 @@ def tool_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -492,6 +506,7 @@ def tool_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -501,7 +516,9 @@ def tool_llm_call_sync[T: BaseModel](
 
     The same call as the async form, driven on llmkit's persistent loop by
     :func:`run_sync`: same arguments, same retries, logging, rate limits and
-    result. Every argument is forwarded untouched.
+    result. Every argument is forwarded untouched, ``service_tier`` included
+    (unset defers to ``options``, then to the provider's configured tier; an
+    explicit ``None`` asks for no tier).
 
     ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
     invalid values raise ``ValueError`` before call admission (at first
@@ -522,6 +539,7 @@ def tool_llm_call_sync[T: BaseModel](
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             options=options,

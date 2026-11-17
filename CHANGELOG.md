@@ -247,10 +247,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Call records carry the requested and the served service tier.**
   `LLMCallRecord` gains `requested_service_tier` and `served_service_tier`,
   both `str | None` and defaulted, written in the YAML body and on the
-  `index.jsonl` line. The requested tier is the top-level `service_tier` a
-  provider's `completion_kwargs()` returns, recorded on every attempt that
-  built a request, failed ones included; LiteLLM may still rewrite or drop it
-  on the wire. The served tier is what the response, or the last stream frame
+  `index.jsonl` line. The requested tier is the call's `service_tier` setting
+  as the host wrote it (see the next entry), recorded on every attempt that
+  reached the transport, failed ones included; the provider may translate it
+  on the wire, as Anthropic does. The served tier is what the response, or the last stream frame
   that reported one, said was served: its `service_tier`, its usage block's
   `service_tier`, or Google's `trafficType`, verbatim, on failed attempts that
   received a response too. `null` means no tier reached llmkit, not that the
@@ -262,7 +262,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   LiteLLM's OpenAI handler at 1.109.1 and 1.104.0 deliver the tier on
   buffered responses and on streams whose frames carry it, and not when only
   the final usage frame reports it; the README records the coverage. This is
-  not live evidence.
+  not live evidence. When llmkit sent Anthropic fast mode, the served tier is
+  the `speed` the response's usage block reports (`fast` or `standard`),
+  which never equals the requested `priority`.
+
+- **A `service_tier` request setting.** A host can now ask for a provider
+  service tier without subclassing a provider: a per-call `service_tier`
+  keyword on every call function and its sync form, an
+  `LLMCallOptions.service_tier` field, and a client-wide default on
+  `LLMClientConfig.service_tier` and `make_provider(..., service_tier=...)`,
+  resolved in that order. An explicit `None` on the call or the options asks
+  for no tier and cancels a configured default, unlike `reasoning_effort`. A
+  `Provider` member passed per call is built from the environment and carries
+  no configured tier. Values must be a non-empty string or `None`; anything
+  else raises `ValueError`. The new `ServiceTier` type names the portable
+  values `"default"`, `"flex"` and `"priority"`; any other string is the
+  provider's own tier name. Each provider forwards, translates or refuses
+  the value through a new concrete `BaseProvider.service_tier_kwargs(tier,
+  model)` hook, which a host-written provider may override (it is not part
+  of `LLMProviderInterface`). OpenAI, OpenRouter, DeepSeek, Moonshot and
+  Alibaba forward any value; Anthropic sends `"default"` as `standard_only`,
+  `"priority"` as fast mode (`speed: "fast"`) on the models LiteLLM's model
+  table marks `supports_speed`, and forwards its own `"auto"` and
+  `"standard_only"` (refused, naming the upgrade, under a LiteLLM that does
+  not send a tier on that route, such as the 1.104.0 floor); Bedrock
+  forwards only the three portable names, and only on LiteLLM's Converse
+  route (a model LiteLLM sends through its invoke route is refused); Google
+  AI Studio forwards everything but `"auto"`, which LiteLLM would send as
+  `"priority"`; Vertex, Cerebras and Ollama refuse every tier. The
+  forwarded and translated rows were measured live on 2026-11-17 at LiteLLM
+  1.109.1 on every provider but Moonshot and Alibaba, which are unmeasured;
+  the refusals rest on LiteLLM's behaviour, probed offline (and, for Vertex
+  Gemini, a live 400). DeepSeek accepts every value and reports no
+  served tier, so it is forwarded but not confirmed. The README's per-provider
+  table records each result. `testing.TransportRequest` gains `service_tier`,
+  the tier the host asked for. The tier is not part of the response cache
+  key: requests that differ only in tier share a stored answer, and
+  `LLM_CACHE_KEY_VERSION` is unchanged.
+
+- **`ServiceTierUnsupportedError`.** Raised, before the call is logged,
+  before the response cache is read and before any request, when the route
+  cannot honour the resolved tier, and when a provider's `completion_kwargs()`
+  returns a top-level `service_tier`. An `LlmkitError`, in no `LLM_*_ERRORS`
+  tuple and never retried. A stream raises it on first iteration.
 
 - **`get_diagnostics_health()` — see whether llmkit's own warnings were
   lost.** Returns a frozen `DiagnosticsHealth` snapshot: `lost`, the
@@ -447,6 +489,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **Breaking: a `service_tier` in a provider's `completion_kwargs()` is
+  refused.** Before the `service_tier` setting existed, a host asked for a
+  tier by returning `service_tier` from its own provider subclass's
+  `completion_kwargs()`. A top-level `service_tier` there now raises
+  `ServiceTierUnsupportedError`, naming the setting, before any request,
+  whether or not the setting is also given; a value nested in `extra_body`
+  is not inspected. The record's `requested_service_tier` is now the setting
+  as the host wrote it, not the value read from the built request.
+  **Migration:** remove `service_tier` from `completion_kwargs()` and pass
+  it as `LLMClientConfig(service_tier=...)`, `make_provider(...,
+  service_tier=...)`, `LLMCallOptions(service_tier=...)` or the call's
+  `service_tier=` keyword.
 
 - **Rate limits are keyed by route: a provider built with a `base_url`
   elsewhere gets its own budget and its own name.** Budgets were keyed by the

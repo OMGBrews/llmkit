@@ -191,8 +191,8 @@ class LlmkitError(Exception):
     :class:`ResultValidationError`), and its configuration errors
     (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
     :class:`ToolChoiceUnsupportedError`,
-    :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`,
-    :class:`UnsupportedSchemaError`). It
+    :class:`ReasoningEffortUnsupportedError`, :class:`ServiceTierUnsupportedError`,
+    :class:`SchemaEngineError`, :class:`UnsupportedSchemaError`). It
     does not catch the third-party errors a call can also raise (``openai``
     and ``httpx`` transport errors, a bare pydantic ``ValidationError``, and
     instructor's ``InstructorRetryException`` wrapping a transport or
@@ -877,6 +877,22 @@ class ReasoningEffortUnsupportedError(LlmkitError):
 
     A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS``:
     retrying cannot establish a missing capability or disable an always-on model.
+    """
+
+
+class ServiceTierUnsupportedError(LlmkitError):
+    """The requested service tier cannot be honoured, or was supplied the wrong way.
+
+    Raised before any request, before the response cache is read, and before
+    the call is logged, when the provider and model the call runs on cannot
+    honour the resolved ``service_tier`` (the route takes no tier, or would
+    refuse, drop or change the value), and when a provider's own request
+    arguments (``completion_kwargs()``) carry a top-level ``service_tier``: the
+    ``service_tier`` setting is the only supported way to ask for one.
+
+    A permanent configuration error, outside ``LLM_RECOVERABLE_ERRORS`` and
+    absent from :data:`~llmkit.DEFAULT_RETRY_POLICY`'s ``retry_on``: retrying
+    cannot make a route accept a tier.
     """
 
 

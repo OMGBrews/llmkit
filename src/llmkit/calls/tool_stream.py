@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 
 from llmkit._snapshot import snapshot_data, snapshot_prompt, snapshot_tools
 from llmkit._transport import WireUsage
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier, ServiceTierRequest
 from llmkit.calls._shared import (
     error_text,
     parse_tool_calls,
@@ -89,6 +89,7 @@ async def tool_llm_call_stream(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -131,6 +132,14 @@ async def tool_llm_call_stream(
     :func:`~llmkit.structured_llm_call`). Blocking code uses
     :func:`~llmkit.tool_llm_call_stream_sync`, which yields the same items.
 
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`~llmkit.structured_llm_call`): unset defers to ``options``, then to
+    the ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` at first iteration, before
+    any request.
+
     One log record per attempt is handed to the configured sink, under the
     ``"tools-stream"`` schema, carrying the offered ``tools``, the returned
     ``tool_calls`` and the turn's ``usage`` — the streamed transport asks for
@@ -169,6 +178,7 @@ async def tool_llm_call_stream(
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -209,6 +219,7 @@ async def tool_llm_call_stream(
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             reasoning_effort=args.reasoning_effort,
+            service_tier=args.tier_request,
             provider=provider,
             call_id=call_id,
             attempt=attempt_offset + attempt,
@@ -251,6 +262,7 @@ def tool_llm_call_stream_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -265,7 +277,9 @@ def tool_llm_call_stream_sync(
     asked for. ``timeout`` bounds each wait for the next chunk, as on the async
     form; the sync bridge adds no whole-stream ceiling. It must be a finite
     nonnegative number (not bool), or ``None``; invalid values raise
-    ``ValueError`` on first iteration before call admission.
+    ``ValueError`` on first iteration before call admission. ``service_tier``
+    resolves as on the async form, and an unsupported tier raises
+    :class:`~llmkit.ServiceTierUnsupportedError` on first iteration.
 
     The caller's :mod:`contextvars` context is captured when this function is
     called, not when iteration starts. Closing the generator, breaking out of a
@@ -286,6 +300,7 @@ def tool_llm_call_stream_sync(
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             options=options,
@@ -307,6 +322,7 @@ async def _stream_tools_once(
     max_tokens: int | None,
     timeout: float | None,
     reasoning_effort: ReasoningEffort | None,
+    service_tier: ServiceTierRequest | None,
     provider: LLMProviderInterface | None,
     call_id: str,
     attempt: int,
@@ -376,6 +392,7 @@ async def _stream_tools_once(
                 max_tokens=max_tokens,
                 timeout=timeout,
                 reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
                 provider=provider,
                 feature=feature,
                 label=label,

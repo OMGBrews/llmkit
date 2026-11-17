@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import (
     BaseProvider,
@@ -96,8 +96,9 @@ class CerebrasProvider(BaseProvider):
         model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
         # The *configured* endpoint, not the resolved one: resolution reads the
         # environment and so must happen at the read point, never here (see
@@ -138,6 +139,15 @@ class CerebrasProvider(BaseProvider):
         return {"reasoning_effort": effort}
 
     @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Refuse every tier: Cerebras takes no service tier."""
+        self.refuse_service_tier(
+            tier,
+            model,
+            "Cerebras takes no service tier; LiteLLM refuses the argument on this route",
+        )
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> CerebrasProvider:
         """Construct from an :class:`LLMClientConfig`.
@@ -155,4 +165,5 @@ class CerebrasProvider(BaseProvider):
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

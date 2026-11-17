@@ -205,6 +205,10 @@ def test_all_unset_resolves_to_true_defaults() -> None:
     assert resolved.provider is None
     assert resolved.cache is True
     assert resolved.timeout is None
+    # Unset survives the merge so the provider's configured tier can still
+    # apply; the tier the call sends is filled in later, by the call preamble.
+    assert resolved.service_tier is UNSET
+    assert resolved.tier_request is None
 
 
 def test_repr_shows_only_set_fields_and_sentinel_reads_clean() -> None:
@@ -216,6 +220,9 @@ def test_repr_shows_only_set_fields_and_sentinel_reads_clean() -> None:
     assert repr(LLMCallOptions(temperature=0.9)) == "LLMCallOptions(temperature=0.9)"
     # An explicit None is a *set* field (distinct from unset) and shows up.
     assert repr(LLMCallOptions(model=None)) == "LLMCallOptions(model=None)"
+    # An explicit ``service_tier=None`` asks for no tier, unlike unset, so it shows too.
+    assert repr(LLMCallOptions(service_tier=None)) == "LLMCallOptions(service_tier=None)"
+    assert repr(LLMCallOptions(service_tier="flex")) == "LLMCallOptions(service_tier='flex')"
 
 
 def test_options_threads_through_text_and_sync() -> None:

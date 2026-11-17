@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import BaseProvider, LLMClientConfig
 
@@ -73,8 +73,9 @@ class OllamaProvider(BaseProvider):
         base_url: str = _DEFAULT_BASE_URL,
         model: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._base_url: str | None = base_url
 
     @override
@@ -100,6 +101,13 @@ class OllamaProvider(BaseProvider):
         return {"api_base": self._base_url}
 
     @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Refuse every tier: Ollama takes no service tier."""
+        self.refuse_service_tier(
+            tier, model, "Ollama takes no service tier; LiteLLM refuses the argument on this route"
+        )
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> OllamaProvider:
         """Construct from an :class:`LLMClientConfig` (local endpoint default)."""
@@ -107,4 +115,5 @@ class OllamaProvider(BaseProvider):
             base_url=config.base_url or _DEFAULT_BASE_URL,
             model=config.model,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

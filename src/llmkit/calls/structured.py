@@ -17,13 +17,13 @@ from pydantic import BaseModel, JsonValue
 
 from llmkit._diagnostics import report
 from llmkit._snapshot import snapshot_data, snapshot_prompt
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
-    cache_hit_requested_service_tier,
     error_text,
     guard_output_schema,
     logger,
     prepare_call,
+    requested_tier,
     resolve_model_and_provider,
     result_validation_budget,
     run_cached,
@@ -60,6 +60,7 @@ async def structured_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -125,6 +126,20 @@ async def structured_llm_call[T: BaseModel](
             ``"lowest"`` keeps Gemini thinking to its minimum so it doesn't
             consume the ``max_tokens`` budget; ``"disable"`` turns thinking off
             or raises before transport on a model that cannot stop thinking.
+        service_tier: Optional provider service tier to ask for (see
+            :data:`~llmkit.ServiceTier`): ``"default"``, ``"flex"`` or
+            ``"priority"``, or a provider's own tier name. Unset defers to
+            ``options``, then to the ``service_tier`` of the provider the call
+            runs on (the one built from :class:`~llmkit.LLMClientConfig`, or a
+            ``provider=`` instance built with :func:`~llmkit.make_provider`; a
+            :class:`~llmkit.Provider` member carries none). An explicit
+            ``None`` asks for no tier, even when the provider has one
+            configured. A value that is not a non-empty string or ``None``
+            raises ``ValueError``; a tier the provider and model cannot honour,
+            or a ``service_tier`` in the provider's own ``completion_kwargs()``,
+            raises :class:`~llmkit.ServiceTierUnsupportedError`. Both are raised
+            before the response cache is read and before any request. The
+            tier is not part of the cache key.
         provider: Optional provider for this call: a
             :class:`~llmkit.Provider` member, built for the call from the
             provider's environment variables, or an instance built with
@@ -186,7 +201,8 @@ async def structured_llm_call[T: BaseModel](
             a predicate cannot accept every result silently.
         options: Optional :class:`LLMCallOptions` supplying any of
             ``temperature``/``model``/``max_tokens``/``reasoning_effort``/
-            ``retry``/``provider``/``cache``/``timeout``/``schema_repairs`` once for
+            ``service_tier``/``retry``/``provider``/``cache``/``timeout``/
+            ``schema_repairs`` once for
             reuse across many calls.
             Precedence is **config < options < explicit keyword**, exactly:
             every mergeable keyword above defaults to :data:`~llmkit.UNSET`,
@@ -228,6 +244,7 @@ async def structured_llm_call[T: BaseModel](
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -283,6 +300,7 @@ async def structured_llm_call[T: BaseModel](
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
+                service_tier=args.tier_request,
                 provider=provider,
                 feature=feature,
                 label=label,
@@ -408,7 +426,7 @@ async def structured_llm_call[T: BaseModel](
                 usage=None,
                 cache_hit=True,
                 source_call_id=source_call_id,
-                requested_service_tier=cache_hit_requested_service_tier(provider),
+                requested_service_tier=requested_tier(args),
             )
         )
 
@@ -466,6 +484,7 @@ def structured_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -486,7 +505,9 @@ def structured_llm_call_sync[T: BaseModel](
     semaphore. ``max_tokens`` caps the completion length when set (parity with
     :func:`text_llm_call`); unset leaves it uncapped. ``reasoning_effort`` is
     forwarded identically (unset defers to ``options``, then to the provider
-    the call runs on). ``retry`` is the transient-error budget, inherited from
+    the call runs on). ``service_tier`` is forwarded identically (unset defers
+    to ``options``, then to the provider's configured tier; an explicit
+    ``None`` asks for no tier). ``retry`` is the transient-error budget, inherited from
     the async path (default-on; pass :data:`~llmkit.NO_RETRY` to opt out).
     ``cache`` is the same response-cache opt-out (``False`` bypasses lookup
     and store). ``schema_repairs`` is the same in-call repair allowance
@@ -516,6 +537,7 @@ def structured_llm_call_sync[T: BaseModel](
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             cache=cache,

@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers._gemini import (
     cannot_disable_error,
     is_always_thinking_gemini,
@@ -85,8 +85,9 @@ class OpenRouterProvider(BaseProvider):
         model: str | None = None,
         base_url: str = _DEFAULT_BASE_URL,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
         self._base_url: str | None = base_url
 
@@ -141,4 +142,5 @@ class OpenRouterProvider(BaseProvider):
             model=config.model,
             base_url=config.base_url or _DEFAULT_BASE_URL,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

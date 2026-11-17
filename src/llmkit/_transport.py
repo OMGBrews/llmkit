@@ -17,7 +17,7 @@ installs a :class:`TransportDouble`.
 from __future__ import annotations
 
 import threading
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -91,15 +91,6 @@ class ServiceTiers:
     served: str | None = None
 
 
-def requested_service_tier(request_kwargs: Mapping[str, object]) -> str | None:
-    """The top-level ``service_tier`` a request asked for, when a non-empty string.
-
-    A value nested inside ``extra_body`` is not read.
-    """
-    tier = request_kwargs.get("service_tier")
-    return tier if isinstance(tier, str) and tier else None
-
-
 @dataclass(frozen=True)
 class WireToolFragment:
     """A piece of one streamed tool call, joined to its siblings by ``index``."""
@@ -151,6 +142,8 @@ class CallContext:
     receives, so it holds no credentials or provider-native kwargs.
     ``feature``, ``label``, ``call_id`` and ``attempt`` are ``None`` when a
     transport is called directly, without the call layer's identity.
+    ``service_tier`` is the tier the call asked for, as the host wrote it, not
+    the provider's translation of it.
     """
 
     kind: CallKind
@@ -161,6 +154,7 @@ class CallContext:
     temperature: float | None
     max_tokens: int | None
     reasoning_effort: ReasoningEffort | None
+    service_tier: str | None = None
     feature: str | None = None
     label: str | None = None
     call_id: str | None = None

@@ -21,6 +21,7 @@ imports these two back for :meth:`~llmkit.ToolCallResult.to_message` and
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
@@ -149,10 +150,46 @@ class Message(TypedDict):
 #: non-validating wrapper.
 type ReasoningEffort = Literal["disable", "lowest", "low", "medium", "high"] | str
 
+#: The service tier a call asks the provider for, with three portable names
+#: llmkit gives a meaning on every shipped provider:
+#:
+#: - ``"default"`` asks for the provider's standard tier.
+#: - ``"flex"`` asks for a cheaper, slower tier where the route sells one.
+#: - ``"priority"`` asks for the provider's paid faster lane: the priority tier
+#:   on OpenAI, Bedrock and Google AI Studio, and fast mode (``speed: "fast"``)
+#:   on Anthropic models that support it.
+#:
+#: Any other string is the provider's own tier name and is forwarded only where
+#: llmkit has established that the route sends it unchanged. A value a route
+#: cannot honour raises :class:`~llmkit.ServiceTierUnsupportedError` before
+#: anything is sent; the per-provider behaviour is in the README's
+#: "Service tier" section. ``"auto"`` is not portable: it means different things
+#: on different providers.
+#:
+#: Advisory, like :data:`ReasoningEffort`: the open ``| str`` tail widens the
+#: alias to ``str`` under the type checker.
+type ServiceTier = Literal["default", "flex", "priority"] | str
+
 # ``Message`` deliberately stays closed for existing callers. Tool loops use
 # this union, which retains ordinary messages and adds the OpenAI-normalized
 # assistant-call / tool-result wire shapes.
 type ChatMessage = Message | AssistantToolMessage | ToolResultMessage
+
+
+@dataclass(frozen=True)
+class ServiceTierRequest:
+    """A call's resolved service tier and the request arguments it became.
+
+    Built once per call, in the call preamble, by the provider the call runs
+    on (its ``service_tier_kwargs`` hook), and carried to the transport, which
+    merges ``kwargs`` into every attempt's request without asking the provider
+    again. ``tier`` is the value as the host wrote it, which is what the call
+    record reports as requested; ``kwargs`` is what goes on the wire, such as
+    ``{"service_tier": "standard_only"}`` or ``{"speed": "fast"}`` on Anthropic.
+    """
+
+    tier: str
+    kwargs: Mapping[str, object]
 
 
 @dataclass(frozen=True)

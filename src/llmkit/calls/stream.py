@@ -26,15 +26,15 @@ from contextlib import aclosing
 from datetime import UTC, datetime
 
 from llmkit._snapshot import snapshot_prompt
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier, ServiceTierRequest
 from llmkit.cache import LLMCacheEntry
 from llmkit.cache.read_through import cached_entry, store_entry
 from llmkit.calls._shared import (
     build_text_record,
     cache_and_key,
-    cache_hit_requested_service_tier,
     error_text,
     prepare_call,
+    requested_tier,
     resolve_model_and_provider,
 )
 from llmkit.capture import record_call_async, submit_record_call
@@ -64,6 +64,7 @@ async def text_llm_call_stream(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -103,6 +104,14 @@ async def text_llm_call_stream(
     rule: unset resolves to :data:`~llmkit.DEFAULT_TEMPERATURE` (``None``),
     and a resolved ``None`` forwards **no** ``temperature`` kwarg at all (the
     provider's default sampling applies).
+
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`structured_llm_call`): unset defers to ``options``, then to the
+    ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` at first iteration, before
+    the response cache is read and before any request.
 
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. The stream asks the
@@ -155,6 +164,7 @@ async def text_llm_call_stream(
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -208,7 +218,7 @@ async def text_llm_call_stream(
                     attempt=attempt_offset + 1,
                     cache_hit=True,
                     source_call_id=entry.call_id,
-                    requested_service_tier=cache_hit_requested_service_tier(provider),
+                    requested_service_tier=requested_tier(args),
                 )
                 # The same record-step split as ``_stream_once``, for the same
                 # reason: never suspend while abandonment is unwinding.
@@ -234,6 +244,7 @@ async def text_llm_call_stream(
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             reasoning_effort=args.reasoning_effort,
+            service_tier=args.tier_request,
             provider=provider,
             call_id=call_id,
             attempt=attempt_offset + attempt,
@@ -290,6 +301,7 @@ def text_llm_call_stream_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -304,7 +316,9 @@ def text_llm_call_stream_sync(
     asked for. ``timeout`` bounds each wait for the next chunk, as on the async
     form; the sync bridge adds no whole-stream ceiling. It must be a finite
     nonnegative number (not bool), or ``None``; invalid values raise
-    ``ValueError`` on first iteration before call admission.
+    ``ValueError`` on first iteration before call admission. ``service_tier``
+    resolves as on the async form, and an unsupported tier raises
+    :class:`~llmkit.ServiceTierUnsupportedError` on first iteration.
 
     The caller's :mod:`contextvars` context is captured when this function is
     called, not when iteration starts, so enter :func:`~llmkit.capture_llm_records`
@@ -323,6 +337,7 @@ def text_llm_call_stream_sync(
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             cache=cache,
@@ -341,6 +356,7 @@ async def _stream_once(
     max_tokens: int | None,
     timeout: float | None,
     reasoning_effort: ReasoningEffort | None,
+    service_tier: ServiceTierRequest | None,
     provider: LLMProviderInterface | None,
     call_id: str,
     attempt: int,
@@ -403,6 +419,7 @@ async def _stream_once(
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             feature=feature,
             label=label,

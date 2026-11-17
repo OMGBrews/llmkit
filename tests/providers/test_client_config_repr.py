@@ -49,6 +49,14 @@ def test_config_repr_shows_only_non_default_fields() -> None:
     assert "model=" not in rendered
     assert "gemini_structured_output=" not in rendered
     assert "reasoning_effort=" not in rendered
+    assert "service_tier=" not in rendered
+
+
+def test_config_repr_shows_a_set_service_tier() -> None:
+    """A configured tier shows; the default ``None`` stays hidden like every default."""
+    config = LLMClientConfig(provider=Provider.OPENAI, service_tier="priority")
+    assert "service_tier='priority'" in repr(config)
+    assert "service_tier" not in repr(LLMClientConfig(provider=Provider.OPENAI))
 
 
 def test_config_repr_empty_string_api_key_stays_visible() -> None:

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers._claude import reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
@@ -22,6 +22,30 @@ from llmkit.providers.base import (
 #: Note the deliberate absence of a trailing ``/v1`` — LiteLLM appends its own,
 #: so pinning ``https://api.anthropic.com/v1`` yields ``/v1/v1/messages``.
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+
+def _supports_fast_mode(model: str) -> bool:
+    """Whether LiteLLM's model table marks *model* as accepting ``speed: "fast"``.
+
+    The exact-entry lookup LiteLLM's own Anthropic transform makes before it
+    sends ``speed``: no alias walking, so a model the table does not list is
+    refused here exactly as LiteLLM would refuse it.
+    """
+    import litellm
+
+    table = cast("dict[str, dict[str, object]]", litellm.model_cost)
+    return table.get(model, {}).get("supports_speed") is True
+
+
+def _litellm_sends_service_tier(model: str) -> bool:
+    """Whether the installed LiteLLM forwards ``service_tier`` on the Anthropic route."""
+    import litellm
+
+    supported = cast(
+        "list[str] | None",
+        litellm.get_supported_openai_params(model=model, custom_llm_provider="anthropic"),  # pyright: ignore[reportUnknownMemberType]  # raw-llm — LiteLLM leaves the list untyped
+    )
+    return supported is not None and "service_tier" in supported
 
 
 class AnthropicProvider(BaseProvider):
@@ -99,8 +123,9 @@ class AnthropicProvider(BaseProvider):
         model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
         # The *configured* endpoint, not the resolved one: resolution reads the
         # environment and so must happen at the read point, never here (see
@@ -111,6 +136,50 @@ class AnthropicProvider(BaseProvider):
     def reasoning_kwargs(self, effort: ReasoningEffort, model: str) -> dict[str, object]:
         """Translate disable and lowest, rejecting disable on models known to require thinking."""
         return reasoning_kwargs(effort, model, route="anthropic")
+
+    @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Map the portable tiers onto Anthropic's request, refusing what it cannot honour.
+
+        ``"default"`` is sent as Anthropic's ``standard_only``. ``"priority"`` is
+        sent as fast mode (``speed: "fast"``, a premium-priced faster output
+        lane) with no tier, on a model LiteLLM's model table marks
+        ``supports_speed``; any other model is refused, because LiteLLM would
+        refuse the request or, under a global ``litellm.drop_params``, silently
+        send it without fast mode. It is not Anthropic's Priority Tier, which is
+        committed capacity bought in advance and reached with Anthropic's own
+        ``"auto"``. Anthropic's own names ``"auto"`` and ``"standard_only"`` are
+        forwarded. ``"flex"`` and any other value are refused: Anthropic has no
+        such tier, and LiteLLM would refuse or drop it. A tier is also refused
+        when the installed LiteLLM does not list ``service_tier`` among the
+        Anthropic route's parameters (the declared floor, 1.104.0, does not):
+        it would refuse the request, or drop the tier under a global
+        ``litellm.drop_params``.
+        """
+        if tier in ("default", "auto", "standard_only"):
+            if not _litellm_sends_service_tier(model):
+                self.refuse_service_tier(
+                    tier,
+                    model,
+                    "the installed LiteLLM does not send a service tier on the Anthropic route "
+                    + "(LiteLLM 1.104.0 refuses the argument); upgrade LiteLLM",
+                )
+            return {"service_tier": "standard_only" if tier == "default" else tier}
+        if tier == "priority":
+            if _supports_fast_mode(model):
+                return {"speed": "fast"}
+            self.refuse_service_tier(
+                tier,
+                model,
+                'Anthropic sends "priority" as fast mode, which this model does not offer '
+                + "(LiteLLM's model table marks the models that do with supports_speed)",
+            )
+        self.refuse_service_tier(
+            tier,
+            model,
+            'Anthropic accepts the portable "default" and "priority" and its own "auto" and '
+            + '"standard_only"; it has no flex tier',
+        )
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
@@ -157,4 +226,5 @@ class AnthropicProvider(BaseProvider):
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

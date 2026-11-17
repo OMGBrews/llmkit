@@ -27,7 +27,7 @@ from enum import Enum
 from typing import override
 
 from llmkit._durations import duration
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier, ServiceTierRequest
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 
@@ -89,7 +89,8 @@ class LLMCallOptions:
 
     Every field is **optional and unset by default** (the :data:`UNSET`
     sentinel, not ``None``): an unset field defers to the per-call keyword,
-    which in turn defers, for the dual-homed ``model`` / ``reasoning_effort``,
+    which in turn defers, for ``model`` / ``reasoning_effort`` /
+    ``service_tier`` (each a client-wide default you can override per call),
     to the provider the call runs on: the one built from the configured
     :class:`~llmkit.LLMClientConfig`, or a ``provider`` given here or per
     call. This is what makes "unset option does not clobber config" work —
@@ -155,6 +156,15 @@ class LLMCallOptions:
             ``int`` (a ``bool``, a float such as ``1.0``, a negative value)
             raises ``ValueError``, the rule :class:`~llmkit.RetryPolicy`
             applies to its attempt counts.
+        service_tier: The provider service tier to ask for (see
+            :data:`~llmkit.ServiceTier`). Unset defers to the per-call
+            ``service_tier`` keyword, then to the ``service_tier`` of the
+            provider the call runs on (set through
+            :class:`~llmkit.LLMClientConfig`). An explicit ``None`` asks for
+            no tier, even when the provider has one configured. A value must
+            be a non-empty string or ``None``; anything else raises
+            ``ValueError`` before any request, and a tier the route cannot
+            honour raises :class:`~llmkit.ServiceTierUnsupportedError`.
     """
 
     temperature: float | None | Unset = UNSET
@@ -166,6 +176,7 @@ class LLMCallOptions:
     cache: bool | Unset = UNSET
     timeout: float | None | Unset = UNSET
     schema_repairs: int | Unset = UNSET
+    service_tier: ServiceTier | None | Unset = UNSET
 
     @override
     def __repr__(self) -> str:
@@ -201,6 +212,16 @@ class ResolvedCallArgs:
     cache: bool
     timeout: float | None
     schema_repairs: int
+    #: The merged tier setting: :data:`UNSET` when neither the keyword nor the
+    #: options set one, so the provider's configured tier still applies, and
+    #: ``None`` when the caller asked for no tier. Kept distinct here because,
+    #: unlike ``reasoning_effort``, an explicit ``None`` cancels a configured
+    #: default.
+    service_tier: ServiceTier | None | Unset = UNSET
+    #: The tier the call will send, with the provider's translation of it;
+    #: filled by the call preamble once the provider is known, ``None`` when
+    #: no tier applies.
+    tier_request: ServiceTierRequest | None = None
 
 
 def resolve_call_args(
@@ -215,6 +236,7 @@ def resolve_call_args(
     cache: bool | Unset,
     timeout: float | None | Unset,
     schema_repairs: int | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
 ) -> ResolvedCallArgs:
     """Merge ``options`` under the explicit per-call keywords.
 
@@ -249,6 +271,12 @@ def resolve_call_args(
     claimed from an enclosing retry loop and before any request: anything
     but a non-negative ``int`` raises ``ValueError``. There is no upper bound.
 
+    ``service_tier`` is the one field whose unset state survives the merge:
+    an unset tier stays :data:`UNSET` so the provider's configured tier can
+    apply later, while an explicit ``None`` means "no tier" and overrides it.
+    A set value must be a non-empty string or ``None``; anything else raises
+    ``ValueError`` here.
+
     ``options=None`` is simply an all-unset options, so the flat-kwarg path
     resolves to the same values as before options existed. The true defaults
     are applied here and only here — the call signatures carry :data:`UNSET`,
@@ -267,6 +295,7 @@ def resolve_call_args(
         schema_repairs=_check_schema_repairs(
             _pick(schema_repairs, opts.schema_repairs, DEFAULT_SCHEMA_REPAIRS)
         ),
+        service_tier=_check_service_tier(_pick(service_tier, opts.service_tier, UNSET)),
     )
 
 
@@ -319,6 +348,21 @@ DEFAULT_SCHEMA_REPAIRS: int = 1
 # Shared all-unset instance for the ``options=None`` path, so resolving the
 # flat-keyword call doesn't allocate a throwaway options object per call.
 _ALL_UNSET_OPTIONS = LLMCallOptions()
+
+
+def _check_service_tier(value: object) -> str | None | Unset:
+    """Return *value* if it is a usable tier setting, else raise ``ValueError``.
+
+    A usable setting is :data:`UNSET`, ``None``, or a non-empty string;
+    :class:`~llmkit.LLMClientConfig` checks its own field the same way.
+    """
+    if value is UNSET:
+        return UNSET
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"service_tier must be a non-empty string or None, got {value!r}")
 
 
 def _check_timeout(value: object) -> float | None:
