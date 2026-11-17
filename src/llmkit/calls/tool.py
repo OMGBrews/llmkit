@@ -137,6 +137,13 @@ async def tool_llm_call[T: BaseModel](
     fires at the first wait. Unset or ``None`` sets no deadline and sends no
     timeout keyword, leaving LiteLLM's default in effect.
 
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`~llmkit.structured_llm_call`): unset defers to ``options``, then to
+    the ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` before any request.
+
     A round in which only *some* requested calls are malformed keeps the
     well-formed ones on ``tool_calls`` and reports the rest on
     ``invalid_calls``; a round in which every call is malformed still raises
@@ -509,7 +516,9 @@ def tool_llm_call_sync[T: BaseModel](
 
     The same call as the async form, driven on llmkit's persistent loop by
     :func:`run_sync`: same arguments, same retries, logging, rate limits and
-    result. Every argument is forwarded untouched.
+    result. Every argument is forwarded untouched, ``service_tier`` included
+    (unset defers to ``options``, then to the provider's configured tier; an
+    explicit ``None`` asks for no tier).
 
     ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
     invalid values raise ``ValueError`` before call admission (at first

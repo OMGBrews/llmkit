@@ -105,6 +105,14 @@ async def text_llm_call_stream(
     and a resolved ``None`` forwards **no** ``temperature`` kwarg at all (the
     provider's default sampling applies).
 
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`structured_llm_call`): unset defers to ``options``, then to the
+    ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` at first iteration, before
+    the response cache is read and before any request.
+
     The ``schema`` field in the log is the literal string ``"stream"``
     since there is no Pydantic schema applied here. The stream asks the
     provider for usage, so a stream that runs out — completed or truncated —
@@ -308,7 +316,9 @@ def text_llm_call_stream_sync(
     asked for. ``timeout`` bounds each wait for the next chunk, as on the async
     form; the sync bridge adds no whole-stream ceiling. It must be a finite
     nonnegative number (not bool), or ``None``; invalid values raise
-    ``ValueError`` on first iteration before call admission.
+    ``ValueError`` on first iteration before call admission. ``service_tier``
+    resolves as on the async form, and an unsupported tier raises
+    :class:`~llmkit.ServiceTierUnsupportedError` on first iteration.
 
     The caller's :mod:`contextvars` context is captured when this function is
     called, not when iteration starts, so enter :func:`~llmkit.capture_llm_records`

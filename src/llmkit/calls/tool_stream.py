@@ -132,6 +132,14 @@ async def tool_llm_call_stream(
     :func:`~llmkit.structured_llm_call`). Blocking code uses
     :func:`~llmkit.tool_llm_call_stream_sync`, which yields the same items.
 
+    ``service_tier`` is the provider service tier to ask for (see
+    :func:`~llmkit.structured_llm_call`): unset defers to ``options``, then to
+    the ``service_tier`` of the provider the call runs on, and an explicit
+    ``None`` asks for no tier. A tier the route cannot honour, or a
+    ``service_tier`` in the provider's own ``completion_kwargs()``, raises
+    :class:`~llmkit.ServiceTierUnsupportedError` at first iteration, before
+    any request.
+
     One log record per attempt is handed to the configured sink, under the
     ``"tools-stream"`` schema, carrying the offered ``tools``, the returned
     ``tool_calls`` and the turn's ``usage`` — the streamed transport asks for
@@ -269,7 +277,9 @@ def tool_llm_call_stream_sync(
     asked for. ``timeout`` bounds each wait for the next chunk, as on the async
     form; the sync bridge adds no whole-stream ceiling. It must be a finite
     nonnegative number (not bool), or ``None``; invalid values raise
-    ``ValueError`` on first iteration before call admission.
+    ``ValueError`` on first iteration before call admission. ``service_tier``
+    resolves as on the async form, and an unsupported tier raises
+    :class:`~llmkit.ServiceTierUnsupportedError` on first iteration.
 
     The caller's :mod:`contextvars` context is captured when this function is
     called, not when iteration starts. Closing the generator, breaking out of a

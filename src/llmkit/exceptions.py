@@ -191,8 +191,8 @@ class LlmkitError(Exception):
     :class:`ResultValidationError`), and its configuration errors
     (:class:`LLMClientNotConfiguredError`, :class:`ComposeUnsupportedError`,
     :class:`ToolChoiceUnsupportedError`,
-    :class:`ReasoningEffortUnsupportedError`, :class:`SchemaEngineError`,
-    :class:`UnsupportedSchemaError`). It
+    :class:`ReasoningEffortUnsupportedError`, :class:`ServiceTierUnsupportedError`,
+    :class:`SchemaEngineError`, :class:`UnsupportedSchemaError`). It
     does not catch the third-party errors a call can also raise (``openai``
     and ``httpx`` transport errors, a bare pydantic ``ValidationError``, and
     instructor's ``InstructorRetryException`` wrapping a transport or

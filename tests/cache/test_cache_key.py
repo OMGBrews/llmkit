@@ -7,6 +7,7 @@ pinned digest makes any change to the form a deliberate version bump.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 
 import pytest
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from llmkit import ChatMessage, llm_cache_key
 from llmkit.cache import LLM_CACHE_KEY_VERSION
+from llmkit.providers import OpenAIProvider
 from tests.cache.conftest import cache_provider
 
 
@@ -151,6 +153,23 @@ def test_effective_reasoning_effort_is_what_counts() -> None:
     the transport resolves it, so the two spellings are one request."""
     configured = cache_provider(reasoning_effort="low")
     assert _key(provider=configured) == _key(reasoning_effort="low")
+
+
+def test_the_service_tier_is_not_part_of_the_key() -> None:
+    """Two requests that differ only in tier share a key, and the form is unchanged.
+
+    The tier changes the price and the latency of an answer, not the answer, so
+    a cached answer serves a call that asks for another tier. A tier a provider
+    is configured with is read from its ``service_tier``, never from
+    ``completion_kwargs()`` (where llmkit refuses one), so it cannot reach the
+    endpoint kwargs the key hashes either.
+    """
+    assert LLM_CACHE_KEY_VERSION == 4
+    tiered = OpenAIProvider(api_key="k", model="gpt-4.1-mini", service_tier="priority")
+    untiered = OpenAIProvider(api_key="k", model="gpt-4.1-mini")
+    flex = OpenAIProvider(api_key="k", model="gpt-4.1-mini", service_tier="flex")
+    assert _key(provider=tiered) == _key(provider=untiered) == _key(provider=flex)
+    assert "service_tier" not in inspect.signature(llm_cache_key).parameters
 
 
 def test_text_key_ignores_the_structured_output_mode() -> None:

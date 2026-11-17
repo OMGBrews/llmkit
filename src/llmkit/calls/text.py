@@ -97,6 +97,12 @@ async def text_llm_call(
             reasoning/thinking effort; unset defers to ``options``, then to
             the ``reasoning_effort`` of the provider the call runs on (see
             :func:`structured_llm_call`).
+        service_tier: Optional provider service tier (see
+            :func:`structured_llm_call`); unset defers to ``options``, then to
+            the ``service_tier`` of the provider the call runs on, and an
+            explicit ``None`` asks for no tier. A tier the route cannot honour
+            raises :class:`~llmkit.ServiceTierUnsupportedError` before the
+            response cache is read and before any request.
         provider: Optional provider for this call (see
             :func:`structured_llm_call`); unset defers to ``options``, then
             to the provider registered with
@@ -330,7 +336,9 @@ def text_llm_call_sync(
     structured sync wrapper — every rate-limit dimension (including the
     per-provider concurrency cap) is enforced inside the async path on the shared
     persistent loop, with no separate calling-thread semaphore (see
-    :func:`structured_llm_call_sync`).
+    :func:`structured_llm_call_sync`). ``service_tier`` is forwarded
+    identically (unset defers to ``options``, then to the provider's
+    configured tier; an explicit ``None`` asks for no tier).
 
     ``timeout`` must be a finite nonnegative number (not bool), or ``None``;
     invalid values raise ``ValueError`` before call admission (at first

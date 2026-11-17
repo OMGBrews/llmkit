@@ -1,18 +1,22 @@
 """The call record carries the requested and the served service tier.
 
-The requested tier is the top-level ``service_tier`` in the provider's request
-arguments; the served tier is what the response, or a stream frame, reported.
-Most tests drive every public lane through the :mod:`llmkit.testing` fake; the
-``real LiteLLM`` tests send through LiteLLM's own OpenAI handler and stream
-processing to an in-process HTTP transport, so the conversion from LiteLLM's
-objects is measured at whichever LiteLLM is installed (the declared floor under
-the lowest-direct run). No test reaches the network.
+The requested tier is the ``service_tier`` setting as the host wrote it (here
+the per-call keyword, on an OpenAI provider, which forwards any tier); the
+served tier is what the response, or a stream frame, reported. A top-level
+``service_tier`` in a provider's own ``completion_kwargs()`` is refused with
+:class:`~llmkit.ServiceTierUnsupportedError` before any request, and Ollama
+refuses every tier. Most tests drive every public lane through the
+:mod:`llmkit.testing` fake; the ``real LiteLLM`` tests send through LiteLLM's
+own OpenAI handler and stream processing to an in-process HTTP transport, so
+the conversion from LiteLLM's objects is measured at whichever LiteLLM is
+installed (the declared floor under the lowest-direct run). No test reaches the
+network.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal, cast, override
 
@@ -32,6 +36,7 @@ from llmkit import (
     OutputLimitError,
     ProviderFailureError,
     RetryPolicy,
+    ServiceTierUnsupportedError,
     ToolDefinition,
     capture_llm_records,
     configure_llm_cache,
@@ -48,7 +53,7 @@ from llmkit import (
 from llmkit._litellm import (
     _served_service_tier,
 )
-from llmkit._transport import requested_service_tier
+from llmkit.options import UNSET, Unset
 from llmkit.providers import OllamaProvider, OpenAIProvider
 from llmkit.testing import Reply, TransportRequest, install
 
@@ -64,50 +69,84 @@ TOOL = ToolDefinition.from_model("answer", Answer)
 ANSWER = '{"value": 1}'
 
 
-class _TieredOllama(OllamaProvider):
-    """The keyless test provider, asking for *tier* the way a host does."""
+def _openai() -> OpenAIProvider:
+    """A provider that forwards any tier; the fake answers it without network."""
+    return OpenAIProvider(api_key="sk-test", model="fake-model")
 
-    def __init__(self, tier: object) -> None:
-        super().__init__(model="fake-model")
-        self._tier: object = tier
+
+OPENAI = _openai()
+
+
+class _OwnTierOpenAI(OpenAIProvider):
+    """An OpenAI provider whose own request arguments carry *extra*."""
+
+    def __init__(self, extra: dict[str, object]) -> None:
+        super().__init__(api_key="sk-test", model="fake-model")
+        self._extra: dict[str, object] = extra
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        return {**super().completion_kwargs(), "service_tier": self._tier}
-
-
-PRIORITY = _TieredOllama("priority")
+        return {**super().completion_kwargs(), **self._extra}
 
 
 async def _call(
     kind: Kind,
     *,
-    provider: OllamaProvider | OpenAIProvider | None = PRIORITY,
+    provider: OllamaProvider | OpenAIProvider | None = OPENAI,
+    service_tier: str | None | Unset = "priority",
     timeout: float | None = None,
     retry: RetryPolicy = NO_RETRY,
     between_chunks: Callable[[], Awaitable[object]] | None = None,
 ) -> None:
     if kind == "text":
         _ = await text_llm_call(
-            "q", feature="tier", provider=provider, timeout=timeout, retry=retry
+            "q",
+            feature="tier",
+            provider=provider,
+            service_tier=service_tier,
+            timeout=timeout,
+            retry=retry,
         )
     elif kind == "structured":
         _ = await structured_llm_call(
-            "q", Answer, feature="tier", provider=provider, timeout=timeout, retry=retry
+            "q",
+            Answer,
+            feature="tier",
+            provider=provider,
+            service_tier=service_tier,
+            timeout=timeout,
+            retry=retry,
         )
     elif kind == "tool":
         _ = await tool_llm_call(
-            "q", [TOOL], feature="tier", provider=provider, timeout=timeout, retry=retry
+            "q",
+            [TOOL],
+            feature="tier",
+            provider=provider,
+            service_tier=service_tier,
+            timeout=timeout,
+            retry=retry,
         )
     elif kind == "text_stream":
         async for _delta in text_llm_call_stream(
-            "q", feature="tier", provider=provider, timeout=timeout, retry=retry
+            "q",
+            feature="tier",
+            provider=provider,
+            service_tier=service_tier,
+            timeout=timeout,
+            retry=retry,
         ):
             if between_chunks is not None:
                 _ = await between_chunks()
     else:
         async for _event in tool_llm_call_stream(
-            "q", [TOOL], feature="tier", provider=provider, timeout=timeout, retry=retry
+            "q",
+            [TOOL],
+            feature="tier",
+            provider=provider,
+            service_tier=service_tier,
+            timeout=timeout,
+            retry=retry,
         ):
             pass
 
@@ -149,22 +188,29 @@ async def test_a_response_reporting_the_requested_tier_records_it(kind: Kind) ->
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("tier", [None, "", 3, {"nested": "priority"}])
-async def test_no_requested_tier_unless_the_request_sets_a_string(kind: Kind, tier: object) -> None:
+async def test_an_explicit_none_requests_no_tier(kind: Kind) -> None:
     with (
-        install(lambda _request: Reply.text(ANSWER, service_tier="default")),
+        install(lambda _request: Reply.text(ANSWER, service_tier="default")) as fake,
         capture_llm_records() as records,
     ):
-        await _call(kind, provider=_TieredOllama(tier))
+        await _call(kind, service_tier=None)
+    assert [request.service_tier for request in fake.requests] == [None]
     [record] = records
     assert record.requested_service_tier is None
     assert record.served_service_tier == "default"
 
 
 @pytest.mark.parametrize("kind", KINDS)
+async def test_the_fake_sees_the_tier_the_host_wrote(kind: Kind) -> None:
+    with install(lambda _request: Reply.text(ANSWER)) as fake:
+        await _call(kind)
+    assert [request.service_tier for request in fake.requests] == ["priority"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
 async def test_the_registered_provider_requests_no_tier(kind: Kind) -> None:
     with install(lambda _request: Reply.text(ANSWER)), capture_llm_records() as records:
-        await _call(kind, provider=None)
+        await _call(kind, provider=None, service_tier=UNSET)
     [record] = records
     assert record.requested_service_tier is None
     assert record.served_service_tier is None
@@ -278,17 +324,120 @@ def test_the_sync_forms_record_both_tiers() -> None:
         install(lambda _request: Reply.text(ANSWER, service_tier="default")),
         capture_llm_records() as records,
     ):
-        _ = text_llm_call_sync("q", feature="tier", provider=PRIORITY, retry=NO_RETRY)
-        _ = structured_llm_call_sync("q", Answer, feature="tier", provider=PRIORITY, retry=NO_RETRY)
-        _ = list(text_llm_call_stream_sync("q", feature="tier", provider=PRIORITY, retry=NO_RETRY))
+        _ = text_llm_call_sync(
+            "q", feature="tier", provider=OPENAI, service_tier="priority", retry=NO_RETRY
+        )
+        _ = structured_llm_call_sync(
+            "q", Answer, feature="tier", provider=OPENAI, service_tier="priority", retry=NO_RETRY
+        )
+        _ = list(
+            text_llm_call_stream_sync(
+                "q", feature="tier", provider=OPENAI, service_tier="priority", retry=NO_RETRY
+            )
+        )
         _ = list(
             tool_llm_call_stream_sync(
-                "q", [TOOL], feature="tier", provider=PRIORITY, retry=NO_RETRY
+                "q",
+                [TOOL],
+                feature="tier",
+                provider=OPENAI,
+                service_tier="priority",
+                retry=NO_RETRY,
             )
         )
     assert [(r.requested_service_tier, r.served_service_tier) for r in records] == [
         ("priority", "default")
     ] * 4
+
+
+# --- refusals before any request --------------------------------------------
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("setting", [UNSET, None, "priority"])
+@pytest.mark.parametrize("own_tier", ["priority", "", 3, {"nested": "priority"}])
+async def test_a_tier_in_the_providers_own_request_arguments_is_refused(
+    kind: Kind, setting: str | None | Unset, own_tier: object
+) -> None:
+    """With or without the setting: the setting is the only way to ask for a tier."""
+    provider = _OwnTierOpenAI({"service_tier": own_tier})
+    with (
+        install(lambda _request: Reply.text(ANSWER)) as fake,
+        capture_llm_records() as records,
+        pytest.raises(ServiceTierUnsupportedError, match="completion_kwargs"),
+    ):
+        await _call(kind, provider=provider, service_tier=setting)
+    assert fake.requests == []
+    assert records == []
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_a_none_tier_in_the_providers_own_request_arguments_is_not_refused(
+    kind: Kind,
+) -> None:
+    provider = _OwnTierOpenAI({"service_tier": None})
+    with install(lambda _request: Reply.text(ANSWER)), capture_llm_records() as records:
+        await _call(kind, provider=provider)
+    [record] = records
+    assert record.requested_service_tier == "priority"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("setting", [UNSET, "priority"])
+async def test_a_tier_nested_in_extra_body_is_not_refused(kind: Kind, setting: str | Unset) -> None:
+    provider = _OwnTierOpenAI({"extra_body": {"service_tier": "flex"}})
+    with (
+        install(lambda _request: Reply.text(ANSWER, service_tier="default")) as fake,
+        capture_llm_records() as records,
+    ):
+        await _call(kind, provider=provider, service_tier=setting)
+    assert len(fake.requests) == 1
+    [record] = records
+    assert record.error is None
+    expected = None if isinstance(setting, Unset) else setting
+    assert record.requested_service_tier == expected
+    assert record.served_service_tier == "default"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("tier", ["default", "flex", "priority", "auto"])
+async def test_ollama_refuses_every_tier_before_any_request(kind: Kind, tier: str) -> None:
+    with (
+        install(lambda _request: Reply.text(ANSWER)) as fake,
+        capture_llm_records() as records,
+        pytest.raises(ServiceTierUnsupportedError),
+    ):
+        await _call(kind, provider=OllamaProvider(model="fake-model"), service_tier=tier)
+    assert fake.requests == []
+    assert records == []
+
+
+@pytest.mark.parametrize("kind", ["text_stream", "tool_stream"])
+async def test_a_stream_raises_the_refusal_at_its_first_iteration(kind: Kind) -> None:
+    provider = _OwnTierOpenAI({"service_tier": "priority"})
+    with install(lambda _request: Reply.text(ANSWER)) as fake:
+        stream = (
+            text_llm_call_stream("q", feature="tier", provider=provider, retry=NO_RETRY)
+            if kind == "text_stream"
+            else tool_llm_call_stream(
+                "q", [TOOL], feature="tier", provider=provider, retry=NO_RETRY
+            )
+        )
+        # Opening the stream sends nothing and raises nothing.
+        with pytest.raises(ServiceTierUnsupportedError):
+            _ = await anext(aiter(stream))
+    assert fake.requests == []
+
+
+def test_the_sync_forms_refuse_before_any_request() -> None:
+    provider = _OwnTierOpenAI({"service_tier": "priority"})
+    with install(lambda _request: Reply.text(ANSWER)) as fake, capture_llm_records() as records:
+        with pytest.raises(ServiceTierUnsupportedError):
+            _ = text_llm_call_sync("q", feature="tier", provider=provider, retry=NO_RETRY)
+        with pytest.raises(ServiceTierUnsupportedError):
+            _ = list(text_llm_call_stream_sync("q", feature="tier", provider=provider))
+    assert fake.requests == []
+    assert records == []
 
 
 # --- the YAML body and the index line ---------------------------------------
@@ -357,20 +506,36 @@ def test_an_empty_served_tier_falls_through_and_nothing_is_mapped() -> None:
     assert _served_service_tier(object()) is None
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "expected"),
-    [
-        ({"service_tier": "priority"}, "priority"),
-        ({"service_tier": ""}, None),
-        ({"service_tier": None}, None),
-        ({"extra_body": {"service_tier": "priority"}}, None),
-        ({}, None),
-    ],
-)
-def test_the_requested_tier_is_the_top_level_string(
-    kwargs: Mapping[str, object], expected: str | None
-) -> None:
-    assert requested_service_tier(kwargs) == expected
+def _fast_mode_response() -> ModelResponse:
+    """Anthropic's answer to fast mode: the speed, its capacity tier, a top-level tier."""
+    response = ModelResponse(usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+    usage = cast("Usage", response.usage)  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — set above
+    usage.speed = "fast"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    usage.service_tier = "standard"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    response.service_tier = "priority"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    return response
+
+
+def test_when_speed_was_sent_the_usage_speed_comes_first() -> None:
+    assert _served_service_tier(_fast_mode_response(), speed_sent=True) == "fast"
+
+
+def test_when_speed_was_not_sent_the_usage_speed_is_ignored() -> None:
+    response = _fast_mode_response()
+    assert _served_service_tier(response) == "priority"
+    assert _served_service_tier(response, speed_sent=False) == "priority"
+    response.service_tier = None  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    assert _served_service_tier(response) == "standard"
+
+
+def test_when_speed_was_sent_but_not_reported_the_usual_order_applies() -> None:
+    response = _fast_mode_response()
+    usage = cast("Usage", response.usage)  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — set above
+    usage.speed = ""  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    assert _served_service_tier(response, speed_sent=True) == "priority"
+    response.service_tier = None  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    assert _served_service_tier(response, speed_sent=True) == "standard"
+    assert _served_service_tier(object(), speed_sent=True) is None
 
 
 # --- real LiteLLM, no fake ---------------------------------------------------
@@ -435,14 +600,17 @@ class _InProcessOpenAI(OpenAIProvider):
 
     @override
     def completion_kwargs(self) -> dict[str, object]:
-        return {**super().completion_kwargs(), "client": self._client, "service_tier": "priority"}
+        return {**super().completion_kwargs(), "client": self._client}
 
 
 async def test_real_litellm_buffered_openai_response_records_its_tier() -> None:
     provider = _InProcessOpenAI(lambda _request: httpx.Response(200, json=_BUFFERED_BODY))
     with capture_llm_records() as records:
         assert (
-            await text_llm_call("q", feature="tier", provider=provider, retry=NO_RETRY) == "Hello"
+            await text_llm_call(
+                "q", feature="tier", provider=provider, service_tier="priority", retry=NO_RETRY
+            )
+            == "Hello"
         )
     assert provider.sent[0]["service_tier"] == "priority"
     [record] = records
@@ -468,7 +636,7 @@ async def test_real_litellm_openai_stream_records_its_tier(
         deltas = [
             delta
             async for delta in text_llm_call_stream(
-                "q", feature="tier", provider=provider, retry=NO_RETRY
+                "q", feature="tier", provider=provider, service_tier="priority", retry=NO_RETRY
             )
         ]
     assert "".join(deltas) == "Hello"

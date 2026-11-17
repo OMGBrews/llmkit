@@ -89,7 +89,8 @@ class LLMCallOptions:
 
     Every field is **optional and unset by default** (the :data:`UNSET`
     sentinel, not ``None``): an unset field defers to the per-call keyword,
-    which in turn defers, for the dual-homed ``model`` / ``reasoning_effort``,
+    which in turn defers, for ``model`` / ``reasoning_effort`` /
+    ``service_tier`` (each a client-wide default you can override per call),
     to the provider the call runs on: the one built from the configured
     :class:`~llmkit.LLMClientConfig`, or a ``provider`` given here or per
     call. This is what makes "unset option does not clobber config" work —
