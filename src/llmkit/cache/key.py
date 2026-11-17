@@ -31,7 +31,10 @@ from llmkit.providers import LLMProviderInterface
 #: was silently replaced by a lower effort that still reasons on some routes:
 #: the key holds the portable value, so such an answer would otherwise keep
 #: being served for a request that now turns thinking off or raises.
-LLM_CACHE_KEY_VERSION: Final = 4
+#: Version 5 retires entries whose key could describe inputs from before a
+#: caller mutation while the provider answered the changed inputs. Calls now
+#: snapshot messages before key computation and keep that baseline throughout.
+LLM_CACHE_KEY_VERSION: Final = 5
 
 # The provider request kwargs that say *where* a request goes, as opposed to
 # who is allowed to send it. An allowlist, so a credential (``api_key``) can
@@ -81,9 +84,11 @@ def llm_cache_key(
     is sent to the provider and steers the order the model generates fields
     in, so two schemas that differ only in field order are different requests.
 
-    Raises whatever the inputs raise — a content part that is not
-    JSON-serialisable, a provider missing an attribute. The call functions
-    treat any such failure as a miss.
+    Raises whatever the inputs raise — for example, a provider missing an
+    attribute or an endpoint setting that is not JSON-serialisable. The call
+    functions treat fingerprint failures as misses, after independently
+    validating and snapshotting their inputs. Unsupported nested prompt data
+    is rejected before cache access; it cannot bypass that ownership check.
     """
     request_kwargs = provider.completion_kwargs()
     structured = output_schema is not None

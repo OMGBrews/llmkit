@@ -49,6 +49,7 @@ from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 from pydantic import BaseModel
 
 from llmkit._diagnostics import report
+from llmkit._snapshot import snapshot_data, snapshot_prompt
 from llmkit._transport import requested_service_tier
 from llmkit._types import AssistantToolMessage, ChatMessage, ReasoningEffort
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
@@ -62,6 +63,7 @@ from llmkit.exceptions import (
     UnsupportedSchemaError,
 )
 from llmkit.logging import LLMCallRecord
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
 from llmkit.providers import LLMProviderInterface, Provider, coerce_call_provider
 from llmkit.providers.base import active_config, client_configured
@@ -665,6 +667,7 @@ def build_text_record(
     first_chunk_at: float | None = None,
     requested_service_tier: str | None = None,
     served_service_tier: str | None = None,
+    requests: list[RequestSnapshot] | None = None,
 ) -> LLMCallRecord:
     """Build the ``LLMCallRecord`` for a plain-text/stream call.
 
@@ -721,7 +724,8 @@ def build_text_record(
         temperature=temperature,
         duration_ms=duration_ms,
         schema=schema,
-        prompt=prompt,
+        prompt=snapshot_prompt(prompt),
+        requests=snapshot_data(requests) if requests is not None else [],
         response=text,
         error=error,
         approximate_cost=approximate_cost,

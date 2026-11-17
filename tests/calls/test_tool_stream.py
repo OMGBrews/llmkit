@@ -268,21 +268,21 @@ async def test_all_malformed_round_is_re_asked_with_repair_before_any_yield() ->
     assert isinstance(result, ToolCallResult)
     assert result.tool_calls[0].validated == _AdditionArgs(left=1, right=2)
     _assert_repaired_retry(installed.requests)
-    # One logical call across both attempts, and the repair attempt's record
-    # shows what was actually sent.
+    # One logical call across both attempts. Both records keep the original
+    # prompt; the repair attempt's request history shows what was actually sent.
     first, second = records
     assert first.call_id == second.call_id
     assert (first.attempt, second.attempt) == (1, 2)
     assert first.error is not None and first.error.startswith("ToolArgumentError")
     assert second.error is None
-    assert first.prompt == "add"
+    assert first.prompt == second.prompt == "add"
+    assert [len(record.requests) for record in records] == [1, 1]
+    assert [record.requests[0]["repair"] for record in records] == [False, True]
     sent = installed.requests[1].messages
-    assert isinstance(second.prompt, list)
-    logged = second.prompt
+    logged = second.requests[0]["messages"]
     assert len(logged) == 4
-    assert logged[:2] == list(sent[:2])
-    assert cast("dict[str, object]", cast("object", logged[2]))["tool_call_id"] == "call_bad"
-    assert logged[3] == sent[3]
+    assert logged == list(sent)
+    assert logged[2]["tool_call_id"] == "call_bad"
 
 
 def test_sync_form_re_asks_an_all_malformed_round_the_same_way() -> None:

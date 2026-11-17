@@ -4,6 +4,11 @@ Call functions capture records before submitting private snapshots to the log
 worker. Only the caller may append a path, when completion is observed within
 its delivery wait. Late writes never mutate capture buffers. The explicit
 low-level :func:`record_call` remains synchronous.
+
+Managed call records own detached original-input and prepared-request copies.
+Their containers remain mutable for inspection, but editing captured ``prompt``,
+``tools`` or ``requests`` cannot change the invocation's future retries. The
+request history observes llmkit dispatches, not SDK-internal retries.
 """
 
 from __future__ import annotations
@@ -111,8 +116,10 @@ def capture_llm_records() -> Generator[list[LLMCallRecord]]:
     the call returns or propagates its error. Retries each produce their own
     record. Capture works when logging is disabled, full or unavailable and
     proves record construction, not persistence. Delivery workers never append
-    to this list after the call returns. The captured record retains its original
-    nested objects; managed delivery receives a separate container snapshot.
+    to this list after the call returns. Managed calls give each record detached
+    original-input and prepared-request containers; editing them cannot affect
+    future retries. Direct low-level records retain the objects supplied by
+    their constructor. Delivery receives another independent container snapshot.
     """
     records: list[LLMCallRecord] = []
     token = _captured_records.set(records)

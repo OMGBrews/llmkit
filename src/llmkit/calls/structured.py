@@ -16,6 +16,7 @@ from typing import cast
 from pydantic import BaseModel, JsonValue
 
 from llmkit._diagnostics import report
+from llmkit._snapshot import snapshot_data, snapshot_prompt
 from llmkit._types import ChatMessage, ReasoningEffort
 from llmkit.calls._shared import (
     cache_hit_requested_service_tier,
@@ -38,6 +39,7 @@ from llmkit.exceptions import (
     StructuredOutputError,
 )
 from llmkit.logging import LLMCallRecord
+from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
@@ -216,6 +218,8 @@ async def structured_llm_call[T: BaseModel](
             immediately. The log is still written on every attempt with the
             error recorded.
     """
+    # First execution owns the baseline; transport and records get separate copies.
+    prompt = snapshot_prompt(prompt)
     guard_output_schema(output_schema)
     prepared = prepare_call(
         options,
@@ -260,6 +264,7 @@ async def structured_llm_call[T: BaseModel](
         # What the transport actually sent, copied right after its await (see
         # :func:`llmkit._litellm.sent_temperature`); the caller's value until then.
         sent_temperature = args.temperature
+        requests: list[RequestSnapshot] = []
         _litellm.begin_sent_temperature()
         tiers = _litellm.begin_service_tiers()
         try:
@@ -270,8 +275,9 @@ async def structured_llm_call[T: BaseModel](
                 text,
                 native_finish_reason,
             ) = await _litellm.acompletion_structured(
-                prompt,
+                snapshot_prompt(prompt),
                 output_schema,
+                requests=requests,
                 temperature=args.temperature,
                 model=args.model,
                 max_tokens=args.max_tokens,
@@ -341,7 +347,8 @@ async def structured_llm_call[T: BaseModel](
                     temperature=sent_temperature,
                     duration_ms=duration_ms,
                     schema=output_schema.__name__,
-                    prompt=prompt,
+                    prompt=snapshot_prompt(prompt),
+                    requests=snapshot_data(requests),
                     response=response_dump,
                     error=error,
                     approximate_cost=cost,
@@ -384,7 +391,7 @@ async def structured_llm_call[T: BaseModel](
                 temperature=args.temperature,
                 duration_ms=(time.monotonic() - start_t) * 1000,
                 schema=output_schema.__name__,
-                prompt=prompt,
+                prompt=snapshot_prompt(prompt),
                 response=_dump_for_log(response, feature, label),
                 error=None,
                 approximate_cost=0.0,
