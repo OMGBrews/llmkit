@@ -37,6 +37,17 @@ def _supports_fast_mode(model: str) -> bool:
     return table.get(model, {}).get("supports_speed") is True
 
 
+def _litellm_sends_service_tier(model: str) -> bool:
+    """Whether the installed LiteLLM forwards ``service_tier`` on the Anthropic route."""
+    import litellm
+
+    supported = cast(
+        "list[str] | None",
+        litellm.get_supported_openai_params(model=model, custom_llm_provider="anthropic"),  # pyright: ignore[reportUnknownMemberType]  # raw-llm — LiteLLM leaves the list untyped
+    )
+    return supported is not None and "service_tier" in supported
+
+
 class AnthropicProvider(BaseProvider):
     """Anthropic (Claude) LLM provider.
 
@@ -139,12 +150,21 @@ class AnthropicProvider(BaseProvider):
         committed capacity bought in advance and reached with Anthropic's own
         ``"auto"``. Anthropic's own names ``"auto"`` and ``"standard_only"`` are
         forwarded. ``"flex"`` and any other value are refused: Anthropic has no
-        such tier, and LiteLLM would refuse or drop it.
+        such tier, and LiteLLM would refuse or drop it. A tier is also refused
+        when the installed LiteLLM does not list ``service_tier`` among the
+        Anthropic route's parameters (the declared floor, 1.104.0, does not):
+        it would refuse the request, or drop the tier under a global
+        ``litellm.drop_params``.
         """
-        if tier == "default":
-            return {"service_tier": "standard_only"}
-        if tier in ("auto", "standard_only"):
-            return {"service_tier": tier}
+        if tier in ("default", "auto", "standard_only"):
+            if not _litellm_sends_service_tier(model):
+                self.refuse_service_tier(
+                    tier,
+                    model,
+                    "the installed LiteLLM does not send a service tier on the Anthropic route "
+                    + "(LiteLLM 1.104.0 refuses the argument); upgrade LiteLLM",
+                )
+            return {"service_tier": "standard_only" if tier == "default" else tier}
         if tier == "priority":
             if _supports_fast_mode(model):
                 return {"speed": "fast"}

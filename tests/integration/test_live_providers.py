@@ -1688,3 +1688,146 @@ async def test_live_ollama_buffered_integer_tool() -> None:
     assert result.tool_calls[0].name == "add"
     assert result.tool_calls[0].validated == _AdditionArgs(left=2, right=3)
     assert not result.invalid_calls
+
+
+# --- service tier -------------------------------------------------------------
+#
+# Each row of the README's "Service tier" table that llmkit forwards or
+# translates is measured here against the live provider: the request is
+# accepted, and the call record carries the tier the provider reported serving
+# (``None`` where the provider reports none). The rows llmkit refuses before
+# sending are pinned offline in tests/providers/test_service_tier_translation.py;
+# the canaries below re-measure the provider behaviour two of those refusals
+# rest on, so a provider or LiteLLM change that lifts it is noticed.
+
+
+async def _tier_roundtrip(provider: Provider, model: str, tier: str) -> str | None:
+    """Send one small text call asking for *tier*; return the served tier recorded."""
+    built = make_provider(provider, model=model, **_live_credentials(provider))
+    with capture_llm_records() as records:
+        text = await text_llm_call(
+            "Reply with the single word: ok",
+            feature="integration-service-tier",
+            label=f"{provider.value}-{tier}",
+            provider=built,
+            service_tier=tier,
+            retry=NO_RETRY,
+        )
+    assert text.strip(), text
+    [record] = records
+    assert record.error is None, record.error
+    assert record.requested_service_tier == tier
+    return record.served_service_tier
+
+
+_SERVED_TIER_CASES = [
+    # (provider, model, tier, served tier the provider reports)
+    pytest.param(Provider.OPENAI, "gpt-4.1-mini", "default", "default", id="openai-default"),
+    pytest.param(Provider.OPENAI, "gpt-4.1-mini", "priority", "priority", id="openai-priority"),
+    # Flex is offered per model: gpt-4.1-mini answers it with a 400, gpt-5-mini serves it.
+    pytest.param(Provider.OPENAI, "gpt-5-mini", "flex", "flex", id="openai-flex"),
+    pytest.param(
+        Provider.GOOGLE, "gemini-3.1-flash-lite", "default", "default", id="google-default"
+    ),
+    pytest.param(Provider.GOOGLE, "gemini-3.1-flash-lite", "flex", "flex", id="google-flex"),
+    pytest.param(
+        Provider.GOOGLE, "gemini-3.1-flash-lite", "priority", "priority", id="google-priority"
+    ),
+    pytest.param(
+        Provider.OPENROUTER,
+        "google/gemini-3.1-flash-lite",
+        "priority",
+        "priority",
+        id="openrouter-gemini-priority",
+    ),
+    pytest.param(
+        Provider.OPENROUTER,
+        "google/gemini-3.1-flash-lite",
+        "flex",
+        "flex",
+        id="openrouter-gemini-flex",
+    ),
+    # Bedrock offers tiers per model: Claude Haiku 4.5 takes only "default".
+    pytest.param(Provider.BEDROCK, _BEDROCK_MODEL, "default", "default", id="bedrock-default"),
+    # Anthropic reports its capacity tier, "standard", for an ordinary request.
+    pytest.param(
+        Provider.ANTHROPIC, "claude-sonnet-4-6", "default", "standard", id="anthropic-default"
+    ),
+    pytest.param(Provider.ANTHROPIC, "claude-sonnet-4-6", "auto", "standard", id="anthropic-auto"),
+    # "priority" is fast mode on Anthropic; the served value is usage.speed.
+    pytest.param(
+        Provider.ANTHROPIC, "claude-opus-5-5", "priority", "fast", id="anthropic-priority-fast"
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider", "model", "tier", "served"), _SERVED_TIER_CASES)
+async def test_service_tier_is_served_live(
+    provider: Provider, model: str, tier: str, served: str
+) -> None:
+    assert await _tier_roundtrip(provider, model, tier) == served
+
+
+_FORWARDED_UNCONFIRMED_CASES = [
+    # Accepted, but the provider reports no served tier: "forwarded, not confirmed".
+    pytest.param(Provider.DEEPSEEK, "deepseek-chat", id="deepseek"),
+    # Not measured when the setting shipped (no credentials); forwarded on the
+    # rule that a provider accepting the request is forwarded to. A 400 here
+    # means the provider rejects the tier, and llmkit should refuse it instead.
+    pytest.param(Provider.MOONSHOT, _MOONSHOT_MODEL, id="moonshot"),
+    pytest.param(Provider.ALIBABA, _ALIBABA_MODEL, id="alibaba"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider", "model"), _FORWARDED_UNCONFIRMED_CASES)
+async def test_service_tier_is_accepted_live(provider: Provider, model: str) -> None:
+    """The provider accepts a request carrying the tier; what it served is not asserted."""
+    _ = await _tier_roundtrip(provider, model, "priority")
+
+
+@pytest.mark.asyncio
+async def test_openrouter_reports_the_tier_it_served_live() -> None:
+    """OpenRouter forwards any value and reports what it served, which can differ.
+
+    An OpenAI model behind OpenRouter reports "default" for a "priority"
+    request; the record shows both, so the README's requested-versus-served
+    scan finds it.
+    """
+    served = await _tier_roundtrip(Provider.OPENROUTER, "openai/gpt-4.1-mini", "priority")
+    assert served == "default"
+
+
+@pytest.mark.asyncio
+async def test_vertex_rejects_the_tier_litellm_sends_live() -> None:
+    """Canary for the Vertex refusal: Vertex answers LiteLLM's tier form with a 400.
+
+    llmkit refuses every tier on Vertex because of this. If the request starts
+    succeeding, LiteLLM or Vertex has changed and the refusal should be revisited.
+    """
+    credentials = _live_credentials(Provider.VERTEX)
+    with pytest.raises(BadRequestError, match="service_tier"):
+        _ = await litellm.acompletion(
+            model=f"vertex_ai/{_VERTEX_MODEL}",
+            messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+            service_tier="priority",
+            vertex_project=credentials.get("vertex_project"),
+            vertex_location=credentials.get("vertex_location"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bedrock_answers_an_unoffered_tier_with_a_400_live() -> None:
+    """Bedrock decides tiers per model and says so loudly; llmkit forwards the portable names."""
+    built = make_provider(
+        Provider.BEDROCK, model=_BEDROCK_MODEL, **_live_credentials(Provider.BEDROCK)
+    )
+    with pytest.raises(BadRequestError, match="service tier"):
+        _ = await text_llm_call(
+            "Reply with the single word: ok",
+            feature="integration-service-tier",
+            provider=built,
+            service_tier="priority",
+            retry=NO_RETRY,
+        )
