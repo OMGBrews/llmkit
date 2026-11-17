@@ -101,9 +101,8 @@ from llmkit._transport import (
     WireToolFragment,
     WireUsage,
     active_double,
-    requested_service_tier,
 )
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTierRequest
 from llmkit.exceptions import (
     REPAIRABLE_PARSE_ERRORS,
     ContentFilterError,
@@ -179,16 +178,18 @@ def begin_service_tiers() -> ServiceTiers:
     return tiers
 
 
-def _attempt_service_tiers(request_kwargs: dict[str, object]) -> ServiceTiers:
-    """The attempt's holder, with the requested tier the merged request carries.
+def _attempt_service_tiers(service_tier: ServiceTierRequest | None) -> ServiceTiers:
+    """The attempt's holder, with the requested tier as the host wrote it.
 
-    Falls back to a detached holder when no call layer began one (a direct
-    transport caller), so the adapters never branch on it.
+    The requested tier comes from the resolved setting, not from the built
+    request, which may carry a translation of it (``standard_only``,
+    ``speed``). Falls back to a detached holder when no call layer began one
+    (a direct transport caller), so the adapters never branch on it.
     """
     tiers = _service_tiers.get()
     if tiers is None:
         tiers = ServiceTiers()
-    tiers.requested = requested_service_tier(request_kwargs)
+    tiers.requested = service_tier.tier if service_tier is not None else None
     return tiers
 
 
@@ -545,7 +546,8 @@ async def _send(request: WireRequest) -> WireResponse:
             _requests=request.requests,
             _repair=request.call.repair if request.call is not None else False,
             **request.kwargs,
-        )
+        ),
+        speed_sent=_FAST_MODE_KEY in request.kwargs,
     )
 
 
@@ -583,6 +585,7 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
             **request.kwargs,
         ),
     )
+    speed_sent = _FAST_MODE_KEY in request.kwargs
     usage: object = None
     try:
         async with aclosing(_bounded_frames(aiter(stream), timeout)) as chunks:
@@ -590,7 +593,7 @@ async def _stream(request: WireRequest) -> AsyncGenerator[WireChunk | WireStream
                 frame_usage: object = getattr(chunk, "usage", None)
                 if frame_usage is not None:
                     usage = frame_usage
-                yield _wire_chunk(chunk)
+                yield _wire_chunk(chunk, speed_sent=speed_sent)
     except Exception as e:
         normalized = normalize_transient_provider_error(e)
         if normalized is not e:
@@ -669,8 +672,20 @@ def _native_finish_reason(choice: object) -> str | None:
     return None
 
 
-def _served_service_tier(raw: object) -> str | None:
+#: The request argument Anthropic's fast mode is asked for with. When a request
+#: carried it, the speed the response's usage reports is the served value.
+_FAST_MODE_KEY = "speed"
+
+
+def _served_service_tier(raw: object, *, speed_sent: bool = False) -> str | None:
     """The service tier *raw* reports serving, verbatim, or ``None``.
+
+    When the request asked for Anthropic's fast mode (*speed_sent*), the speed
+    the usage block reports (``fast`` or ``standard``) comes first: that is
+    what the host's ``"priority"`` asked for, and the same response also
+    reports Anthropic's capacity tier (``standard``), which does not say
+    whether fast mode was served. The value is not mapped back to
+    ``priority``.
 
     The three places LiteLLM itself consults, in its order: the top-level
     ``service_tier`` (a pydantic extra on ``ModelResponse`` and
@@ -681,9 +696,11 @@ def _served_service_tier(raw: object) -> str | None:
     Google's ``ON_DEMAND`` stays ``ON_DEMAND``. Total ``getattr``: nothing here
     raises.
     """
-    candidates: list[object] = [
+    usage = getattr(raw, "usage", None)
+    candidates: list[object] = [getattr(usage, _FAST_MODE_KEY, None)] if speed_sent else []
+    candidates += [
         getattr(raw, "service_tier", None),
-        getattr(getattr(raw, "usage", None), "service_tier", None),
+        getattr(usage, "service_tier", None),
     ]
     hidden = getattr(raw, "_hidden_params", None)
     if isinstance(hidden, Mapping):
@@ -696,7 +713,7 @@ def _served_service_tier(raw: object) -> str | None:
     return None
 
 
-def _wire_response(raw: object) -> WireResponse:
+def _wire_response(raw: object, *, speed_sent: bool = False) -> WireResponse:
     """Convert a LiteLLM completion to :class:`WireResponse`.
 
     Total ``getattr`` rather than typed, so a test double shaped like a
@@ -706,7 +723,7 @@ def _wire_response(raw: object) -> WireResponse:
     """
     usage = _wire_usage(raw)
     cost = _response_cost(raw)
-    service_tier = _served_service_tier(raw)
+    service_tier = _served_service_tier(raw, speed_sent=speed_sent)
     choices = cast("object", getattr(raw, "choices", None))
     if not choices:
         # A degenerate empty-``choices`` response (e.g. a malformed
@@ -731,7 +748,7 @@ def _wire_response(raw: object) -> WireResponse:
     )
 
 
-def _wire_chunk(chunk: ModelResponseStream) -> WireChunk:
+def _wire_chunk(chunk: ModelResponseStream, *, speed_sent: bool = False) -> WireChunk:
     """Convert one LiteLLM stream frame to :class:`WireChunk`."""
     delta = _chunk_delta_text(chunk)
     return WireChunk(
@@ -743,7 +760,7 @@ def _wire_chunk(chunk: ModelResponseStream) -> WireChunk:
         # no choices; a frame without any usage reports ``None``.
         usage=_wire_usage(chunk) if getattr(chunk, "usage", None) is not None else None,
         cost=_response_cost(chunk),
-        service_tier=_served_service_tier(chunk),
+        service_tier=_served_service_tier(chunk, speed_sent=speed_sent),
     )
 
 
@@ -1023,18 +1040,38 @@ def _reasoning_request_kwargs(
 
 
 def _completion_request_kwargs(
-    provider: LLMProviderInterface, effort: ReasoningEffort | None, model: str | None
+    provider: LLMProviderInterface,
+    effort: ReasoningEffort | None,
+    model: str | None,
+    service_tier: ServiceTierRequest | None = None,
 ) -> dict[str, object]:
-    """Merge provider credentials and a reasoning translation for one request."""
-    creds = provider.completion_kwargs()
-    reasoning = _reasoning_request_kwargs(provider, effort, model)
-    native_body = reasoning.pop("extra_body", None)
+    """Merge provider credentials, a reasoning translation and a tier for one request.
+
+    The tier's arguments were translated once, in the call preamble (see
+    :func:`llmkit.calls._shared.resolve_tier_request`); they are merged here
+    the way the reasoning translation is, ``extra_body`` included, so neither
+    overwrites a routing preference the provider's own ``extra_body`` carries.
+    """
+    request = provider.completion_kwargs()
+    for translated in (
+        _reasoning_request_kwargs(provider, effort, model),
+        dict(service_tier.kwargs) if service_tier is not None else {},
+    ):
+        request = _merge_request_kwargs(request, translated)
+    return request
+
+
+def _merge_request_kwargs(
+    request: dict[str, object], translated: dict[str, object]
+) -> dict[str, object]:
+    """Merge *translated* over *request*, merging their ``extra_body`` dicts one level deep."""
+    native_body = translated.pop("extra_body", None)
     if native_body is None:
-        return {**creds, **reasoning}
+        return {**request, **translated}
     if not isinstance(native_body, dict):
         raise TypeError("Provider reasoning extra_body must be a dict")
     native_body = cast("dict[str, object]", native_body)
-    existing_body = creds.get("extra_body")
+    existing_body = request.get("extra_body")
     if existing_body is None:
         merged_body = native_body
     elif isinstance(existing_body, dict):
@@ -1042,7 +1079,7 @@ def _completion_request_kwargs(
         merged_body = {**existing_body, **native_body}
     else:
         raise TypeError("Provider completion extra_body must be a dict")
-    return {**creds, **reasoning, "extra_body": merged_body}
+    return {**request, **translated, "extra_body": merged_body}
 
 
 def _response_cost(
@@ -1348,6 +1385,7 @@ def _call_context(
     label: str | None,
     call_id: str | None,
     attempt: int | None,
+    service_tier: str | None = None,
     repair: bool = False,
     output_schema: type[BaseModel] | None = None,
     tools: Sequence[ToolDefinition] = (),
@@ -1365,6 +1403,7 @@ def _call_context(
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         feature=feature,
         label=label,
         call_id=call_id,
@@ -1384,6 +1423,7 @@ async def acompletion_structured[T: BaseModel](
     timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    service_tier: ServiceTierRequest | None = None,
     provider: LLMProviderInterface | None = None,
     feature: str | None = None,
     label: str | None = None,
@@ -1446,8 +1486,8 @@ async def acompletion_structured[T: BaseModel](
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
     litellm_model = provider.litellm_model(model)
-    request_kwargs = _completion_request_kwargs(provider, effort, model)
-    tiers = _attempt_service_tiers(request_kwargs)
+    request_kwargs = _completion_request_kwargs(provider, effort, model, service_tier)
+    tiers = _attempt_service_tiers(service_tier)
     # The completion callable is the library's seam under instructor: it sends
     # through the transport boundary, and providers that opt in via
     # ``strict_json_schema`` (OpenRouter) get their ``response_format``
@@ -1464,6 +1504,7 @@ async def acompletion_structured[T: BaseModel](
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
+        service_tier=service_tier.tier if service_tier is not None else None,
         feature=feature,
         label=label,
         call_id=call_id,
@@ -1687,6 +1728,7 @@ async def acompletion_text(
     timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    service_tier: ServiceTierRequest | None = None,
     provider: LLMProviderInterface | None = None,
     feature: str | None = None,
     label: str | None = None,
@@ -1718,8 +1760,8 @@ async def acompletion_text(
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
-    request_kwargs = _completion_request_kwargs(provider, effort, model)
-    tiers = _attempt_service_tiers(request_kwargs)
+    request_kwargs = _completion_request_kwargs(provider, effort, model, service_tier)
+    tiers = _attempt_service_tiers(service_tier)
     litellm_model = provider.litellm_model(model)
     messages = wire_messages(prompt)
     call = _call_context(
@@ -1732,6 +1774,7 @@ async def acompletion_text(
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
+        service_tier=service_tier.tier if service_tier is not None else None,
         feature=feature,
         label=label,
         call_id=call_id,
@@ -1794,6 +1837,7 @@ async def acompletion_tools(
     timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    service_tier: ServiceTierRequest | None = None,
     provider: LLMProviderInterface | None = None,
     response_format: dict[str, object] | None = None,
     output_schema: type[BaseModel] | None = None,
@@ -1814,8 +1858,8 @@ async def acompletion_tools(
     provider = provider if provider is not None else build_provider()
     guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
-    request_kwargs = _completion_request_kwargs(provider, effort, model)
-    tiers = _attempt_service_tiers(request_kwargs)
+    request_kwargs = _completion_request_kwargs(provider, effort, model, service_tier)
+    tiers = _attempt_service_tiers(service_tier)
     if response_format is not None and provider.strict_json_schema:
         _stricten_json_schema_response_format({"response_format": response_format})
     choice: object = tool_choice
@@ -1833,6 +1877,7 @@ async def acompletion_tools(
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
+        service_tier=service_tier.tier if service_tier is not None else None,
         feature=feature,
         label=label,
         call_id=call_id,
@@ -2040,6 +2085,7 @@ async def astream_tools(
     timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    service_tier: ServiceTierRequest | None = None,
     provider: LLMProviderInterface | None = None,
     feature: str | None = None,
     label: str | None = None,
@@ -2081,8 +2127,8 @@ async def astream_tools(
     provider = provider if provider is not None else build_provider()
     guard_tool_choice(provider, tool_choice)
     effort = resolve_reasoning_effort(reasoning_effort, provider)
-    request_kwargs = _completion_request_kwargs(provider, effort, model)
-    tiers = _attempt_service_tiers(request_kwargs)
+    request_kwargs = _completion_request_kwargs(provider, effort, model, service_tier)
+    tiers = _attempt_service_tiers(service_tier)
     choice: object = tool_choice
     if isinstance(tool_choice, ToolName):
         choice = {"type": "function", "function": {"name": tool_choice.value}}
@@ -2098,6 +2144,7 @@ async def astream_tools(
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
+        service_tier=service_tier.tier if service_tier is not None else None,
         feature=feature,
         label=label,
         call_id=call_id,
@@ -2188,6 +2235,7 @@ async def astream_text(
     timeout: float | None = None,
     max_tokens: int | None = None,
     reasoning_effort: ReasoningEffort | None = None,
+    service_tier: ServiceTierRequest | None = None,
     provider: LLMProviderInterface | None = None,
     feature: str | None = None,
     label: str | None = None,
@@ -2227,8 +2275,8 @@ async def astream_text(
     """
     provider = provider if provider is not None else build_provider()
     effort = resolve_reasoning_effort(reasoning_effort, provider)
-    request_kwargs = _completion_request_kwargs(provider, effort, model)
-    tiers = _attempt_service_tiers(request_kwargs)
+    request_kwargs = _completion_request_kwargs(provider, effort, model, service_tier)
+    tiers = _attempt_service_tiers(service_tier)
     litellm_model = provider.litellm_model(model)
     messages = wire_messages(prompt)
     call = _call_context(
@@ -2241,6 +2289,7 @@ async def astream_text(
         timeout=timeout,
         max_tokens=max_tokens,
         reasoning_effort=effort,
+        service_tier=service_tier.tier if service_tier is not None else None,
         feature=feature,
         label=label,
         call_id=call_id,

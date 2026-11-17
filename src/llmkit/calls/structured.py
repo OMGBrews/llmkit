@@ -17,13 +17,13 @@ from pydantic import BaseModel, JsonValue
 
 from llmkit._diagnostics import report
 from llmkit._snapshot import snapshot_data, snapshot_prompt
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
-    cache_hit_requested_service_tier,
     error_text,
     guard_output_schema,
     logger,
     prepare_call,
+    requested_tier,
     resolve_model_and_provider,
     result_validation_budget,
     run_cached,
@@ -60,6 +60,7 @@ async def structured_llm_call[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -228,6 +229,7 @@ async def structured_llm_call[T: BaseModel](
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -283,6 +285,7 @@ async def structured_llm_call[T: BaseModel](
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
+                service_tier=args.tier_request,
                 provider=provider,
                 feature=feature,
                 label=label,
@@ -408,7 +411,7 @@ async def structured_llm_call[T: BaseModel](
                 usage=None,
                 cache_hit=True,
                 source_call_id=source_call_id,
-                requested_service_tier=cache_hit_requested_service_tier(provider),
+                requested_service_tier=requested_tier(args),
             )
         )
 
@@ -466,6 +469,7 @@ def structured_llm_call_sync[T: BaseModel](
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -516,6 +520,7 @@ def structured_llm_call_sync[T: BaseModel](
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             cache=cache,

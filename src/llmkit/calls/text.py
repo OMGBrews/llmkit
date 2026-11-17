@@ -14,12 +14,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
 from llmkit._snapshot import snapshot_prompt
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
     build_text_record,
-    cache_hit_requested_service_tier,
     error_text,
     prepare_call,
+    requested_tier,
     result_validation_budget,
     run_cached,
     run_on_result,
@@ -46,6 +46,7 @@ async def text_llm_call(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -143,6 +144,7 @@ async def text_llm_call(
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -188,6 +190,7 @@ async def text_llm_call(
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 reasoning_effort=args.reasoning_effort,
+                service_tier=args.tier_request,
                 provider=provider,
                 feature=feature,
                 label=label,
@@ -287,7 +290,7 @@ async def text_llm_call(
                 attempt=attempt_offset + 1,
                 cache_hit=True,
                 source_call_id=source_call_id,
-                requested_service_tier=cache_hit_requested_service_tier(provider),
+                requested_service_tier=requested_tier(args),
             )
         )
 
@@ -313,6 +316,7 @@ def text_llm_call_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     cache: bool | Unset = UNSET,
@@ -346,6 +350,7 @@ def text_llm_call_sync(
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             cache=cache,

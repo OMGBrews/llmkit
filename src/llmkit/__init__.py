@@ -33,6 +33,7 @@ from llmkit._types import (
     ChatMessage,
     Message,
     ReasoningEffort,
+    ServiceTier,
     ToolResultMessage,
 )
 from llmkit.cache import (
@@ -80,6 +81,7 @@ from llmkit.exceptions import (
     ReasoningEffortUnsupportedError,
     ResultValidationError,
     SchemaEngineError,
+    ServiceTierUnsupportedError,
     ServiceUnavailableError,
     StructuredOutputError,
     ToolArgumentError,
@@ -247,6 +249,7 @@ __all__ = [
     "Message",
     "ChatMessage",
     "ReasoningEffort",
+    "ServiceTier",
     "AssistantToolMessage",
     "ToolResultMessage",
     "ToolDefinition",
@@ -280,6 +283,7 @@ __all__ = [
     "ComposeUnsupportedError",
     "ContentFilterError",
     "FinishReasonError",
+    "ServiceTierUnsupportedError",
     "ServiceUnavailableError",
     "TransientProviderError",
     "SchemaEngineError",

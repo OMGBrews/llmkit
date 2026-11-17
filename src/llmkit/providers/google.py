@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers._gemini import direct_reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
@@ -113,9 +113,10 @@ class GoogleProvider(BaseProvider):
         model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
         structured_output: str = "schema",
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
         # The *configured* endpoint, not the resolved one: resolution reads the
         # environment and so must happen at the read point, never here (see
@@ -164,6 +165,21 @@ class GoogleProvider(BaseProvider):
         return kwargs
 
     @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Forward the tier as written, refusing ``"auto"``.
+
+        LiteLLM lower-cases the value on the wire, which is not a different
+        tier, and sends ``"auto"`` (in any letter case) as ``"priority"``, which
+        is; so ``"auto"`` is refused rather than sent as a paid tier the host
+        did not name. Google answers an unknown name with a 400.
+        """
+        if tier.lower() == "auto":
+            self.refuse_service_tier(
+                tier, model, 'LiteLLM sends "auto" to Google as "priority"; name the tier'
+            )
+        return {"service_tier": tier}
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> GoogleProvider:
         """Construct from an :class:`LLMClientConfig`.
@@ -181,5 +197,6 @@ class GoogleProvider(BaseProvider):
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
             structured_output=config.gemini_structured_output,
         )

@@ -39,13 +39,22 @@ from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields
 from enum import StrEnum
 from functools import lru_cache
-from typing import ClassVar, Literal, Protocol, cast, overload, override, runtime_checkable
+from typing import (
+    ClassVar,
+    Literal,
+    NoReturn,
+    Protocol,
+    cast,
+    overload,
+    override,
+    runtime_checkable,
+)
 from urllib.parse import urlsplit
 
 import instructor
 
-from llmkit._types import ReasoningEffort
-from llmkit.exceptions import LLMClientNotConfiguredError
+from llmkit._types import ReasoningEffort, ServiceTier
+from llmkit.exceptions import LLMClientNotConfiguredError, ServiceTierUnsupportedError
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +443,16 @@ class LLMClientConfig:
     Gemini's default-on thinking otherwise spends reasoning tokens against
     ``max_tokens`` and can truncate small-capped structured output.
 
+    ``service_tier`` is a client-wide default for the provider service tier every call asks
+    for (see :data:`~llmkit.ServiceTier`): ``"default"``, ``"flex"`` or ``"priority"``, or a
+    provider's own tier name. ``None`` (the default) asks for no tier, and the request carries no
+    tier argument. A call overrides it with its own ``service_tier`` keyword or
+    :class:`~llmkit.LLMCallOptions` field, where an explicit ``None`` asks for no tier. A value
+    must be a non-empty string or ``None``; anything else raises ``ValueError`` here. Whether the
+    selected provider can honour the value is checked per call, because the model is known only
+    then: a tier the route cannot honour raises
+    :class:`~llmkit.ServiceTierUnsupportedError` before anything is sent.
+
     ``aws_region_name`` carries the AWS region for the Bedrock provider and
     is not accepted by any other provider (which authenticate with ``api_key`` /
     ``base_url``). It is the *only* AWS-shaped field on this config on
@@ -482,6 +501,7 @@ class LLMClientConfig:
     vertex_project: str | None = None
     vertex_location: str | None = None
     gemini_structured_output: Literal["schema", "json"] = "schema"
+    service_tier: ServiceTier | None = None
 
     def __post_init__(self) -> None:
         # The annotation already makes a type checker refuse a string, but a
@@ -496,6 +516,11 @@ class LLMClientConfig:
                 + f"{type(self.provider).__name__} {self.provider!r}: parse a name "
                 + f"with Provider({self.provider!r}), which ignores case, or pass "
                 + "a member such as Provider.OLLAMA."
+            )
+        tier = cast("object", self.service_tier)
+        if tier is not None and not (isinstance(tier, str) and tier):
+            raise ValueError(
+                f"LLMClientConfig.service_tier must be a non-empty string or None, got {tier!r}"
             )
 
     @override
@@ -667,7 +692,7 @@ class LLMProviderInterface(Protocol):
 
 #: The provider-shaped :class:`LLMClientConfig` knobs — the ones a given provider
 #: may or may not read, as opposed to ``provider`` / ``model`` /
-#: ``reasoning_effort``, which every provider reads. Each provider declares the
+#: ``reasoning_effort`` / ``service_tier``, which every provider reads. Each provider declares the
 #: subset it honours in ``_accepted_config_fields``; the rest are rejected by
 #: :meth:`BaseProvider.reject_unread_config_fields`.
 _PROVIDER_SHAPED_FIELDS: frozenset[str] = frozenset(
@@ -775,7 +800,7 @@ class BaseProvider(ABC):
     #: forget to declare it (``__init_subclass__`` enforces its presence). It is
     #: annotation-only here (no value), so a concrete subclass that omits it trips
     #: that check; a provider reading none of the six may declare an empty
-    #: frozenset. ``provider`` / ``model`` / ``reasoning_effort`` are universal
+    #: frozenset. ``provider`` / ``model`` / ``reasoning_effort`` / ``service_tier`` are universal
     #: and never listed.
     _accepted_config_fields: ClassVar[frozenset[str]]
 
@@ -818,7 +843,10 @@ class BaseProvider(ABC):
             )
 
     def __init__(
-        self, model: str | None = None, reasoning_effort: ReasoningEffort | None = None
+        self,
+        model: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ) -> None:
         # A falsy model (None or "") falls back to the provider's own default
         # so the LiteLLM id assembled by ``litellm_model`` is always well-formed
@@ -828,6 +856,7 @@ class BaseProvider(ABC):
         # well-formed by construction, not merely by convention.
         self._model: str = model or self._default_model
         self._reasoning_effort: ReasoningEffort | None = reasoning_effort
+        self._service_tier: ServiceTier | None = service_tier
 
     @property
     def name(self) -> str:
@@ -932,6 +961,40 @@ class BaseProvider(ABC):
         del model
         return {"reasoning_effort": "disable" if effort == "lowest" else effort}
 
+    @property
+    def service_tier(self) -> ServiceTier | None:
+        """Configured service tier, or ``None`` to ask for no tier.
+
+        The client-wide default a call's own ``service_tier`` overrides. Not
+        part of :class:`LLMProviderInterface`: llmkit reads it with
+        ``getattr``, so a provider written without it asks for no tier.
+        """
+        return self._service_tier
+
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Translate a resolved service tier into this route's request arguments.
+
+        Called once per call, before the response cache is read and before
+        anything is sent, with the tier as the host wrote it and the model the
+        call runs on. Returns the arguments merged into every attempt's
+        request, or raises :class:`~llmkit.ServiceTierUnsupportedError` when the
+        route cannot honour the tier. This default forwards the value as
+        LiteLLM's ``service_tier``, which is the measured behaviour of the
+        OpenAI-compatible routes (OpenAI, OpenRouter, DeepSeek, Moonshot,
+        Alibaba); the other shipped providers override it. Concrete, and absent from
+        :class:`LLMProviderInterface`, so a provider written before it existed
+        keeps working: llmkit falls back to the same flat key for a provider
+        without the method.
+        """
+        del model
+        return {"service_tier": tier}
+
+    def refuse_service_tier(self, tier: ServiceTier, model: str, reason: str) -> NoReturn:
+        """Raise :class:`~llmkit.ServiceTierUnsupportedError` naming this route, *model* and *tier*."""
+        raise ServiceTierUnsupportedError(
+            f"{self.name} cannot honour service_tier={tier!r} on {model!r}: {reason}"
+        )
+
     def litellm_model(self, model: str | None = None) -> str:
         """Return the provider-prefixed LiteLLM model string.
 
@@ -968,7 +1031,8 @@ class BaseProvider(ABC):
     def reject_unread_config_fields(cls, config: LLMClientConfig) -> None:
         """Reject a populated config knob this provider will not read.
 
-        Every provider reads ``provider`` / ``model`` / ``reasoning_effort``, but the six
+        Every provider reads ``provider`` / ``model`` / ``reasoning_effort`` / ``service_tier``,
+        but the six
         provider-shaped knobs (:data:`_PROVIDER_SHAPED_FIELDS`) are provider-specific. Passing one
         to a provider that never reads it — an ``api_key`` to Bedrock or Google's Agent Platform
         (which authenticate via their ambient AWS/Google credential chains), a ``base_url`` to a
@@ -1005,7 +1069,7 @@ class BaseProvider(ABC):
             f"{cls._provider_name} does not read the config field(s) {sorted(offenders)}: it "
             + "would silently ignore them, which llmkit refuses. Populate only the fields the "
             + f"selected provider uses — {cls._provider_name} reads: {reads} (every provider "
-            + "also reads 'model' and 'reasoning_effort')."
+            + "also reads 'model', 'reasoning_effort' and 'service_tier')."
         )
 
 

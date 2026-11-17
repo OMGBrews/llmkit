@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers._gemini import direct_reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
@@ -157,10 +157,11 @@ class VertexProvider(BaseProvider):
         vertex_project: str | None = None,
         vertex_location: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
         structured_output: str = "schema",
     ):
         require_google_auth_sdk(self._provider_name)
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._vertex_project: str | None = vertex_project
         self._vertex_location: str | None = vertex_location
         # Resolve the host-selected strategy once, loudly rejecting a typo.
@@ -213,6 +214,23 @@ class VertexProvider(BaseProvider):
         return kwargs
 
     @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Refuse every tier on every model.
+
+        Gemini models: LiteLLM sends the tier in the lower-case form Google AI
+        Studio takes, and Vertex rejects every such value with a 400 (measured
+        live on gemini-3.1-flash-lite for ``"default"``, ``"flex"``,
+        ``"priority"`` and ``"auto"``, 2026-11-17). Partner models, Claude
+        included: LiteLLM refuses the argument on these routes.
+        """
+        self.refuse_service_tier(
+            tier,
+            model,
+            "Vertex rejects the service tier LiteLLM sends for Gemini models, and LiteLLM "
+            + "refuses it for partner models",
+        )
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> VertexProvider:
         """Construct from an :class:`LLMClientConfig` (project/location only; no secrets)."""
@@ -221,5 +239,6 @@ class VertexProvider(BaseProvider):
             vertex_project=config.vertex_project,
             vertex_location=config.vertex_location,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
             structured_output=config.gemini_structured_output,
         )

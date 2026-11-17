@@ -6,7 +6,7 @@ from typing import ClassVar, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers._claude import reasoning_kwargs
 from llmkit.providers.base import (
     BaseProvider,
@@ -131,9 +131,10 @@ class BedrockProvider(BaseProvider):
         model: str | None = None,
         aws_region_name: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
         require_boto3_sdk(self._provider_name)
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._aws_region_name: str | None = aws_region_name
 
     @override
@@ -152,6 +153,26 @@ class BedrockProvider(BaseProvider):
         return {"aws_region_name": self._aws_region_name} if self._aws_region_name else {}
 
     @override
+    def service_tier_kwargs(self, tier: ServiceTier, model: str) -> dict[str, object]:
+        """Forward the three portable tiers; refuse every other value.
+
+        LiteLLM's Converse transform turns ``"default"``, ``"flex"`` and
+        ``"priority"`` into Bedrock's ``serviceTier``, sends ``"auto"`` as
+        ``"default"`` and drops anything else without a word, so only the
+        three portable names are sent. Which tiers a model offers is Bedrock's
+        to say: a model without one answers with a 400 (measured live on
+        Claude Haiku 4.5 for ``"flex"`` and ``"priority"``, 2026-11-17).
+        """
+        if tier in ("default", "flex", "priority"):
+            return {"service_tier": tier}
+        self.refuse_service_tier(
+            tier,
+            model,
+            'Bedrock takes only "default", "flex" and "priority"; LiteLLM sends "auto" as '
+            + '"default" and drops any other value',
+        )
+
+    @override
     @classmethod
     def build(cls, config: LLMClientConfig) -> BedrockProvider:
         """Construct from an :class:`LLMClientConfig` (region only; no secrets)."""
@@ -159,4 +180,5 @@ class BedrockProvider(BaseProvider):
             model=config.model,
             aws_region_name=config.aws_region_name,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

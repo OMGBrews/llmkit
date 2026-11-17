@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib
 from typing import Literal, assert_never
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.providers.alibaba import AlibabaProvider
 from llmkit.providers.anthropic import AnthropicProvider
 from llmkit.providers.base import (
@@ -157,6 +157,7 @@ def make_provider(
     vertex_project: str | None = None,
     vertex_location: str | None = None,
     gemini_structured_output: Literal["schema", "json"] = "schema",
+    service_tier: ServiceTier | None = None,
 ) -> BaseProvider:
     """Construct a provider directly from raw credentials.
 
@@ -229,6 +230,10 @@ def make_provider(
             JSON-schema constrained decoding; ``"json"`` switches to JSON-mime-type output with
             client-side validation to escape the constrained-decoding repetition-loop trap (see the
             Gemini provider docstrings).
+        service_tier: Default service tier every call on this provider asks
+            for (see :data:`~llmkit.ServiceTier`); ``None`` asks for none. A
+            call's own ``service_tier`` overrides it. Whether the route can
+            honour it is checked per call.
 
     Returns:
         A constructed provider, ready to pass as a per-call ``provider=``.
@@ -258,6 +263,7 @@ def make_provider(
         vertex_project=vertex_project,
         vertex_location=vertex_location,
         gemini_structured_output=gemini_structured_output,
+        service_tier=service_tier,
     )
     return build_provider(config)
 

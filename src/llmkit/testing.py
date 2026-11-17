@@ -131,6 +131,9 @@ class TransportRequest:
             whose ``delay`` outlasts it raises ``TimeoutError``.
         max_tokens: The output-token cap, or ``None``.
         reasoning_effort: The effective reasoning effort, or ``None``.
+        service_tier: The service tier the call asked for, as the host wrote
+            it (``"priority"``, not the provider's translation of it), or
+            ``None`` when it asked for none.
     """
 
     kind: CallKind
@@ -150,6 +153,7 @@ class TransportRequest:
     timeout: float | None
     max_tokens: int | None
     reasoning_effort: ReasoningEffort | None
+    service_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +372,7 @@ def _public_request(call: CallContext) -> TransportRequest:
         timeout=call.timeout,
         max_tokens=call.max_tokens,
         reasoning_effort=call.reasoning_effort,
+        service_tier=call.service_tier,
     )
 
 

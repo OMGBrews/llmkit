@@ -42,7 +42,7 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import NamedTuple, cast, get_args, get_type_hints, is_typeddict
 
@@ -50,21 +50,33 @@ from pydantic import BaseModel
 
 from llmkit._diagnostics import report
 from llmkit._snapshot import snapshot_data, snapshot_prompt
-from llmkit._transport import requested_service_tier
-from llmkit._types import AssistantToolMessage, ChatMessage, ReasoningEffort
+from llmkit._types import (
+    AssistantToolMessage,
+    ChatMessage,
+    ReasoningEffort,
+    ServiceTier,
+    ServiceTierRequest,
+)
 from llmkit.cache import LLMCache, LLMCacheEntry, get_llm_cache
 from llmkit.cache.read_through import CacheDecodeError, cache_key_or_none, read_through
 from llmkit.exceptions import (
     OutputLimitDiagnostics,
     ResultValidationError,
     SchemaEngineError,
+    ServiceTierUnsupportedError,
     StructuredOutputError,
     ToolArgumentError,
     UnsupportedSchemaError,
 )
 from llmkit.logging import LLMCallRecord
 from llmkit.logging.record import RequestSnapshot
-from llmkit.options import UNSET, LLMCallOptions, ResolvedCallArgs, Unset, resolve_call_args
+from llmkit.options import (
+    UNSET,
+    LLMCallOptions,
+    ResolvedCallArgs,
+    Unset,
+    resolve_call_args,
+)
 from llmkit.providers import LLMProviderInterface, Provider, coerce_call_provider
 from llmkit.providers.base import active_config, client_configured
 from llmkit.rate_limiting import current_queue_wait_ms
@@ -296,6 +308,7 @@ def prepare_call(
     cache: bool | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     schema_repairs: int | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
@@ -324,6 +337,11 @@ def prepare_call(
     unset. *schema_repairs* is passed by the structured family only; the
     others leave it unset, so only an ``options`` value reaches the merge,
     where an invalid one is still rejected.
+
+    The service tier is resolved and checked here too, once the provider is
+    built and before the claim (see :func:`resolve_tier_request`), so a tier
+    the route cannot honour raises before any attempt, log record, cache
+    lookup or request. The result rides on ``args.tier_request``.
     """
     args = resolve_call_args(
         options,
@@ -336,6 +354,7 @@ def prepare_call(
         provider=provider,
         cache=cache,
         schema_repairs=schema_repairs,
+        service_tier=service_tier,
     )
     # Before the claim: inside an outer with_retries a claim counts an attempt,
     # so an error raised after it would count a phantom one.
@@ -345,8 +364,69 @@ def prepare_call(
         # is made or logged, naming it. Other provider build failures keep the
         # best-effort path below.
         _ = active_config()
+    # Built before the claim so the tier check below can refuse before an
+    # attempt is counted. Building is best-effort and never raises: with no
+    # provider the check is skipped and the transport raises the build error.
+    built = build_call_provider(call_provider)
+    if built is not None:
+        args = dataclasses.replace(args, tier_request=resolve_tier_request(args, built))
     call_id, attempt_offset = claim_logical_call(feature, label)
-    return PreparedCall(args, build_call_provider(call_provider), call_id, attempt_offset)
+    return PreparedCall(args, built, call_id, attempt_offset)
+
+
+def resolve_tier_request(
+    args: ResolvedCallArgs, provider: LLMProviderInterface
+) -> ServiceTierRequest | None:
+    """The service tier this call sends and its request arguments, or ``None``.
+
+    Refuses a top-level ``service_tier`` in the provider's own request
+    arguments (``completion_kwargs()``) with
+    :class:`~llmkit.ServiceTierUnsupportedError`, whether or not the setting is
+    also given: the setting is the only supported way to ask for a tier. A
+    ``service_tier`` nested in ``extra_body`` is not inspected. When
+    ``completion_kwargs()`` itself fails, that check is skipped and the
+    transport raises the real error inside its attempt, as it does today.
+
+    The tier is the merged per-call setting when the call or its options set
+    one (an explicit ``None`` asks for none), else the provider's configured
+    ``service_tier``, read with ``getattr`` so a provider without the attribute
+    asks for none. The provider's ``service_tier_kwargs`` hook then translates
+    it for the call's model, or raises when the route cannot honour it; a
+    provider without the hook forwards the flat ``service_tier``, as
+    :meth:`~llmkit.providers.base.BaseProvider.service_tier_kwargs` does.
+    """
+    try:
+        own = cast("object", provider.completion_kwargs())
+    except Exception:
+        own = None
+    own_tier = (
+        cast("Mapping[str, object]", own).get("service_tier") if isinstance(own, Mapping) else None
+    )
+    if own_tier is not None:
+        raise ServiceTierUnsupportedError(
+            f"{provider.name}'s completion_kwargs() carries service_tier="
+            + f"{own_tier!r}; a tier in a provider's request arguments is not "
+            + "supported. Use the service_tier setting instead: the per-call keyword, "
+            + "LLMCallOptions(service_tier=...), or LLMClientConfig(service_tier=...)."
+        )
+    if args.service_tier is not UNSET:
+        tier = args.service_tier
+    else:
+        # Read like ``reasoning_effort``: tolerantly, so a provider without the
+        # attribute, or a test double answering every attribute, asks for none.
+        # A shipped provider's value was checked when its config was built.
+        configured = cast("object", getattr(provider, "service_tier", None))
+        tier = configured if isinstance(configured, str) and configured else None
+    if tier is None:
+        return None
+    model = args.model or provider.model
+    translate = cast(
+        "Callable[[str, str], dict[str, object]] | None",
+        getattr(provider, "service_tier_kwargs", None),
+    )
+    if translate is None:
+        return ServiceTierRequest(tier, {"service_tier": tier})
+    return ServiceTierRequest(tier, dict(translate(tier, model)))
 
 
 async def run_with_policy[T](
@@ -747,25 +827,14 @@ def build_text_record(
     )
 
 
-def cache_hit_requested_service_tier(provider: LLMProviderInterface | None) -> str | None:
-    """The tier a cache hit's request would have asked for, best-effort.
+def requested_tier(args: ResolvedCallArgs) -> str | None:
+    """The tier a call's record reports as requested, as the host wrote it.
 
-    A hit builds no request, so the provider's request arguments are read here
-    once more; the cache key has just read them successfully. Any failure
-    records ``None`` rather than failing a call the cache already answered.
+    Read from the resolved setting rather than from the built request, which
+    may carry a translation (``standard_only``, ``speed``) or no tier at all.
+    A cache hit builds no request, so this is also what its record reports.
     """
-    if provider is None:
-        return None
-    try:
-        return requested_service_tier(provider.completion_kwargs())
-    except Exception:
-        _ = report(
-            logger,
-            logging.DEBUG,
-            "Could not read the requested service tier for a cache hit",
-            exc_info=True,
-        )
-        return None
+    return args.tier_request.tier if args.tier_request is not None else None
 
 
 def tool_repair_messages(

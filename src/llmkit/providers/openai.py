@@ -6,7 +6,7 @@ from typing import ClassVar, cast, override
 
 import instructor
 
-from llmkit._types import ReasoningEffort
+from llmkit._types import ReasoningEffort, ServiceTier
 from llmkit.exceptions import ReasoningEffortUnsupportedError
 from llmkit.providers.base import (
     BaseProvider,
@@ -73,8 +73,9 @@ class OpenAIProvider(BaseProvider):
         model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
+        service_tier: ServiceTier | None = None,
     ):
-        super().__init__(model, reasoning_effort)
+        super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
         # The *configured* endpoint, not the resolved one: resolution reads the
         # environment and so must happen at the read point, never here (see
@@ -195,4 +196,5 @@ class OpenAIProvider(BaseProvider):
             model=config.model,
             base_url=config.base_url,
             reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier,
         )

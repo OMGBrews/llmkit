@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 
 from llmkit._snapshot import snapshot_data, snapshot_prompt, snapshot_tools
 from llmkit._transport import WireUsage
-from llmkit._types import ChatMessage, ReasoningEffort
+from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier, ServiceTierRequest
 from llmkit.calls._shared import (
     error_text,
     parse_tool_calls,
@@ -89,6 +89,7 @@ async def tool_llm_call_stream(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -169,6 +170,7 @@ async def tool_llm_call_stream(
         max_tokens=max_tokens,
         timeout=timeout,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         retry=retry,
         provider=provider,
         feature=feature,
@@ -209,6 +211,7 @@ async def tool_llm_call_stream(
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             reasoning_effort=args.reasoning_effort,
+            service_tier=args.tier_request,
             provider=provider,
             call_id=call_id,
             attempt=attempt_offset + attempt,
@@ -251,6 +254,7 @@ def tool_llm_call_stream_sync(
     max_tokens: int | None | Unset = UNSET,
     timeout: float | None | Unset = UNSET,
     reasoning_effort: ReasoningEffort | None | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
     provider: LLMProviderInterface | Provider | None | Unset = UNSET,
     retry: RetryPolicy | Unset = UNSET,
     options: LLMCallOptions | None = None,
@@ -286,6 +290,7 @@ def tool_llm_call_stream_sync(
             max_tokens=max_tokens,
             timeout=timeout,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             provider=provider,
             retry=retry,
             options=options,
@@ -307,6 +312,7 @@ async def _stream_tools_once(
     max_tokens: int | None,
     timeout: float | None,
     reasoning_effort: ReasoningEffort | None,
+    service_tier: ServiceTierRequest | None,
     provider: LLMProviderInterface | None,
     call_id: str,
     attempt: int,
@@ -376,6 +382,7 @@ async def _stream_tools_once(
                 max_tokens=max_tokens,
                 timeout=timeout,
                 reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
                 provider=provider,
                 feature=feature,
                 label=label,
