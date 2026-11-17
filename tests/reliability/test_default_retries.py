@@ -48,6 +48,7 @@ from llmkit import (
     calls as llm_calls,
 )
 from llmkit.capture import capture_llm_log_paths
+from llmkit.logging import flush_llm_logs_async
 from llmkit.testing import Fake, Reply, TransportRequest, install, timeout_error
 from tests._support import OkSchema
 
@@ -162,10 +163,16 @@ async def test_each_attempt_is_its_own_logged_call(tmp_path: Path) -> None:
                 "hi", OkSchema, feature="test", retry=_NO_BACKOFF
             )
     finally:
+        delivered = await flush_llm_logs_async(timeout=10.0)
         configure_llm_logging(LocalYamlLogSink())
 
     assert result.ok is True
-    assert len(paths) == 2
+    # Count the files written, not the paths captured: a path is captured only when its
+    # write lands within the 0.1 s delivery wait, which a slow filesystem (the Windows
+    # runner) can overrun without anything being lost.
+    assert delivered
+    assert len(list(tmp_path.glob("*.yaml"))) == 2
+    assert len(paths) <= 2
     assert all(p.exists() for p in paths)
 
 
@@ -223,10 +230,16 @@ async def test_stream_each_attempt_is_its_own_logged_call(tmp_path: Path) -> Non
                 llm_calls.text_llm_call_stream("hi", feature="test", retry=_NO_BACKOFF)
             )
     finally:
+        delivered = await flush_llm_logs_async(timeout=10.0)
         configure_llm_logging(LocalYamlLogSink())
 
     assert chunks == ["he", "llo"]
-    assert len(paths) == 2
+    # Count the files written, not the paths captured: a path is captured only when its
+    # write lands within the 0.1 s delivery wait, which a slow filesystem (the Windows
+    # runner) can overrun without anything being lost.
+    assert delivered
+    assert len(list(tmp_path.glob("*.yaml"))) == 2
+    assert len(paths) <= 2
     assert all(p.exists() for p in paths)
 
 
