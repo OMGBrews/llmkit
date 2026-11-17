@@ -286,11 +286,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   table marks `supports_speed`, and forwards its own `"auto"` and
   `"standard_only"` (refused, naming the upgrade, under a LiteLLM that does
   not send a tier on that route, such as the 1.104.0 floor); Bedrock
-  forwards only the three portable names; Google
+  forwards only the three portable names, and only on LiteLLM's Converse
+  route (a model LiteLLM sends through its invoke route is refused); Google
   AI Studio forwards everything but `"auto"`, which LiteLLM would send as
-  `"priority"`; Vertex, Cerebras and Ollama refuse every tier. Measured
-  live on 2026-11-17 at LiteLLM 1.109.1 on every provider but Moonshot and
-  Alibaba, which are unmeasured; DeepSeek accepts every value and reports no
+  `"priority"`; Vertex, Cerebras and Ollama refuse every tier. The
+  forwarded and translated rows were measured live on 2026-11-17 at LiteLLM
+  1.109.1 on every provider but Moonshot and Alibaba, which are unmeasured;
+  the refusals rest on LiteLLM's behaviour, probed offline (and, for Vertex
+  Gemini, a live 400). DeepSeek accepts every value and reports no
   served tier, so it is forwarded but not confirmed. The README's per-provider
   table records each result. `testing.TransportRequest` gains `service_tier`,
   the tier the host asked for. The tier is not part of the response cache

@@ -157,8 +157,8 @@ class VertexProvider(BaseProvider):
         vertex_project: str | None = None,
         vertex_location: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
-        service_tier: ServiceTier | None = None,
         structured_output: str = "schema",
+        service_tier: ServiceTier | None = None,
     ):
         require_google_auth_sdk(self._provider_name)
         super().__init__(model, reasoning_effort, service_tier)

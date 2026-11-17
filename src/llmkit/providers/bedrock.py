@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 
 import instructor
 
@@ -13,6 +13,17 @@ from llmkit.providers.base import (
     LLMClientConfig,
     require_boto3_sdk,
 )
+
+
+def _litellm_sends_service_tier(model: str) -> bool:
+    """Whether LiteLLM's route for *model* on Bedrock forwards ``service_tier`` (Converse does)."""
+    import litellm
+
+    supported = cast(
+        "list[str] | None",
+        litellm.get_supported_openai_params(model=model, custom_llm_provider="bedrock"),  # pyright: ignore[reportUnknownMemberType]  # raw-llm — LiteLLM leaves the list untyped
+    )
+    return supported is not None and "service_tier" in supported
 
 
 class BedrockProvider(BaseProvider):
@@ -162,8 +173,21 @@ class BedrockProvider(BaseProvider):
         three portable names are sent. Which tiers a model offers is Bedrock's
         to say: a model without one answers with a 400 (measured live on
         Claude Haiku 4.5 for ``"flex"`` and ``"priority"``, 2026-11-17).
+
+        Only LiteLLM's Converse route sends a tier. A model LiteLLM sends
+        through its invoke route (older Mistral, Titan and Cohere ids, or an
+        explicit ``invoke/`` id) is refused, because LiteLLM would refuse the
+        argument or, under a global ``litellm.drop_params``, send the request
+        without it. The route is read from LiteLLM's own parameter list.
         """
         if tier in ("default", "flex", "priority"):
+            if not _litellm_sends_service_tier(model):
+                self.refuse_service_tier(
+                    tier,
+                    model,
+                    "LiteLLM sends this model through its Bedrock invoke route, which takes no "
+                    + "service tier; the Converse route does (a converse/ model id selects it)",
+                )
             return {"service_tier": tier}
         self.refuse_service_tier(
             tier,

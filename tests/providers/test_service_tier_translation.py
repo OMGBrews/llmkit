@@ -304,3 +304,37 @@ def test_config_rejects_a_tier_that_is_not_a_non_empty_string(bad: object) -> No
 def test_config_accepts_none_and_a_string(good: str | None) -> None:
     config = LLMClientConfig(provider=Provider.OPENAI, api_key="k", service_tier=good)
     assert config.service_tier == good
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "mistral.mistral-7b-instruct-v0:2",
+        "amazon.titan-text-express-v1",
+        "invoke/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    ],
+)
+@pytest.mark.parametrize("tier", ["default", "flex", "priority"])
+def test_bedrock_refuses_a_tier_on_litellms_invoke_route(model: str, tier: str) -> None:
+    """Only Converse sends a tier; on invoke LiteLLM refuses it or, under drop_params, drops it."""
+    provider = _provider(Provider.BEDROCK)
+    with pytest.raises(ServiceTierUnsupportedError, match="invoke route") as caught:
+        _ = provider.service_tier_kwargs(tier, model)
+    _assert_refusal_names(caught, provider, model, tier)
+
+
+def test_bedrock_forwards_on_the_converse_route_named_explicitly() -> None:
+    provider = _provider(Provider.BEDROCK)
+    model = "converse/mistral.mistral-7b-instruct-v0:2"
+    assert provider.service_tier_kwargs("flex", model) == {"service_tier": "flex"}
+
+
+def test_gemini_constructors_keep_their_positional_order() -> None:
+    """``service_tier`` was appended, so a positional ``structured_output`` still binds."""
+    from llmkit.providers import GoogleProvider, VertexProvider
+
+    google = GoogleProvider("k", None, None, None, "json")
+    vertex = VertexProvider(None, "p", "us-central1", None, "json")
+    for provider in (google, vertex):
+        assert provider.service_tier is None
+        assert provider.instructor_mode.name == "JSON"

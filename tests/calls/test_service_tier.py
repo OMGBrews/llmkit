@@ -644,3 +644,39 @@ async def test_real_litellm_openai_stream_records_its_tier(
     [record] = records
     assert record.error is None
     assert (record.requested_service_tier, record.served_service_tier) == ("priority", served)
+
+
+def test_the_transport_reads_usage_speed_when_it_sent_fast_mode() -> None:
+    """``_send`` and ``_stream`` pass whether ``speed`` was sent to the wire converters."""
+    from llmkit._litellm import _wire_chunk, _wire_response
+
+    response = ModelResponse(usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+    usage = cast("Usage", response.usage)  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — set above
+    usage.speed = "fast"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    usage.service_tier = "standard"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    assert _wire_response(response, speed_sent=True).service_tier == "fast"
+    assert _wire_response(response).service_tier == "standard"
+    chunk = ModelResponseStream()
+    chunk.usage = usage
+    assert _wire_chunk(chunk, speed_sent=True).service_tier == "fast"
+    assert _wire_chunk(chunk).service_tier == "standard"
+
+
+async def test_send_reports_fast_mode_from_the_request_it_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import llmkit._litellm as adapter
+    from llmkit._transport import WireRequest
+
+    response = ModelResponse(usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2))
+    usage = cast("Usage", response.usage)  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — set above
+    usage.speed = "fast"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+    usage.service_tier = "standard"  # pyright: ignore[reportAttributeAccessIssue]  # test-helper — a pydantic extra
+
+    async def _fake(**_kwargs: object) -> ModelResponse:
+        return response
+
+    monkeypatch.setattr(adapter, "_acompletion", _fake)
+    sent = await adapter._send(WireRequest(kwargs={"model": "anthropic/m", "speed": "fast"}))
+    plain = await adapter._send(WireRequest(kwargs={"model": "anthropic/m"}))
+    assert (sent.service_tier, plain.service_tier) == ("fast", "standard")

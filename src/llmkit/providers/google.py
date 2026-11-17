@@ -113,8 +113,8 @@ class GoogleProvider(BaseProvider):
         model: str | None = None,
         base_url: str | None = None,
         reasoning_effort: ReasoningEffort | None = None,
-        service_tier: ServiceTier | None = None,
         structured_output: str = "schema",
+        service_tier: ServiceTier | None = None,
     ):
         super().__init__(model, reasoning_effort, service_tier)
         self._api_key: str = api_key
