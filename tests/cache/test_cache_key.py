@@ -164,7 +164,7 @@ def test_the_service_tier_is_not_part_of_the_key() -> None:
     ``completion_kwargs()`` (where llmkit refuses one), so it cannot reach the
     endpoint kwargs the key hashes either.
     """
-    assert LLM_CACHE_KEY_VERSION == 4
+    assert LLM_CACHE_KEY_VERSION == 5  # unchanged by the tier setting
     tiered = OpenAIProvider(api_key="k", model="gpt-4.1-mini", service_tier="priority")
     untiered = OpenAIProvider(api_key="k", model="gpt-4.1-mini")
     flex = OpenAIProvider(api_key="k", model="gpt-4.1-mini", service_tier="flex")
