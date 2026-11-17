@@ -9,3 +9,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # One pull request a week for every action, rather than one per action:
+    # separate bumps to neighbouring pins in publish.yml went unreviewed for
+    # weeks and would each have needed a rebase after the last.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
