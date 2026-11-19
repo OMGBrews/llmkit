@@ -5,7 +5,9 @@ log directory (``LLMKIT_LOG_DIR``, else the enclosing project root, else a
 per-user state directory), and reducing caller-supplied ``feature`` / ``label``
 strings to something safe to put in a path. The private opener that creates
 files 0600 lives here too, so the security-relevant filesystem policy is in one
-place rather than spread through the sink.
+place rather than spread through the sink. The names of the logging
+environment variables live here as well, with the blank-is-unset rule they
+share.
 
 Symbols the sink imports carry public names; the helpers used only within this
 module stay underscored.
@@ -23,9 +25,41 @@ from pathlib import Path
 #: llmkit`` still takes effect.
 LOG_DIR_ENV_VAR = "LLMKIT_LOG_DIR"
 
+#: Environment variable switching the import-time default sink off (``off``,
+#: ``0``, ``false``, ``no``) or explicitly on (``on``, ``1``, ``true``,
+#: ``yes``), stripped and case-insensitive. Read once, at the first registry
+#: read or write after import, never at import; an explicit
+#: ``configure_llm_logging(...)`` always wins. Any other non-blank value turns
+#: logging off with one warning (fail closed: a prompt written to disk cannot
+#: be taken back).
+LOG_ENV_VAR = "LLMKIT_LOG"
+
+#: Environment variable setting the age bound of every ``LocalYamlLogSink``
+#: constructed without ``retention_days``: a decimal integer ``>= 1`` (days),
+#: or ``forever`` to keep every file. Read at each such sink's first write; an
+#: explicit ``retention_days=`` (including ``None``) always wins. Any other
+#: non-blank value disables age pruning for that sink, with one warning and a
+#: degraded ``housekeeping`` entry in ``get_logging_health()``.
+LOG_RETENTION_ENV_VAR = "LLMKIT_LOG_RETENTION_DAYS"
+
 #: Marker files whose presence makes a directory a "project root" for
 #: :func:`default_log_dir`'s upward walk.
 _PROJECT_ROOT_MARKERS = ("pyproject.toml", ".git")
+
+
+def blank_is_unset(value: str | None) -> str | None:
+    """*value* as read from the environment, or ``None`` when blank.
+
+    The one rule every llmkit logging variable shares: an empty or
+    whitespace-only value means "not set", so ``LLMKIT_LOG_DIR=" "`` falls
+    through to the default directory instead of naming a directory called
+    ``"   "``. A non-blank value is returned unchanged. It takes the value the
+    caller already read, not the variable's name, so each read stays a plain
+    ``os.environ.get(<constant>)`` at its own site.
+    """
+    if value is None or not value.strip():
+        return None
+    return value
 
 
 def _find_project_root(start: Path) -> Path | None:
@@ -63,7 +97,7 @@ def _user_state_log_dir() -> Path:
 def resolve_default_log_dir() -> tuple[Path, bool]:
     """Resolve the default log directory; the bool marks the project-root case.
 
-    Resolution order: :data:`LOG_DIR_ENV_VAR` if set, else ``data/llm-logs``
+    Resolution order: :data:`LOG_DIR_ENV_VAR` if set and not blank, else ``data/llm-logs``
     under the nearest project root above the current directory, else the
     per-user state directory. Only the project-root case (the one where a
     repository could accidentally swallow prompt logs) returns ``True``, which
@@ -78,8 +112,8 @@ def resolve_default_log_dir() -> tuple[Path, bool]:
     are left intact, since the frozen answer only has to be stable, not
     canonical.
     """
-    env_dir = os.environ.get(LOG_DIR_ENV_VAR)
-    if env_dir:
+    env_dir = blank_is_unset(os.environ.get(LOG_DIR_ENV_VAR))
+    if env_dir is not None:
         return Path(env_dir).absolute(), False
     root = _find_project_root(Path.cwd())
     if root is not None:
@@ -91,7 +125,8 @@ def resolve_default_log_dir() -> tuple[Path, bool]:
 def default_log_dir() -> Path:
     """Compute where :class:`LocalYamlLogSink` writes when no ``log_dir`` is given.
 
-    ``LLMKIT_LOG_DIR`` wins when set; otherwise ``data/llm-logs/`` under the
+    ``LLMKIT_LOG_DIR`` wins when set (a blank or whitespace-only value counts
+    as unset); otherwise ``data/llm-logs/`` under the
     nearest ancestor directory carrying a ``pyproject.toml`` or ``.git``
     (nearest wins); otherwise a per-user state directory
     (``$XDG_STATE_HOME/llmkit/llm-logs`` on Linux, ``~/Library/Logs/llmkit``

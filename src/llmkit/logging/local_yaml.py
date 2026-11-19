@@ -1,22 +1,25 @@
 """The shipped default sink: one YAML file per call, plus an index line.
 
-Stays one class. Its ten methods share the frozen-once log directory, the
-announce latch, the prune throttle and three warn-once latches, so carving
-write / index / retention apart would relocate the coupling rather than reduce
-it.
+Stays one class. Its methods share the frozen-once log directory, the
+once-resolved retention bound, the announce latch, the prune throttle and
+three warn-once latches, so carving write / index / retention apart would
+relocate the coupling rather than reduce it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import enum
 import json
 import logging
 import os
+import re
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, override
 
 import yaml
 
@@ -24,7 +27,10 @@ from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import FailureStage, WriteOutcome
 from llmkit.logging._paths import (
+    LOG_ENV_VAR,
+    LOG_RETENTION_ENV_VAR,
     MAX_FILENAME_ATTEMPTS,
+    blank_is_unset,
     oneline,
     open_private,
     resolve_default_log_dir,
@@ -40,7 +46,8 @@ logger = logging.getLogger("llmkit.logging")
 
 #: Default age bound for the per-call YAML files (and rotated index
 #: generations): files older than this many days are pruned. ``None`` on the
-#: sink keeps everything forever.
+#: sink keeps everything forever. A sink built without ``retention_days``
+#: uses it only when ``LLMKIT_LOG_RETENTION_DAYS`` is unset.
 DEFAULT_RETENTION_DAYS = 30
 
 #: Default size bound for the active ``index.jsonl``: past this many bytes it
@@ -51,6 +58,48 @@ DEFAULT_MAX_INDEX_BYTES = 50 * 2**20
 # Retention housekeeping runs at most this often per sink instance, so the
 # per-write cost of a bounded log dir stays one monotonic-clock read.
 _PRUNE_INTERVAL_SECONDS = 3600.0
+
+
+class _NotPassed(enum.Enum):
+    """``retention_days`` was not passed, so the environment may set it."""
+
+    TOKEN = 0
+
+    @override
+    def __repr__(self) -> str:
+        return f"<from {LOG_RETENTION_ENV_VAR}, else {DEFAULT_RETENTION_DAYS}>"
+
+
+_NOT_PASSED = _NotPassed.TOKEN
+
+# One process-wide latch for an invalid LLMKIT_LOG_RETENTION_DAYS, so every
+# sink that reads the same bad value does not warn again.
+_retention_env_latch = OnceLatch()
+
+
+def _validate_retention_days(retention_days: object) -> None:
+    if retention_days is not None and (type(retention_days) is not int or retention_days < 1):
+        raise ValueError(
+            "retention_days must be an integer >= 1 or None "
+            + f"(None keeps every log forever), got {retention_days!r}"
+        )
+
+
+def _parse_retention_env(value: str) -> int | None:
+    """A non-blank ``LLMKIT_LOG_RETENTION_DAYS`` value as ``retention_days``.
+
+    A decimal integer ``>= 1`` is a number of days; ``forever`` (any case)
+    keeps every file. Anything else, ``0`` included for the reason the
+    constructor rejects it, raises :class:`ValueError`.
+    """
+    text = value.strip()
+    if text.casefold() == "forever":
+        return None
+    if re.fullmatch(r"[0-9]+", text) and int(text) >= 1:
+        return int(text)
+    raise ValueError(
+        f"{LOG_RETENTION_ENV_VAR} must be a whole number of days >= 1 or 'forever', got {value!r}"
+    )
 
 
 def _publish(part: Path, final: Path) -> bool:
@@ -126,7 +175,7 @@ class LocalYamlLogSink:
     possible.
 
     By default, the sink attempts to prune per-call YAML files older than
-    ``retention_days`` (default 30; ``None`` keeps forever), and
+    ``retention_days`` (``None`` keeps forever), and
     an ``index.jsonl`` past ``max_index_bytes`` (default 50 MiB; ``None``
     never rotates) is rotated to a date-stamped sibling that ages out under
     the same policy. Housekeeping is best effort, at most hourly, after successful
@@ -142,6 +191,15 @@ class LocalYamlLogSink:
     Give llmkit a directory of its own if you need co-located files to
     outlive the policy.
 
+    When ``retention_days`` is not passed, the sink reads
+    ``LLMKIT_LOG_RETENTION_DAYS`` at its first write (or first read of
+    :attr:`retention_days`): a whole number of days ``>= 1``, or ``forever``
+    for ``None``; unset or blank means 30. Any other value disables age
+    pruning for this sink, with one warning and a degraded ``housekeeping``
+    entry in :func:`~llmkit.logging.get_logging_health`, and never raises. An
+    explicit ``retention_days=``, ``None`` included, always wins over the
+    environment.
+
     Both bounds take a *positive* value or ``None``; ``0`` and negatives are
     rejected at construction rather than given one of their two plausible
     meanings (see :meth:`__init__`).
@@ -151,7 +209,7 @@ class LocalYamlLogSink:
         self,
         log_dir: Path | None = None,
         *,
-        retention_days: int | None = DEFAULT_RETENTION_DAYS,
+        retention_days: int | None | _NotPassed = _NOT_PASSED,
         max_index_bytes: int | None = DEFAULT_MAX_INDEX_BYTES,
     ) -> None:
         """Configure the sink, validating the growth bounds eagerly.
@@ -159,9 +217,11 @@ class LocalYamlLogSink:
         An explicit ``log_dir`` is made absolute here so the directory the
         sink freezes cannot move under a later ``chdir``.
 
-        Both bounds stay plain public attributes afterwards: this validates
-        *construction*, so assigning ``sink.retention_days = 0`` later reopens
-        the hole. Configure the sink once, at startup, as the module docstring
+        Both bounds stay assignable attributes afterwards. Assigning
+        ``retention_days`` is validated like the argument and, like it, wins
+        over ``LLMKIT_LOG_RETENTION_DAYS``; ``max_index_bytes`` is a plain
+        attribute, so assigning ``sink.max_index_bytes = 0`` later reopens the
+        hole. Configure the sink once, at startup, as the module docstring
         describes.
 
         Raises:
@@ -180,11 +240,8 @@ class LocalYamlLogSink:
                 write, where the best-effort swallow turns "every log is
                 lost" into one warning.
         """
-        if retention_days is not None and (type(retention_days) is not int or retention_days < 1):
-            raise ValueError(
-                "retention_days must be an integer >= 1 or None "
-                + f"(None keeps every log forever), got {retention_days!r}"
-            )
+        if retention_days is not _NOT_PASSED:
+            _validate_retention_days(retention_days)
         if max_index_bytes is not None and (
             type(max_index_bytes) is not int or max_index_bytes < 1
         ):
@@ -200,7 +257,19 @@ class LocalYamlLogSink:
                 f"log_dir must be a Path or None, got {type(log_dir).__name__}"
             )
         self._log_dir: Path | None = None if log_dir is None else log_dir.absolute()
-        self.retention_days: int | None = retention_days
+        # Until resolved, a sink built without retention_days still owes the
+        # LLMKIT_LOG_RETENTION_DAYS read; the lock makes that read happen once.
+        self._retention_pending: bool = retention_days is _NOT_PASSED
+        self._retention_days: int | None = (
+            DEFAULT_RETENTION_DAYS if retention_days is _NOT_PASSED else retention_days
+        )
+        # "argument", "default" (environment unset), "environment" or
+        # "invalid" (environment set to a value it could not use).
+        self._retention_source: str = "default" if self._retention_pending else "argument"
+        # An invalid environment value, reported once as a degraded
+        # housekeeping outcome by the next successful write.
+        self._retention_error: ValueError | None = None
+        self._retention_lock: threading.Lock = threading.Lock()
         self.max_index_bytes: int | None = max_index_bytes
         # True once the default resolution chose the project-root location —
         # the one case where the sink seeds a .gitignore (when none exists).
@@ -214,6 +283,65 @@ class LocalYamlLogSink:
         self._yaml_latch: OnceLatch = OnceLatch()
         self._index_latch: OnceLatch = OnceLatch()
         self._prune_latch: OnceLatch = OnceLatch()
+
+    @property
+    def retention_days(self) -> int | None:
+        """The age bound in days, or ``None`` when files are kept forever.
+
+        For a sink built without ``retention_days``, the first read (or first
+        write) resolves ``LLMKIT_LOG_RETENTION_DAYS`` and freezes the answer;
+        an invalid value reads as ``None``. Assigning validates like the
+        constructor argument and replaces whatever the environment said.
+        """
+        if self._retention_pending:
+            self._resolve_retention()
+        return self._retention_days
+
+    @retention_days.setter
+    def retention_days(self, value: int | None) -> None:
+        _validate_retention_days(value)
+        with self._retention_lock:
+            self._retention_days = value
+            self._retention_pending = False
+            self._retention_source = "argument"
+            self._retention_error = None
+
+    def _resolve_retention(self) -> None:
+        """Read ``LLMKIT_LOG_RETENTION_DAYS`` once for a sink built without a bound.
+
+        Never raises: an unusable value turns age pruning off for this sink
+        (keeping files is the recoverable mistake), warns once per process,
+        and is held for the next successful write to report as a degraded
+        ``housekeeping`` outcome.
+        """
+        invalid: ValueError | None = None
+        with self._retention_lock:
+            if not self._retention_pending:
+                return
+            raw = blank_is_unset(os.environ.get(LOG_RETENTION_ENV_VAR))
+            if raw is not None:
+                try:
+                    self._retention_days = _parse_retention_env(raw)
+                    self._retention_source = "environment"
+                except ValueError as exc:
+                    self._retention_days = None
+                    self._retention_source = "invalid"
+                    self._retention_error = invalid = exc
+            self._retention_pending = False
+        if invalid is not None:
+            # Outside the lock: a host handler that reads the sink back must
+            # not deadlock on it.
+            _ = report(
+                logger,
+                logging.WARNING if _retention_env_latch.should_warn(invalid) else logging.DEBUG,
+                "%s; age-based pruning of LLM logs is off for this sink",
+                invalid,
+            )
+
+    def _take_retention_error(self) -> ValueError | None:
+        with self._retention_lock:
+            error, self._retention_error = self._retention_error, None
+        return error
 
     @property
     def log_dir(self) -> Path:
@@ -279,17 +407,25 @@ class LocalYamlLogSink:
         if self._announced:
             return
         self._announced = True
+        days = self.retention_days
         retention = (
-            f"{self.retention_days}-day retention"
-            if self.retention_days is not None
-            else "no retention (files kept forever)"
+            f"{days}-day retention" if days is not None else "no retention (files kept forever)"
         )
+        if self._retention_source == "default":
+            retention += f", {LOG_RETENTION_ENV_VAR} changes it"
+        elif self._retention_source == "environment":
+            retention += f" from {LOG_RETENTION_ENV_VAR}"
+        elif self._retention_source == "invalid":
+            retention = f"no age-based retention: {LOG_RETENTION_ENV_VAR} is invalid"
+        else:
+            retention += f" set in code, so {LOG_RETENTION_ENV_VAR} is ignored"
         _ = report(
             logger,
             logging.INFO,
-            "llmkit is logging LLM calls to %s (%s; configure_llm_logging(None) disables)",
+            "llmkit is logging LLM calls to %s (%s; %s=off or configure_llm_logging(None) disables)",
             self.log_dir,
             retention,
+            LOG_ENV_VAR,
         )
 
     def write(self, record: LLMCallRecord) -> None:
@@ -348,6 +484,8 @@ class LocalYamlLogSink:
         Best-effort means *any* :class:`Exception` is swallowed (with a
         warning); such a failure also removes the temporary file.
         """
+        if self._retention_pending:
+            self._resolve_retention()
         try:
             self._ensure_log_dir()
             ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
@@ -487,6 +625,9 @@ class LocalYamlLogSink:
         # Best-effort index append, kept separate so an index failure can
         # never lose the per-call record that was just written successfully.
         post_write_failures: list[tuple[FailureStage, Exception]] = []
+        retention_error = self._take_retention_error()
+        if retention_error is not None:
+            post_write_failures.append(("housekeeping", retention_error))
         index_error = self._append_index(record, filepath)
         if index_error is not None:
             post_write_failures.append(("index", index_error))

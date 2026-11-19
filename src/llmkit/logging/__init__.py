@@ -7,6 +7,9 @@ per call to a directory resolved lazily at first write (see
 :func:`default_log_dir`: ``LLMKIT_LOG_DIR``, else ``data/llm-logs/`` under
 the enclosing project root, else a per-user state directory), preserving
 the historical log shape so existing analysis tooling keeps working.
+``LLMKIT_LOG=off`` switches that default sink off and
+``LLMKIT_LOG_RETENTION_DAYS`` sets its retention, both without a code change;
+an explicit :func:`configure_llm_logging` or ``retention_days=`` wins.
 
 Managed logging uses one daemon worker and a bounded queue (256 waiting
 records by default). Calls wait at most 100 ms after snapshot preparation;
@@ -39,7 +42,12 @@ from llmkit.logging._delivery import (
     flush_llm_logs_async,
 )
 from llmkit.logging._health import LoggingFailure, LoggingHealth
-from llmkit.logging._paths import LOG_DIR_ENV_VAR, default_log_dir
+from llmkit.logging._paths import (
+    LOG_DIR_ENV_VAR,
+    LOG_ENV_VAR,
+    LOG_RETENTION_ENV_VAR,
+    default_log_dir,
+)
 from llmkit.logging._policy import LogDeliveryPolicy
 from llmkit.logging.local_yaml import (
     DEFAULT_MAX_INDEX_BYTES,
@@ -63,6 +71,8 @@ __all__ = [
     "DEFAULT_RETENTION_DAYS",
     "INDEX_FILENAME",
     "LOG_DIR_ENV_VAR",
+    "LOG_ENV_VAR",
+    "LOG_RETENTION_ENV_VAR",
     "LLMCallRecord",
     "RequestSnapshot",
     "LocalYamlLogSink",
