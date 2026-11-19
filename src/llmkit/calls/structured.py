@@ -396,8 +396,17 @@ async def structured_llm_call[T: BaseModel](
         )
 
     async def _record_hit(
-        response: T, source_call_id: str | None, started_at: datetime, start_t: float
+        response: T,
+        source_call_id: str | None,
+        started_at: datetime,
+        start_t: float,
+        rejection: BaseException | None,
     ) -> None:
+        nonlocal attempt_count
+        # The hit is a pass of this logical call (an enclosing ``with_retries``
+        # ledger has already counted the first); a rejected one is followed
+        # by another pass, so each takes the next number.
+        attempt_count += 1
         resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
         _ = await record_call_async(
             LLMCallRecord(
@@ -411,14 +420,12 @@ async def structured_llm_call[T: BaseModel](
                 schema=output_schema.__name__,
                 prompt=snapshot_prompt(prompt),
                 response=_dump_for_log(response, feature, label),
-                error=None,
+                error=error_text(rejection) if rejection is not None else None,
                 approximate_cost=0.0,
                 max_tokens=args.max_tokens,
                 reasoning_effort=args.reasoning_effort,
                 call_id=call_id,
-                # The hit is this logical call's pass, so an enclosing
-                # ``with_retries`` ledger has already counted it.
-                attempt=attempt_offset + 1,
+                attempt=attempt_offset + attempt_count,
                 # Never queued: the queue-wait stamp would still hold the
                 # previous attempt's value, so it is not read.
                 queue_wait_ms=None,

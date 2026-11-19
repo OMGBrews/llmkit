@@ -92,10 +92,12 @@ async def read_through[T](
     *run* is the call's whole retry pass; only a result that leaves it cleanly
     is encoded and stored, which keeps a raised attempt, an ``on_result``
     rejection and a truncated answer out of the store. *accept* turns a stored
-    entry into the call's result and writes the hit record; a
+    entry into the call's result and writes the hit record, for a rejected
+    entry as well as an accepted one; a
     :class:`~llmkit.ResultValidationError` from it (the caller's ``on_result``
     rejected the stored answer) or a :class:`CacheDecodeError` makes it a miss.
-    Any other exception from *accept* propagates.
+    Any other exception from *accept* propagates. A cancellation while the
+    store's ``get`` or a leader's entry is awaited never reaches *accept*.
 
     With *lookup* false — a re-roll pass of an enclosing
     :func:`~llmkit.retry.with_retries` loop, whose caller rejected the earlier

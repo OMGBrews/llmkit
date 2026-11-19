@@ -41,6 +41,7 @@ from llmkit import (
     InMemoryLLMCache,
     LocalYamlLogSink,
     Provider,
+    ResultValidationError,
     RetryPolicy,
     TokenUsage,
     configure_llm_cache,
@@ -179,6 +180,7 @@ type Outcome = Literal[
     "some_tool_calls_malformed",
     "retry_attempt",
     "cache_hit",
+    "rejected_cache_hit",
     "output_limit",
     "mid_stream_failure",
     "abandoned_stream",
@@ -253,6 +255,7 @@ _NO_STREAM = "a buffered lane has no stream to fail, abandon or cut mid-way"
 _NO_HOOK = "this lane has no on_result hook"
 _NO_TOOLS = "only the tool lanes parse tool-call arguments"
 _NO_CACHE = "the tool lanes never read or write the response cache"
+_NO_STREAM_HOOK = "a stream has no on_result hook, so nothing rejects its replayed answer"
 _NO_SCHEMA = "only structured_llm_call parses a schema answer from text"
 _NO_COMPOSE = "only tool_llm_call takes output_schema= (compose)"
 
@@ -392,10 +395,6 @@ def _cells() -> list[Cell]:
             )
         )
         # Cache hit: the paid attempt, then the hit.
-        # The rejected-cache-hit cell (opportunity 1: on_result rejecting the
-        # stored answer on the second call) goes here once the maintainer has
-        # chosen the record's design; see the brief's Recommended solution,
-        # section 3. Until then a rejected hit writes no record at all.
         cells.append(
             Cell(
                 family,
@@ -418,6 +417,47 @@ def _cells() -> list[Cell]:
             )
             if not tool
             else na(family, "cache_hit", _NO_CACHE)
+        )
+        # Rejected cache hit: a paid call under another label stores the
+        # answer; this call's on_result rejects the stored answer, which is
+        # its own attempt, and then accepts the live one numbered after it.
+        cells.append(
+            Cell(
+                family,
+                "rejected_cache_hit",
+                (
+                    Expect(
+                        "ERROR",
+                        {
+                            "cache_hit": eq(True),
+                            "attempt": eq(1),
+                            "error": eq("ResultValidationError: stored answer rejected"),
+                            "response": eq(_SUCCESS_RESPONSE[family]),
+                            "approximate_cost": eq(0.0),
+                            "usage": NULL,
+                            "queue_wait_ms": NULL,
+                            "source_call_id": matches(r"[0-9a-f]{32}"),
+                        },
+                    ),
+                    Expect(
+                        "ok",
+                        {
+                            "cache_hit": eq(False),
+                            "attempt": eq(2),
+                            "call_id": same_as("call_id", 0),
+                            "error": NULL,
+                            "queue_wait_ms": FLOAT,
+                            "response": eq(_SUCCESS_RESPONSE[family]),
+                        },
+                    ),
+                ),
+            )
+            if family in ("structured", "text")
+            else na(
+                family,
+                "rejected_cache_hit",
+                _NO_STREAM_HOOK if family == "text_stream" else _NO_CACHE,
+            )
         )
         cells.append(
             Cell(
@@ -599,6 +639,22 @@ async def _drive_cache_hit(family: Family) -> None:
     assert len(installed.requests) == 1, "the second call was not a cache hit"
 
 
+async def _drive_rejected_cache_hit(family: Family) -> None:
+    configure_llm_cache(InMemoryLLMCache())
+    seen: list[object] = []
+
+    def reject_the_stored_answer(value: object) -> None:
+        seen.append(value)
+        if len(seen) == 1:
+            raise ResultValidationError("stored answer rejected")
+
+    with install(fake_answer) as installed:
+        _ = await call(family, label="seed")
+        _ = await call(family, label=_LABEL, on_result=reject_the_stored_answer)
+    assert len(installed.requests) == 2, "the rejected hit did not go to the provider"
+    assert len(seen) == 2, "the hook did not see the stored answer and then the live one"
+
+
 async def _drive_output_limit(family: Family) -> None:
     with install(lambda _r: Reply.text(_TRUNCATED, finish_reason="length")):
         await _expect_raise(call(family, label=_LABEL))
@@ -679,6 +735,7 @@ DRIVERS: dict[Outcome, Callable[[Family], Awaitable[None]]] = {
     "some_tool_calls_malformed": _drive_some_malformed,
     "retry_attempt": _drive_retry,
     "cache_hit": _drive_cache_hit,
+    "rejected_cache_hit": _drive_rejected_cache_hit,
     "output_limit": _drive_output_limit,
     "mid_stream_failure": _drive_mid_stream,
     "abandoned_stream": _drive_abandoned,
@@ -693,7 +750,7 @@ DRIVERS: dict[Outcome, Callable[[Family], Awaitable[None]]] = {
 
 def check_cell(cell: Cell, records: list[DiskRecord]) -> None:
     assert len(records) == len(cell.expects), [r.path.name for r in records]
-    if len(records) > 1 and cell.outcome == "retry_attempt":
+    if len(records) > 1 and cell.outcome in ("retry_attempt", "rejected_cache_hit"):
         assert len({r.body["call_id"] for r in records}) == 1
     for record, expect in zip(records, cell.expects, strict=True):
         assert record.status == expect.status, record.header[0]
