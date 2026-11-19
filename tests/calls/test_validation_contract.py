@@ -916,12 +916,14 @@ async def test_a_raising_serializer_still_returns_the_validated_compose_answer(
     assert len(fake.requests) == 1
     [record] = records
     assert record.error is None
-    assert cast("object", record.response) is None
+    response = cast("dict[str, object]", record.response)
+    assert response["unserializable"] == "ToolComposeResult"
+    assert str(response["repr"]).startswith("ToolComposeResult(")
     assert [
         warning.getMessage()
         for warning in caplog.records
         if warning.name == "llmkit.calls" and warning.levelno == logging.WARNING
-    ] == ["Could not dump the f/None compose result for the log; recording response as null"]
+    ] == ["Could not dump the f/None compose result for the log; recording a fallback"]
 
 
 # --- (f) a reply with no choices ---------------------------------------------

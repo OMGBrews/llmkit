@@ -89,6 +89,25 @@ async def test_hit_replays_the_stored_text_as_one_chunk(caplog: pytest.LogCaptur
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+async def test_an_interrupted_hit_records_the_interrupt(interrupt: type[BaseException]) -> None:
+    """A ``KeyboardInterrupt`` or ``SystemExit`` thrown into a replaying hit is
+    neither a clean hit nor an abandonment: the record names it."""
+    configure_llm_cache(InMemoryLLMCache())
+    provider = cache_provider()
+    with install(_InTurn()), capture_llm_records() as records:
+        _ = await _chunks(provider=provider)
+        stream = text_llm_call_stream("q", feature="f", provider=provider)
+        assert await anext(stream) == "one two"
+        with pytest.raises(interrupt):
+            _ = await stream.athrow(interrupt("stop"))
+
+    paid, hit = records
+    assert (paid.error, paid.cache_hit) == (None, False)
+    assert (hit.error, hit.cache_hit) == (f"{interrupt.__name__}: stop", True)
+
+
+@pytest.mark.asyncio
 async def test_a_buffered_answer_serves_a_stream(caplog: pytest.LogCaptureFixture) -> None:
     configure_llm_cache(InMemoryLLMCache())
     transport = _InTurn()

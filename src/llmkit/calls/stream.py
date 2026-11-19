@@ -195,7 +195,9 @@ async def text_llm_call_stream(
             except (GeneratorExit, asyncio.CancelledError):
                 error = STREAM_ABANDONED_ERROR
                 raise
-            except Exception as exc:
+            except BaseException as exc:
+                # An ordinary error, or a ``KeyboardInterrupt`` / ``SystemExit``
+                # raised inside the hit: recorded, never written as clean.
                 error = error_text(exc)
                 raise
             finally:
@@ -461,6 +463,13 @@ async def _stream_once(
             partial_text = exc.partial_text
             native_finish_reason = exc.native_finish_reason
             usage = TokenUsage(*exc.usage.counts())
+        raise
+    except BaseException as exc:
+        # Any other ``BaseException`` (a ``KeyboardInterrupt`` or
+        # ``SystemExit`` raised inside the attempt) bypasses both clauses
+        # above, so the ``finally`` would record the stream as one the model
+        # finished. Recorded as the error it is, and re-raised untouched.
+        error = error_text(exc)
         raise
     finally:
         if not captured:

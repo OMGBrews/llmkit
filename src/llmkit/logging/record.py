@@ -160,15 +160,17 @@ class LLMCallRecord:
     the calls the model requested (:meth:`~llmkit.ToolCall.to_wire` shape).
 
     ``usage`` carries provider-reported token counts on successful, truncated,
-    filtered and native-failed completions. Schema and transport failures
-    may log ``None``.
+    filtered and native-failed completions, and on answers that failed
+    validation. Transport failures may log ``None``.
     A cache hit spent no tokens and logs ``None``. Both stream lanes ask for
     usage and retain the counts on every stream that runs out.
 
     ``output_limit`` is truncation-only: the completion's finish reason and
     token counts (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`). A
     truncation with no reported counts is a mapping of nulls, not ``None``.
-    ``partial_text`` carries the unfinished, filtered or failed answer text.
+    ``partial_text`` carries the unfinished, filtered or failed answer text,
+    including a structured or compose answer that failed validation and a
+    rejected tool round's raw arguments.
     Buffered attempts keep ``response=None``; streams keep the transcript
     already delivered to the consumer. Reasoning tokens may contribute to
     counts without appearing in the partial text.

@@ -92,7 +92,7 @@ def _assert_exc_info(handler: RaisingHandler, expected: type[BaseException]) -> 
 
 
 _STRUCTURED_DUMP = (
-    "Failed to serialize LLM response for log f/None; recording response as None",
+    "Failed to serialize LLM response for log f/None; recording a fallback",
     logging.WARNING,
 )
 
@@ -113,7 +113,10 @@ async def test_structured_success_survives_a_raising_handler_on_the_dump_warning
     _assert_exc_info(handler, _DUMP_ERROR)
     [record] = records
     assert record.error is None
-    assert cast("object", record.response) is None
+    assert cast("object", record.response) == {
+        "unserializable": "_UndumpableAnswer",
+        "repr": "_UndumpableAnswer(ok=True)",
+    }
 
 
 async def test_structured_error_path_keeps_the_original_error_not_the_handlers() -> None:
@@ -157,7 +160,7 @@ async def test_compose_answer_survives_a_raising_handler_on_the_dump_warning() -
     assert lost_diagnostics() - before == 1
     assert _messages(handler) == [
         (
-            "Could not dump the f/None compose result for the log; recording response as null",
+            "Could not dump the f/None compose result for the log; recording a fallback",
             logging.WARNING,
         )
     ]

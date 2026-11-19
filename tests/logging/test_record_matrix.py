@@ -125,12 +125,11 @@ def tool_calls_named(*ids: str) -> State:
     return State(f"tool calls {ids}", holds)
 
 
-#: The structured lane records instructor's wrapper type for an exhausted
-#: transport failure; the retry layer unwraps it, the record does not
+#: Every lane records the transport error itself: the structured lane
+#: unwraps instructor's ``InstructorRetryException`` as the retry layer does
 #: (``llmkit/exceptions.py``, the ``InstructorRetryException`` caveat).
-def transport_error(family: Family, type_name: str) -> State:
-    shown = "InstructorRetryException" if family == "structured" else type_name
-    return matches(rf"{shown}: .+")
+def transport_error(type_name: str) -> State:
+    return matches(rf"{type_name}: .+")
 
 
 BUFFERED: tuple[Family, ...] = ("structured", "text", "tool")
@@ -297,7 +296,7 @@ def _cells() -> list[Cell]:
                     outcome,
                     one(
                         "ERROR",
-                        error=transport_error(family, type_name),
+                        error=transport_error(type_name),
                         usage=NULL,
                         approximate_cost=NULL,
                         queue_wait_ms=FLOAT,
@@ -306,7 +305,9 @@ def _cells() -> list[Cell]:
                     ),
                 )
             )
-        # Validation failures.
+        # Validation failures. A failed parse was paid for: its usage (the
+        # in-call total over the default one repair re-ask, two sends) and
+        # cost are recorded, and the rejected answer is in ``partial_text``.
         cells.append(
             Cell(
                 family,
@@ -316,6 +317,9 @@ def _cells() -> list[Cell]:
                     error=matches(r"StructuredOutputError: .+"),
                     response=NULL,
                     queue_wait_ms=FLOAT,
+                    usage=eq({"prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10}),
+                    approximate_cost=eq(0.001),
+                    partial_text=eq("not json"),
                 ),
             )
             if family == "structured"
@@ -345,6 +349,8 @@ def _cells() -> list[Cell]:
                     tool_calls=NULL,
                     response=eq(no_answer(family)),
                     first_chunk_ms=_first_chunk(family),
+                    # The rejected round's raw arguments.
+                    partial_text=eq("{"),
                 ),
             )
             if tool
@@ -378,7 +384,7 @@ def _cells() -> list[Cell]:
                     Expect(
                         "ERROR",
                         {
-                            "error": transport_error(family, "InternalServerError"),
+                            "error": transport_error("InternalServerError"),
                             "attempt": eq(1),
                         },
                     ),
@@ -598,7 +604,7 @@ def _transport_driver(make: Callable[[], Exception]) -> Callable[[Family], Await
 
 
 async def _drive_invalid_json(family: Family) -> None:
-    with install(lambda _r: Reply.text("not json")):
+    with install(lambda _r: Reply.text("not json", usage=_USAGE, cost=0.001)):
         await _expect_raise(call(family, label=_LABEL))
 
 

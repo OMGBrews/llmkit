@@ -1589,7 +1589,13 @@ async def acompletion_structured[T: BaseModel](
                 slot.record_tokens(cause.usage.debit())
                 raise cause from e
             last_completion = getattr(e, "last_completion", None)
+            # A failed parse was still paid for: the last rendered completion
+            # carries instructor's in-call usage total (as on success, below),
+            # which the TPM limiter is debited and the call log records.
+            failed_usage = _wire_usage(last_completion)
+            failed_cost = _response_cost(last_completion)
             if _is_no_choice_crash(cause, last_completion):
+                slot.record_tokens(failed_usage.debit())
                 # instructor raised its repairable "No choices" parse error,
                 # then its own repair step crashed indexing the empty choice
                 # list. That is a parse failure with no answer, not a
@@ -1604,9 +1610,12 @@ async def acompletion_structured[T: BaseModel](
                     model=litellm_model,
                     provider=provider.name,
                     native_finish_reason=invocations.native_finish_reason,
+                    usage=failed_usage,
+                    approximate_cost=failed_cost,
                 ) from e
             if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
                 raise
+            slot.record_tokens(failed_usage.debit())
             # Word the message by the re-asks that actually ran: with an
             # allowance of zero no repair happened, and saying otherwise would
             # put a false claim in the call log's ``error`` field.
@@ -1628,6 +1637,8 @@ async def acompletion_structured[T: BaseModel](
                 model=litellm_model,
                 provider=provider.name,
                 native_finish_reason=invocations.native_finish_reason,
+                usage=failed_usage,
+                approximate_cost=failed_cost,
             ) from e
         # instructor types the raw completion half of the tuple as Any. It is
         # the last rendered response, whose usage instructor's tally has

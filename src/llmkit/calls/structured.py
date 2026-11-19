@@ -20,6 +20,7 @@ from llmkit._snapshot import snapshot_data, snapshot_prompt
 from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
     error_text,
+    fallback_log_dump,
     guard_output_schema,
     logger,
     prepare_call,
@@ -37,6 +38,7 @@ from llmkit.exceptions import (
     OutputLimitDiagnostics,
     OutputLimitError,
     StructuredOutputError,
+    underlying_provider_error,
 )
 from llmkit.logging import LLMCallRecord
 from llmkit.logging.record import RequestSnapshot
@@ -321,7 +323,11 @@ async def structured_llm_call[T: BaseModel](
             # instructor can raise after a completion returned (a truncation),
             # in which case the funnel already stamped what it sent.
             sent_temperature = _litellm.sent_temperature(sent_temperature)
-            error = error_text(exc)
+            # instructor wraps a transport or permanent failure that escapes
+            # its in-call loop in ``InstructorRetryException``; the record
+            # names the underlying error, as the other lanes do, the way the
+            # retry layer classifies it.
+            error = error_text(underlying_provider_error(exc))
             if isinstance(exc, OutputLimitError):
                 # ``None`` for a directly constructed error: no fields logged.
                 diagnostics = exc.diagnostics
@@ -340,6 +346,12 @@ async def structured_llm_call[T: BaseModel](
                 usage = TokenUsage(*exc.usage.counts())
             elif isinstance(exc, StructuredOutputError):
                 native_finish_reason = exc.native_finish_reason
+                # The rejected answer and what it cost: a failed parse was
+                # still paid for.
+                partial_text = exc.raw_text
+                if exc.usage is not None:
+                    usage = TokenUsage(*exc.usage.counts())
+                cost = exc.approximate_cost
             raise
         except BaseException as exc:
             # A cancellation (a host's ``asyncio.timeout`` around the call, a
@@ -456,7 +468,11 @@ async def structured_llm_call[T: BaseModel](
 def _dump_for_log(
     response: BaseModel | None, feature: str, label: str | None
 ) -> dict[str, JsonValue] | None:
-    """The log record's ``response``: the parsed result's ``model_dump``, or ``None``."""
+    """The log record's ``response``: the parsed result's ``model_dump``.
+
+    ``None`` when there is no result; a :func:`fallback_log_dump` marker when
+    the dump raises.
+    """
     if response is None:
         return None
     try:
@@ -464,20 +480,22 @@ def _dump_for_log(
         return cast("dict[str, JsonValue]", response.model_dump())
     except Exception:
         # A custom @field_serializer/@model_serializer on the schema raised.
-        # The dump exists only for the log, so it degrades to None — logging
-        # must never break the call (success path) or mask the real provider
-        # error (error path). Same warn pattern as the sink failures in
-        # llmkit.logging; report() contains an ordinary exception from a host
-        # handler on the warning itself (a blocking handler is not contained).
+        # The dump exists only for the log, so it degrades to a marker naming
+        # the type with a bounded repr — logging must never break the call
+        # (success path) or mask the real provider error (error path), and an
+        # answer that existed must not read as ``null``. Same warn pattern as
+        # the sink failures in llmkit.logging; report() contains an ordinary
+        # exception from a host handler on the warning itself (a blocking
+        # handler is not contained).
         _ = report(
             logger,
             logging.WARNING,
-            "Failed to serialize LLM response for log %s/%s; recording response as None",
+            "Failed to serialize LLM response for log %s/%s; recording a fallback",
             feature,
             label,
             exc_info=True,
         )
-        return None
+        return {**fallback_log_dump(response)}
 
 
 def structured_llm_call_sync[T: BaseModel](

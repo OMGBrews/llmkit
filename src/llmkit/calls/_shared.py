@@ -725,6 +725,39 @@ def error_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
+#: How much of an unserializable answer's ``repr`` :func:`fallback_log_dump`
+#: keeps, so one odd object cannot bloat a record.
+FALLBACK_REPR_LIMIT = 500
+
+
+def fallback_log_dump(value: object) -> dict[str, str]:
+    """The record's ``response`` for an answer whose dump raised.
+
+    ``{"unserializable": "<TypeName>", "repr": "<repr, first 500 characters>"}``:
+    the record says an answer existed, what it was, and a bounded readable
+    form, where ``null`` would read as no answer at all. ``repr`` is left out
+    when ``repr()`` itself raises.
+    """
+    marker = {"unserializable": type(value).__name__}
+    try:
+        shown = repr(value)
+    except Exception:
+        return marker
+    marker["repr"] = shown[:FALLBACK_REPR_LIMIT]
+    return marker
+
+
+def rejected_arguments_text(exc: ToolArgumentError) -> str | None:
+    """The record's ``partial_text`` for a rejected tool round: its raw arguments.
+
+    One line per rejected call that carried an argument string, in the order
+    the model sent them; ``None`` when none did.
+    """
+    rejected = exc.round_errors or (exc,)
+    raw = [error.arguments_raw for error in rejected if error.arguments_raw is not None]
+    return "\n".join(raw) if raw else None
+
+
 def usage_log_dict(usage: TokenUsage | None) -> dict[str, int | None] | None:
     """The log record's ``usage`` mapping, ``None`` when no usage was received.
 

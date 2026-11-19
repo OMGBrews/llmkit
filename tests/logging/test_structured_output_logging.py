@@ -9,7 +9,7 @@ a ``grep`` away.
 Also pins two response-fidelity contracts: a failed buffered text attempt
 logs ``response: None`` (not ``""``, which would be indistinguishable from
 a successful empty completion), and a schema whose custom serializer raises
-degrades the *logged* response to ``None`` without breaking the call.
+degrades the *logged* response to a fallback marker without breaking the call.
 
 The call-driven tests fake the provider through :mod:`llmkit.testing`, except
 two that stay on the private seams (each docstring says why). The
@@ -22,16 +22,18 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel, model_serializer
 
 from llmkit import (
+    InMemoryLLMCache,
     LLMCallRecord,
     LocalYamlLogSink,
     capture_llm_records,
+    configure_llm_cache,
     configure_llm_logging,
 )
 from llmkit import (
@@ -393,8 +395,9 @@ def test_raising_model_serializer_degrades_logged_response_not_the_call(
 ) -> None:
     """A custom ``@model_serializer`` that raises must not replace a
     successful return value (or mask a real provider error) — the dump
-    exists only for the log, so the logged response degrades to ``None``
-    with a warning, and the call still returns the parsed model."""
+    exists only for the log, so the logged response degrades to a marker
+    naming the type with its ``repr``, with a warning, and the call still
+    returns the parsed model."""
     # Raw JSON, not ``Reply.json``: serializing this schema is what explodes.
     with (
         install(lambda _request: Reply.text('{"ok": true}', cost=0.001)),
@@ -413,6 +416,75 @@ def test_raising_model_serializer_degrades_logged_response_not_the_call(
     # The call itself succeeds — the serializer failure stays in the log path.
     assert result.ok is True
     assert len(captured) == 1
-    assert cast("object", captured[0].response) is None
+    assert cast("object", captured[0].response) == {
+        "unserializable": "_ExplodingDumpSchema",
+        "repr": "_ExplodingDumpSchema(ok=True)",
+    }
     assert captured[0].error is None
-    assert any("Failed to serialize LLM response" in m for m in caplog.messages)
+    assert any(
+        "Failed to serialize LLM response" in m and m.endswith("recording a fallback")
+        for m in caplog.messages
+    )
+
+
+class _LongUndumpable(BaseModel):
+    """Undumpable, with a ``repr`` far longer than the fallback keeps."""
+
+    text: str
+
+    @model_serializer
+    def _boom(self) -> dict[str, object]:
+        raise ValueError("serializer exploded")
+
+
+class _UnreprableUndumpable(_LongUndumpable):
+    """Undumpable, and its ``repr`` raises too."""
+
+    @override
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+
+async def _undumpable_record(schema: type[BaseModel]) -> LLMCallRecord:
+    with (
+        install(lambda _request: Reply.text('{"text": "' + "x" * 1000 + '"}')),
+        capture_llm_records() as records,
+    ):
+        _ = await llm_calls.structured_llm_call("hi", schema, feature="extraction")
+    [record] = records
+    return record
+
+
+async def test_the_fallback_repr_is_cut_at_500_characters() -> None:
+    record = await _undumpable_record(_LongUndumpable)
+    response = cast("dict[str, object]", record.response)
+    assert response["unserializable"] == "_LongUndumpable"
+    assert response["repr"] == repr(_LongUndumpable(text="x" * 1000))[:500]
+    assert len(cast("str", response["repr"])) == 500
+
+
+async def test_a_raising_repr_leaves_only_the_type_name() -> None:
+    record = await _undumpable_record(_UnreprableUndumpable)
+    assert cast("object", record.response) == {"unserializable": "_UnreprableUndumpable"}
+    assert record.error is None
+
+
+async def test_the_structured_cache_hit_records_the_same_fallback() -> None:
+    configure_llm_cache(InMemoryLLMCache())
+    try:
+        with (
+            install(lambda _request: Reply.text('{"ok": true}')) as installed,
+            capture_llm_records() as records,
+        ):
+            for _ in range(2):
+                _ = await llm_calls.structured_llm_call(
+                    "hi", _ExplodingDumpSchema, feature="extraction"
+                )
+    finally:
+        configure_llm_cache(None)
+    assert len(installed.requests) == 1
+    paid, hit = records
+    assert hit.cache_hit is True
+    expected = {"unserializable": "_ExplodingDumpSchema", "repr": "_ExplodingDumpSchema(ok=True)"}
+    assert cast("object", paid.response) == expected
+    assert cast("object", hit.response) == expected

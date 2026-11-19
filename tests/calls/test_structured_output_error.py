@@ -13,7 +13,10 @@ instead and is not re-asked. Every test answers through the public
 from __future__ import annotations
 
 import pickle
+from collections.abc import AsyncGenerator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
+from unittest.mock import MagicMock, patch
 
 import pytest
 from instructor.core import InstructorRetryException
@@ -129,6 +132,32 @@ async def test_compose_failure_carries_the_answer_and_the_attempt() -> None:
     assert len(fake.requests) == 2
     assert exc.attempt == 2
     assert exc.provider == _PROVIDER.name
+
+
+async def test_both_lanes_record_the_rejected_answer() -> None:
+    """The answer that failed validation reaches the record's ``partial_text``
+    on the structured and the compose lane alike."""
+    for call in ("structured", "compose"):
+        with (
+            install(lambda _request: Reply.text('{"n": 0}')),
+            capture_llm_records() as records,
+            pytest.raises(StructuredOutputError),
+        ):
+            if call == "structured":
+                _ = await structured_llm_call(
+                    "q", _Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+                )
+            else:
+                _ = await tool_llm_call(
+                    "q",
+                    [],
+                    output_schema=_Positive,
+                    feature="f",
+                    retry=NO_RETRY,
+                    provider=_PROVIDER,
+                )
+        [record] = records
+        assert record.partial_text == '{"n": 0}', call
 
 
 async def test_compose_turn_with_neither_calls_nor_text_raises_the_same_type() -> None:
@@ -251,10 +280,68 @@ async def test_the_error_survives_a_pickle_round_trip() -> None:
     assert isinstance(restored, StructuredOutputError)
 
     assert str(restored) == str(caught.value)
-    for name in ("schema_name", "raw_text", "attempt", "model", "provider"):
+    for name in (
+        "schema_name",
+        "raw_text",
+        "attempt",
+        "model",
+        "provider",
+        "usage",
+        "approximate_cost",
+    ):
         assert getattr(restored, name) == getattr(caught.value, name), name
     # ``ctx`` holds the validator's exception object, equal only to itself.
     assert restored.errors is not None and caught.value.errors is not None
     assert [(e["type"], e["loc"], e["msg"], e["input"]) for e in restored.errors] == [
         (e["type"], e["loc"], e["msg"], e["input"]) for e in caught.value.errors
     ]
+
+
+@asynccontextmanager
+async def _debits_into(debits: list[int | None]) -> AsyncGenerator[MagicMock]:
+    slot = MagicMock()
+    slot.record_tokens = debits.append
+    yield slot
+
+
+@pytest.mark.parametrize(
+    ("reply", "counts"),
+    # A malformed answer is re-asked once (the default repair allowance), so
+    # its usage is instructor's in-call total over two sends; a reply with no
+    # choices ends the attempt after one.
+    [("malformed", (6, 4, 10)), ("no_choice", (3, 2, 5))],
+)
+async def test_a_failed_parse_is_debited_and_recorded_with_what_it_cost(
+    reply: str, counts: tuple[int, int, int]
+) -> None:
+    """A failed parse was paid for: the provider's usage is debited to the TPM
+    limiter and recorded with the cost, as a parsed answer's is."""
+    answer = (
+        Reply.text("not json", usage=TokenUsage(3, 2, 5), cost=0.001)
+        if reply == "malformed"
+        else Reply(no_choice=True, usage=TokenUsage(3, 2, 5), cost=0.001)
+    )
+    debits: list[int | None] = []
+
+    def acquire(_name: str) -> AbstractAsyncContextManager[MagicMock]:
+        return _debits_into(debits)
+
+    with (
+        patch("llmkit._litellm.GlobalRateLimiter.acquire_async", acquire),
+        install(lambda _request: answer),
+        capture_llm_records() as records,
+        pytest.raises(StructuredOutputError) as caught,
+    ):
+        _ = await structured_llm_call(
+            "q", _Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+        )
+
+    assert debits == [counts[2]]
+    assert caught.value.usage is not None
+    assert caught.value.usage.counts() == counts
+    assert caught.value.approximate_cost == 0.001
+    [record] = records
+    assert record.usage == dict(
+        zip(("prompt_tokens", "completion_tokens", "total_tokens"), counts, strict=True)
+    )
+    assert record.approximate_cost == 0.001
