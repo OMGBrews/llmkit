@@ -15,9 +15,10 @@ reading as a success that returned nothing.
 
 The structured lane is the one wrinkle, and an existing one: instructor wraps
 every transport error that escapes it in ``InstructorRetryException``, so the
-cut-off ``TimeoutError`` reaches the caller and the record inside that
-wrapper, as a LiteLLM timeout always has. The retry layer unwraps it and
-charges it to the transport budget.
+cut-off ``TimeoutError`` reaches the caller inside that wrapper, as a LiteLLM
+timeout always has. The retry layer unwraps it and charges it to the
+transport budget, and the record names the ``TimeoutError`` itself, as on
+every other lane.
 """
 
 from __future__ import annotations
@@ -105,9 +106,6 @@ async def _run(
 def _cut(record: LLMCallRecord, deadline: float = _DEADLINE) -> bool:
     """Whether *record* says its attempt was cut off at *deadline*."""
     message = f"no provider response within {deadline:g}s"
-    if record.schema == OkSchema.__name__:
-        # The structured lane records instructor's wrapper around the timeout.
-        return record.error == f"InstructorRetryException: {message}"
     return record.error == f"TimeoutError: {message}"
 
 

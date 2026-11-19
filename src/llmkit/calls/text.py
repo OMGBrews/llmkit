@@ -273,8 +273,16 @@ async def text_llm_call(
         )
 
     async def _record_hit(
-        text: str, source_call_id: str | None, started_at: datetime, start_t: float
+        text: str,
+        source_call_id: str | None,
+        started_at: datetime,
+        start_t: float,
+        rejection: BaseException | None,
     ) -> None:
+        nonlocal attempt_count
+        # The hit is this logical call's pass, numbered like any other
+        # (see structured.py).
+        attempt_count += 1
         _ = await record_call_async(
             build_text_record(
                 started_at=started_at,
@@ -286,14 +294,13 @@ async def text_llm_call(
                 temperature=args.temperature,
                 model=args.model,
                 provider=provider,
-                error=None,
+                error=error_text(rejection) if rejection is not None else None,
                 approximate_cost=0.0,
                 schema="text",
                 max_tokens=args.max_tokens,
                 reasoning_effort=args.reasoning_effort,
                 call_id=call_id,
-                # The hit is this logical call's pass (see structured.py).
-                attempt=attempt_offset + 1,
+                attempt=attempt_offset + attempt_count,
                 cache_hit=True,
                 source_call_id=source_call_id,
                 requested_service_tier=requested_tier(args),

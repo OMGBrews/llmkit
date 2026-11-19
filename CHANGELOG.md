@@ -8,6 +8,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A failed structured answer records what it cost.** A structured answer
+  that fails validation now writes the provider-reported `usage` (on the
+  structured lane, instructor's total across its in-call repairs) and
+  `approximate_cost`, which used to be `null`, and debits those tokens to the
+  TPM limit, including when the repair re-ask then fails on transport (the
+  record then names the transport error). `StructuredOutputError` gains
+  `usage` and `approximate_cost`, filled on the structured and compose lanes.
+
+- **A rejected answer stays in the record.** A validation-failure record now
+  keeps the rejected answer in `partial_text`: the answer text on the
+  structured and compose lanes, and a rejected tool round's raw arguments,
+  verbatim and joined with a newline between calls, on both tool lanes. Before, it reached the
+  record only when a later repair happened to carry it in `requests`.
+
+- **An interrupted stream is no longer recorded as clean.** A
+  `KeyboardInterrupt` or `SystemExit` raised inside a `text_llm_call_stream`
+  attempt or cache-hit replay, or a `tool_llm_call_stream` attempt, was
+  recorded `# ok` with `error: null`. It is now recorded as `KeyboardInterrupt`
+  (or `"<Type>: <message>"`) and raised. Abandonment and cancellation keep the
+  abandoned-stream marker.
+
+- **A lone surrogate no longer loses a record.** A lone surrogate (for
+  example from a `surrogateescape` file name in an exception message) in a
+  record's `error` lost its `index.jsonl` line, and one in `feature` or
+  `label` lost the whole record. The index line now escapes it as `\udXXX`,
+  file names replace it with `_`, and the header escapes it.
+
+- **The first-write notice names the directory as the sink uses it.** It
+  printed the symlink-resolved path, which could differ from
+  `default_log_dir()` and `LLMKIT_LOG_DIR`; it now prints the absolute path
+  the sink froze, symlinks intact.
+
+- **A whitespace-only `LLMKIT_LOG_DIR` counts as unset.** It used to name a
+  directory called `"   "` under the current directory.
+
 - **Numeric settings reject invalid values before they disable bounds or harm
   the shared sync loop.** Caller timeouts, token caps and temperatures are
   validated during option resolution, including cache hits. Provider-supplied
@@ -209,6 +244,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and mark `repair=True`.
 
 ### Added
+
+- **Logging can be switched off, and its retention changed, from the
+  environment.** `LLMKIT_LOG=off` (or `0`, `false`, `no`; trimmed, any case)
+  turns the import-time default sink off as `configure_llm_logging(None)`
+  does; `on`, `1`, `true` or `yes` leave it on. It is read once, at the first
+  logged call or the first `get_log_sink()` or `get_logging_health()`, never
+  at import, and any `configure_llm_logging(...)` call wins over it. An
+  unrecognised value fails closed: logging is off and one WARNING names the
+  value. `LLMKIT_LOG_RETENTION_DAYS` sets the age bound of every
+  `LocalYamlLogSink` built without `retention_days`: a whole number of days
+  `>= 1`, or `forever`; it is read at the sink's first write, and an explicit
+  `retention_days=`, `None` included, wins. An invalid value turns age
+  pruning off for that sink, warns once per process and counts one degraded
+  `housekeeping` outcome in `get_logging_health()`; it never fails a call. An
+  empty or whitespace-only value leaves either variable unset, and a value a
+  `.env` file supplies counts once LiteLLM has loaded it, which happens at the
+  first call. The names are exported as `llmkit.logging.LOG_ENV_VAR` and
+  `llmkit.logging.LOG_RETENTION_ENV_VAR`. The first-write INFO notice now
+  names `LLMKIT_LOG=off` for the default sink (a sink set up in code says the
+  variable does not disable it) and says where the retention came from.
+
+  **Compatibility:** a process that already has `LLMKIT_LOG` or
+  `LLMKIT_LOG_RETENTION_DAYS` set, for any reason, now honours it.
+  `LocalYamlLogSink.retention_days` is now a property: assigning it is
+  validated like the constructor argument, so assigning `0`, a negative, a
+  float or a bool raises `ValueError` where it used to be accepted silently.
+  Its default in the signature is a private sentinel rather than `30`
+  (`DEFAULT_RETENTION_DAYS` still applies when the variable is unset).
+
+- **The first dropped log record logs a WARNING.** The first record an
+  installation drops (a full delivery queue, delivery closed or unavailable,
+  the worker stopping, or the exit drain timing out) logs one WARNING on
+  `llmkit.logging` naming `get_logging_health()`. It carries no payload or
+  exception text. Later drops are only counted, as before, and
+  `configure_llm_logging` re-arms the warning. Previously a drop was visible
+  only in `get_logging_health()`.
+
+  **Compatibility:** a new WARNING can appear under load or at exit. As for
+  every contained diagnostic, a host handler that raises an ordinary
+  exception on it is contained and counted; one that raises
+  `KeyboardInterrupt` or a cancellation on a caller's path reaches the
+  caller.
 
 - **Moonshot and Alibaba are first-class providers.** `Provider.MOONSHOT`
   (`MoonshotProvider`) calls Moonshot's Kimi models through LiteLLM's native
@@ -489,6 +566,73 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream or a mid-stream error still writes `null` usage.
 
 ### Changed
+
+- **A cached answer your `on_result` hook rejects is recorded as its own
+  attempt.** Such a pass used to write no record at all. It now writes an
+  `ERROR` record with `cache_hit: true` and `cache=hit` in the header,
+  `source_call_id` naming the call that stored the answer, `response` the
+  rejected answer, `approximate_cost` `0.0`, and `error` the exception your
+  hook raised, by its own type rather than the `ResultValidationError` llmkit
+  wraps a validation-budget exception in. A hook exception outside
+  `validation_retry_on` is recorded and then raised. A request that waited on
+  an identical one in flight and rejects both the stored and the in-flight
+  answer writes two such records. A cancellation while the store or an
+  in-flight request is awaited still writes nothing. Inside an enclosing
+  `with_retries` loop, the extra attempt is counted in the loop's ledger.
+
+  **Compatibility:** the provider attempt that follows a rejected hit is now
+  numbered after it (attempt 2, or 3 after two rejections) where it used to
+  be attempt 1, so per-call attempt numbers shift for calls with a rejected
+  hit. `cache_hit` now means the cache supplied the attempt's answer, accepted
+  or not, rather than that the cache answered the call, and a record can be
+  both `ERROR` and `cache=hit`. A reader that took `cache_hit: true` to mean
+  a successful hit must also check `error`.
+
+- **A structured call's transport failure is recorded as the underlying
+  error.** `structured_llm_call` records a rate limit, outage, server error or
+  timeout as `RateLimitError: …`, `TimeoutError: …` and so on, as the other
+  four lanes do, instead of instructor's `InstructorRetryException: …`. The
+  raised exception is unchanged.
+
+  **Compatibility:** the `error` text, and the triage key in `index.jsonl`,
+  changes for those structured attempts.
+
+- **An answer whose schema cannot dump for the log is recorded as a marker,
+  not `null`.** When a custom serializer makes `model_dump()` raise, the
+  structured and compose records, and the structured cache-hit record, now
+  write `response: {unserializable: <TypeName>, repr: <the first 500
+  characters of repr()>}` for the schema instance (without `repr` when
+  `repr()` raises too). The answer is still returned.
+
+  **Compatibility:** `response` is no longer `null` for such an attempt, and
+  the two warnings now end "recording a fallback" instead of "recording
+  response as None".
+
+- **The `.gitignore` seed no longer depends on who created the log
+  directory.** At the project-root default `data/llm-logs/`, the sink now
+  seeds a `.gitignore` containing `*` whenever none exists: once per sink for
+  an existing directory, and on every creation. It used to seed only a
+  directory it created itself, so a directory made by a checkout, a `mkdir`
+  or an older llmkit stayed unprotected. An existing `.gitignore` is never
+  touched, an existing directory is never re-chmodded, and an
+  `LLMKIT_LOG_DIR` or explicit directory is still never seeded.
+
+  **Compatibility:** a `.gitignore` can appear in an existing project-root
+  log directory. It does not untrack files already committed.
+
+- **Each record is published only once it is complete.** `LocalYamlLogSink`
+  writes a record under a hidden temporary name (`.<name>.yaml.part`,
+  exclusive-create, `0o600`) and then gives it its `*.yaml` name with a hard
+  link that never overwrites, falling back, where hard links are unsupported,
+  to a rename once the name is checked free, so no empty or partial `*.yaml`
+  is ever visible. A write cut off mid-file (a
+  killed process, an interrupt, the exit drain) used to leave a truncated
+  `*.yaml` whose header still read `# ok`. Retention sweeps leftover `.part`
+  files older than its bound and keeps them under `retention_days=None`.
+
+  **Compatibility:** file names, modes and content are unchanged; a hidden
+  `.part` file can now appear in the log directory, and pruning owns that
+  name pattern too.
 
 - **Breaking: a `service_tier` in a provider's `completion_kwargs()` is
   refused.** Before the `service_tier` setting existed, a host asked for a
@@ -792,8 +936,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A compose answer whose schema cannot dump for the log is still
   returned.** A raising serializer on the output schema used to escape from
-  the log write after a valid final answer; the record now writes `response:
-  null` with a warning, as the structured lane does.
+  the log write after a valid final answer; the record now writes the
+  `unserializable` marker described above, with a warning, as the structured
+  lane does.
 
 - **Breaking: a compose call's truncated final answer raises
   `OutputLimitError`.**

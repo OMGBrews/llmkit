@@ -6,7 +6,10 @@ a snapshot, and every :func:`configure_llm_logging` call would silently no-op
 while records kept going to the old sink — a failure with no error anywhere.
 
 The default is constructed eagerly at import, so logging is on with zero setup;
-its log directory is still resolved lazily at the first write.
+its log directory is still resolved lazily at the first write. ``LLMKIT_LOG``
+can switch that import-time default off: it is read once, at the first read or
+write of the installation, never at import, and an explicit
+:func:`configure_llm_logging` always wins over it.
 
 The sink and its health counters are installed together as one object, so a
 write reads both with a single attribute load and a reconfigure during an
@@ -16,6 +19,8 @@ in-flight write cannot land that write's outcome in the new counters.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -23,8 +28,9 @@ from typing import Protocol, runtime_checkable
 from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
+from llmkit.logging._paths import LOG_ENV_VAR, blank_is_unset
 from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
-from llmkit.logging.local_yaml import LocalYamlLogSink
+from llmkit.logging.local_yaml import implicit_default_sink
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
 
@@ -94,7 +100,14 @@ def _install(sink: LogSink | None) -> Installed:
 # directory (resolved lazily at first write). The host overrides it once at
 # startup; tests typically point it at a tmp directory. Replaced whole, never
 # mutated, so every reader sees a consistent sink/health pair.
-_installed: Installed = _install(LocalYamlLogSink())
+_installed: Installed = _install(implicit_default_sink())
+
+# True while ``_installed`` is still the import-time default and ``LLMKIT_LOG``
+# has not been read. The first reader clears it under the lock, swapping in the
+# disabled installation when the variable says off; configure_llm_logging
+# clears it too, so an explicit choice is never overridden by the environment.
+_implicit: bool = True
+_switch_lock = threading.Lock()
 
 # Warn-once latch for a *configured* sink that raises out of ``write`` — the
 # custom-sink counterpart of LocalYamlLogSink's internal latches, so a
@@ -119,6 +132,11 @@ def configure_llm_logging(
     """Set the sink that receives every :class:`LLMCallRecord`.
 
     Pass ``None`` to disable logging entirely (writes become no-ops).
+    Without a call, the import-time default :class:`LocalYamlLogSink` is
+    installed unless ``LLMKIT_LOG`` says off (``off``, ``0``, ``false`` or
+    ``no``; any unrecognised value also turns it off, with one warning). An
+    explicit call always wins: once this has run, ``LLMKIT_LOG`` is never
+    read, whatever it says.
     Optional ``delivery_policy`` configures managed queue capacity and wait/drain
     budgets before the first managed admission. Later explicit policy changes
     raise RuntimeError; omitting it preserves policy during sink swaps.
@@ -143,7 +161,7 @@ def configure_llm_logging(
             ``__getattr__``), so stub with ``Mock(spec=LogSink)``, a small
             fake class, or ``None``.
     """
-    global _installed
+    global _installed, _implicit
     # Deliberate runtime guards at the library's public boundary: the annotation
     # says ``LogSink | None``, but an untyped caller passing something else
     # would otherwise install it silently and lose every subsequent log.
@@ -161,12 +179,60 @@ def configure_llm_logging(
         )
     if delivery_policy is not None:
         configure_delivery(delivery_policy)
-    _installed = _install(sink)
+    with _switch_lock:
+        _installed = _install(sink)
+        _implicit = False
     _sink_latch.succeeded()
 
 
+def _apply_log_switch() -> None:
+    """Read ``LLMKIT_LOG`` once and, when it says off, disable the default sink.
+
+    Idempotent and locked against :func:`configure_llm_logging`: whichever
+    takes the lock first decides, and an explicit configuration that got
+    there first is left alone. An unrecognised value fails closed, because a
+    prompt written to disk cannot be taken back; it warns once (the read
+    happens once per process) and never raises.
+
+    ``_implicit`` is cleared only after ``_installed`` holds the answer:
+    :func:`get_installed` reads the flag without the lock, so a reader that
+    sees it cleared must also see the disabled installation, never the
+    default sink the switch is about to replace.
+    """
+    global _installed, _implicit
+    invalid: str | None = None
+    with _switch_lock:
+        if not _implicit:
+            return
+        raw = blank_is_unset(os.environ.get(LOG_ENV_VAR))
+        value = None if raw is None else raw.strip().casefold()
+        if value is not None and value not in {"on", "1", "true", "yes"}:
+            if value not in {"off", "0", "false", "no"}:
+                invalid = raw
+            _installed = _install(None)
+        _implicit = False
+    if invalid is not None:
+        # Outside the lock: a host handler reading the health back must not
+        # deadlock on it.
+        _ = report(
+            logger,
+            logging.WARNING,
+            "%s=%r is not one of on/off, 1/0, true/false or yes/no; LLM call logging is "
+            + "off (an unrecognised value fails closed)",
+            LOG_ENV_VAR,
+            invalid,
+        )
+
+
 def get_installed() -> Installed:
-    """Bind the sink and counters together before managed preparation."""
+    """Bind the sink and counters together before managed preparation.
+
+    The first call (or the first :func:`get_log_sink`,
+    :func:`get_logging_health` or :func:`write_llm_log`) applies
+    ``LLMKIT_LOG`` to the import-time default sink.
+    """
+    if _implicit:
+        _apply_log_switch()
     return _installed
 
 
@@ -205,7 +271,7 @@ def get_log_sink() -> LogSink | None:
     permanent ``configure_llm_logging(None)`` with no error anywhere, caught
     only by a test that reads the private name too.
     """
-    return _installed.sink
+    return get_installed().sink
 
 
 def get_logging_health() -> LoggingHealth:
@@ -241,7 +307,7 @@ def get_logging_health() -> LoggingHealth:
     ``wait_timeouts`` expired waits that may still deliver later.
     ``preparation_failed`` also contributes to ``failed``.
     """
-    return _installed.health.snapshot()
+    return get_installed().health.snapshot()
 
 
 def write_llm_log(record: LLMCallRecord) -> Path | None:
@@ -276,7 +342,7 @@ def write_llm_log(record: LLMCallRecord) -> Path | None:
     Every outcome is also counted in :func:`get_logging_health`, against the
     installation read here at entry.
     """
-    return write_installed(record, _installed)
+    return write_installed(record, get_installed())
 
 
 @dataclass

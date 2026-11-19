@@ -95,17 +95,25 @@ class LLMCallRecord:
     which is how a stream cut off before its first chunk reads.
 
     ``cache_hit`` is ``True`` when the response cache
-    (:func:`~llmkit.configure_llm_cache`) answered the call instead of a
-    provider, and it is the field that disambiguates every other one on such
-    a record: one record is still one pass of the call (``attempt`` counts
-    it), but no provider attempt was made, so ``approximate_cost`` is
+    (:func:`~llmkit.configure_llm_cache`) supplied this pass's answer instead
+    of a provider, and it is the field that disambiguates every other one on
+    such a record: one record is still one pass of the call (``attempt``
+    counts it), but no provider attempt was made, so ``approximate_cost`` is
     ``0.0``, ``usage`` and ``queue_wait_ms`` are ``None`` (no tokens spent, no
     rate-limiter slot taken — a ``None`` ``queue_wait_ms`` otherwise means an
     attempt failed before acquiring one), and ``duration_ms`` is the lookup
     plus any wait on an identical request in flight. A hit has its own
-    ``call_id``; ``source_call_id`` names the paid call whose answer it
-    returned (``None`` on every record that is not a hit). The YAML body
-    carries both; ``index.jsonl`` carries ``cache_hit`` only.
+    ``call_id``; ``source_call_id`` names the paid call whose stored answer it
+    read (``None`` on every record that is not a hit). The YAML body carries
+    both; ``index.jsonl`` carries ``cache_hit`` only. A stored answer the
+    caller's ``on_result`` hook rejects is still such a pass: its record has
+    ``cache_hit`` ``True``, ``response`` the rejected answer and ``error`` the
+    hook's own exception (not the :class:`~llmkit.ResultValidationError` a
+    validation-budget exception becomes), and the live attempt that follows
+    is numbered after it, so a hit that was rejected reads as an error record
+    with ``cache_hit`` ``True``. A single-flight follower that rejects the
+    stored answer and then the in-flight leader's writes one such record for
+    each.
 
     ``temperature`` is the temperature the request actually sent. It is
     ``None`` exactly when none was sent and the model's default sampling
@@ -152,15 +160,17 @@ class LLMCallRecord:
     the calls the model requested (:meth:`~llmkit.ToolCall.to_wire` shape).
 
     ``usage`` carries provider-reported token counts on successful, truncated,
-    filtered and native-failed completions. Schema and transport failures
-    may log ``None``.
+    filtered and native-failed completions, and on answers that failed
+    validation. Transport failures may log ``None``.
     A cache hit spent no tokens and logs ``None``. Both stream lanes ask for
     usage and retain the counts on every stream that runs out.
 
     ``output_limit`` is truncation-only: the completion's finish reason and
     token counts (:meth:`~llmkit.OutputLimitDiagnostics.to_log_dict`). A
     truncation with no reported counts is a mapping of nulls, not ``None``.
-    ``partial_text`` carries the unfinished, filtered or failed answer text.
+    ``partial_text`` carries the unfinished, filtered or failed answer text,
+    including a structured or compose answer that failed validation and a
+    rejected tool round's raw arguments.
     Buffered attempts keep ``response=None``; streams keep the transcript
     already delivered to the consumer. Reasoning tokens may contribute to
     counts without appearing in the partial text.

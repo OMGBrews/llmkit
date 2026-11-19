@@ -408,8 +408,18 @@ async def main():
     health = get_logging_health()
     assert health.failed == 1, health
     # The worker took its existing fatal path: delivery is now unavailable.
-    submit_record_call(make_record(label="after-interrupt"))
+    # That drop's one WARNING runs on this caller, where report() lets the
+    # handler's BaseException propagate as for any contained diagnostic.
+    try:
+        submit_record_call(make_record(label="after-interrupt"))
+    except error:
+        pass
+    else:
+        raise AssertionError("the drop warning did not reach the handler")
     assert get_logging_health().unavailable == 1, get_logging_health()
+    # Later drops are only counted: the handler is not called again.
+    submit_record_call(make_record(label="second-drop"))
+    assert get_logging_health().unavailable == 2, get_logging_health()
 
 asyncio.run(main())
 print("done", flush=True)

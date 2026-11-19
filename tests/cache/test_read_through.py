@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import ClassVar
 
 import pytest
@@ -25,6 +27,7 @@ from llmkit import (
     LLMCallOptions,
     OutputLimitError,
     ResultValidationError,
+    capture_llm_records,
     configure_llm_cache,
     structured_llm_call,
     structured_llm_call_sync,
@@ -430,3 +433,56 @@ async def test_an_aliased_answer_is_cached_and_hit(caplog: pytest.LogCaptureFixt
     assert hit.score == 3
     assert len(installed.requests) == 1
     _no_cache_warning(caplog)
+
+
+@pytest.mark.asyncio
+async def test_a_followers_second_pass_is_timed_from_the_end_of_its_first() -> None:
+    """A follower whose hook rejects the stored answer and then judges the
+    leader's writes two records; the second starts where the first ended
+    rather than repeating its start time."""
+    configure_llm_cache(InMemoryLLMCache())
+    provider = cache_provider()
+    release = asyncio.Event()
+
+    sent: list[TransportRequest] = []
+
+    async def _answer(request: TransportRequest) -> Reply:
+        sent.append(request)
+        if len(sent) == 1:
+            return Reply.text("old")
+        _ = await release.wait()
+        return Reply.text("new")
+
+    def _reject_old(answer: str) -> None:
+        if answer == "old":
+            raise ResultValidationError("stale")
+
+    def _slow_reject_old(answer: str) -> None:
+        if answer == "old":
+            time.sleep(0.05)
+        _reject_old(answer)
+
+    with install(_answer), capture_llm_records() as records:
+        assert await text_llm_call("q", feature="seed", provider=provider) == "old"
+        leader = asyncio.create_task(
+            text_llm_call("q", feature="lead", provider=provider, on_result=_reject_old)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        follower = asyncio.create_task(
+            text_llm_call("q", feature="follow", provider=provider, on_result=_slow_reject_old)
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(leader, follower) == ["new", "new"]
+
+    assert len(sent) == 2
+    first, second = [r for r in records if r.feature == "follow"]
+    assert (first.cache_hit, second.cache_hit) == (True, True)
+    assert (first.attempt, second.attempt) == (1, 2)
+    assert first.duration_ms >= 50
+    # Wall clock against a monotonic duration: a few milliseconds of slack,
+    # far inside the 50 ms the first pass's hook held it.
+    assert second.started_at >= first.started_at + timedelta(milliseconds=first.duration_ms - 5)
+    assert second.duration_ms < first.duration_ms

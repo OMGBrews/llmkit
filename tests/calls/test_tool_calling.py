@@ -33,6 +33,7 @@ from llmkit import (
     flush_llm_logs_async,
     make_provider,
     tool_llm_call,
+    tool_llm_call_stream,
     tool_result_message,
 )
 from llmkit.providers import LLMProviderInterface
@@ -367,3 +368,28 @@ async def test_tool_call_refuses_unsupported_tool_choice_on_ollama_before_any_at
                 )
     assert installed.requests == []
     assert records == []
+
+
+@pytest.mark.parametrize("lane", ["buffered", "stream"])
+async def test_a_rejected_round_records_its_raw_arguments(lane: str) -> None:
+    """The record keeps what the model actually answered: every rejected
+    call's raw arguments, one per line in the order sent, in ``partial_text``."""
+    reply = _calls(
+        FakeToolCall("weather", "{not json", id="call_bad"),
+        FakeToolCall("weather", "[]", id="call_worse"),
+    )
+    tools = [ToolDefinition.from_model("weather", _WeatherArgs)]
+    with (
+        install(lambda _request: reply),
+        capturing_sink() as records,
+        pytest.raises(ToolArgumentError),
+    ):
+        if lane == "buffered":
+            _ = await tool_llm_call("weather?", tools, feature="assistant", retry=NO_RETRY)
+        else:
+            async for _event in tool_llm_call_stream(
+                "weather?", tools, feature="assistant", retry=NO_RETRY
+            ):
+                pass
+    [record] = records
+    assert record.partial_text == "{not json\n[]"

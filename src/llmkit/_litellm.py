@@ -1589,7 +1589,13 @@ async def acompletion_structured[T: BaseModel](
                 slot.record_tokens(cause.usage.debit())
                 raise cause from e
             last_completion = getattr(e, "last_completion", None)
+            # A failed parse was still paid for: the last rendered completion
+            # carries instructor's in-call usage total (as on success, below),
+            # which the TPM limiter is debited and the call log records.
+            failed_usage = _wire_usage(last_completion)
+            failed_cost = _response_cost(last_completion)
             if _is_no_choice_crash(cause, last_completion):
+                slot.record_tokens(failed_usage.debit())
                 # instructor raised its repairable "No choices" parse error,
                 # then its own repair step crashed indexing the empty choice
                 # list. That is a parse failure with no answer, not a
@@ -1604,7 +1610,12 @@ async def acompletion_structured[T: BaseModel](
                     model=litellm_model,
                     provider=provider.name,
                     native_finish_reason=invocations.native_finish_reason,
+                    usage=failed_usage,
+                    approximate_cost=failed_cost,
                 ) from e
+            # Debited whatever ends the call: a re-ask that fails on transport
+            # after a parse failure still paid for the rejected completion.
+            slot.record_tokens(failed_usage.debit())
             if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
                 raise
             # Word the message by the re-asks that actually ran: with an
@@ -1628,6 +1639,8 @@ async def acompletion_structured[T: BaseModel](
                 model=litellm_model,
                 provider=provider.name,
                 native_finish_reason=invocations.native_finish_reason,
+                usage=failed_usage,
+                approximate_cost=failed_cost,
             ) from e
         # instructor types the raw completion half of the tuple as Any. It is
         # the last rendered response, whose usage instructor's tally has
@@ -1646,6 +1659,28 @@ async def acompletion_structured[T: BaseModel](
         text,
         invocations.native_finish_reason,
     )
+
+
+def paid_completion_spend(
+    exc: BaseException,
+) -> tuple[tuple[int | None, int | None, int | None], float | None] | None:
+    """The ``(counts, cost)`` of a paid completion carried on instructor's wrap.
+
+    A schema-repair re-ask that then fails on transport or a permanent error
+    escapes :func:`acompletion_structured` as instructor's
+    ``InstructorRetryException`` (the retry layer classifies through it), whose
+    ``last_completion`` is the rejected answer that was already paid for. The
+    structured lane's call log records its usage and cost from here. ``None``
+    when *exc* is not that wrap or carries no reported usage (the transport
+    failed before any completion arrived).
+    """
+    if not isinstance(exc, InstructorRetryException):
+        return None
+    completion = getattr(exc, "last_completion", None)
+    usage = _wire_usage(completion)
+    if usage.debit() is None:
+        return None
+    return usage.counts(), _response_cost(completion)
 
 
 def _is_no_choice_crash(cause: BaseException, last_completion: object) -> bool:

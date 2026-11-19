@@ -41,6 +41,7 @@ from llmkit.calls._shared import (
     error_text,
     parse_tool_calls,
     prepare_call,
+    rejected_arguments_text,
     resolve_model_and_provider,
     tool_repair_messages,
     tool_validation_budget,
@@ -465,6 +466,15 @@ async def _stream_tools_once(
             partial_text = exc.partial_text
             native_finish_reason = exc.native_finish_reason
             usage = TokenUsage(*exc.usage.counts())
+        elif isinstance(exc, ToolArgumentError):
+            partial_text = rejected_arguments_text(exc)
+        raise
+    except BaseException as exc:
+        # Any other ``BaseException`` (a ``KeyboardInterrupt`` or
+        # ``SystemExit`` raised inside the attempt) bypasses both clauses
+        # above, so the ``finally`` would record the turn as a clean one.
+        # Recorded as the error it is, and re-raised untouched.
+        error = error_text(exc)
         raise
     finally:
         if not captured:

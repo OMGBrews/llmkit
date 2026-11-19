@@ -399,6 +399,14 @@ class _CallLedger:
         self._entries[key] = (call_id, claimed + 1)
         return call_id, claimed
 
+    def count_extra(self, call_id: str) -> None:
+        """Count one more attempt for the logical call *call_id*, made within
+        the pass that claimed it (a rejected cache hit before the live one)."""
+        for key, (entry_id, claimed) in self._entries.items():
+            if entry_id == call_id:
+                self._entries[key] = (entry_id, claimed + 1)
+                return
+
 
 @final
 class _RetryScope:
@@ -464,6 +472,21 @@ def claim_logical_call(feature: str, label: str | None) -> tuple[str, int]:
     if scope is None or scope.ledger is None or scope.task is not asyncio.current_task():
         return uuid.uuid4().hex, 0
     return scope.ledger.claim(feature, label)
+
+
+def count_extra_attempt(call_id: str) -> None:
+    """Record that the logical call *call_id* used one more attempt number.
+
+    A pass normally makes one attempt, which :func:`claim_logical_call` has
+    already counted. A cache hit rejected by ``on_result`` is a recorded
+    attempt of its own, followed by a live one in the same pass, so the
+    loop's ledger is told; a later pass then numbers after both. Outside a
+    loop owned by the current task this does nothing.
+    """
+    scope = _retry_scope.get()
+    if scope is None or scope.ledger is None or scope.task is not asyncio.current_task():
+        return
+    scope.ledger.count_extra(call_id)
 
 
 class RetryProgressCallback(Protocol):

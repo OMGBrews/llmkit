@@ -444,6 +444,12 @@ class StructuredOutputError(LlmkitError):
             ``openai/gpt-4.1-mini``), or ``None``.
         provider: The provider name the call ran against, or ``None``.
         native_finish_reason: The last completion's native reason, where delivered.
+        usage: The token counts the provider reported for the failed attempt
+            (on the structured lane, instructor's in-call total across its
+            repair re-asks; on the compose lane, the final turn's), each
+            ``None`` when not reported; ``None`` when none were read.
+        approximate_cost: LiteLLM's cost estimate for the last completion,
+            or ``None`` when unavailable.
     """
 
     def __init__(
@@ -457,6 +463,8 @@ class StructuredOutputError(LlmkitError):
         model: str | None,
         provider: str | None,
         native_finish_reason: str | None = None,
+        usage: WireUsage | None = None,
+        approximate_cost: float | None = None,
     ) -> None:
         super().__init__(message)
         self.schema_name: str = schema_name
@@ -466,6 +474,8 @@ class StructuredOutputError(LlmkitError):
         self.model: str | None = model
         self.provider: str | None = provider
         self.native_finish_reason: str | None = native_finish_reason
+        self.usage: WireUsage | None = usage
+        self.approximate_cost: float | None = approximate_cost
 
     @override
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
@@ -482,6 +492,8 @@ class StructuredOutputError(LlmkitError):
                 model=self.model,
                 provider=self.provider,
                 native_finish_reason=self.native_finish_reason,
+                usage=self.usage,
+                approximate_cost=self.approximate_cost,
             ),
             (),
         )

@@ -145,6 +145,7 @@ class HealthState:
     _preparation_failed: int = 0
     _last_failure: LoggingFailure | None = None
     _last_success_at: datetime | None = None
+    _drop_warned: bool = False
 
     @staticmethod
     def _failure(
@@ -210,6 +211,18 @@ class HealthState:
             self._wait_timeouts += wait_timeouts
             self._preparation_failed += preparation_failed
             self._failed += preparation_failed
+
+    def claim_drop_warning(self) -> bool:
+        """``True`` exactly once per installation: the first drop's caller warns.
+
+        A latch rather than a counter check, so concurrent first drops cannot
+        both warn; a reconfigure installs fresh state and so re-arms it.
+        """
+        with self._lock:
+            if self._drop_warned:
+                return False
+            self._drop_warned = True
+            return True
 
     def record_worker_failure(self) -> None:
         """Count a fatal worker exception without invoking its formatting hooks."""

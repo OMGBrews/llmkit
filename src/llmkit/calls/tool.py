@@ -27,10 +27,12 @@ from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier
 from llmkit.calls._shared import (
     compose_validation_budget,
     error_text,
+    fallback_log_dump,
     guard_output_schema,
     logger,
     parse_tool_calls,
     prepare_call,
+    rejected_arguments_text,
     resolve_model_and_provider,
     run_with_policy,
     tool_repair_messages,
@@ -315,6 +317,8 @@ async def tool_llm_call[T: BaseModel](
                         attempt=attempt_offset + attempt_count,
                         model=routed_model,
                         provider=provider_name,
+                        usage=WireUsage(*counts),
+                        approximate_cost=cost,
                     )
                 try:
                     # Strict JSON mode: the structured lane's rule.
@@ -333,6 +337,8 @@ async def tool_llm_call[T: BaseModel](
                         attempt=attempt_offset + attempt_count,
                         model=routed_model,
                         provider=provider_name,
+                        usage=WireUsage(*counts),
+                        approximate_cost=cost,
                     ) from exc
                 result = ToolComposeResult[T](*base, parsed=parsed)
             return result
@@ -361,6 +367,11 @@ async def tool_llm_call[T: BaseModel](
                 partial_text = exc.partial_text
                 native_finish_reason = exc.native_finish_reason
                 usage = TokenUsage(*exc.usage.counts())
+            elif isinstance(exc, StructuredOutputError):
+                # The compose answer that failed validation.
+                partial_text = exc.raw_text
+            elif isinstance(exc, ToolArgumentError):
+                partial_text = rejected_arguments_text(exc)
             raise
         finally:
             resolved_model, resolved_provider = resolve_model_and_provider(args.model, provider)
@@ -428,13 +439,16 @@ async def tool_llm_call[T: BaseModel](
 def _dump_for_log(
     result: ToolCallResult | None, feature: str, label: str | None
 ) -> dict[str, object] | None:
-    """The record's ``response``, or ``None`` when the caller's schema cannot dump.
+    """The record's ``response``, or a fallback when the caller's schema cannot dump.
 
     A raising serializer on the output schema must not turn a validated final
     answer into an exception: the dump exists only for the log, as on the
-    structured lane. The warning goes through
-    :func:`~llmkit._diagnostics.report`, so a host handler that raises on it
-    is contained and counted rather than replacing the answer.
+    structured lane, so it degrades to a :func:`fallback_log_dump` marker of
+    the caller's schema instance (a final answer has no tool calls, and its
+    text is that answer), not of the result wrapper around it.
+    The warning goes through :func:`~llmkit._diagnostics.report`, so a host
+    handler that raises on it is contained and counted rather than replacing
+    the answer.
     """
     if result is None:
         return None
@@ -444,12 +458,13 @@ def _dump_for_log(
         _ = report(
             logger,
             logging.WARNING,
-            "Could not dump the %s/%s compose result for the log; recording response as null",
+            "Could not dump the %s/%s compose result for the log; recording a fallback",
             feature,
             label,
             exc_info=True,
         )
-        return None
+        answer = result.parsed if isinstance(result, ToolComposeResult) else None
+        return {**fallback_log_dump(result if answer is None else answer)}
 
 
 @overload

@@ -80,7 +80,7 @@ from llmkit.options import (
 from llmkit.providers import LLMProviderInterface, Provider, coerce_call_provider
 from llmkit.providers.base import active_config, client_configured
 from llmkit.rate_limiting import current_queue_wait_ms
-from llmkit.retry import RetryPolicy, claim_logical_call, with_retries
+from llmkit.retry import RetryPolicy, claim_logical_call, count_extra_attempt, with_retries
 from llmkit.run_scope import get_run_id
 from llmkit.tools import TokenUsage, ToolCall, ToolDefinition, tool_result_message
 
@@ -490,7 +490,7 @@ async def run_cached[T](
     encode: Callable[[T], str | None],
     decode: Callable[[str], T],
     on_result: Callable[[T], object] | None,
-    record_hit: Callable[[T, str | None, datetime, float], Awaitable[None]],
+    record_hit: Callable[[T, str | None, datetime, float, BaseException | None], Awaitable[None]],
 ) -> T:
     """Run *run* (the call's whole retry pass) through the response cache.
 
@@ -507,7 +507,19 @@ async def run_cached[T](
     decode failure is a cache failure — and
     writes its own record through *record_hit*,
     called with the decoded answer, the ``call_id`` of the call that paid for
-    it, and the hit's start time (wall clock, then monotonic).
+    it, the pass's start time (wall clock, then monotonic: the lookup for the
+    first entry, the end of the rejected pass for the next), and the exception
+    the hook raised (``None`` when it accepted the answer).
+
+    Every entry the hook sees is a pass of the call with its own record, so a
+    rejected entry is recorded too, with the hook's own exception rather than
+    the :class:`~llmkit.ResultValidationError` it becomes here, and *record_hit*
+    numbers each record after the last; up to two entries reach the hook (the
+    stored one, then a single-flight leader's). A rejection also counts one
+    extra attempt in an enclosing :func:`~llmkit.retry.with_retries` loop's
+    ledger, whose later passes number after the live attempt that follows it.
+    A decode failure, or a cancellation while the store's ``get`` or the
+    leader is awaited, reaches no hook and writes no record.
 
     *encode* and *decode* turn a result into the stored string and back;
     *encode* returning ``None`` stores nothing.
@@ -536,6 +548,7 @@ async def run_cached[T](
         )
 
     async def _accept(entry: LLMCacheEntry) -> T:
+        nonlocal started_at, start_t
         try:
             result = decode(entry.response)
         except Exception as exc:
@@ -545,12 +558,25 @@ async def run_cached[T](
         if on_result is not None:
             try:
                 await run_on_result(on_result, result)
-            except args.retry.validation_retry_on as exc:
-                # On a paid answer the call would re-roll on this exception
-                # (it is in the validation budget), so on a hit it is a miss,
-                # like a ResultValidationError; anything else propagates.
-                raise ResultValidationError(str(exc)) from exc
-        await record_hit(result, entry.call_id, started_at, start_t)
+            except BaseException as exc:
+                # On a paid answer the call would re-roll on a
+                # ResultValidationError or an exception in the validation
+                # budget, so on a hit either is a miss; anything else
+                # propagates. Either way this pass is recorded, with the
+                # hook's own exception, as the paid path records it.
+                rejected = isinstance(exc, (ResultValidationError, *args.retry.validation_retry_on))
+                if rejected:
+                    # The live attempt that follows takes the next number.
+                    count_extra_attempt(call_id)
+                await record_hit(result, entry.call_id, started_at, start_t, exc)
+                # A later pass (the single-flight leader's entry) is timed
+                # from here, not from the lookup this pass already covered.
+                started_at = datetime.now(UTC)
+                start_t = time.monotonic()
+                if rejected and not isinstance(exc, ResultValidationError):
+                    raise ResultValidationError(str(exc)) from exc
+                raise
+        await record_hit(result, entry.call_id, started_at, start_t, None)
         return result
 
     # A pass re-run by an enclosing ``with_retries`` loop exists because the
@@ -703,6 +729,41 @@ def error_text(exc: BaseException) -> str:
     records ``"CancelledError"`` rather than ``"CancelledError: "``.
     """
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+#: How much of an unserializable answer's ``repr`` :func:`fallback_log_dump`
+#: keeps, so one odd object cannot bloat a record.
+FALLBACK_REPR_LIMIT = 500
+
+
+def fallback_log_dump(value: object) -> dict[str, str]:
+    """The record's ``response`` for an answer whose dump raised.
+
+    ``{"unserializable": "<TypeName>", "repr": "<repr, first 500 characters>"}``:
+    the record says an answer existed, what it was, and a bounded readable
+    form, where ``null`` would read as no answer at all. ``repr`` is left out
+    when ``repr()`` itself raises.
+    """
+    marker = {"unserializable": type(value).__name__}
+    try:
+        shown = repr(value)
+    except Exception:
+        return marker
+    marker["repr"] = shown[:FALLBACK_REPR_LIMIT]
+    return marker
+
+
+def rejected_arguments_text(exc: ToolArgumentError) -> str | None:
+    """The record's ``partial_text`` for a rejected tool round: its raw arguments.
+
+    Each rejected call's argument string, verbatim and in the order the model
+    sent them, joined with a newline; ``None`` when none carried one. An
+    argument string that itself spans lines is kept as sent, so line breaks
+    alone do not separate the calls.
+    """
+    rejected = exc.round_errors or (exc,)
+    raw = [error.arguments_raw for error in rejected if error.arguments_raw is not None]
+    return "\n".join(raw) if raw else None
 
 
 def usage_log_dict(usage: TokenUsage | None) -> dict[str, int | None] | None:
