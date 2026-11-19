@@ -6,8 +6,8 @@ Pins the July-2026 audit fixes to :class:`LocalYamlLogSink` /
 * **Default directory** — :func:`default_log_dir` resolves lazily
   (``LLMKIT_LOG_DIR`` > nearest project root > per-user state dir), the sink
   freezes the answer at first use so a mid-run ``chdir`` can't split logs,
-  and the project-root default seeds a ``.gitignore`` so prompt logs never
-  land in the repo's history.
+  and the project-root default seeds a ``.gitignore`` (whoever created the
+  directory) so prompt logs never land in the repo's history.
 * **Permissions** — files ``0o600`` and a sink-created directory ``0o700``
   (POSIX), with a pre-existing directory never re-chmodded.
 * **Warn-once latch** — a persistently broken sink warns once (per failure
@@ -15,6 +15,10 @@ Pins the July-2026 audit fixes to :class:`LocalYamlLogSink` /
 * **Retention** — aged YAMLs and rotated index generations are pruned and an
   oversized ``index.jsonl`` rotates losslessly, throttled to hourly; the
   first successful write announces the directory and policy at INFO.
+* **Whole files only** — a record is written under a hidden ``.part`` name
+  and published without clobbering, so a write cut short never leaves a
+  ``*.yaml``; retention sweeps stale ``.part`` files, and lone surrogates in a
+  record never lose its file or index line.
 * **Eager config validation** — the growth bounds take a positive int or
   ``None`` (``0`` raises rather than being read as either "keep nothing" or
   "unlimited"), a relative log directory is absolutised before it is frozen,
@@ -28,13 +32,16 @@ LLM call is made.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
+import yaml
 
 from llmkit import (
     LLMCallRecord,
@@ -235,6 +242,45 @@ def test_project_root_default_seeds_gitignore(
     assert path is not None
     gitignore = project / "data" / "llm-logs" / ".gitignore"
     assert gitignore.read_text() == "*\n"
+
+
+def _project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project root as the current directory, with no ``LLMKIT_LOG_DIR``."""
+    monkeypatch.delenv("LLMKIT_LOG_DIR", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir()
+    _ = (project / "pyproject.toml").write_text("[project]\n")
+    monkeypatch.chdir(project)
+    return project
+
+
+def test_pre_existing_project_root_default_is_seeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A project-root default directory that already existed (a checkout, a
+    ``mkdir``, an older llmkit) is seeded too, and is still never re-chmodded."""
+    log_dir = _project(tmp_path, monkeypatch) / "data" / "llm-logs"
+    log_dir.mkdir(parents=True)
+    os.chmod(log_dir, 0o755)
+    sink = LocalYamlLogSink()
+    assert sink.write_returning_path(_record()) is not None
+    assert (log_dir / ".gitignore").read_text() == "*\n"
+    if os.name == "posix":
+        assert log_dir.stat().st_mode & 0o777 == 0o755
+
+
+def test_existing_gitignore_is_left_alone_and_not_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The seed is exclusive-create: the user's own ``.gitignore`` survives,
+    and finding one is not a "Could not seed" diagnostic."""
+    log_dir = _project(tmp_path, monkeypatch) / "data" / "llm-logs"
+    log_dir.mkdir(parents=True)
+    _ = (log_dir / ".gitignore").write_text("*.yaml\n")
+    with caplog.at_level(logging.DEBUG, logger="llmkit.logging"):
+        assert LocalYamlLogSink().write_returning_path(_record()) is not None
+    assert (log_dir / ".gitignore").read_text() == "*.yaml\n"
+    assert not [r for r in caplog.records if "Could not seed" in r.message]
 
 
 def test_explicit_log_dir_is_not_seeded(tmp_path: Path) -> None:
@@ -576,6 +622,29 @@ def test_retention_none_keeps_everything(tmp_path: Path) -> None:
     assert stale.exists()
 
 
+def test_stale_part_files_are_swept_and_fresh_ones_kept(tmp_path: Path) -> None:
+    """A ``.part`` file a cut-short write left behind ages out under the same
+    cutoff; a fresh one may be a write in progress and is kept."""
+    stale = tmp_path / ".2026-06-01T00-00-00-000000_old_call_deadbeef.yaml.part"
+    _ = stale.write_text("# ok | cut\n")
+    _age(stale, days=40)
+    fresh = tmp_path / ".2026-07-19T00-00-00-000000_new_call_cafebabe.yaml.part"
+    _ = fresh.write_text("# ok | in progress\n")
+    assert LocalYamlLogSink(tmp_path, retention_days=30).write_returning_path(_record())
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_retention_none_keeps_part_files(tmp_path: Path) -> None:
+    """With retention opted out, nothing is aged out — ``.part`` files included."""
+    stale = tmp_path / ".2020-01-01T00-00-00-000000_ancient_call_deadbeef.yaml.part"
+    _ = stale.write_text("# ok | cut\n")
+    _age(stale, days=2000)
+    sink = LocalYamlLogSink(tmp_path, retention_days=None)
+    assert sink.write_returning_path(_record()) is not None
+    assert stale.exists()
+
+
 def test_prune_is_throttled_to_hourly(tmp_path: Path) -> None:
     """After one prune, the next writes skip housekeeping until the interval
     elapses — the steady-state write cost is one clock read."""
@@ -642,8 +711,27 @@ def test_first_successful_write_announces_location_and_policy(
         assert sink.write_returning_path(_record()) is not None
     infos = [r for r in caplog.records if r.levelno == logging.INFO]
     assert len(infos) == 1
-    assert str(tmp_path.resolve()) in infos[0].message
+    assert str(tmp_path) in infos[0].message
     assert "30-day retention" in infos[0].message
+
+
+def test_announcement_names_the_frozen_path_not_the_symlink_target(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The notice names the directory as the sink froze it (absolute, symlinks
+    intact), the same path ``default_log_dir()`` and ``log_dir`` report."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with caplog.at_level(logging.INFO, logger="llmkit.logging"):
+        assert LocalYamlLogSink(link / "logs").write_returning_path(_record()) is not None
+    [info] = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert str(link / "logs") in info.message
+    assert str(real) not in info.message
 
 
 def test_announcement_states_keep_forever_when_retention_off(
@@ -670,3 +758,93 @@ def test_failed_write_does_not_announce(
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert LocalYamlLogSink(tmp_path).write_returning_path(_record()) is None
     assert [r for r in caplog.records if r.levelno == logging.INFO] == []
+
+
+# 7. Whole files only.
+
+
+class _Interrupted(BaseException):
+    """Stands in for SIGKILL / KeyboardInterrupt / exit cutting a write short."""
+
+
+def test_interrupted_write_leaves_no_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A write cut off mid-body (a ``BaseException`` skips the cleanup) leaves
+    only a hidden ``.part`` file, never a truncated ``*.yaml`` that
+    ``head -1 *.yaml`` would read as ``# ok``."""
+    real_dump = yaml.dump
+
+    def _cut_short(_data: object, stream: object, **kwargs: object) -> None:
+        real_dump({"timestamp": "half"}, stream, **kwargs)  # pyright: ignore[reportArgumentType, reportCallIssue]  # forwarding the sink's own kwargs
+        raise _Interrupted
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _cut_short)
+    with pytest.raises(_Interrupted):
+        _ = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert list(tmp_path.glob("*.yaml")) == []
+    [part] = list(tmp_path.glob(".*.yaml.part"))
+    assert part.read_text().startswith("# ok |")
+
+
+def test_published_record_leaves_no_part_file(tmp_path: Path) -> None:
+    """A completed write publishes the ``*.yaml`` and removes its ``.part``."""
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert path is not None
+    assert yaml.safe_load(path.read_text())["feature"] == "extraction"
+    assert {p.name for p in tmp_path.iterdir()} == {INDEX_FILENAME, path.name}
+
+
+def test_publish_without_hard_links_still_writes_whole_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a filesystem without hard links the record is still published under
+    its own exclusively reserved name, with no ``.part`` left behind."""
+
+    def _no_links(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(1, "hard links unsupported")
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.link", _no_links)
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert path is not None
+    assert yaml.safe_load(path.read_text())["feature"] == "extraction"
+    assert {p.name for p in tmp_path.iterdir()} == {INDEX_FILENAME, path.name}
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_publish_never_clobbers_an_existing_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the final name is taken between the ``.part`` create and the
+    publish, the existing file is untouched and the record lands elsewhere."""
+    real_link = os.link
+    squatted: list[Path] = []
+
+    def _squat_then_link(src: str, dst: str) -> None:
+        if not squatted:
+            squatted.append(Path(dst))
+            _ = Path(dst).write_text("someone else's\n")
+        real_link(src, dst)
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.link", _squat_then_link)
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert path is not None
+    assert path != squatted[0]
+    assert squatted[0].read_text() == "someone else's\n"
+    assert list(tmp_path.glob(".*.part")) == []
+
+
+@pytest.mark.parametrize("field", ["error", "label", "feature", "prompt"])
+def test_lone_surrogate_keeps_record_and_index_line(tmp_path: Path, field: str) -> None:
+    """A lone surrogate (``surrogateescape`` text from a filename or OSError)
+    in any record field loses neither the YAML nor the index line."""
+    value = "bad \udcff byte"
+    override: object = [{"role": "user", "content": value}] if field == "prompt" else value
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record(**{field: override}))
+    assert path is not None
+    body = cast("dict[str, object]", yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert body[field] == override
+    [line] = (tmp_path / INDEX_FILENAME).read_text(encoding="utf-8").splitlines()
+    entry = cast("dict[str, object]", json.loads(line))
+    assert entry["file"] == path.name
+    if field != "prompt":
+        assert entry[field] == value

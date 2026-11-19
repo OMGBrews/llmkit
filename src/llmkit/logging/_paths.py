@@ -67,7 +67,8 @@ def resolve_default_log_dir() -> tuple[Path, bool]:
     under the nearest project root above the current directory, else the
     per-user state directory. Only the project-root case (the one where a
     repository could accidentally swallow prompt logs) returns ``True``, which
-    makes the sink seed a ``.gitignore`` when it creates that directory.
+    makes the sink seed a ``.gitignore`` there when none exists, whoever
+    created the directory.
 
     Every branch returns an absolute path — a *relative* ``LLMKIT_LOG_DIR``
     (or ``XDG_STATE_HOME`` / ``LOCALAPPDATA``, which the state-dir fallback
@@ -120,8 +121,10 @@ MAX_FILENAME_ATTEMPTS = 8
 
 # Matches a run of characters that are unsafe in a path component: path
 # separators, control characters (incl. CR/LF), and other filesystem-hostile
-# punctuation. Collapsed to a single "_" so names stay readable.
-_UNSAFE_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f/\\<>:\"|?*]+")
+# punctuation, and lone surrogates (``surrogateescape`` text from a filename or
+# OSError), which no filesystem encoding accepts. Collapsed to a single "_" so
+# names stay readable.
+_UNSAFE_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f/\\<>:\"|?*\ud800-\udfff]+")
 
 # Strips the leading/trailing "_" and collapses any "." runs that remain so a
 # value can never resolve to "." / ".." or a hidden traversal segment.
@@ -131,6 +134,9 @@ _DOT_RUN = re.compile(r"\.+")
 # interpolated into the "#" header comment, so a value can't forge a second
 # comment line.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+# Matches one lone surrogate, which the UTF-8 log file cannot encode.
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 # Byte budget for a single sanitized filename component. Most filesystems cap
 # a path component at 255 *bytes*; the composed name carries a ~26-byte
@@ -143,10 +149,10 @@ _MAX_COMPONENT_BYTES = 80
 def safe_path_component(value: str) -> str:
     """Neutralize *value* so it is safe as a single filename component.
 
-    Path separators (``/``, ``\\``, :data:`os.sep`), control characters, and
-    other filesystem-hostile punctuation are replaced with ``_``; ``.`` runs
-    are collapsed to a single ``_`` so the result can never be ``.``/``..`` or
-    a hidden traversal segment. The result is also clamped to
+    Path separators (``/``, ``\\``, :data:`os.sep`), control characters, lone
+    surrogates, and other filesystem-hostile punctuation are replaced with
+    ``_``; ``.`` runs are collapsed to a single ``_`` so the result can never
+    be ``.``/``..`` or a hidden traversal segment. The result is also clamped to
     :data:`_MAX_COMPONENT_BYTES` UTF-8 bytes (cutting on a codepoint boundary,
     never mid-character) so an oversized ``feature``/``label`` cannot push the
     composed filename past the filesystem's 255-byte component limit and turn
@@ -175,6 +181,9 @@ def oneline(value: str) -> str:
 
     Used on every caller-derived field interpolated into the ``#`` header
     comment so a value containing a newline cannot forge a second
-    ``# ok | ...`` verdict line and corrupt the ``head -1`` triage.
+    ``# ok | ...`` verdict line and corrupt the ``head -1`` triage. A lone
+    surrogate is written as its ``\\udXXX`` escape, so it cannot make the
+    header unencodable and lose the whole record.
     """
-    return _CONTROL_CHARS.sub(" ", value).strip()
+    collapsed = _CONTROL_CHARS.sub(" ", value).strip()
+    return _SURROGATE.sub(lambda match: f"\\u{ord(match.group()):04x}", collapsed)

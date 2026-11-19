@@ -8,6 +8,7 @@ it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,38 @@ DEFAULT_MAX_INDEX_BYTES = 50 * 2**20
 _PRUNE_INTERVAL_SECONDS = 3600.0
 
 
+def _publish(part: Path, final: Path) -> bool:
+    """Give the finished temporary file *part* its final name, never clobbering.
+
+    A hard link fails with ``FileExistsError`` instead of replacing a file
+    already at *final*, so ``False`` (name taken) asks the caller to retry
+    under a fresh name. Where the filesystem has no hard links, *final* is
+    reserved with an exclusive create and *part* renamed over that empty
+    reservation, which is ours alone. Removing *part* after linking is
+    best-effort: the record is already published, and :meth:`_prune
+    <LocalYamlLogSink._prune>` sweeps a leftover ``.part``.
+    """
+    try:
+        os.link(part, final)
+    except FileExistsError:
+        return False
+    except OSError:
+        try:
+            with open(final, "x", encoding="utf-8", opener=open_private):
+                pass
+        except FileExistsError:
+            return False
+        try:
+            os.replace(part, final)
+        except BaseException:
+            final.unlink(missing_ok=True)
+            raise
+        return True
+    with contextlib.suppress(OSError):
+        part.unlink()
+    return True
+
+
 class LocalYamlLogSink:
     """Default sink: one YAML file per call under ``log_dir``, plus a
     compact append-only ``index.jsonl`` summarising every call.
@@ -88,7 +121,9 @@ class LocalYamlLogSink:
     directories or pre-existing files. Existing directory permissions are
     preserved, but sharing the directory alone does not grant read access to
     new log files. At the project-root default location, a best-effort
-    ``.gitignore`` seed reduces accidental commits; forced staging is possible.
+    ``.gitignore`` seed reduces accidental commits whoever created the
+    directory (an existing ``.gitignore`` is left alone); forced staging is
+    possible.
 
     By default, the sink attempts to prune per-call YAML files older than
     ``retention_days`` (default 30; ``None`` keeps forever), and
@@ -100,7 +135,8 @@ class LocalYamlLogSink:
     **Pruning is a glob over the directory, not a list of files the sink
     remembers writing**: the sink owns ``log_dir``'s ``*.yaml`` and
     ``index-*.jsonl`` namespace, so a co-located file of either shape ages
-    out under the same policy whoever wrote it — deliberate (a
+    out under the same policy whoever wrote it, as does a stale
+    ``.*.yaml.part`` file a write cut short left behind — deliberate (a
     cross-reference file and the logs it references rot on one clock), but
     it makes ``log_dir`` llmkit's directory rather than shared storage.
     Give llmkit a directory of its own if you need co-located files to
@@ -167,8 +203,12 @@ class LocalYamlLogSink:
         self.retention_days: int | None = retention_days
         self.max_index_bytes: int | None = max_index_bytes
         # True once the default resolution chose the project-root location —
-        # the one case where the sink seeds a .gitignore on dir creation.
+        # the one case where the sink seeds a .gitignore (when none exists).
         self._seed_gitignore: bool = False
+        # True once this sink has tried the seed for an existing directory, so
+        # the steady-state write does not retry it; a directory the sink
+        # (re)creates is always tried.
+        self._seed_checked: bool = False
         self._announced: bool = False
         self._last_prune: float | None = None
         self._yaml_latch: OnceLatch = OnceLatch()
@@ -193,22 +233,31 @@ class LocalYamlLogSink:
 
         Creation is detected via the ``FileExistsError`` branch rather than
         ``exist_ok=True`` so a pre-existing (possibly user-shared) directory
-        is never re-chmodded and never seeded. Only the leaf gets ``0o700``;
-        the ``.gitignore`` seed applies only to the project-root *default*
-        location — an explicit path or env override is the caller's choice,
-        and the state-dir fallback is never inside a repository.
+        is never re-chmodded. Only the leaf gets ``0o700``. The ``.gitignore``
+        seed applies only to the project-root *default* location — an
+        explicit path or env override is the caller's choice, and the
+        state-dir fallback is never inside a repository — and there it is
+        written whoever created the directory (a checkout, a ``mkdir``, an
+        older llmkit), once per sink for an existing directory and on every
+        (re)creation. It is exclusive-create, so an existing ``.gitignore``
+        is never touched.
         """
         try:
             self.log_dir.mkdir(parents=True, mode=0o700)
         except FileExistsError:
-            return
+            if self._seed_checked:
+                return
         if self._seed_gitignore:
+            self._seed_checked = True
             try:
                 with open(self.log_dir / ".gitignore", "x", encoding="utf-8") as f:
                     _ = f.write("*\n")
+            except FileExistsError:
+                # Already seeded (or the user's own file): nothing to report.
+                pass
             except Exception:
                 # Best-effort: an unseedable .gitignore must not break the
-                # write that triggered the mkdir.
+                # write that triggered the seed.
                 _ = report(
                     logger,
                     logging.DEBUG,
@@ -239,7 +288,7 @@ class LocalYamlLogSink:
             logger,
             logging.INFO,
             "llmkit is logging LLM calls to %s (%s; configure_llm_logging(None) disables)",
-            self.log_dir.resolve(),
+            self.log_dir,
             retention,
         )
 
@@ -286,10 +335,18 @@ class LocalYamlLogSink:
         guarantees two records can never share a path or silently overwrite
         each other.
 
+        The body is written under a hidden temporary name outside the
+        ``*.yaml`` glob (``.<name>.yaml.part``, exclusive-create, ``0o600``)
+        and published by a hard link that fails rather than overwrite, so a
+        ``*.yaml`` only ever appears complete: a write cut off mid-file
+        (``SIGKILL``, a ``KeyboardInterrupt``, the process ending under the
+        delivery worker) can leave only a ``.part`` file, which
+        :meth:`_prune` sweeps once it is older than ``retention_days``. On a
+        filesystem without hard links the name is reserved exclusively and
+        the temporary file renamed over the empty reservation.
+
         Best-effort means *any* :class:`Exception` is swallowed (with a
-        warning); a failure after the file was exclusively created also
-        removes the truncated orphan, so the log dir never accumulates
-        partial YAML.
+        warning); such a failure also removes the temporary file.
         """
         try:
             self._ensure_log_dir()
@@ -350,8 +407,9 @@ class LocalYamlLogSink:
                 candidate = (
                     self.log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
                 )
+                part = candidate.with_name(f".{candidate.name}.part")
                 try:
-                    with open(candidate, "x", encoding="utf-8", opener=open_private) as f:
+                    with open(part, "x", encoding="utf-8", opener=open_private) as f:
                         _ = f.write(header)
                         # LogSafeDumper keeps the file safe_load-able: only
                         # plain YAML tags, never ``!!python/object`` (Enum
@@ -366,6 +424,7 @@ class LocalYamlLogSink:
                             allow_unicode=True,
                             width=120,
                         )
+                    published = _publish(part, candidate)
                 except FileExistsError:
                     # Suffix collision — regenerate and retry; never overwrite.
                     continue
@@ -373,15 +432,18 @@ class LocalYamlLogSink:
                     # Any mid-write failure (disk full, un-encodable surrogates
                     # even on the utf-8 stream, a RecursionError from a deeply
                     # nested/cyclic payload, an exotic representer/emitter
-                    # error) leaves a truncated file behind under the
-                    # exclusive-create name. Remove the orphan before degrading
-                    # so the log dir never accumulates empty/partial YAML, then
-                    # re-raise to the best-effort handler below. Deliberately
-                    # broad — this sink is best-effort by contract — but never
-                    # BaseException, so KeyboardInterrupt/SystemExit still
-                    # propagate (the orphan cleanup is forfeited for those).
-                    candidate.unlink(missing_ok=True)
+                    # error) leaves a truncated temporary file behind. Remove
+                    # it before degrading, then re-raise to the best-effort
+                    # handler below. Deliberately broad — this sink is
+                    # best-effort by contract — but never BaseException, so
+                    # KeyboardInterrupt/SystemExit still propagate (the
+                    # ``.part`` file is then left for _prune to sweep).
+                    part.unlink(missing_ok=True)
                     raise
+                if not published:
+                    # The final name was taken: drop this copy and retry.
+                    part.unlink(missing_ok=True)
+                    continue
                 filepath = candidate
                 break
             if filepath is None:
@@ -518,8 +580,14 @@ class LocalYamlLogSink:
                 "served_service_tier": record.served_service_tier,
             }
             # Serialize before opening so a serialization failure can't even
-            # create/touch the index file.
-            payload = json.dumps(line, ensure_ascii=False) + "\n"
+            # create/touch the index file. A lone surrogate (only ever inside a
+            # JSON string) is written as its ``\udXXX`` JSON escape rather
+            # than failing the encode and losing the line.
+            payload = (
+                (json.dumps(line, ensure_ascii=False) + "\n")
+                .encode("utf-8", errors="backslashreplace")
+                .decode("utf-8")
+            )
             with open(
                 self.log_dir / INDEX_FILENAME, "a", encoding="utf-8", opener=open_private
             ) as f:
@@ -588,9 +656,12 @@ class LocalYamlLogSink:
     def _prune(self) -> None:
         """Apply the retention policy: age out YAMLs, rotate an oversized index.
 
-        Age pruning covers the per-call ``*.yaml`` files and previously
-        rotated ``index-*.jsonl`` generations, keyed on file mtime so tests
-        (and operators) can reason about it with ``touch``. The patterns are
+        Age pruning covers the per-call ``*.yaml`` files, previously
+        rotated ``index-*.jsonl`` generations and the ``.*.yaml.part``
+        temporary files a write cut short left behind (a fresh one may be a
+        write in progress, so only the retention cutoff removes it), keyed on
+        file mtime so tests (and operators) can reason about it with
+        ``touch``. The patterns are
         globs over the directory, so this owns the whole ``*.yaml`` /
         ``index-*.jsonl`` namespace in ``log_dir`` and sweeps a co-located
         foreign file of either shape too — the documented contract, not an
@@ -604,7 +675,7 @@ class LocalYamlLogSink:
         """
         if self.retention_days is not None:
             cutoff = time.time() - self.retention_days * 86400
-            for pattern in ("*.yaml", "index-*.jsonl"):
+            for pattern in ("*.yaml", "index-*.jsonl", ".*.yaml.part"):
                 for stale in self.log_dir.glob(pattern):
                     try:
                         if stale.stat().st_mtime < cutoff:
