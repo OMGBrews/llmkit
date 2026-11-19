@@ -43,6 +43,7 @@ from typing import cast
 import pytest
 import yaml
 
+import llmkit.logging.local_yaml as local_yaml
 from llmkit import (
     LLMCallRecord,
     LocalYamlLogSink,
@@ -831,6 +832,39 @@ def test_publish_never_clobbers_an_existing_name(
     assert path != squatted[0]
     assert squatted[0].read_text() == "someone else's\n"
     assert list(tmp_path.glob(".*.part")) == []
+
+
+def _no_links(*_args: object, **_kwargs: object) -> None:
+    raise PermissionError(1, "hard links unsupported")
+
+
+def test_publish_without_hard_links_shows_no_yaml_until_it_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without hard links nothing appears under a ``*.yaml`` name before the
+    body is moved there, so a process killed mid-publish leaves no empty
+    record; a name already taken is left untouched."""
+    real_replace = os.replace
+    seen: list[list[Path]] = []
+
+    def _observe_then_replace(src: str, dst: str) -> None:
+        seen.append(sorted(tmp_path.glob("*.yaml")))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.link", _no_links)
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.replace", _observe_then_replace)
+    path = LocalYamlLogSink(tmp_path).write_returning_path(_record())
+    assert path is not None
+    assert seen == [[]]
+    assert yaml.safe_load(path.read_text())["feature"] == "extraction"
+
+    taken = tmp_path / "taken.yaml"
+    _ = taken.write_text("someone else's\n")
+    part = tmp_path / ".taken.yaml.part"
+    _ = part.write_text("ours\n")
+    assert not local_yaml._publish(part, taken)
+    assert taken.read_text() == "someone else's\n"
+    assert part.read_text() == "ours\n"
 
 
 @pytest.mark.parametrize("field", ["error", "label", "feature", "prompt"])

@@ -107,27 +107,26 @@ def _publish(part: Path, final: Path) -> bool:
 
     A hard link fails with ``FileExistsError`` instead of replacing a file
     already at *final*, so ``False`` (name taken) asks the caller to retry
-    under a fresh name. Where the filesystem has no hard links, *final* is
-    reserved with an exclusive create and *part* renamed over that empty
-    reservation, which is ours alone. Removing *part* after linking is
-    best-effort: the record is already published, and :meth:`_prune
+    under a fresh name. Removing *part* after linking is best-effort: the
+    record is already published, and :meth:`_prune
     <LocalYamlLogSink._prune>` sweeps a leftover ``.part``.
+
+    Where the filesystem has no hard links, *part* is renamed to *final*
+    after checking the name is free, so nothing appears under *final* until
+    it is complete. The check and the rename are not one atomic step, but
+    the exclusively created *part* already reserves *final* against every
+    other llmkit writer, which must create the same ``.part`` name before
+    publishing to it; only a foreign process writing that exact
+    timestamped, uuid-suffixed name in between could be overwritten.
     """
     try:
         os.link(part, final)
     except FileExistsError:
         return False
     except OSError:
-        try:
-            with open(final, "x", encoding="utf-8", opener=open_private):
-                pass
-        except FileExistsError:
+        if os.path.lexists(final):
             return False
-        try:
-            os.replace(part, final)
-        except BaseException:
-            final.unlink(missing_ok=True)
-            raise
+        os.replace(part, final)
         return True
     with contextlib.suppress(OSError):
         part.unlink()
@@ -279,6 +278,9 @@ class LocalYamlLogSink:
         # (re)creates is always tried.
         self._seed_checked: bool = False
         self._announced: bool = False
+        # True only for the registry's import-time default, the one sink
+        # ``LLMKIT_LOG`` can turn off; the first-write notice says which.
+        self._env_switch_applies: bool = False
         self._last_prune: float | None = None
         self._yaml_latch: OnceLatch = OnceLatch()
         self._index_latch: OnceLatch = OnceLatch()
@@ -419,13 +421,21 @@ class LocalYamlLogSink:
             retention = f"no age-based retention: {LOG_RETENTION_ENV_VAR} is invalid"
         else:
             retention += f" set in code, so {LOG_RETENTION_ENV_VAR} is ignored"
+        # Only the import-time default answers to LLMKIT_LOG: a sink set up
+        # in code was chosen explicitly, and the registry never reads the
+        # variable after that, so naming it as an off switch would mislead.
+        off_switch = (
+            f"{LOG_ENV_VAR}=off or configure_llm_logging(None) disables"
+            if self._env_switch_applies
+            else f"set up in code, so {LOG_ENV_VAR}=off does not disable it"
+        )
         _ = report(
             logger,
             logging.INFO,
-            "llmkit is logging LLM calls to %s (%s; %s=off or configure_llm_logging(None) disables)",
+            "llmkit is logging LLM calls to %s (%s; %s)",
             self.log_dir,
             retention,
-            LOG_ENV_VAR,
+            off_switch,
         )
 
     def write(self, record: LLMCallRecord) -> None:
@@ -478,8 +488,9 @@ class LocalYamlLogSink:
         (``SIGKILL``, a ``KeyboardInterrupt``, the process ending under the
         delivery worker) can leave only a ``.part`` file, which
         :meth:`_prune` sweeps once it is older than ``retention_days``. On a
-        filesystem without hard links the name is reserved exclusively and
-        the temporary file renamed over the empty reservation.
+        filesystem without hard links the temporary file is renamed to the
+        final name once that name is checked free, which publishes it whole
+        too.
 
         Best-effort means *any* :class:`Exception` is swallowed (with a
         warning); such a failure also removes the temporary file.
@@ -832,3 +843,14 @@ class LocalYamlLogSink:
             if size > self.max_index_bytes:
                 stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")
                 os.replace(index, self.log_dir / f"index-{stamp}.jsonl")
+
+
+def implicit_default_sink(log_dir: Path | None = None) -> LocalYamlLogSink:
+    """The registry's import-time default sink, whose notice names ``LLMKIT_LOG``.
+
+    Internal: :mod:`llmkit.logging.registry` builds its default with this, and
+    tests rebuild that state with a directory of their own.
+    """
+    sink = LocalYamlLogSink(log_dir)
+    sink._env_switch_applies = True  # pyright: ignore[reportPrivateUsage]  # the module that owns the class
+    return sink

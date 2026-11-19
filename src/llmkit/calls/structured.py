@@ -352,6 +352,11 @@ async def structured_llm_call[T: BaseModel](
                 if exc.usage is not None:
                     usage = TokenUsage(*exc.usage.counts())
                 cost = exc.approximate_cost
+            elif (spent := _litellm.paid_completion_spend(exc)) is not None:
+                # A repair re-ask that failed on transport: the rejected
+                # answer before it was still paid for.
+                usage = TokenUsage(*spent[0])
+                cost = spent[1]
             raise
         except BaseException as exc:
             # A cancellation (a host's ``asyncio.timeout`` around the call, a

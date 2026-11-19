@@ -12,12 +12,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that fails validation now writes the provider-reported `usage` (on the
   structured lane, instructor's total across its in-call repairs) and
   `approximate_cost`, which used to be `null`, and debits those tokens to the
-  TPM limit. `StructuredOutputError` gains `usage` and `approximate_cost`.
+  TPM limit, including when the repair re-ask then fails on transport (the
+  record then names the transport error). `StructuredOutputError` gains
+  `usage` and `approximate_cost`, filled on the structured and compose lanes.
 
 - **A rejected answer stays in the record.** A validation-failure record now
   keeps the rejected answer in `partial_text`: the answer text on the
   structured and compose lanes, and a rejected tool round's raw arguments,
-  one line per rejected call, on both tool lanes. Before, it reached the
+  verbatim and joined with a newline between calls, on both tool lanes. Before, it reached the
   record only when a later repair happened to carry it in `requests`.
 
 - **An interrupted stream is no longer recorded as clean.** A
@@ -260,7 +262,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env` file supplies counts once LiteLLM has loaded it, which happens at the
   first call. The names are exported as `llmkit.logging.LOG_ENV_VAR` and
   `llmkit.logging.LOG_RETENTION_ENV_VAR`. The first-write INFO notice now
-  names `LLMKIT_LOG=off` and says where the retention came from.
+  names `LLMKIT_LOG=off` for the default sink (a sink set up in code says the
+  variable does not disable it) and says where the retention came from.
 
   **Compatibility:** a process that already has `LLMKIT_LOG` or
   `LLMKIT_LOG_RETENTION_DAYS` set, for any reason, now honours it.
@@ -598,8 +601,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not `null`.** When a custom serializer makes `model_dump()` raise, the
   structured and compose records, and the structured cache-hit record, now
   write `response: {unserializable: <TypeName>, repr: <the first 500
-  characters of repr()>}` (without `repr` when `repr()` raises too). The
-  answer is still returned.
+  characters of repr()>}` for the schema instance (without `repr` when
+  `repr()` raises too). The answer is still returned.
 
   **Compatibility:** `response` is no longer `null` for such an attempt, and
   the two warnings now end "recording a fallback" instead of "recording
@@ -620,8 +623,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Each record is published only once it is complete.** `LocalYamlLogSink`
   writes a record under a hidden temporary name (`.<name>.yaml.part`,
   exclusive-create, `0o600`) and then gives it its `*.yaml` name with a hard
-  link that never overwrites, falling back to an exclusive reservation and a
-  rename where hard links are unsupported. A write cut off mid-file (a
+  link that never overwrites, falling back, where hard links are unsupported,
+  to a rename once the name is checked free, so no empty or partial `*.yaml`
+  is ever visible. A write cut off mid-file (a
   killed process, an interrupt, the exit drain) used to leave a truncated
   `*.yaml` whose header still read `# ok`. Retention sweeps leftover `.part`
   files older than its bound and keeps them under `retention_days=None`.

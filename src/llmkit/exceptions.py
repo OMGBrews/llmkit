@@ -446,9 +446,8 @@ class StructuredOutputError(LlmkitError):
         native_finish_reason: The last completion's native reason, where delivered.
         usage: The token counts the provider reported for the failed attempt
             (on the structured lane, instructor's in-call total across its
-            repair re-asks), each ``None`` when not reported; ``None`` when
-            none were read, as on the compose lane, whose record takes them
-            from the round itself.
+            repair re-asks; on the compose lane, the final turn's), each
+            ``None`` when not reported; ``None`` when none were read.
         approximate_cost: LiteLLM's cost estimate for the last completion,
             or ``None`` when unavailable.
     """

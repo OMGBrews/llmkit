@@ -18,6 +18,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
 from unittest.mock import MagicMock, patch
 
+import litellm
 import pytest
 from instructor.core import InstructorRetryException
 from pydantic import BaseModel, field_validator
@@ -344,4 +345,67 @@ async def test_a_failed_parse_is_debited_and_recorded_with_what_it_cost(
     assert record.usage == dict(
         zip(("prompt_tokens", "completion_tokens", "total_tokens"), counts, strict=True)
     )
+    assert record.approximate_cost == 0.001
+
+
+async def test_a_paid_parse_failure_is_accounted_when_the_repair_fails_on_transport() -> None:
+    """A malformed answer whose repair re-ask then fails on transport still
+    paid for the first completion: it is debited and recorded, while the error
+    stays the transport failure the retry layer classifies."""
+    sends: list[int] = []
+
+    def answer(_request: object) -> Reply:
+        sends.append(len(sends))
+        if len(sends) == 1:
+            return Reply.text("not json", usage=TokenUsage(3, 2, 5), cost=0.001)
+        raise litellm.exceptions.APIConnectionError(
+            message="boom", llm_provider="openai", model="gpt-4.1-mini"
+        )
+
+    debits: list[int | None] = []
+
+    def acquire(_name: str) -> AbstractAsyncContextManager[MagicMock]:
+        return _debits_into(debits)
+
+    with (
+        patch("llmkit._litellm.GlobalRateLimiter.acquire_async", acquire),
+        install(answer),
+        capture_llm_records() as records,
+        pytest.raises(InstructorRetryException),
+    ):
+        _ = await structured_llm_call(
+            "q", _Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+        )
+
+    assert len(sends) == 2
+    assert debits == [5]
+    [record] = records
+    assert record.error is not None and record.error.startswith("APIConnectionError")
+    assert record.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    assert record.approximate_cost == 0.001
+
+
+@pytest.mark.parametrize("reply", ['{"n": 0}', None])
+async def test_a_compose_failure_carries_what_the_turn_cost(reply: str | None) -> None:
+    """The compose lane's error carries the final turn's usage and cost, as
+    its record does, for an answer that failed validation and for a turn with
+    neither tool calls nor text."""
+    answer = (
+        Reply.text(reply, usage=TokenUsage(3, 2, 5), cost=0.001)
+        if reply is not None
+        else Reply(usage=TokenUsage(3, 2, 5), cost=0.001)
+    )
+    with (
+        install(lambda _request: answer),
+        capture_llm_records() as records,
+        pytest.raises(StructuredOutputError) as caught,
+    ):
+        _ = await tool_llm_call(
+            "q", [], output_schema=_Positive, feature="f", retry=NO_RETRY, provider=_PROVIDER
+        )
+    assert caught.value.usage is not None
+    assert caught.value.usage.counts() == (3, 2, 5)
+    assert caught.value.approximate_cost == 0.001
+    [record] = records
+    assert record.usage == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
     assert record.approximate_cost == 0.001

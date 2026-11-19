@@ -317,6 +317,8 @@ async def tool_llm_call[T: BaseModel](
                         attempt=attempt_offset + attempt_count,
                         model=routed_model,
                         provider=provider_name,
+                        usage=WireUsage(*counts),
+                        approximate_cost=cost,
                     )
                 try:
                     # Strict JSON mode: the structured lane's rule.
@@ -335,6 +337,8 @@ async def tool_llm_call[T: BaseModel](
                         attempt=attempt_offset + attempt_count,
                         model=routed_model,
                         provider=provider_name,
+                        usage=WireUsage(*counts),
+                        approximate_cost=cost,
                     ) from exc
                 result = ToolComposeResult[T](*base, parsed=parsed)
             return result
@@ -439,7 +443,9 @@ def _dump_for_log(
 
     A raising serializer on the output schema must not turn a validated final
     answer into an exception: the dump exists only for the log, as on the
-    structured lane, so it degrades to a :func:`fallback_log_dump` marker.
+    structured lane, so it degrades to a :func:`fallback_log_dump` marker of
+    the caller's schema instance (a final answer has no tool calls, and its
+    text is that answer), not of the result wrapper around it.
     The warning goes through :func:`~llmkit._diagnostics.report`, so a host
     handler that raises on it is contained and counted rather than replacing
     the answer.
@@ -457,7 +463,8 @@ def _dump_for_log(
             label,
             exc_info=True,
         )
-        return {**fallback_log_dump(result)}
+        answer = result.parsed if isinstance(result, ToolComposeResult) else None
+        return {**fallback_log_dump(result if answer is None else answer)}
 
 
 @overload

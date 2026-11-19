@@ -30,7 +30,7 @@ from llmkit._latch import OnceLatch
 from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
 from llmkit.logging._paths import LOG_ENV_VAR, blank_is_unset
 from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
-from llmkit.logging.local_yaml import LocalYamlLogSink
+from llmkit.logging.local_yaml import implicit_default_sink
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
 
@@ -100,7 +100,7 @@ def _install(sink: LogSink | None) -> Installed:
 # directory (resolved lazily at first write). The host overrides it once at
 # startup; tests typically point it at a tmp directory. Replaced whole, never
 # mutated, so every reader sees a consistent sink/health pair.
-_installed: Installed = _install(LocalYamlLogSink())
+_installed: Installed = _install(implicit_default_sink())
 
 # True while ``_installed`` is still the import-time default and ``LLMKIT_LOG``
 # has not been read. The first reader clears it under the lock, swapping in the
@@ -193,22 +193,24 @@ def _apply_log_switch() -> None:
     there first is left alone. An unrecognised value fails closed, because a
     prompt written to disk cannot be taken back; it warns once (the read
     happens once per process) and never raises.
+
+    ``_implicit`` is cleared only after ``_installed`` holds the answer:
+    :func:`get_installed` reads the flag without the lock, so a reader that
+    sees it cleared must also see the disabled installation, never the
+    default sink the switch is about to replace.
     """
     global _installed, _implicit
     invalid: str | None = None
     with _switch_lock:
         if not _implicit:
             return
-        _implicit = False
         raw = blank_is_unset(os.environ.get(LOG_ENV_VAR))
-        if raw is None:
-            return
-        value = raw.strip().casefold()
-        if value in {"on", "1", "true", "yes"}:
-            return
-        if value not in {"off", "0", "false", "no"}:
-            invalid = raw
-        _installed = _install(None)
+        value = None if raw is None else raw.strip().casefold()
+        if value is not None and value not in {"on", "1", "true", "yes"}:
+            if value not in {"off", "0", "false", "no"}:
+                invalid = raw
+            _installed = _install(None)
+        _implicit = False
     if invalid is not None:
         # Outside the lock: a host handler reading the health back must not
         # deadlock on it.

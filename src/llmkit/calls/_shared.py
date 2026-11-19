@@ -507,7 +507,8 @@ async def run_cached[T](
     decode failure is a cache failure — and
     writes its own record through *record_hit*,
     called with the decoded answer, the ``call_id`` of the call that paid for
-    it, the hit's start time (wall clock, then monotonic), and the exception
+    it, the pass's start time (wall clock, then monotonic: the lookup for the
+    first entry, the end of the rejected pass for the next), and the exception
     the hook raised (``None`` when it accepted the answer).
 
     Every entry the hook sees is a pass of the call with its own record, so a
@@ -547,6 +548,7 @@ async def run_cached[T](
         )
 
     async def _accept(entry: LLMCacheEntry) -> T:
+        nonlocal started_at, start_t
         try:
             result = decode(entry.response)
         except Exception as exc:
@@ -567,6 +569,10 @@ async def run_cached[T](
                     # The live attempt that follows takes the next number.
                     count_extra_attempt(call_id)
                 await record_hit(result, entry.call_id, started_at, start_t, exc)
+                # A later pass (the single-flight leader's entry) is timed
+                # from here, not from the lookup this pass already covered.
+                started_at = datetime.now(UTC)
+                start_t = time.monotonic()
                 if rejected and not isinstance(exc, ResultValidationError):
                     raise ResultValidationError(str(exc)) from exc
                 raise
@@ -750,8 +756,10 @@ def fallback_log_dump(value: object) -> dict[str, str]:
 def rejected_arguments_text(exc: ToolArgumentError) -> str | None:
     """The record's ``partial_text`` for a rejected tool round: its raw arguments.
 
-    One line per rejected call that carried an argument string, in the order
-    the model sent them; ``None`` when none did.
+    Each rejected call's argument string, verbatim and in the order the model
+    sent them, joined with a newline; ``None`` when none carried one. An
+    argument string that itself spans lines is kept as sent, so line breaks
+    alone do not separate the calls.
     """
     rejected = exc.round_errors or (exc,)
     raw = [error.arguments_raw for error in rejected if error.arguments_raw is not None]

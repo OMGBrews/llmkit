@@ -20,7 +20,12 @@ from typing import override
 
 import pytest
 
-from llmkit import LLMCallRecord, configure_llm_logging, get_logging_health
+from llmkit import (
+    LLMCallRecord,
+    configure_llm_logging,
+    get_diagnostics_health,
+    get_logging_health,
+)
 from llmkit.logging import _delivery
 from llmkit.logging._policy import get_delivery_policy
 from tests._support import make_record
@@ -153,12 +158,16 @@ def test_raising_host_handler_does_not_escape_the_drop(
     """A host logging handler that raises on the warning is contained: the
     caller sees an ordinary drop, not the handler's exception."""
 
+    emitted: list[str] = []
+
     class _Raising(logging.Handler):
         @override
         def emit(self, record: logging.LogRecord) -> None:
+            emitted.append(record.getMessage())
             raise RuntimeError("host handler is broken")
 
     handler = _Raising()
+    lost_before = get_diagnostics_health().lost
     llmkit_logger = logging.getLogger("llmkit.logging")
     llmkit_logger.addHandler(handler)
     try:
@@ -169,6 +178,11 @@ def test_raising_host_handler_does_not_escape_the_drop(
     finally:
         llmkit_logger.removeHandler(handler)
     assert get_logging_health().dropped == 1
+    # The warning reached the raising handler and its loss was counted, so
+    # the containment above is of a warning that was actually emitted.
+    [message] = emitted
+    assert "dropped an LLM call record" in message
+    assert get_diagnostics_health().lost == lost_before + 1
     del caplog_warnings
 
 
@@ -179,9 +193,12 @@ def test_worker_drop_warning_contains_a_base_exception_from_the_handler(
     contained: the worker ends quietly instead of through the thread
     excepthook."""
 
+    emitted: list[str] = []
+
     class _Interrupting(logging.Handler):
         @override
         def emit(self, record: logging.LogRecord) -> None:
+            emitted.append(record.getMessage())
             raise _Stop
 
     escaped: list[threading.ExceptHookArgs] = []
@@ -206,3 +223,5 @@ def test_worker_drop_warning_contains_a_base_exception_from_the_handler(
         llmkit_logger.removeHandler(handler)
     assert get_logging_health().dropped == 1
     assert escaped == []
+    # The worker did emit the drop warning; only its handler's raise was contained.
+    assert [m for m in emitted if "dropped an LLM call record" in m] != []

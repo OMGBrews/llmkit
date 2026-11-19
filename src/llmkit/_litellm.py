@@ -1613,9 +1613,11 @@ async def acompletion_structured[T: BaseModel](
                     usage=failed_usage,
                     approximate_cost=failed_cost,
                 ) from e
+            # Debited whatever ends the call: a re-ask that fails on transport
+            # after a parse failure still paid for the rejected completion.
+            slot.record_tokens(failed_usage.debit())
             if not isinstance(cause, REPAIRABLE_PARSE_ERRORS):
                 raise
-            slot.record_tokens(failed_usage.debit())
             # Word the message by the re-asks that actually ran: with an
             # allowance of zero no repair happened, and saying otherwise would
             # put a false claim in the call log's ``error`` field.
@@ -1657,6 +1659,28 @@ async def acompletion_structured[T: BaseModel](
         text,
         invocations.native_finish_reason,
     )
+
+
+def paid_completion_spend(
+    exc: BaseException,
+) -> tuple[tuple[int | None, int | None, int | None], float | None] | None:
+    """The ``(counts, cost)`` of a paid completion carried on instructor's wrap.
+
+    A schema-repair re-ask that then fails on transport or a permanent error
+    escapes :func:`acompletion_structured` as instructor's
+    ``InstructorRetryException`` (the retry layer classifies through it), whose
+    ``last_completion`` is the rejected answer that was already paid for. The
+    structured lane's call log records its usage and cost from here. ``None``
+    when *exc* is not that wrap or carries no reported usage (the transport
+    failed before any completion arrived).
+    """
+    if not isinstance(exc, InstructorRetryException):
+        return None
+    completion = getattr(exc, "last_completion", None)
+    usage = _wire_usage(completion)
+    if usage.debit() is None:
+        return None
+    return usage.counts(), _response_cost(completion)
 
 
 def _is_no_choice_crash(cause: BaseException, last_completion: object) -> bool:

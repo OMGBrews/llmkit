@@ -917,8 +917,8 @@ async def test_a_raising_serializer_still_returns_the_validated_compose_answer(
     [record] = records
     assert record.error is None
     response = cast("dict[str, object]", record.response)
-    assert response["unserializable"] == "ToolComposeResult"
-    assert str(response["repr"]).startswith("ToolComposeResult(")
+    # The marker names the caller's schema, not the result wrapper around it.
+    assert response == {"unserializable": "_UndumpableAnswer", "repr": "_UndumpableAnswer(n=1)"}
     assert [
         warning.getMessage()
         for warning in caplog.records

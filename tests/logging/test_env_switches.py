@@ -17,6 +17,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import cast
@@ -30,12 +31,14 @@ from llmkit.logging import (
     LOG_ENV_VAR,
     LOG_RETENTION_ENV_VAR,
     LocalYamlLogSink,
+    LogSink,
     configure_llm_logging,
     get_log_sink,
     get_logging_health,
     write_llm_log,
 )
-from llmkit.logging._paths import resolve_default_log_dir
+from llmkit.logging._paths import blank_is_unset, resolve_default_log_dir
+from llmkit.logging.local_yaml import implicit_default_sink
 from tests._support import make_record as _record
 
 _CHILD = r"""
@@ -130,7 +133,7 @@ def test_explicit_sink_beats_log_off_in_a_fresh_process(tmp_path: Path) -> None:
 @pytest.fixture
 def implicit_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalYamlLogSink:
     """Put the registry back in its import-time state, with the default sink in tmp_path."""
-    sink = LocalYamlLogSink(tmp_path / "default")
+    sink = implicit_default_sink(tmp_path / "default")
     monkeypatch.setattr(registry, "_installed", registry._install(sink))
     monkeypatch.setattr(registry, "_implicit", True)
     return sink
@@ -217,6 +220,36 @@ def test_invalid_log_value_fails_closed_with_one_warning(
     assert repr(value) in warning.getMessage()
 
 
+@pytest.mark.usefixtures("implicit_default")
+def test_a_concurrent_first_read_never_sees_the_default_sink_under_log_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second thread that reads the registry while the first is still
+    applying ``LLMKIT_LOG=off`` gets the disabled installation, not the default
+    sink the switch is replacing (which would write its prompt to disk)."""
+    monkeypatch.setenv(LOG_ENV_VAR, "off")
+    concurrent: list[LogSink | None] = []
+
+    def _read() -> None:
+        concurrent.append(registry.get_installed().sink)
+
+    reader = threading.Thread(target=_read)
+
+    def _slow_blank_is_unset(value: str | None) -> str | None:
+        # The switch is mid-read: let the second reader run now. With the
+        # flag cleared before the swap it returns at once with the default
+        # sink; done right it blocks on the switch lock until this returns.
+        reader.start()
+        reader.join(timeout=0.5)
+        return blank_is_unset(value)
+
+    monkeypatch.setattr("llmkit.logging.registry.blank_is_unset", _slow_blank_is_unset)
+    assert registry.get_installed().sink is None
+    reader.join(timeout=5)
+    assert not reader.is_alive()
+    assert concurrent == [None]
+
+
 def _backdated(log_dir: Path, name: str, days: float) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / name
@@ -242,7 +275,32 @@ def test_retention_is_read_at_first_write_not_at_construction(
     assert newer.exists()
     [info] = [r for r in caplog.records if r.levelno == logging.INFO]
     assert f"7-day retention from {LOG_RETENTION_ENV_VAR}" in info.getMessage()
-    assert f"{LOG_ENV_VAR}=off" in info.getMessage()
+    assert f"so {LOG_ENV_VAR}=off does not disable it" in info.getMessage()
+
+
+def test_only_the_default_sinks_notice_names_the_off_switch(
+    implicit_default: LocalYamlLogSink,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``LLMKIT_LOG=off`` disables only the import-time default, so only its
+    first-write notice offers it; a sink set up in code says the variable does
+    not disable it, which stays true while the variable is set to off."""
+    with caplog.at_level(logging.INFO, logger="llmkit.logging"):
+        assert write_llm_log(_record()) is not None
+        monkeypatch.setenv(LOG_ENV_VAR, "off")
+        explicit = LocalYamlLogSink(tmp_path / "explicit")
+        configure_llm_logging(explicit)
+        assert write_llm_log(_record()) is not None
+    default_notice, explicit_notice = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+    ]
+    assert str(implicit_default.log_dir) in default_notice
+    assert f"{LOG_ENV_VAR}=off or configure_llm_logging(None) disables" in default_notice
+    assert str(explicit.log_dir) in explicit_notice
+    assert f"set up in code, so {LOG_ENV_VAR}=off does not disable it" in explicit_notice
+    assert f"{LOG_ENV_VAR}=off or" not in explicit_notice
 
 
 def test_retention_is_frozen_after_the_first_resolution(
