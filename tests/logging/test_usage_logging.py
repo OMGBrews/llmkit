@@ -24,7 +24,7 @@ from litellm.types.utils import ModelResponse, Usage
 
 from llmkit import NO_RETRY, LocalYamlLogSink, ResultValidationError, configure_llm_logging
 from llmkit import calls as llm_calls
-from llmkit.logging import INDEX_FILENAME
+from llmkit.logging import INDEX_FILENAME, flush_llm_logs, get_logging_health
 from tests._support import OkSchema
 
 _NO_COUNTS = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
@@ -69,12 +69,20 @@ def log_dir(tmp_path: Path) -> Iterator[Path]:
         configure_llm_logging(None)
 
 
+def _settle() -> None:
+    """Wait for the delivery worker: a call waits at most 100 ms for its write."""
+    assert flush_llm_logs()
+    assert get_logging_health().dropped == 0
+
+
 def _read_log(log_dir: Path) -> dict[str, object]:
+    _settle()
     [path] = log_dir.glob("*.yaml")
     return cast("dict[str, object]", yaml.safe_load(path.read_text()))
 
 
 def _index_entry(log_dir: Path) -> dict[str, object]:
+    _settle()
     [line] = (log_dir / INDEX_FILENAME).read_text().splitlines()
     return cast("dict[str, object]", json.loads(line))
 

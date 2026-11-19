@@ -28,7 +28,7 @@ from llmkit import (
     configure_llm_logging,
 )
 from llmkit import calls as llm_calls
-from llmkit.logging import INDEX_FILENAME
+from llmkit.logging import INDEX_FILENAME, flush_llm_logs, get_logging_health
 from llmkit.retry import RetryPolicy, with_retries
 from tests._support import OkSchema
 
@@ -75,7 +75,14 @@ def log_dir(tmp_path: Path) -> Iterator[Path]:
         configure_llm_logging(None)
 
 
+def _settle() -> None:
+    """Wait for the delivery worker: a call waits at most 100 ms for its write."""
+    assert flush_llm_logs()
+    assert get_logging_health().dropped == 0
+
+
 def _read_logs(log_dir: Path) -> list[dict[str, object]]:
+    _settle()
     docs = [
         cast("dict[str, object]", yaml.safe_load(path.read_text()))
         for path in sorted(log_dir.glob("*.yaml"))
@@ -84,6 +91,7 @@ def _read_logs(log_dir: Path) -> list[dict[str, object]]:
 
 
 def _index_lines(log_dir: Path) -> list[str]:
+    _settle()
     return (log_dir / INDEX_FILENAME).read_text().splitlines()
 
 
