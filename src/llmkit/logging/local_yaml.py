@@ -30,10 +30,12 @@ from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import FailureStage, WriteOutcome
 from llmkit.logging._paths import (
+    FILENAME_TIMESTAMP_FORMAT,
     LOG_ENV_VAR,
     LOG_RETENTION_ENV_VAR,
     MAX_FILENAME_ATTEMPTS,
     blank_is_unset,
+    is_prunable_name,
     oneline,
     open_private,
     resolve_default_log_dir,
@@ -203,15 +205,14 @@ class LocalYamlLogSink:
     the same policy. Housekeeping is best effort, at most hourly, after successful
     writes. Inactive applications or failed deletions can leave old files
     indefinitely; a fixed deletion deadline requires external cleanup.
-    **Pruning is a glob over the directory, not a list of files the sink
-    remembers writing**: the sink owns ``log_dir``'s ``*.yaml`` and
-    ``index-*.jsonl`` namespace, so a co-located file of either shape ages
-    out under the same policy whoever wrote it, as does a stale
-    ``.*.yaml.part`` file a write cut short left behind — deliberate (a
-    cross-reference file and the logs it references rot on one clock), but
-    it makes ``log_dir`` llmkit's directory rather than shared storage.
-    Give llmkit a directory of its own if you need co-located files to
-    outlive the policy.
+    **Pruning removes only file names llmkit generates**: per-call
+    ``{timestamp}_{feature}_{label}_{uuid8}.yaml`` records, rotated
+    ``index-{timestamp}.jsonl`` generations, and a stale hidden
+    ``.{record}.part`` file a write cut short left behind. A co-located file
+    llmkit did not name — ``docker-compose.yaml``, ``index-notes.jsonl``, a
+    consumer's ``trace_*.yaml`` — is never pruned, so its owner must clean it
+    up. Matching is by the whole name, not ownership: a foreign file whose
+    entire name has the generated shape is still swept.
 
     When ``retention_days`` is not passed, the sink reads
     ``LLMKIT_LOG_RETENTION_DAYS`` at its first write (or first read of
@@ -575,7 +576,7 @@ class LocalYamlLogSink:
             record = transformed
         try:
             self._ensure_log_dir()
-            ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
+            ts = record.started_at.strftime(FILENAME_TIMESTAMP_FORMAT)
             safe_feature = safe_path_component(record.feature)
             safe_label = safe_path_component(record.label or "unlabeled")
 
@@ -956,32 +957,41 @@ class LocalYamlLogSink:
     def _prune(self) -> None:
         """Apply the retention policy: age out YAMLs, rotate an oversized index.
 
-        Age pruning covers the per-call ``*.yaml`` files, previously
-        rotated ``index-*.jsonl`` generations and the ``.*.yaml.part``
-        temporary files a write cut short left behind (a fresh one may be a
-        write in progress, so only the retention cutoff removes it), keyed on
-        file mtime so tests (and operators) can reason about it with
-        ``touch``. The patterns are
-        globs over the directory, so this owns the whole ``*.yaml`` /
-        ``index-*.jsonl`` namespace in ``log_dir`` and sweeps a co-located
-        foreign file of either shape too — the documented contract, not an
-        oversight (the active ``index.jsonl`` is excluded: the pattern
-        requires the rotation hyphen). Rotation renames the active index with
-        :func:`os.replace` — atomic on POSIX, and a concurrent writer holding
-        the old file descriptor simply finishes its ``O_APPEND`` line into the
-        rotated file, so no index line is ever torn or lost. A file vanishing
-        mid-scan (a concurrent prune, a manual cleanup) is skipped, not an
-        error.
+        Age pruning covers only names llmkit generates
+        (:func:`~llmkit.logging._paths.is_prunable_name`): per-call
+        ``{timestamp}_{feature}_{label}_{uuid8}.yaml`` records, rotated
+        ``index-{timestamp}.jsonl`` generations and the hidden
+        ``.{record}.part`` temporary files a write cut short left behind (a
+        fresh one may be a write in progress, so only the retention cutoff
+        removes it), keyed on file mtime so tests (and operators) can reason
+        about it with ``touch``. Every other file in ``log_dir`` is left
+        alone, whatever its extension — ``docker-compose.yaml`` and
+        ``index-notes.jsonl`` included — and so is the active
+        ``index.jsonl``. A foreign file whose whole name has the generated
+        shape is indistinguishable and is swept like one of llmkit's own.
+        Rotation renames the active index with :func:`os.replace` — atomic on
+        POSIX, and a concurrent writer holding the old file descriptor simply
+        finishes its ``O_APPEND`` line into the rotated file, so no index line
+        is ever torn or lost. A file vanishing mid-scan (a concurrent prune, a
+        manual cleanup) is skipped, not an error, and so is an index another
+        process rotated between the size check and the rename.
         """
         if self.retention_days is not None:
             cutoff = time.time() - self.retention_days * 86400
-            for pattern in ("*.yaml", "index-*.jsonl", ".*.yaml.part"):
-                for stale in self.log_dir.glob(pattern):
-                    try:
-                        if stale.stat().st_mtime < cutoff:
-                            stale.unlink(missing_ok=True)
-                    except OSError:
-                        continue
+            try:
+                entries = list(self.log_dir.iterdir())
+            except OSError:
+                # An unreadable or vanished directory has nothing to age out,
+                # exactly as the directory globs this scan replaced behaved.
+                entries = []
+            for stale in entries:
+                if not is_prunable_name(stale.name):
+                    continue
+                try:
+                    if stale.stat().st_mtime < cutoff:
+                        stale.unlink(missing_ok=True)
+                except OSError:
+                    continue
         if self.max_index_bytes is not None:
             index = self.log_dir / INDEX_FILENAME
             try:
@@ -989,8 +999,11 @@ class LocalYamlLogSink:
             except OSError:
                 return
             if size > self.max_index_bytes:
-                stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")
-                os.replace(index, self.log_dir / f"index-{stamp}.jsonl")
+                stamp = datetime.now(UTC).strftime(FILENAME_TIMESTAMP_FORMAT)
+                # Another process may rotate the index between the stat above
+                # and this rename; then the bound is already enforced.
+                with contextlib.suppress(FileNotFoundError):
+                    os.replace(index, self.log_dir / f"index-{stamp}.jsonl")
 
 
 def implicit_default_sink(log_dir: Path | None = None) -> LocalYamlLogSink:

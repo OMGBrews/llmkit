@@ -250,9 +250,15 @@ def test_a_concurrent_first_read_never_sees_the_default_sink_under_log_off(
     assert concurrent == [None]
 
 
-def _backdated(log_dir: Path, name: str, days: float) -> Path:
+def _backdated(log_dir: Path, label: str, days: float) -> Path:
+    """A record-shaped file named for *label*, its mtime *days* in the past.
+
+    Named the way the sink names records, because retention prunes only names
+    llmkit generates: a ``stale.yaml`` would survive any setting and make a
+    survival assertion pass vacuously.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / name
+    path = log_dir / f"2026-01-01T00-00-00-000000_fixture_{label}_0123abcd.yaml"
     _ = path.write_text("old: true\n", encoding="utf-8")
     stamp = time.time() - days * 86400
     os.utime(path, (stamp, stamp))
@@ -266,8 +272,8 @@ def test_retention_is_read_at_first_write_not_at_construction(
     notice says the bound came from the environment."""
     sink = LocalYamlLogSink(tmp_path)
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, " 7 ")
-    older = _backdated(tmp_path, "older.yaml", 8)
-    newer = _backdated(tmp_path, "newer.yaml", 6)
+    older = _backdated(tmp_path, "older", 8)
+    newer = _backdated(tmp_path, "newer", 6)
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert sink.write_returning_path(_record()) is not None
     assert sink.retention_days == 7
@@ -318,7 +324,7 @@ def test_forever_keeps_a_back_dated_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, value: str
 ) -> None:
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, value)
-    ancient = _backdated(tmp_path, "ancient.yaml", 400)
+    ancient = _backdated(tmp_path, "ancient", 400)
     sink = LocalYamlLogSink(tmp_path)
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert sink.write_returning_path(_record()) is not None
@@ -335,7 +341,7 @@ def test_blank_retention_is_unset(
     """A blank value falls back to the 30-day default, and the notice names the
     variable that would change it."""
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, value)
-    stale = _backdated(tmp_path, "stale.yaml", 31)
+    stale = _backdated(tmp_path, "stale", 31)
     sink = LocalYamlLogSink(tmp_path)
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert sink.write_returning_path(_record()) is not None
@@ -355,7 +361,7 @@ def test_invalid_retention_keeps_files_warns_once_and_degrades_housekeeping(
     monkeypatch.setattr("llmkit.logging.local_yaml._retention_env_latch", OnceLatch())
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, value)
     first_dir, second_dir = tmp_path / "first", tmp_path / "second"
-    kept = _backdated(first_dir, "ancient.yaml", 400)
+    kept = _backdated(first_dir, "ancient", 400)
     first = LocalYamlLogSink(first_dir)
     with caplog.at_level(logging.DEBUG, logger="llmkit.logging"):
         configure_llm_logging(first)
@@ -385,7 +391,7 @@ def test_explicit_retention_beats_the_environment(
     age: int,
 ) -> None:
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, "1")
-    kept = _backdated(tmp_path, "kept.yaml", age)
+    kept = _backdated(tmp_path, "kept", age)
     sink = LocalYamlLogSink(tmp_path, retention_days=retention_days)
     with caplog.at_level(logging.INFO, logger="llmkit.logging"):
         assert sink.write_returning_path(_record()) is not None
@@ -401,7 +407,7 @@ def test_assigned_retention_beats_the_environment_and_is_validated(
     """The attribute stays assignable; an assignment before the first write
     replaces the environment's answer, and the constructor's bounds apply."""
     monkeypatch.setenv(LOG_RETENTION_ENV_VAR, "1")
-    kept = _backdated(tmp_path, "kept.yaml", 10)
+    kept = _backdated(tmp_path, "kept", 10)
     sink = LocalYamlLogSink(tmp_path)
     sink.retention_days = None
     assert sink.write_returning_path(_record()) is not None

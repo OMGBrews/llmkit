@@ -591,6 +591,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **⚠️ Log retention deletes only files llmkit named.** `LocalYamlLogSink`'s
+  retention pass used to delete any `*.yaml` or `index-*.jsonl` file in
+  `log_dir` older than `retention_days`, whoever wrote it, so pointing the logs
+  at a project directory (`LLMKIT_LOG_DIR=.`) could delete its
+  `docker-compose.yaml`. It now deletes a file only when its whole name has a
+  shape the sink generates: a record
+  `{timestamp}_{feature}_{label}_{uuid8}.yaml`, its hidden `.{record}.part`
+  temporary file, or a rotated `index-{timestamp}.jsonl`.
+
+  **Compatibility:** files you keep beside the logs are no longer pruned, so
+  they need their own cleanup — including cross-reference YAML such as
+  `trace_*.yaml` that used to age out with the records. A foreign file whose
+  whole name has the generated shape is still pruned. Records written before
+  v0.2.0, which had no `_{uuid8}` suffix, are no longer matched; any left in a
+  log directory must be removed by hand.
+
+- **A concurrent index rotation is no longer a housekeeping failure.** When two
+  processes sharing a log directory both found `index.jsonl` over
+  `max_index_bytes` and the other renamed it first, this process's rename
+  raised `FileNotFoundError`, which was reported as a failed prune: a warning
+  and a degraded `housekeeping` entry in `get_logging_health()`. It is now
+  treated as done. Other rename failures are still reported.
+
 - **A cached answer your `on_result` hook rejects is recorded as its own
   attempt.** Such a pass used to write no record at all. It now writes an
   `ERROR` record with `cache_hit: true` and `cache=hit` in the header,

@@ -7,7 +7,8 @@ strings to something safe to put in a path. The private opener that creates
 files 0600 lives here too, so the security-relevant filesystem policy is in one
 place rather than spread through the sink. The names of the logging
 environment variables live here as well, with the blank-is-unset rule they
-share.
+share, and so do the timestamp format of generated file names and the
+full-name patterns retention uses to recognise them.
 
 Symbols the sink imports carry public names; the helpers used only within this
 module stay underscored.
@@ -147,6 +148,49 @@ def open_private(path: str, flags: int) -> int:
     file — and is inert on Windows.
     """
     return os.open(path, flags, 0o600)
+
+
+#: ``strftime`` format of the timestamp in every file name llmkit generates in
+#: a log directory: the leading stamp of a per-call record (and so of its
+#: temporary ``.part`` file) and the stamp of a rotated index generation. The
+#: prune patterns below are written against this format, so the two live side
+#: by side; changing one without the other strands files that pruning would
+#: no longer recognise.
+FILENAME_TIMESTAMP_FORMAT = "%Y-%m-%dT%H-%M-%S-%f"
+
+# The timestamp FILENAME_TIMESTAMP_FORMAT produces: date, "T", then hour,
+# minute, second and six-digit microseconds, all hyphen-separated.
+_TIMESTAMP_PATTERN = r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{6}"
+
+# A per-call record: ``{timestamp}_{feature}_{label}_{uuid8}.yaml``. The
+# sanitized feature and label may themselves contain "_", so the middle is
+# matched as one non-empty run rather than split further.
+_RECORD_PATTERN = rf"{_TIMESTAMP_PATTERN}_.+_[0-9a-f]{{8}}\.yaml"
+
+#: Full-name patterns (applied with ``fullmatch``) for the files llmkit itself
+#: names in a log directory and that retention may delete: a per-call record,
+#: the hidden ``.{record}.part`` temporary file a cut-short write leaves
+#: behind, and a rotated ``index-{timestamp}.jsonl`` generation. Anything else
+#: in the directory, whatever its extension, is not llmkit's to prune. The
+#: active ``index.jsonl`` matches none of them: it is never age-pruned.
+PRUNABLE_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(_RECORD_PATTERN),
+    re.compile(rf"\.{_RECORD_PATTERN}\.part"),
+    re.compile(rf"index-{_TIMESTAMP_PATTERN}\.jsonl"),
+)
+
+
+def is_prunable_name(name: str) -> bool:
+    """Whether *name* is a file name llmkit generates and retention may delete.
+
+    True only when the *whole* name matches one of
+    :data:`PRUNABLE_NAME_PATTERNS`, so ``docker-compose.yaml`` or
+    ``index-notes.jsonl`` beside the logs is never touched. A foreign file
+    whose entire name happens to have the generated shape (a 26-character
+    timestamp, then eight hex digits before ``.yaml``) is indistinguishable
+    and is still treated as llmkit's.
+    """
+    return any(pattern.fullmatch(name) for pattern in PRUNABLE_NAME_PATTERNS)
 
 
 # Bounded retry budget for the exclusive-create filename loop: a uuid4 suffix
