@@ -33,6 +33,14 @@ concurrency on one loop (LiteLLM's intended mode), with the per-provider
 concurrency cap enforced inside the async path by ``GlobalRateLimiter``'s
 now-shared async semaphore (keyed on ``L``).
 
+**Interrupts on the loop thread.** A :class:`KeyboardInterrupt` or
+:class:`SystemExit` raised inside a sync call or a sync stream step (by a hook,
+a callback the call runs, or a tool) is passed to the sync caller waiting on
+it, and ``L`` keeps running on the same thread, so later sync calls are
+unaffected. One raised on ``L`` outside any submitted call, by a plain loop
+callback or another task, has no caller: it is contained and logged at debug
+(see :func:`_loop_main`).
+
 **Reentrant calls.** A loop already running in the calling thread — an async
 framework calling a ``*_sync`` helper, or a coroutine running on ``L`` itself
 that calls back into sync code — splits into two cases:
@@ -108,6 +116,9 @@ _LOOP_GONE_MESSAGE = "llmkit's sync loop was shut down while this stream was ope
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _thread: threading.Thread | None = None
+# Set by ``_shutdown_loop`` before it stops the current loop, so ``_loop_main``
+# ends instead of restarting after an interrupt (see its docstring).
+_stop_requested: threading.Event | None = None
 
 # Serializes the loop-on-loop fallback's fresh-loop lifecycle: at most one fresh
 # loop may ever exist at a time, so LiteLLM's logging worker only ever rebinds
@@ -117,7 +128,9 @@ _thread: threading.Thread | None = None
 _fallback_lock = threading.Lock()
 
 
-def _loop_main(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
+def _loop_main(
+    loop: asyncio.AbstractEventLoop, ready: threading.Event, stop_requested: threading.Event
+) -> None:
     """Run the persistent loop forever on its dedicated daemon thread.
 
     Signals *ready* once the loop is installed as this thread's loop (so the
@@ -126,11 +139,39 @@ def _loop_main(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
     stop it settles async generators and closes the loop — the close must happen
     on this thread, after ``run_forever`` returns, so it pairs with the
     drain-and-cancel :func:`shutdown` runs *before* stopping the loop.
+
+    A :class:`KeyboardInterrupt` or :class:`SystemExit` raised by code on the
+    loop (a hook or tool calling ``sys.exit()``, a library re-raising an
+    interrupt) does not end the thread. asyncio lets exactly those two escape
+    ``run_forever``, and only after a task raising one has stored it as its
+    outcome and scheduled its done-callbacks, so restarting ``run_forever``
+    runs ``_submit_to_loop``'s relay and the waiting caller receives the
+    interrupt unchanged. One raised by a plain callback or an unsubmitted task
+    has no caller; it is logged at debug. Without the restart the loop would be
+    closed while this module still hands it out, and every later sync call in
+    the process would fail or hang.
+
+    The loop is not restarted once *stop_requested* is set. ``shutdown`` sets
+    it before queueing ``loop.stop``, because an interrupt raised later in the
+    same loop iteration as that ``stop`` ends ``run_forever`` by exception, and
+    asyncio then clears the stop flag: a restart would run forever and the loop
+    would never close. The teardown below still turns the loop, so a pending
+    relay is delivered either way.
     """
     asyncio.set_event_loop(loop)
     ready.set()
     try:
-        loop.run_forever()
+        while True:
+            try:
+                loop.run_forever()
+            except (KeyboardInterrupt, SystemExit):
+                # The task holds the exception and its relay is already
+                # scheduled; the next turn of the loop delivers it.
+                logger.debug("contained an interrupt raised on the sync loop thread", exc_info=True)
+                if stop_requested.is_set():
+                    break
+                continue
+            break
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -147,18 +188,23 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
     ``_lock`` so two first-callers can't construct competing loops, and an
     :mod:`atexit` hook is registered once to drain and close it on a clean exit.
     """
-    global _loop, _thread
+    global _loop, _thread, _stop_requested
     with _lock:
         if _loop is not None:
             return _loop
         loop = asyncio.new_event_loop()
         ready = threading.Event()
+        stop_requested = threading.Event()
         thread = threading.Thread(
-            target=_loop_main, args=(loop, ready), name="llmkit-sync-loop", daemon=True
+            target=_loop_main,
+            args=(loop, ready, stop_requested),
+            name="llmkit-sync-loop",
+            daemon=True,
         )
         thread.start()
         _loop = loop
         _thread = thread
+        _stop_requested = stop_requested
     # Wait outside the lock: the thread sets ``ready`` once the loop is its
     # current loop, so a coroutine scheduled immediately after isn't lost.
     _ = ready.wait()
@@ -773,12 +819,14 @@ def _remaining(deadline: float | None) -> float | None:
 
 def _shutdown_loop(deadline: float | None) -> None:
     """Close the sync loop, sharing one caller deadline across drain and join."""
-    global _loop, _thread
+    global _loop, _thread, _stop_requested
     with _lock:
         loop = _loop
         thread = _thread
+        stop_requested = _stop_requested
         _loop = None
         _thread = None
+        _stop_requested = None
     if loop is None:
         return
     try:
@@ -787,6 +835,8 @@ def _shutdown_loop(deadline: float | None) -> None:
     except Exception:  # pragma: no cover - best-effort shutdown drain
         logger.debug("persistent-loop shutdown drain failed", exc_info=True)
     finally:
+        if stop_requested is not None:
+            stop_requested.set()
         _ = loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             # _loop_main closes suspended async generators after loop.stop.
