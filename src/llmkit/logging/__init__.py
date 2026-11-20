@@ -5,7 +5,9 @@ to the configured :class:`LogSink`. Its ``requests`` history holds each prepared
 llmkit dispatch, including in-call repairs and temperature reissues. The default sink writes one YAML file
 per call to a directory resolved lazily at first write (see
 :func:`default_log_dir`: ``LLMKIT_LOG_DIR``, else ``data/llm-logs/`` under
-the enclosing project root, else a per-user state directory), preserving
+the enclosing project root, else a per-user state directory, which is also
+where it falls back to, once and with a warning, when the project folder
+cannot hold files), preserving
 the historical log shape so existing analysis tooling keeps working.
 ``LLMKIT_LOG=off`` switches that default sink off and
 ``LLMKIT_LOG_RETENTION_DAYS`` sets its retention, both without a code change;

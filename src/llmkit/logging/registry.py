@@ -289,7 +289,9 @@ def get_logging_health() -> LoggingHealth:
       :class:`LocalYamlLogSink`, whose writes llmkit verifies) or
       ``"custom"``.
     * ``written`` counts built-in writes that reached disk; ``degraded``
-      counts those whose index line or retention housekeeping then failed.
+      counts those whose index line or retention housekeeping then failed,
+      and the first written after the default folder fell back to the
+      per-user one (``last_failure.stage == "location"``).
     * ``handed_off`` counts records a custom sink accepted by returning
       normally. llmkit cannot see past that return, so it is not evidence
       the record was stored.

@@ -109,7 +109,9 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
     Both places the default sink could resolve to are under ``tmp_path``, so a
     write that should not happen is visible, and none can reach the
-    repository's own ``data/llm-logs``.
+    repository's own ``data/llm-logs``. The third, the per-user folder a
+    default sink falls back to when its project folder cannot hold files, is
+    out of reach: with ``LLMKIT_LOG_DIR`` set, the default never falls back.
     """
     assert_delivery_available()
     root = tmp_path / "project"

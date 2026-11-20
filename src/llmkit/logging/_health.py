@@ -31,8 +31,13 @@ from typing import Literal
 #: ``None``;
 #: ``transform`` — the built-in sink's ``transform`` hook raised, or returned
 #: neither a record nor ``None``, so nothing was written. Its ``error`` is the
-#: exception type name only, never the message, which may quote record data.
-FailureStage = Literal["write", "index", "housekeeping", "sink_raised", "contract", "transform"]
+#: exception type name only, never the message, which may quote record data;
+#: ``location`` — the built-in sink's default project-root folder could not
+#: hold files (or there was no current directory to find it from), so the
+#: sink moved to the per-user state directory and wrote the file there.
+FailureStage = Literal[
+    "write", "index", "housekeeping", "sink_raised", "contract", "transform", "location"
+]
 
 #: What kind of sink the health snapshot describes.
 SinkKind = Literal["disabled", "builtin", "custom"]
@@ -82,7 +87,9 @@ class LoggingHealth:
             its ``transform`` hook failed, a sink raised, or a sink broke its
             return contract.
         degraded: Written records whose index line or retention housekeeping
-            failed afterwards. Each is also counted in ``written``.
+            failed afterwards, or that were the first written after the
+            default folder fell back to the per-user one (the ``location``
+            stage). Each is also counted in ``written``.
         skipped: Records the built-in sink's ``transform`` hook chose not to
             write by returning ``None``. Counted nowhere else: a skip is
             neither a write, a failure nor a drop.
@@ -120,8 +127,9 @@ class WriteOutcome:
     ``path`` is the written file, or ``None`` when nothing was written:
     either the write failed with ``write_error`` at ``failure_stage``, or
     ``skipped`` is true because the sink's ``transform`` hook returned
-    ``None``. ``post_write_failures`` lists the index and housekeeping
-    failures that followed a successful write, in the order they occurred.
+    ``None``. ``post_write_failures`` lists what degraded a successful
+    write: a ``location`` fallback first, then the index and housekeeping
+    failures that followed, in the order they occurred.
     """
 
     path: Path | None

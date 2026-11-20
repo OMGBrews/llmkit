@@ -38,6 +38,7 @@ from llmkit import (
 )
 from llmkit.capture import record_call
 from llmkit.logging import INDEX_FILENAME, local_yaml, write_llm_log
+from llmkit.logging._paths import DefaultLogDir
 from llmkit.testing import Reply, TransportRequest, install
 from tests._support import make_record
 from tests._support.diagnostics import RaisingHandler, lost_diagnostics, raising_handler
@@ -294,7 +295,11 @@ def test_unseedable_gitignore_with_raising_handler_keeps_the_path(
 ) -> None:
     log_dir = tmp_path / "logs"
     # The project-root default is the one location that owes a .gitignore.
-    monkeypatch.setattr(local_yaml, "resolve_default_log_dir", lambda: (log_dir, True))
+    monkeypatch.setattr(
+        local_yaml,
+        "resolve_default_log_dir_detail",
+        lambda: DefaultLogDir(log_dir, project_root=True),
+    )
     real_open = open
 
     def _open(
