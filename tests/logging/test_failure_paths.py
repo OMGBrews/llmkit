@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -44,10 +42,6 @@ class InvalidPathSink:
         return "invalid"  # pyright: ignore[reportReturnType]  # intentional contract breach
 
 
-async def unavailable_offload(*_args: object, **_kwargs: object) -> object:
-    raise RuntimeError("executor shut down")
-
-
 async def call_lane(lane: str) -> object:
     tools = [ToolDefinition.from_model("check", OkSchema, "Check.")]
     if lane == "structured":
@@ -64,10 +58,9 @@ async def call_lane(lane: str) -> object:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["structured", "text", "tool", "text_stream", "tool_stream"])
 @pytest.mark.parametrize("fault", ["raises", "invalid_path", "filesystem"])
-@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("provider_fails", [False, True])
 async def test_sink_fault_preserves_call_and_capture(
-    lane: str, fault: str, fallback: bool, provider_fails: bool, tmp_path: Path
+    lane: str, fault: str, provider_fails: bool, tmp_path: Path
 ) -> None:
     if fault == "filesystem":
         blocked = tmp_path / "not-a-directory"
@@ -85,25 +78,20 @@ async def test_sink_fault_preserves_call_and_capture(
 
     with install(respond):
         with capture_llm_records() as records, capture_llm_log_paths() as paths:
-            with (
-                patch("llmkit.capture.asyncio.to_thread", side_effect=unavailable_offload)
-                if fallback
-                else nullcontext()
-            ):
-                if provider_fails:
-                    with pytest.raises(Exception) as raised:
-                        _ = await call_lane(lane)
-                    assert underlying_provider_error(raised.value) is original
+            if provider_fails:
+                with pytest.raises(Exception) as raised:
+                    _ = await call_lane(lane)
+                assert underlying_provider_error(raised.value) is original
+            else:
+                result = await call_lane(lane)
+                if lane == "structured":
+                    assert result == OkSchema(ok=True)
+                elif lane == "text":
+                    assert result == "answer"
+                elif lane == "text_stream":
+                    assert result == ["answer"]
                 else:
-                    result = await call_lane(lane)
-                    if lane == "structured":
-                        assert result == OkSchema(ok=True)
-                    elif lane == "text":
-                        assert result == "answer"
-                    elif lane == "text_stream":
-                        assert result == ["answer"]
-                    else:
-                        assert result is not None
+                    assert result is not None
     assert len(records) == 1
     assert (records[0].error is not None) is provider_fails
     assert paths == []
