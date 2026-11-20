@@ -28,8 +28,11 @@ from typing import Literal
 #: ``housekeeping`` — the file was written but retention pruning failed;
 #: ``sink_raised`` — a configured sink raised out of its write method;
 #: ``contract`` — a sink's ``write_returning_path`` returned neither a path nor
-#: ``None``.
-FailureStage = Literal["write", "index", "housekeeping", "sink_raised", "contract"]
+#: ``None``;
+#: ``transform`` — the built-in sink's ``transform`` hook raised, or returned
+#: neither a record nor ``None``, so nothing was written. Its ``error`` is the
+#: exception type name only, never the message, which may quote record data.
+FailureStage = Literal["write", "index", "housekeeping", "sink_raised", "contract", "transform"]
 
 #: What kind of sink the health snapshot describes.
 SinkKind = Literal["disabled", "builtin", "custom"]
@@ -44,7 +47,8 @@ class LoggingFailure:
 
     Attributes:
         stage: Where the failure happened (see the ``FailureStage`` values).
-        error: ``"ExceptionType: message"`` text of the underlying exception.
+        error: ``"ExceptionType: message"`` text of the underlying exception;
+            for the ``transform`` stage, the exception type name alone.
         feature: The failed record's ``feature``.
         label: The failed record's ``label``.
         occurred_at: Timezone-aware UTC time the failure was recorded.
@@ -75,9 +79,13 @@ class LoggingHealth:
             llmkit cannot see past that return, so this is not evidence that
             the record was persisted.
         failed: Records lost to a detected failure: the built-in write failed,
-            a sink raised, or a sink broke its return contract.
+            its ``transform`` hook failed, a sink raised, or a sink broke its
+            return contract.
         degraded: Written records whose index line or retention housekeeping
             failed afterwards. Each is also counted in ``written``.
+        skipped: Records the built-in sink's ``transform`` hook chose not to
+            write by returning ``None``. Counted nowhere else: a skip is
+            neither a write, a failure nor a drop.
         queued: Waiting records, including snapshot preparation reservations.
         in_flight: Records currently inside a sink write.
         dropped: Records rejected or discarded before a sink write.
@@ -102,23 +110,33 @@ class LoggingHealth:
     unavailable: int = 0
     wait_timeouts: int = 0
     preparation_failed: int = 0
+    skipped: int = 0
 
 
 @dataclass(frozen=True)
 class WriteOutcome:
     """What one built-in write produced, returned instead of swallowed.
 
-    ``path`` is the written file, or ``None`` when the write failed with
-    ``write_error``. ``post_write_failures`` lists the index and housekeeping
+    ``path`` is the written file, or ``None`` when nothing was written:
+    either the write failed with ``write_error`` at ``failure_stage``, or
+    ``skipped`` is true because the sink's ``transform`` hook returned
+    ``None``. ``post_write_failures`` lists the index and housekeeping
     failures that followed a successful write, in the order they occurred.
     """
 
     path: Path | None
     write_error: Exception | None = None
     post_write_failures: tuple[tuple[FailureStage, Exception], ...] = ()
+    skipped: bool = False
+    failure_stage: FailureStage = "write"
 
 
-def _describe(exc: BaseException) -> str:
+def _describe(stage: FailureStage, exc: BaseException) -> str:
+    # A transform's exception message may quote the record it was redacting,
+    # so that stage keeps the type alone; formatting it also never runs the
+    # exception's own __str__.
+    if stage == "transform":
+        return type(exc).__name__
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -143,6 +161,7 @@ class HealthState:
     _unavailable: int = 0
     _wait_timeouts: int = 0
     _preparation_failed: int = 0
+    _skipped: int = 0
     _last_failure: LoggingFailure | None = None
     _last_success_at: datetime | None = None
     _drop_warned: bool = False
@@ -154,7 +173,7 @@ class HealthState:
         # Exception formatting may run arbitrary sink code: never hold _lock.
         return LoggingFailure(
             stage=stage,
-            error=_describe(exc),
+            error=_describe(stage, exc),
             feature=feature,
             label=label,
             occurred_at=datetime.now(UTC),
@@ -178,6 +197,11 @@ class HealthState:
         with self._lock:
             self._handed_off += 1
             self._last_success_at = datetime.now(UTC)
+
+    def record_skipped(self) -> None:
+        """Count a record the ``transform`` hook skipped; nothing else changes."""
+        with self._lock:
+            self._skipped += 1
 
     def record_failed(
         self, stage: FailureStage, exc: BaseException, feature: str, label: str | None
@@ -243,6 +267,7 @@ class HealthState:
                 unavailable=self._unavailable,
                 wait_timeouts=self._wait_timeouts,
                 preparation_failed=self._preparation_failed,
+                skipped=self._skipped,
                 last_failure=self._last_failure,
                 last_success_at=self._last_success_at,
             )

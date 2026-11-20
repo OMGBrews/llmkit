@@ -2,7 +2,7 @@
 
 Stays one class. Its methods share the frozen-once log directory, the
 once-resolved retention bound, the announce latch, the prune throttle and
-three warn-once latches, so carving write / index / retention apart would
+four warn-once latches, so carving write / index / retention apart would
 relocate the coupling rather than reduce it.
 """
 
@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import inspect
 import json
 import logging
 import os
 import re
 import threading
 import time
+import traceback
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast, override
@@ -72,6 +75,20 @@ class _NotPassed(enum.Enum):
 
 _NOT_PASSED = _NotPassed.TOKEN
 
+# The ``transform`` hook's type: return the record to write, or ``None`` to
+# skip it.
+_RecordTransform = Callable[[LLMCallRecord], "LLMCallRecord | None"]
+
+
+class _TransformContractError(TypeError):
+    """A ``transform`` hook returned neither an :class:`LLMCallRecord` nor ``None``.
+
+    Its own type, like the registry's ``_SinkContractError``, keeps the
+    warn-once latch's signature distinct from a hook that raises a genuine
+    ``TypeError``. It carries no message: the caller words the warning.
+    """
+
+
 # One process-wide latch for an invalid LLMKIT_LOG_RETENTION_DAYS, so every
 # sink that reads the same bad value does not warn again.
 _retention_env_latch = OnceLatch()
@@ -100,6 +117,12 @@ def _parse_retention_env(value: str) -> int | None:
     raise ValueError(
         f"{LOG_RETENTION_ENV_VAR} must be a whole number of days >= 1 or 'forever', got {value!r}"
     )
+
+
+def _callable_name(func: object) -> str:
+    """A callable's qualified name for a warning, without calling its ``__repr__``."""
+    name = getattr(func, "__qualname__", None)
+    return name if isinstance(name, str) else type(func).__qualname__
 
 
 def _publish(part: Path, final: Path) -> bool:
@@ -202,6 +225,24 @@ class LocalYamlLogSink:
     Both bounds take a *positive* value or ``None``; ``0`` and negatives are
     rejected at construction rather than given one of their two plausible
     meanings (see :meth:`__init__`).
+
+    ``transform`` rewrites or skips each record before it is serialized, the
+    supported way to redact what reaches disk while keeping the built-in
+    health counts, path capture and warnings. It runs inside every write
+    through this sink (the delivery worker, :func:`~llmkit.logging.write_llm_log`
+    and the write methods called directly), and the filename, summary header,
+    YAML body and index line all come from the record it returns. It should
+    return a new record, typically ``dataclasses.replace(record, ...)``,
+    rather than mutate the one it receives: that object is shared with
+    :func:`~llmkit.capture.capture_llm_records`, which keeps returning the
+    original. Returning ``None`` writes nothing and counts the record as
+    ``skipped`` in :func:`~llmkit.logging.get_logging_health`. A hook that
+    raises an :class:`Exception`, or returns anything else, writes nothing
+    and counts as a ``failed`` record at the ``transform`` stage; its warning
+    and the health entry name the exception type (and, for a raise, where
+    it was raised) but never its message or traceback, which may quote the
+    data being redacted. ``feature`` and ``label`` are identifiers, not
+    redactable content: failure reports always carry the original values.
     """
 
     def __init__(
@@ -210,6 +251,7 @@ class LocalYamlLogSink:
         *,
         retention_days: int | None | _NotPassed = _NOT_PASSED,
         max_index_bytes: int | None = DEFAULT_MAX_INDEX_BYTES,
+        transform: Callable[[LLMCallRecord], LLMCallRecord | None] | None = None,
     ) -> None:
         """Configure the sink, validating the growth bounds eagerly.
 
@@ -222,6 +264,11 @@ class LocalYamlLogSink:
         attribute, so assigning ``sink.max_index_bytes = 0`` later reopens the
         hole. Configure the sink once, at startup, as the module docstring
         describes.
+
+        ``transform`` is fixed here and has no public attribute; see the
+        class docstring for what it does. It must be a synchronous callable:
+        it runs on the thread doing the write, which has no event loop to
+        await a coroutine on.
 
         Raises:
             ValueError: if ``retention_days`` or ``max_index_bytes`` is set to
@@ -237,7 +284,10 @@ class LocalYamlLogSink:
             TypeError: if ``log_dir`` is neither a :class:`~pathlib.Path` nor
                 ``None``. A ``str`` would otherwise fail deep in the first
                 write, where the best-effort swallow turns "every log is
-                lost" into one warning.
+                lost" into one warning. Also if ``transform`` is neither
+                ``None`` nor a callable, or is an ``async`` function, whose
+                un-awaited coroutine would otherwise count every record as
+                a failed transform.
         """
         if retention_days is not _NOT_PASSED:
             _validate_retention_days(retention_days)
@@ -255,6 +305,20 @@ class LocalYamlLogSink:
             raise TypeError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
                 f"log_dir must be a Path or None, got {type(log_dir).__name__}"
             )
+        if transform is not None:
+            if not callable(transform):
+                raise TypeError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
+                    f"transform must be a callable or None, got {type(transform).__name__}"
+                )
+            # An object whose __call__ is async is just as unusable as an
+            # async function, and iscoroutinefunction() does not look there.
+            if inspect.iscoroutinefunction(transform) or inspect.iscoroutinefunction(
+                type(transform).__call__
+            ):
+                raise TypeError(
+                    "transform must be a synchronous function; an async one cannot be "
+                    + "awaited on the thread that writes the log"
+                )
         self._log_dir: Path | None = None if log_dir is None else log_dir.absolute()
         # Until resolved, a sink built without retention_days still owes the
         # LLMKIT_LOG_RETENTION_DAYS read; the lock makes that read happen once.
@@ -285,6 +349,8 @@ class LocalYamlLogSink:
         self._yaml_latch: OnceLatch = OnceLatch()
         self._index_latch: OnceLatch = OnceLatch()
         self._prune_latch: OnceLatch = OnceLatch()
+        self._transform: _RecordTransform | None = transform
+        self._transform_latch: OnceLatch = OnceLatch()
 
     @property
     def retention_days(self) -> int | None:
@@ -494,9 +560,19 @@ class LocalYamlLogSink:
 
         Best-effort means *any* :class:`Exception` is swallowed (with a
         warning); such a failure also removes the temporary file.
+
+        With a ``transform`` hook, it runs first and everything above applies
+        to the record it returns. A skip returns ``skipped=True`` with no
+        path; a failed hook returns ``write_error`` at the ``transform``
+        stage, and nothing is written in either case.
         """
         if self._retention_pending:
             self._resolve_retention()
+        if self._transform is not None:
+            transformed = self._apply_transform(self._transform, record)
+            if isinstance(transformed, WriteOutcome):
+                return transformed
+            record = transformed
         try:
             self._ensure_log_dir()
             ts = record.started_at.strftime("%Y-%m-%dT%H-%M-%S-%f")
@@ -646,6 +722,78 @@ class LocalYamlLogSink:
         if prune_error is not None:
             post_write_failures.append(("housekeeping", prune_error))
         return WriteOutcome(path=filepath, post_write_failures=tuple(post_write_failures))
+
+    def _apply_transform(
+        self, transform: _RecordTransform, record: LLMCallRecord
+    ) -> LLMCallRecord | WriteOutcome:
+        """Run the ``transform`` hook: the record to write, or the outcome to return.
+
+        Any :class:`Exception` from the hook, and a return that is neither a
+        record nor ``None``, is a ``transform`` failure. Its warning carries
+        the exception type and where it was raised, never the message or a
+        traceback, at every level: both can quote the very data the hook
+        exists to keep off disk. ``BaseException`` propagates, as it does
+        from the write itself.
+        """
+        raised: Exception | None = None
+        result: LLMCallRecord | None = None
+        try:
+            result = transform(record)
+        except Exception as exc:
+            raised = exc
+        if raised is not None:
+            # Reported only after the except block has ended: a stdlib handler
+            # that fails in emit() prints the exception being handled, chained
+            # context included, so warning inside the block would print the
+            # hook's own message and traceback to stderr after all.
+            frames = traceback.extract_tb(raised.__traceback__)
+            # frames[0] is this method; the innermost frame is where it was
+            # raised. A hook with no Python frame of its own (a builtin that
+            # raised) is located by its name instead.
+            where = (
+                f"{frames[-1].name} ({frames[-1].filename}:{frames[-1].lineno})"
+                if len(frames) > 1
+                else _callable_name(transform)
+            )
+            self._warn_transform_failed(
+                raised,
+                "transform raised %s at %s for %s/%s; the record was not written",
+                type(raised).__name__,
+                where,
+                record.feature,
+                record.label,
+            )
+            return WriteOutcome(path=None, write_error=raised, failure_stage="transform")
+        if result is None:
+            self._transform_latch.succeeded()
+            return WriteOutcome(path=None, skipped=True)
+        if not isinstance(result, LLMCallRecord):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard on a user callable's return
+            error = _TransformContractError()  # pyright: ignore[reportUnreachable]  # reachable from untyped callables
+            self._warn_transform_failed(
+                error,
+                "transform %s returned %s, not an LLMCallRecord or None, for %s/%s; "
+                + "the record was not written",
+                _callable_name(transform),
+                type(result).__name__,
+                record.feature,
+                record.label,
+            )
+            return WriteOutcome(path=None, write_error=error, failure_stage="transform")
+        self._transform_latch.succeeded()
+        return result
+
+    def _warn_transform_failed(self, exc: Exception, message: str, *args: object) -> None:
+        """One WARNING per new failure type, DEBUG for repeats; never ``exc_info``."""
+        if self._transform_latch.should_warn(exc):
+            _ = report(
+                logger,
+                logging.WARNING,
+                message + " (repeats logged at DEBUG)",
+                *args,
+                stacklevel=2,
+            )
+        else:
+            _ = report(logger, logging.DEBUG, message, *args, stacklevel=2)
 
     @staticmethod
     def _summary_header(record: LLMCallRecord) -> str:
