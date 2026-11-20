@@ -33,6 +33,11 @@ concurrency on one loop (LiteLLM's intended mode), with the per-provider
 concurrency cap enforced inside the async path by ``GlobalRateLimiter``'s
 now-shared async semaphore (keyed on ``L``).
 
+**Interrupts on the loop thread.** A :class:`KeyboardInterrupt` or
+:class:`SystemExit` raised by code running on ``L`` is passed to the sync
+caller that submitted it, and ``L`` keeps running on the same thread, so later
+sync calls are unaffected (see :func:`_loop_main`).
+
 **Reentrant calls.** A loop already running in the calling thread — an async
 framework calling a ``*_sync`` helper, or a coroutine running on ``L`` itself
 that calls back into sync code — splits into two cases:
@@ -126,11 +131,34 @@ def _loop_main(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
     stop it settles async generators and closes the loop — the close must happen
     on this thread, after ``run_forever`` returns, so it pairs with the
     drain-and-cancel :func:`shutdown` runs *before* stopping the loop.
+
+    A :class:`KeyboardInterrupt` or :class:`SystemExit` raised by code on the
+    loop (a host callback or tool calling ``sys.exit()``, a library re-raising
+    an interrupt) does not end the thread. asyncio lets exactly those two
+    escape ``run_forever``, and only after a task raising one has stored it as
+    its outcome and scheduled its done-callbacks, so restarting ``run_forever``
+    runs ``_submit_to_loop``'s relay and the waiting caller receives the
+    interrupt unchanged. One raised by a plain callback has no caller; it is
+    logged at debug. Without the restart the loop would be closed while this
+    module still hands it out, and every later sync call in the process would
+    fail or hang.
     """
     asyncio.set_event_loop(loop)
     ready.set()
     try:
-        loop.run_forever()
+        while True:
+            try:
+                loop.run_forever()
+            except (KeyboardInterrupt, SystemExit):
+                # The task holds the exception and its relay is already
+                # scheduled; the next turn of the loop delivers it. A
+                # ``loop.stop`` queued by ``shutdown`` still ends the restarted
+                # run normally.
+                logger.debug(
+                    "contained an interrupt raised on the sync loop thread", exc_info=True
+                )
+                continue
+            break
     finally:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())

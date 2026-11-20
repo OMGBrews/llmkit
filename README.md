@@ -162,7 +162,9 @@ async def summarize() -> Summary:
 The two forms are the same call. They take the same arguments and give the
 same retries, logging and result; the sync form runs the async call on
 llmkit's own event loop and waits for it. Inside async code, await the async
-form.
+form. A `KeyboardInterrupt` or `SystemExit` raised by code on that loop, such
+as a callback calling `sys.exit()`, is raised to the sync caller, and the loop
+keeps running for later sync calls.
 
 Every call is logged with nothing to set up: one YAML file per attempt lands in
 `data/llm-logs/` under the nearest directory holding a `pyproject.toml` or

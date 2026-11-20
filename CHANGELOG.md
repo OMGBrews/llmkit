@@ -39,6 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (or `"<Type>: <message>"`) and raised. Abandonment and cancellation keep the
   abandoned-stream marker.
 
+- **An interrupt on the sync loop no longer breaks later sync calls.** A
+  `KeyboardInterrupt` or `SystemExit` raised by code running on llmkit's sync
+  loop, through a `*_sync` call or a step of a sync stream, ended the
+  `llmkit-sync-loop` thread. The caller received the interrupt, but every
+  later sync call in the process then raised `RuntimeError: Event loop is
+  closed` or waited forever, and exit printed the same error. The interrupt
+  still reaches the caller, and the loop now keeps running on the same thread.
+
 - **A lone surrogate no longer loses a record.** A lone surrogate (for
   example from a `surrogateescape` file name in an exception message) in a
   record's `error` lost its `index.jsonl` line, and one in `feature` or
