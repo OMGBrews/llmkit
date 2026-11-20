@@ -4,10 +4,14 @@ The five families (structured, text, streamed text, tool, streamed tool) differ
 in what one *attempt* is; they agree on everything around it. That agreement
 lives here so the next family added does not become another copy:
 
-* :func:`prepare_call` — the per-call resolution every family does before its
-  first attempt: merge the options, build the provider exactly once, and mint
+* :func:`resolve_call` — the per-call resolution every family does before its
+  first attempt: merge the options and build the provider exactly once, raising
+  every refusal it owns before the call is claimed;
+* :func:`prepare_call` — :func:`resolve_call` followed by the claim, which mints
   the correlation id — or, inside a :func:`~llmkit.retry.with_retries` loop,
-  join the loop's logical call;
+  joins the loop's logical call — for the text, streamed text and structured
+  families; the two tool families call :func:`resolve_call`, run their own
+  guards, and then claim, so a refused call counts no attempt;
 * :func:`run_with_policy` — the :func:`~llmkit.retry.with_retries` invocation,
   which differs between families only in which errors are charged to the
   validation budget;
