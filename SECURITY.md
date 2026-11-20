@@ -52,7 +52,9 @@ network service. The most security-relevant surfaces are:
 - **Log retention** defaults to 30 days, with best-effort cleanup after
   successful writes, at most once per hour. Inactive applications can leave
   old logs indefinitely, and deletion failures can also leave files behind.
-  The active `index.jsonl` is not age-pruned. Applications requiring a fixed
+  The active `index.jsonl` is not age-pruned, and cleanup removes only files
+  whose names llmkit generates, never other files in the log directory.
+  Applications requiring a fixed
   deletion deadline need their own cleanup policy. `LLMKIT_LOG_RETENTION_DAYS`
   changes the default without a code change; an invalid value turns age
   pruning off rather than deleting anything. See

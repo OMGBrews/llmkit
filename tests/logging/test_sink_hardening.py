@@ -12,9 +12,12 @@ Pins the July-2026 audit fixes to :class:`LocalYamlLogSink` /
   (POSIX), with a pre-existing directory never re-chmodded.
 * **Warn-once latch** — a persistently broken sink warns once (per failure
   signature) and drops to DEBUG, re-arming on success/reconfigure.
-* **Retention** — aged YAMLs and rotated index generations are pruned and an
-  oversized ``index.jsonl`` rotates losslessly, throttled to hourly; the
-  first successful write announces the directory and policy at INFO.
+* **Retention** — aged records and rotated index generations are pruned,
+  only by the names llmkit generates (a co-located ``docker-compose.yaml`` or
+  ``index-notes.jsonl`` survives), and an oversized ``index.jsonl`` rotates
+  losslessly, with a rotation another process already made counted as done,
+  throttled to hourly; the first successful write announces the directory and
+  policy at INFO.
 * **Whole files only** — a record is written under a hidden ``.part`` name
   and published without clobbering, so a write cut short never leaves a
   ``*.yaml``; retention sweeps stale ``.part`` files, and lone surrogates in a
@@ -54,6 +57,7 @@ from llmkit import (
 )
 from llmkit.capture import record_call
 from llmkit.logging import INDEX_FILENAME, write_llm_log
+from llmkit.logging._paths import is_prunable_name
 from tests._support import make_record as _record
 
 _POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="permission bits are POSIX-only")
@@ -686,6 +690,139 @@ def test_rotated_index_generations_age_out(tmp_path: Path) -> None:
     _age(rotated, days=40)
     assert LocalYamlLogSink(tmp_path, retention_days=30).write_returning_path(_record()) is not None
     assert not rotated.exists()
+
+
+def test_prune_leaves_files_llmkit_did_not_name(tmp_path: Path) -> None:
+    """Retention deletes only the names llmkit generates: a co-located
+    project file of a ``*.yaml`` or ``index-*.jsonl`` shape outlives the
+    cutoff, while llmkit's own expired record, rotated index and ``.part``
+    file in the same directory are still removed."""
+    foreign = [
+        "docker-compose.yaml",
+        "mkdocs.yaml",
+        "index-notes.jsonl",
+        "trace_2026-06-01_lookup.yaml",
+        ".settings.yaml.part",
+        # Pre-v0.2.0 records carried no uuid suffix; they are not matched.
+        "2026-06-01T00-00-00-000000_old_call.yaml",
+        INDEX_FILENAME,
+    ]
+    own = [
+        "2026-06-01T00-00-00-000000_old_call_deadbeef.yaml",
+        "index-2026-06-01T00-00-00-000000.jsonl",
+        ".2026-06-01T00-00-00-000000_old_call_deadbeef.yaml.part",
+    ]
+    for name in (*foreign, *own):
+        path = tmp_path / name
+        _ = path.write_text("# kept or not\n")
+        _age(path, days=40)
+    sink = LocalYamlLogSink(tmp_path, retention_days=30, max_index_bytes=None)
+    # Housekeeping alone, not a write: a write appends to ``index.jsonl``
+    # first and would refresh the aged active index's mtime before the prune.
+    assert sink._maybe_prune() is None  # private: the housekeeping verdict under test
+    assert [name for name in foreign if not (tmp_path / name).exists()] == []
+    assert [name for name in own if (tmp_path / name).exists()] == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml",
+        "2026-06-01T00-00-00-000000_my_feature_with_underscores_unlabeled_0123abcd.yaml",
+        "2026-06-01T00-00-00-000000_résumé_étape_0123abcd.yaml",
+        ".2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml.part",
+        "index-2026-06-01T00-00-00-000000.jsonl",
+    ],
+)
+def test_generated_shapes_are_prunable(name: str) -> None:
+    assert is_prunable_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        INDEX_FILENAME,
+        ".gitignore",
+        "docker-compose.yaml",
+        "index-notes.jsonl",
+        "index-2026-06-01.jsonl",
+        "2026-06-01T00-00-00-000000_old_call.yaml",
+        "2026-06-01T00-00-00-000000_extraction_summary_0123ABCD.yaml",
+        "2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml.bak",
+        "notes-2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml",
+        "2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml.part",
+        ".2026-06-01T00-00-00-000000_extraction_summary_0123abcd.yaml",
+    ],
+)
+def test_other_shapes_are_not_prunable(name: str) -> None:
+    assert not is_prunable_name(name)
+
+
+def test_every_name_the_sink_generates_is_prunable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write path, the ``.part`` file and the rotation all produce names
+    the prune patterns recognise, so a change to the generated shape cannot
+    silently strand files that retention would no longer delete."""
+    sink = LocalYamlLogSink(tmp_path, retention_days=None, max_index_bytes=10)
+    record_path = sink.write_returning_path(
+        _record(feature="my_feature/v2", label="a label with spaces")
+    )
+    assert record_path is not None
+    [rotated] = list(tmp_path.glob("index-*.jsonl"))  # the first write's prune rotated it
+    real_dump = yaml.dump
+
+    def _cut_short(_data: object, stream: object, **kwargs: object) -> None:
+        real_dump({"timestamp": "half"}, stream, **kwargs)  # pyright: ignore[reportArgumentType, reportCallIssue]  # forwarding the sink's own kwargs
+        raise _Interrupted
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.yaml.dump", _cut_short)
+    with pytest.raises(_Interrupted):
+        _ = sink.write_returning_path(_record())
+    [part] = list(tmp_path.glob(".*.part"))
+    generated = {record_path.name, rotated.name, part.name}
+    assert {name for name in generated if not is_prunable_name(name)} == set()
+
+
+def test_rotation_already_done_by_another_process_is_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two processes sharing a directory can both see an oversized index;
+    when the other one renames it first, this rotation's rename finds no
+    source, and that is success — the bound is already enforced."""
+    _ = (tmp_path / INDEX_FILENAME).write_text('{"file": "a.yaml"}\n' * 4)
+    real_replace = os.replace
+
+    def _other_process_wins(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(src).name == INDEX_FILENAME:
+            # The other process renames the index first ...
+            real_replace(src, tmp_path / "index-2026-06-01T00-00-00-000001.jsonl")
+        real_replace(src, dst)  # ... so this rename genuinely finds nothing.
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.replace", _other_process_wins)
+    sink = LocalYamlLogSink(tmp_path, retention_days=None, max_index_bytes=10)
+    with caplog.at_level(logging.DEBUG, logger="llmkit"):
+        assert sink._maybe_prune() is None  # private: the housekeeping verdict under test
+    assert [r for r in caplog.records if "prune" in r.getMessage()] == []
+    assert not (tmp_path / INDEX_FILENAME).exists()
+    assert len(list(tmp_path.glob("index-*.jsonl"))) == 1
+
+
+def test_other_rotation_errors_still_count_as_housekeeping_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a vanished source is treated as another process's rotation; any
+    other failure to rename keeps surfacing."""
+    _ = (tmp_path / INDEX_FILENAME).write_text('{"file": "a.yaml"}\n' * 4)
+
+    def _denied(_src: object, _dst: object) -> None:
+        raise PermissionError("rename denied")
+
+    monkeypatch.setattr("llmkit.logging.local_yaml.os.replace", _denied)
+    sink = LocalYamlLogSink(tmp_path, retention_days=None, max_index_bytes=10)
+    assert isinstance(
+        sink._maybe_prune(), PermissionError
+    )  # private: the housekeeping verdict under test
 
 
 def test_max_index_bytes_none_never_rotates(tmp_path: Path) -> None:
