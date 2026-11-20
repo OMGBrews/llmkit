@@ -1269,6 +1269,8 @@ def redact(record: LLMCallRecord) -> LLMCallRecord | None:
         response="[redacted]",
         partial_text=None,
         tool_calls=None,
+        # "Type: message" -> "Type": the message can quote the prompt.
+        error=record.error and record.error.split(":", 1)[0],
     )
 
 configure_llm_logging(LocalYamlLogSink(transform=redact))
@@ -1279,7 +1281,7 @@ The transform is part of the sink, so it applies to every write through it: mana
 - **What callers see.** `capture_llm_records()` returns the original, unredacted record.
 - **A skip.** Returning `None` writes no file and no index line, returns no path, and counts in `get_logging_health().skipped`, nowhere else. Nothing is logged.
 - **A failure.** A transform that raises an `Exception`, or returns something that is neither a record nor `None`, writes nothing: the untransformed record never reaches disk. The record counts as `failed` at the `transform` stage. The warning names the exception type and where it was raised, but never its message or traceback, which may quote the data being redacted. The first failure of each exception type warns; repeats are logged at DEBUG until a transform succeeds. `last_failure.error` holds the type name alone.
-- **Identifiers.** `feature` and `label` appear in file names, warnings and `last_failure` as the caller passed them, even when the transform changes them. Keep sensitive data out of them.
+- **Identifiers.** A transform can change `feature` and `label`, and the file name, header and index line then use its values. A failed transform has no result, so its warning and `last_failure` name the record by the values the caller passed. Treat both as identifiers and keep sensitive data out of them.
 - **Constraints.** The transform must be synchronous; a non-callable or an `async` function is rejected with `TypeError` at construction. It runs on the thread doing the write, the delivery worker for a managed call, so a slow transform can push a write past the [delivery wait](#capturing-call-records) and leave `capture_llm_log_paths()` without that path.
 
 A sink that wraps `LocalYamlLogSink` to filter records still works, but it is a custom sink: health counts its records as handoffs and captures no paths.

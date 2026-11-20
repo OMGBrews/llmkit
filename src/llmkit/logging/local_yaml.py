@@ -310,7 +310,11 @@ class LocalYamlLogSink:
                 raise TypeError(  # pyright: ignore[reportUnreachable]  # reachable from untyped callers
                     f"transform must be a callable or None, got {type(transform).__name__}"
                 )
-            if inspect.iscoroutinefunction(transform):
+            # An object whose __call__ is async is just as unusable as an
+            # async function, and iscoroutinefunction() does not look there.
+            if inspect.iscoroutinefunction(transform) or inspect.iscoroutinefunction(
+                type(transform).__call__
+            ):
                 raise TypeError(
                     "transform must be a synchronous function; an async one cannot be "
                     + "awaited on the thread that writes the log"
@@ -731,10 +735,18 @@ class LocalYamlLogSink:
         exists to keep off disk. ``BaseException`` propagates, as it does
         from the write itself.
         """
+        raised: Exception | None = None
+        result: LLMCallRecord | None = None
         try:
             result = transform(record)
         except Exception as exc:
-            frames = traceback.extract_tb(exc.__traceback__)
+            raised = exc
+        if raised is not None:
+            # Reported only after the except block has ended: a stdlib handler
+            # that fails in emit() prints the exception being handled, chained
+            # context included, so warning inside the block would print the
+            # hook's own message and traceback to stderr after all.
+            frames = traceback.extract_tb(raised.__traceback__)
             # frames[0] is this method; the innermost frame is where it was
             # raised. A hook with no Python frame of its own (a builtin that
             # raised) is located by its name instead.
@@ -744,19 +756,19 @@ class LocalYamlLogSink:
                 else _callable_name(transform)
             )
             self._warn_transform_failed(
-                exc,
+                raised,
                 "transform raised %s at %s for %s/%s; the record was not written",
-                type(exc).__name__,
+                type(raised).__name__,
                 where,
                 record.feature,
                 record.label,
             )
-            return WriteOutcome(path=None, write_error=exc, failure_stage="transform")
+            return WriteOutcome(path=None, write_error=raised, failure_stage="transform")
         if result is None:
             self._transform_latch.succeeded()
             return WriteOutcome(path=None, skipped=True)
         if not isinstance(result, LLMCallRecord):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard on a user callable's return
-            error = _TransformContractError()
+            error = _TransformContractError()  # pyright: ignore[reportUnreachable]  # reachable from untyped callables
             self._warn_transform_failed(
                 error,
                 "transform %s returned %s, not an LLMCallRecord or None, for %s/%s; "

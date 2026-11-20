@@ -22,6 +22,7 @@ import pytest
 import yaml
 
 from llmkit import (
+    NO_RETRY,
     LLMCallRecord,
     LocalYamlLogSink,
     capture_llm_log_paths,
@@ -56,6 +57,7 @@ def _redact(record: LLMCallRecord) -> LLMCallRecord:
         partial_text=None,
         requests=[],
         tool_calls=None,
+        error=record.error and record.error.split(":", 1)[0],
         label="redacted",
     )
 
@@ -255,6 +257,62 @@ def test_a_raising_transform_writes_nothing_and_hides_its_message(
     assert "not written" in message
 
 
+def _helper_that_raises(record: LLMCallRecord) -> LLMCallRecord:
+    raise LookupError(record.prompt)
+
+
+def _hook_calling_a_helper(record: LLMCallRecord) -> LLMCallRecord:
+    return _helper_that_raises(record)
+
+
+def test_the_location_is_the_innermost_frame_not_the_hook(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="llmkit.logging")
+    sink = LocalYamlLogSink(tmp_path, transform=_hook_calling_a_helper)
+
+    sink.write(make_record(prompt=SECRET))
+
+    [warning] = _llmkit_logs(caplog)
+    raise_line = _helper_that_raises.__code__.co_firstlineno + 1
+    assert f"_helper_that_raises ({__file__}:{raise_line})" in warning.getMessage()
+    assert "_hook_calling_a_helper" not in warning.getMessage()
+
+
+class _BrokenStream:
+    def write(self, _text: str) -> int:
+        raise ValueError("stream closed")
+
+    def flush(self) -> None:
+        pass
+
+
+def test_a_failing_handler_does_not_print_the_transform_exception(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stdlib handler that fails in emit() prints the exception being handled,
+    chained context included, so the warning must not be emitted while the
+    hook's exception is still being handled."""
+    caplog.set_level(logging.DEBUG, logger="llmkit.logging")
+    handler = logging.StreamHandler(_BrokenStream())
+    llmkit_logger = logging.getLogger("llmkit.logging")
+    llmkit_logger.addHandler(handler)
+    assert logging.raiseExceptions
+    try:
+        sink = LocalYamlLogSink(tmp_path, transform=_raise_value_error)
+        sink.write(make_record())  # WARNING
+        sink.write(make_record())  # DEBUG repeat
+    finally:
+        llmkit_logger.removeHandler(handler)
+
+    stderr = capsys.readouterr().err
+    assert "--- Logging error ---" in stderr  # the handler did fail, twice
+    assert stderr.count("--- Logging error ---") == 2
+    assert SECRET not in stderr
+    assert "_raise_value_error" not in stderr.split("Message:")[0]
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_transform_warnings_are_latched_per_type_and_rearmed_by_success(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -374,11 +432,17 @@ async def _async_transform(record: LLMCallRecord) -> LLMCallRecord:
     return record
 
 
+class _AsyncCallable:
+    async def __call__(self, record: LLMCallRecord) -> LLMCallRecord:
+        return record
+
+
 @pytest.mark.parametrize(
     ("transform", "match"),
     [
         ("not callable", "transform must be a callable or None, got str"),
         (_async_transform, "transform must be a synchronous function"),
+        (_AsyncCallable(), "transform must be a synchronous function"),
     ],
 )
 def test_a_bad_transform_is_rejected_before_any_state(
@@ -428,7 +492,15 @@ def test_the_readme_example_redacts_every_copy_and_skips_its_feature(tmp_path: P
         _ = text_llm_call_sync(SECRET, feature="demo", label="x")
         _ = text_llm_call_sync(SECRET, feature="medical-intake", label="y")
 
+    def _provider_rejects(_request: object) -> Reply:
+        raise ValueError(f"provider rejected message: {SECRET}")
+
+    with install(_provider_rejects), pytest.raises(Exception, match=SECRET):
+        _ = text_llm_call_sync(SECRET, feature="demo", label="z", retry=NO_RETRY)
+
     health = get_logging_health()
-    assert (health.written, health.skipped, health.failed) == (1, 1, 0)
-    assert len(_yaml_files(tmp_path)) == 1
+    assert (health.written, health.skipped, health.failed) == (2, 1, 0)
+    assert len(_yaml_files(tmp_path)) == 2
+    # The failed call is still logged as an error, by type.
+    assert any(line["error"] == "ValueError" for line in _index_lines(tmp_path))
     assert SECRET not in _all_disk_text(tmp_path)
