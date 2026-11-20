@@ -502,3 +502,63 @@ def test_racing_first_writes_both_land_after_one_warning(
     assert len(results) == 2
     assert all(path is not None and path.parent == state for path in results), results
     assert len(_warnings(caplog)) == 1
+
+
+def test_a_failure_after_a_racing_first_record_landed_does_not_move_the_sink(
+    project: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A record published in the project folder closes the fallback window at
+    once: a second first write failing there a moment later is reported as a
+    failed write, not turned into a move away from the folder that took it."""
+    caplog.set_level(logging.INFO, logger=_LOGGER)
+    project_dir = project / "data" / "llm-logs"
+    published = threading.Event()
+    real_publish = local_yaml._publish
+    real_open = open
+    failing_thread: list[threading.Thread] = []
+
+    def _slow_publish(part: Path, final: Path) -> bool:
+        result = real_publish(part, final)
+        published.set()
+        # Give the other writer time to fail before this one returns.
+        _ = threading.Event().wait(0.3)
+        return result
+
+    def _open(
+        file: Path,
+        mode: OpenTextMode,
+        *,
+        encoding: str,
+        opener: Callable[[str, int], int] | None = None,
+    ) -> TextIOWrapper:
+        if (
+            threading.current_thread() in failing_thread
+            and file.parent == project_dir
+            and file.name.endswith(".part")
+        ):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(file, mode, encoding=encoding, opener=opener)
+
+    monkeypatch.setattr(local_yaml, "_publish", _slow_publish)
+    monkeypatch.setattr(local_yaml, "open", _open, raising=False)
+    sink = LocalYamlLogSink(retention_days=None, max_index_bytes=None)
+    results: dict[str, Path | None] = {}
+
+    def _write(label: str) -> None:
+        results[label] = sink.write_returning_path(make_record(label=label))
+
+    first = threading.Thread(target=_write, args=("first",))
+    second = threading.Thread(target=_write, args=("second",))
+    failing_thread.append(second)
+    first.start()
+    assert published.wait(10)
+    second.start()
+    first.join(timeout=20)
+    second.join(timeout=20)
+
+    landed = results["first"]
+    assert landed is not None and landed.parent == project_dir
+    assert results["second"] is None
+    assert sink.log_dir == project_dir
+    assert not _state_dir().exists()
+    assert not any("instead" in w for w in _warnings(caplog))

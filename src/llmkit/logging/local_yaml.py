@@ -562,11 +562,22 @@ class LocalYamlLogSink:
             error, self._location_error = self._location_error, None
         return error
 
-    def _write_succeeded(self) -> None:
-        """Close the fallback window: a folder that took a record is kept."""
-        if self._may_fall_back:
-            with self._location_lock:
+    def _publish_closing_fallback(self, part: Path, final: Path, log_dir: Path) -> bool:
+        """:func:`_publish`, closing the fallback window in the same step.
+
+        While the sink may still fall back, the publish runs under the
+        location lock and a record landing in the sink's current folder
+        closes the window before the lock is released, so a writer failing
+        there a moment later cannot move the sink away from a folder that
+        has already taken a record. After that the lock is not taken.
+        """
+        if not self._may_fall_back:
+            return _publish(part, final)
+        with self._location_lock:
+            published = _publish(part, final)
+            if published and log_dir == self._log_dir:
                 self._may_fall_back = False
+            return published
 
     def _ensure_log_dir(self, log_dir: Path) -> None:
         """Create ``log_dir`` (``0o700``) if absent; seed ``.gitignore`` when owed.
@@ -750,7 +761,6 @@ class LocalYamlLogSink:
             return WriteOutcome(path=None, write_error=exc)
 
         self._yaml_latch.succeeded()
-        self._write_succeeded()
         self._announce_once(filepath.parent)
         # Best-effort index append, kept separate so an index failure can
         # never lose the per-call record that was just written successfully.
@@ -876,7 +886,7 @@ class LocalYamlLogSink:
                         allow_unicode=True,
                         width=120,
                     )
-                published = _publish(part, candidate)
+                published = self._publish_closing_fallback(part, candidate, log_dir)
             except FileExistsError:
                 # Suffix collision — regenerate and retry; never overwrite.
                 continue
