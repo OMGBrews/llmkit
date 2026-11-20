@@ -18,7 +18,8 @@ and a step of an ``iterate_sync`` stream):
 * the interrupt reaches the calling thread unchanged;
 * the *same* loop thread object is still alive afterwards;
 * a following sync call returns on it;
-* process exit after the interrupt is clean.
+* process exit after the interrupt is clean;
+* a restart never swallows the stop that ``shutdown`` queued.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ def _fresh_sync_loop() -> Iterator[None]:
         with sync_module._lock:
             sync_module._loop = None
             sync_module._thread = None
+            sync_module._stop_requested = None
     else:
         with contextlib.suppress(RuntimeError):
             sync_module.shutdown()
@@ -113,8 +115,41 @@ def test_an_interrupt_in_a_stream_step_reaches_the_caller_and_the_loop_survives(
     _assert_loop_survived(thread)
 
 
+def test_an_interrupt_in_the_same_turn_as_shutdowns_stop_still_ends_the_loop() -> None:
+    """A restart must not swallow the ``loop.stop`` that ``shutdown`` queued.
+
+    ``loop.stop`` only sets a flag that ``run_forever`` reads after the current
+    batch of callbacks. When a later callback in that batch raises an
+    interrupt, ``run_forever`` ends by exception and asyncio clears the flag.
+    A plain restart would then run forever and the loop would never close.
+    One callback that requests the stop the way ``_shutdown_loop`` does and
+    then raises reproduces that ordering deterministically.
+    """
+    loop = sync_module._ensure_loop()
+    thread = sync_module._thread
+    stop_requested = sync_module._stop_requested
+    assert thread is not None
+    assert stop_requested is not None
+    with sync_module._lock:
+        sync_module._loop = None
+        sync_module._thread = None
+        sync_module._stop_requested = None
+
+    def _stop_then_interrupt() -> None:
+        stop_requested.set()
+        loop.stop()
+        raise SystemExit("raised in the same turn as the stop")
+
+    _ = loop.call_soon_threadsafe(_stop_then_interrupt)
+    thread.join(_FOLLOW_UP_TIMEOUT)
+
+    assert not thread.is_alive()
+    assert loop.is_closed()
+
+
+# Interrupt once through one bridge, then exit at once: the exit hook is the
+# first thing to touch the loop afterwards, so a dead loop shows there.
 _EXIT_SCRIPT = """
-import asyncio
 import sys
 
 from llmkit.sync import iterate_sync, run_sync
@@ -131,36 +166,32 @@ async def _items():
     raise interrupt("stream")
 
 
-async def _answer():
-    return 42
-
-
 try:
-    run_sync(_raise())
+    if sys.argv[2] == "call":
+        run_sync(_raise(), timeout=5)
+    else:
+        stream = iterate_sync(_items())
+        next(stream)
+        next(stream)
 except interrupt:
-    pass
-try:
-    for _ in iterate_sync(_items()):
-        pass
-except interrupt:
-    pass
-print(run_sync(_answer(), timeout=5))
+    print("caught")
 """
 
 
+@pytest.mark.parametrize("bridge", ["call", "stream"])
 @pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=_IDS)
 def test_process_exit_after_an_interrupt_on_the_loop_is_clean(
-    interrupt: type[BaseException],
+    interrupt: type[BaseException], bridge: str
 ) -> None:
     proc = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(_EXIT_SCRIPT), interrupt.__name__],
+        [sys.executable, "-c", textwrap.dedent(_EXIT_SCRIPT), interrupt.__name__, bridge],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert proc.stdout.strip() == "42", proc.stdout + proc.stderr
+    assert proc.stdout.strip() == "caught", proc.stdout + proc.stderr
     assert "Event loop is closed" not in proc.stderr, proc.stderr
     assert "Exception in thread" not in proc.stderr, proc.stderr
     assert "never awaited" not in proc.stderr, proc.stderr
