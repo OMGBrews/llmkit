@@ -133,6 +133,26 @@ export VERTEXAI_PROJECT=my-gcp-project VERTEXAI_LOCATION=us
 uv run pytest tests/integration --run-live -k vertex
 ```
 
+## Adding an error to the log-folder fallback
+
+The default `LocalYamlLogSink` moves from an unusable project folder to the
+per-user state directory only on the `errno` values in `FALLBACK_ERRNOS`
+(`src/llmkit/logging/_paths.py`). An error belongs there only when it means
+the location can never hold this process's files; a transient or
+record-specific error (a full disk, a quota, too many open files, an
+over-long name) must keep failing visibly, because moving the logs would hide
+a problem the user has to fix. To add one:
+
+1. Reproduce the failure and note the `errno` it raises and where: creating
+   the folder, or opening the first record's file. Errors from any later step
+   never trigger the move.
+2. Add the `errno` constant to `FALLBACK_ERRNOS`.
+3. Add it to `_DECIDED_ERRNOS` in `tests/logging/test_default_dir_fallback.py`,
+   which runs every listed error through the fallback, and, where the error
+   can be produced on a real filesystem, add a case that produces it (as the
+   symlink cases do) and fails without the addition. Mention the error in the
+   README's [Where the logs go](README.md#where-the-logs-go).
+
 ## Conventions
 
 - Keep the public surface small — `llmkit` owns the call ergonomics, not transport.

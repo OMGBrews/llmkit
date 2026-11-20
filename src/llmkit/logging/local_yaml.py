@@ -1,8 +1,8 @@
 """The shipped default sink: one YAML file per call, plus an index line.
 
-Stays one class. Its methods share the frozen-once log directory, the
-once-resolved retention bound, the announce latch, the prune throttle and
-four warn-once latches, so carving write / index / retention apart would
+Stays one class. Its methods share the frozen-once log directory and its
+one-time fallback, the once-resolved retention bound, the announce latch, the
+prune throttle and four warn-once latches, so carving write / index / retention apart would
 relocate the coupling rather than reduce it.
 """
 
@@ -30,7 +30,9 @@ from llmkit._diagnostics import report
 from llmkit._latch import OnceLatch
 from llmkit.logging._health import FailureStage, WriteOutcome
 from llmkit.logging._paths import (
+    FALLBACK_ERRNOS,
     FILENAME_TIMESTAMP_FORMAT,
+    LOG_DIR_ENV_VAR,
     LOG_ENV_VAR,
     LOG_RETENTION_ENV_VAR,
     MAX_FILENAME_ATTEMPTS,
@@ -38,7 +40,8 @@ from llmkit.logging._paths import (
     is_prunable_name,
     oneline,
     open_private,
-    resolve_default_log_dir,
+    per_user_log_dir,
+    resolve_default_log_dir_detail,
     safe_path_component,
 )
 from llmkit.logging._yaml import LogSafeDumper
@@ -121,6 +124,32 @@ def _parse_retention_env(value: str) -> int | None:
     )
 
 
+class _AttemptStage:
+    """Whether a write attempt is at a step that tests the folder itself.
+
+    Set around creating the log folder and opening the record's temporary
+    file: a :data:`~llmkit.logging._paths.FALLBACK_ERRNOS` error there means
+    the folder cannot hold files, while the same error from any later step
+    (dumping, publishing) does not. A flag rather than a match on the
+    exception object, because the cleanup after a failed open can replace
+    the open's exception with its own, carrying the same ``errno``.
+    """
+
+    __slots__: tuple[str, ...] = ("at_location",)
+
+    def __init__(self) -> None:
+        self.at_location: bool = False
+
+
+# The fallback's one WARNING, a message and its arguments.
+_LocationWarning = tuple[str, tuple[object, ...]]
+
+
+def _error_text(exc: OSError) -> str:
+    """``"ExceptionType: reason"`` without the path the message repeats."""
+    return f"{type(exc).__name__}: {exc.strerror or exc}"
+
+
 def _callable_name(func: object) -> str:
     """A callable's qualified name for a warning, without calling its ``__repr__``."""
     name = getattr(func, "__qualname__", None)
@@ -197,6 +226,24 @@ class LocalYamlLogSink:
     ``.gitignore`` seed reduces accidental commits whoever created the
     directory (an existing ``.gitignore`` is left alone); forced staging is
     possible.
+
+    **The default location falls back once.** When ``log_dir`` was not given,
+    ``LLMKIT_LOG_DIR`` is unset, and the project-root folder cannot hold
+    files, the sink moves to the per-user state directory instead of losing
+    every record: a file where ``data`` or ``data/llm-logs`` must be, a
+    read-only project, or a current directory deleted under the process (no
+    project can then be found at all). Only the errors in
+    :data:`~llmkit.logging._paths.FALLBACK_ERRNOS`, raised while creating the
+    folder or opening the first record's file, move it; a full disk or any
+    other error fails visibly as before. The move happens only before the
+    sink's first successful write, so a project folder that has taken a
+    record is kept for the life of the sink, and a sink that moved stays
+    moved. It is reported once per sink: one WARNING naming the project
+    folder (or why there is none) and the per-user one, and the first record
+    written there counts as ``degraded`` at the ``location`` stage in
+    :func:`~llmkit.logging.get_logging_health`. No ``.gitignore`` is seeded
+    in the per-user folder. An explicit ``log_dir=`` or ``LLMKIT_LOG_DIR`` is
+    the caller's choice and never moves.
 
     By default, the sink attempts to prune per-call YAML files older than
     ``retention_days`` (``None`` keeps forever), and
@@ -342,6 +389,17 @@ class LocalYamlLogSink:
         # the steady-state write does not retry it; a directory the sink
         # (re)creates is always tried.
         self._seed_checked: bool = False
+        # True while a failure to use the project-root default may still move
+        # the sink to the per-user folder: set when default resolution picks
+        # that folder, cleared by the move and by the first successful write.
+        self._may_fall_back: bool = False
+        # What a fallback still owes, each taken once: the WARNING, emitted
+        # at the next write attempt, and the error, reported as a degraded
+        # "location" outcome by the next successful write.
+        self._location_warning: _LocationWarning | None = None
+        self._location_error: OSError | None = None
+        # Guards resolving the default folder, the move, and the two above.
+        self._location_lock: threading.Lock = threading.Lock()
         self._announced: bool = False
         # True only for the registry's import-time default, the one sink
         # ``LLMKIT_LOG`` can turn off; the first-write notice says which.
@@ -419,13 +477,109 @@ class LocalYamlLogSink:
         A sink constructed without an explicit ``log_dir`` resolves
         :func:`default_log_dir` on first access and freezes the result, so
         every write (and every reader of this property) sees one stable
-        directory regardless of later ``chdir`` or environment changes.
+        directory regardless of later ``chdir`` or environment changes. The
+        one exception is the default location's fallback: if the
+        project-root folder cannot hold files, the first write moves the
+        sink to the per-user state directory (see the class docstring), so
+        a value read before the first successful write can change once.
         """
-        if self._log_dir is None:
-            self._log_dir, self._seed_gitignore = resolve_default_log_dir()
-        return self._log_dir
+        log_dir = self._log_dir
+        if log_dir is None:
+            log_dir = self._resolve_default_log_dir()
+        return log_dir
 
-    def _ensure_log_dir(self) -> None:
+    def _resolve_default_log_dir(self) -> Path:
+        """Resolve and freeze the default folder, noting a fallback it owes."""
+        with self._location_lock:
+            if self._log_dir is not None:
+                return self._log_dir
+            resolved = resolve_default_log_dir_detail()
+            self._seed_gitignore = resolved.project_root
+            self._may_fall_back = resolved.project_root
+            if resolved.cwd_error is not None:
+                self._location_error = resolved.cwd_error
+                self._location_warning = (
+                    "Cannot read the current directory (%s), so no project folder can be "
+                    + "found for LLM logs; logging to %s instead. Set %s to choose a location.",
+                    (_error_text(resolved.cwd_error), resolved.path, LOG_DIR_ENV_VAR),
+                )
+            self._log_dir = resolved.path
+            return resolved.path
+
+    def _fall_back(self, exc: OSError, failed_dir: Path) -> Path | None:
+        """Where to retry after *failed_dir* proved unusable, or ``None`` to fail.
+
+        Moves the sink to the per-user folder when it is still eligible (a
+        default project-root folder, no successful write yet). A writer that
+        lost the race to another one's move retries in the folder that one
+        chose rather than losing its record.
+        """
+        try:
+            target = per_user_log_dir()
+        except OSError:
+            # A relative XDG_STATE_HOME with no current directory: there is
+            # nowhere to go, so the original failure stands.
+            return None
+        with self._location_lock:
+            current = self._log_dir
+            if current is not None and current != failed_dir:
+                return current
+            if not self._may_fall_back:
+                return None
+            self._may_fall_back = False
+            # Cleared before the folder changes, so no writer that sees the
+            # new folder can seed a .gitignore there.
+            self._seed_gitignore = False
+            self._location_error = exc
+            self._location_warning = (
+                "Cannot write LLM logs to the project folder %s (%s); logging to %s "
+                + "instead. Set %s to choose a location.",
+                (failed_dir, _error_text(exc), target, LOG_DIR_ENV_VAR),
+            )
+            self._log_dir = target
+        return target
+
+    def _report_location_warning(self) -> None:
+        """Emit the fallback's WARNING if one is owed; at most once per sink."""
+        if self._location_warning is None:
+            return
+        warning = self._take_location_warning()
+        if warning is not None:
+            # Outside the lock: a host handler that reads the sink back must
+            # not deadlock on it.
+            message, args = warning
+            _ = report(logger, logging.WARNING, message, *args)
+
+    def _take_location_warning(self) -> _LocationWarning | None:
+        with self._location_lock:
+            warning, self._location_warning = self._location_warning, None
+        return warning
+
+    def _take_location_error(self) -> OSError | None:
+        if self._location_error is None:
+            return None
+        with self._location_lock:
+            error, self._location_error = self._location_error, None
+        return error
+
+    def _publish_closing_fallback(self, part: Path, final: Path, log_dir: Path) -> bool:
+        """:func:`_publish`, closing the fallback window in the same step.
+
+        While the sink may still fall back, the publish runs under the
+        location lock and a record landing in the sink's current folder
+        closes the window before the lock is released, so a writer failing
+        there a moment later cannot move the sink away from a folder that
+        has already taken a record. After that the lock is not taken.
+        """
+        if not self._may_fall_back:
+            return _publish(part, final)
+        with self._location_lock:
+            published = _publish(part, final)
+            if published and log_dir == self._log_dir:
+                self._may_fall_back = False
+            return published
+
+    def _ensure_log_dir(self, log_dir: Path) -> None:
         """Create ``log_dir`` (``0o700``) if absent; seed ``.gitignore`` when owed.
 
         Creation is detected via the ``FileExistsError`` branch rather than
@@ -433,21 +587,21 @@ class LocalYamlLogSink:
         is never re-chmodded. Only the leaf gets ``0o700``. The ``.gitignore``
         seed applies only to the project-root *default* location — an
         explicit path or env override is the caller's choice, and the
-        state-dir fallback is never inside a repository — and there it is
+        per-user state directory is normally outside any repository — and there it is
         written whoever created the directory (a checkout, a ``mkdir``, an
         older llmkit), once per sink for an existing directory and on every
         (re)creation. It is exclusive-create, so an existing ``.gitignore``
         is never touched.
         """
         try:
-            self.log_dir.mkdir(parents=True, mode=0o700)
+            log_dir.mkdir(parents=True, mode=0o700)
         except FileExistsError:
             if self._seed_checked:
                 return
         if self._seed_gitignore:
             self._seed_checked = True
             try:
-                with open(self.log_dir / ".gitignore", "x", encoding="utf-8") as f:
+                with open(log_dir / ".gitignore", "x", encoding="utf-8") as f:
                     _ = f.write("*\n")
             except FileExistsError:
                 # Already seeded (or the user's own file): nothing to report.
@@ -459,11 +613,11 @@ class LocalYamlLogSink:
                     logger,
                     logging.DEBUG,
                     "Could not seed .gitignore in %s",
-                    self.log_dir,
+                    log_dir,
                     exc_info=True,
                 )
 
-    def _announce_once(self) -> None:
+    def _announce_once(self, log_dir: Path) -> None:
         """One INFO after the first successful write: where the logs are.
 
         Persistence is on by default, so the location (and the retention
@@ -500,7 +654,7 @@ class LocalYamlLogSink:
             logger,
             logging.INFO,
             "llmkit is logging LLM calls to %s (%s; %s)",
-            self.log_dir,
+            log_dir,
             retention,
             off_switch,
         )
@@ -575,109 +729,7 @@ class LocalYamlLogSink:
                 return transformed
             record = transformed
         try:
-            self._ensure_log_dir()
-            ts = record.started_at.strftime(FILENAME_TIMESTAMP_FORMAT)
-            safe_feature = safe_path_component(record.feature)
-            safe_label = safe_path_component(record.label or "unlabeled")
-
-            # Verdict-first order: cheap, high-signal metadata up top; the
-            # large ``partial_text``/``response``/``prompt``/``requests`` blobs last
-            # (``partial_text`` for truncated, filtered or failed answers,
-            # then ``response``, what a debugger usually wants), so the
-            # head of the file is the whole story for most reads.
-            doc: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # raw-llm — YAML log body dict
-                "timestamp": record.started_at.isoformat(),
-                "feature": record.feature,
-                "label": record.label,
-                "model": record.model,
-                "provider": record.provider,
-                "schema": record.schema,
-                "run_id": record.run_id,
-                "call_id": record.call_id,
-                "attempt": record.attempt,
-                "cache_hit": record.cache_hit,
-                "source_call_id": record.source_call_id,
-                "temperature": record.temperature,
-                "max_tokens": record.max_tokens,
-                "reasoning_effort": record.reasoning_effort,
-                "tools": record.tools,
-                "tool_calls": record.tool_calls,
-                "usage": record.usage,
-                "output_limit": record.output_limit,
-                "native_finish_reason": record.native_finish_reason,
-                "requested_service_tier": record.requested_service_tier,
-                "served_service_tier": record.served_service_tier,
-                "duration_ms": round(record.duration_ms, 1),
-                "queue_wait_ms": (
-                    round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
-                ),
-                "first_chunk_ms": (
-                    round(record.first_chunk_ms, 1) if record.first_chunk_ms is not None else None
-                ),
-                "approximate_cost": record.approximate_cost,
-                "error": record.error,
-                "partial_text": record.partial_text,
-                "response": cast("object", record.response),
-                "prompt": record.prompt,
-                "requests": record.requests,
-            }
-            header = self._summary_header(record)
-
-            # Exclusive-create (``mode="x"``) so a path collision raises
-            # FileExistsError instead of truncating an existing log. The
-            # uuid4 suffix makes a collision astronomically unlikely; the
-            # bounded loop regenerates it on the off chance one happens, so
-            # even then no record is ever overwritten.
-            filepath: Path | None = None
-            for _attempt in range(MAX_FILENAME_ATTEMPTS):
-                candidate = (
-                    self.log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
-                )
-                part = candidate.with_name(f".{candidate.name}.part")
-                try:
-                    with open(part, "x", encoding="utf-8", opener=open_private) as f:
-                        _ = f.write(header)
-                        # LogSafeDumper keeps the file safe_load-able: only
-                        # plain YAML tags, never ``!!python/object`` (Enum
-                        # members become their .value, anything else SafeDumper
-                        # can't represent degrades to str(obj)).
-                        yaml.dump(
-                            doc,
-                            f,
-                            Dumper=LogSafeDumper,
-                            default_flow_style=False,
-                            sort_keys=False,
-                            allow_unicode=True,
-                            width=120,
-                        )
-                    published = _publish(part, candidate)
-                except FileExistsError:
-                    # Suffix collision — regenerate and retry; never overwrite.
-                    continue
-                except Exception:
-                    # Any mid-write failure (disk full, un-encodable surrogates
-                    # even on the utf-8 stream, a RecursionError from a deeply
-                    # nested/cyclic payload, an exotic representer/emitter
-                    # error) leaves a truncated temporary file behind. Remove
-                    # it before degrading, then re-raise to the best-effort
-                    # handler below. Deliberately broad — this sink is
-                    # best-effort by contract — but never BaseException, so
-                    # KeyboardInterrupt/SystemExit still propagate (the
-                    # ``.part`` file is then left for _prune to sweep).
-                    part.unlink(missing_ok=True)
-                    raise
-                if not published:
-                    # The final name was taken: drop this copy and retry.
-                    part.unlink(missing_ok=True)
-                    continue
-                filepath = candidate
-                break
-            if filepath is None:
-                # Exhausted the retry budget without a free name (should be
-                # unreachable in practice). Best-effort: skip the write.
-                raise OSError(
-                    f"could not allocate a unique log filename after {MAX_FILENAME_ATTEMPTS} attempts"
-                )
+            filepath = self._write_with_fallback(record)
         except Exception as exc:
             # Best-effort by contract: *any* failure (not just the common
             # OSError/YAMLError/UnicodeError cases) degrades to a warning so an
@@ -709,10 +761,14 @@ class LocalYamlLogSink:
             return WriteOutcome(path=None, write_error=exc)
 
         self._yaml_latch.succeeded()
-        self._announce_once()
+        self._announce_once(filepath.parent)
         # Best-effort index append, kept separate so an index failure can
         # never lose the per-call record that was just written successfully.
         post_write_failures: list[tuple[FailureStage, Exception]] = []
+        # First, so a later failure on this write is the one last_failure keeps.
+        location_error = self._take_location_error()
+        if location_error is not None:
+            post_write_failures.append(("location", location_error))
         retention_error = self._take_retention_error()
         if retention_error is not None:
             post_write_failures.append(("housekeeping", retention_error))
@@ -723,6 +779,142 @@ class LocalYamlLogSink:
         if prune_error is not None:
             post_write_failures.append(("housekeeping", prune_error))
         return WriteOutcome(path=filepath, post_write_failures=tuple(post_write_failures))
+
+    def _write_with_fallback(self, record: LLMCallRecord) -> Path:
+        """Write *record*, moving to the per-user folder once if the default can't hold it.
+
+        A :data:`~llmkit.logging._paths.FALLBACK_ERRNOS` error while creating
+        the folder or opening the record's file, on a sink still eligible to
+        move, retries the same record once in the per-user folder. Anything
+        else, including a failed retry, raises for the caller to report.
+        """
+        log_dir = self.log_dir
+        self._report_location_warning()
+        stage = _AttemptStage()
+        retry_dir: Path | None = None
+        try:
+            return self._write_record(record, log_dir, stage)
+        except OSError as exc:
+            if not stage.at_location or exc.errno not in FALLBACK_ERRNOS:
+                raise
+            retry_dir = self._fall_back(exc, log_dir)
+            if retry_dir is None:
+                raise
+        self._report_location_warning()
+        return self._write_record(record, retry_dir, _AttemptStage())
+
+    def _write_record(self, record: LLMCallRecord, log_dir: Path, stage: _AttemptStage) -> Path:
+        """Write *record* under *log_dir* and return its path; raise on any failure.
+
+        Marks *stage* while creating the folder and opening the temporary
+        file, the two steps whose failure can mean the folder is unusable.
+        """
+        stage.at_location = True
+        self._ensure_log_dir(log_dir)
+        stage.at_location = False
+        ts = record.started_at.strftime(FILENAME_TIMESTAMP_FORMAT)
+        safe_feature = safe_path_component(record.feature)
+        safe_label = safe_path_component(record.label or "unlabeled")
+
+        # Verdict-first order: cheap, high-signal metadata up top; the
+        # large ``partial_text``/``response``/``prompt``/``requests`` blobs last
+        # (``partial_text`` for truncated, filtered or failed answers,
+        # then ``response``, what a debugger usually wants), so the
+        # head of the file is the whole story for most reads.
+        doc: dict[str, Any] = {  # pyright: ignore[reportExplicitAny]  # raw-llm — YAML log body dict
+            "timestamp": record.started_at.isoformat(),
+            "feature": record.feature,
+            "label": record.label,
+            "model": record.model,
+            "provider": record.provider,
+            "schema": record.schema,
+            "run_id": record.run_id,
+            "call_id": record.call_id,
+            "attempt": record.attempt,
+            "cache_hit": record.cache_hit,
+            "source_call_id": record.source_call_id,
+            "temperature": record.temperature,
+            "max_tokens": record.max_tokens,
+            "reasoning_effort": record.reasoning_effort,
+            "tools": record.tools,
+            "tool_calls": record.tool_calls,
+            "usage": record.usage,
+            "output_limit": record.output_limit,
+            "native_finish_reason": record.native_finish_reason,
+            "requested_service_tier": record.requested_service_tier,
+            "served_service_tier": record.served_service_tier,
+            "duration_ms": round(record.duration_ms, 1),
+            "queue_wait_ms": (
+                round(record.queue_wait_ms, 1) if record.queue_wait_ms is not None else None
+            ),
+            "first_chunk_ms": (
+                round(record.first_chunk_ms, 1) if record.first_chunk_ms is not None else None
+            ),
+            "approximate_cost": record.approximate_cost,
+            "error": record.error,
+            "partial_text": record.partial_text,
+            "response": cast("object", record.response),
+            "prompt": record.prompt,
+            "requests": record.requests,
+        }
+        header = self._summary_header(record)
+
+        # Exclusive-create (``mode="x"``) so a path collision raises
+        # FileExistsError instead of truncating an existing log. The
+        # uuid4 suffix makes a collision astronomically unlikely; the
+        # bounded loop regenerates it on the off chance one happens, so
+        # even then no record is ever overwritten.
+        filepath: Path | None = None
+        for _attempt in range(MAX_FILENAME_ATTEMPTS):
+            candidate = log_dir / f"{ts}_{safe_feature}_{safe_label}_{uuid.uuid4().hex[:8]}.yaml"
+            part = candidate.with_name(f".{candidate.name}.part")
+            try:
+                stage.at_location = True
+                with open(part, "x", encoding="utf-8", opener=open_private) as f:
+                    stage.at_location = False
+                    _ = f.write(header)
+                    # LogSafeDumper keeps the file safe_load-able: only
+                    # plain YAML tags, never ``!!python/object`` (Enum
+                    # members become their .value, anything else SafeDumper
+                    # can't represent degrades to str(obj)).
+                    yaml.dump(
+                        doc,
+                        f,
+                        Dumper=LogSafeDumper,
+                        default_flow_style=False,
+                        sort_keys=False,
+                        allow_unicode=True,
+                        width=120,
+                    )
+                published = self._publish_closing_fallback(part, candidate, log_dir)
+            except FileExistsError:
+                # Suffix collision — regenerate and retry; never overwrite.
+                continue
+            except Exception:
+                # Any mid-write failure (disk full, un-encodable surrogates
+                # even on the utf-8 stream, a RecursionError from a deeply
+                # nested/cyclic payload, an exotic representer/emitter
+                # error) leaves a truncated temporary file behind. Remove
+                # it before degrading, then re-raise to the best-effort
+                # handler below. Deliberately broad — this sink is
+                # best-effort by contract — but never BaseException, so
+                # KeyboardInterrupt/SystemExit still propagate (the
+                # ``.part`` file is then left for _prune to sweep).
+                part.unlink(missing_ok=True)
+                raise
+            if not published:
+                # The final name was taken: drop this copy and retry.
+                part.unlink(missing_ok=True)
+                continue
+            filepath = candidate
+            break
+        if filepath is None:
+            # Exhausted the retry budget without a free name (should be
+            # unreachable in practice). Best-effort: skip the write.
+            raise OSError(
+                f"could not allocate a unique log filename after {MAX_FILENAME_ATTEMPTS} attempts"
+            )
+        return filepath
 
     def _apply_transform(
         self, transform: _RecordTransform, record: LLMCallRecord
@@ -889,8 +1081,10 @@ class LocalYamlLogSink:
                 .encode("utf-8", errors="backslashreplace")
                 .decode("utf-8")
             )
+            # Beside the record it indexes, which a concurrent fallback may
+            # have left in a different folder from the sink's current one.
             with open(
-                self.log_dir / INDEX_FILENAME, "a", encoding="utf-8", opener=open_private
+                filepath.parent / INDEX_FILENAME, "a", encoding="utf-8", opener=open_private
             ) as f:
                 _ = f.write(payload)
         except Exception as exc:

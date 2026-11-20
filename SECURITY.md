@@ -49,6 +49,16 @@ network service. The most security-relevant surfaces are:
   seeds a `.gitignore` when the directory has none, whoever created the
   directory, to reduce accidental commits; this is best effort, does not
   untrack files already committed, and does not prevent forced staging.
+  When that project folder cannot hold files (a file in its way, a read-only
+  project, a deleted current directory), the default sink writes to the
+  per-user state directory instead, with one WARNING naming the per-user
+  directory and either the project folder it could not use or, for a deleted
+  current directory, that the current directory is unavailable: records can
+  then leave the project tree. The same `0o700` and `0o600`
+  creation modes apply there, no `.gitignore` is seeded, and the directory
+  is shared with every other process that logs there. Set `LLMKIT_LOG_DIR`
+  or pass `log_dir=` to keep records in a location you chose; those never
+  fall back.
 - **Log retention** defaults to 30 days, with best-effort cleanup after
   successful writes, at most once per hour. Inactive applications can leave
   old logs indefinitely, and deletion failures can also leave files behind.

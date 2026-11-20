@@ -263,6 +263,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The default log folder falls back instead of losing every record.** When
+  nobody chose a log directory and the project's `data/llm-logs/` cannot hold
+  files (a file named `data` or `data/llm-logs`, a read-only project, a
+  broken or looping symlink), the default `LocalYamlLogSink` now writes to the
+  per-user state directory and logs one WARNING naming both folders and
+  `LLMKIT_LOG_DIR`. Before, every write failed. A deleted current directory
+  falls back too: `default_log_dir()` returns the per-user directory instead
+  of raising `FileNotFoundError`, and the WARNING says the current directory
+  is unavailable. Only errors meaning the location can never hold the
+  process's files trigger the move, and only before the sink's first
+  successful write; a full disk still fails visibly, as do an unusable
+  `LLMKIT_LOG_DIR` and an explicit `log_dir=`. No `.gitignore` is seeded in
+  the per-user directory. `get_logging_health()` counts the move once as
+  `degraded`, with the new `FailureStage` value `location` in `last_failure`.
+  See [Where the logs go](README.md#where-the-logs-go).
+
 - **Redact or skip records before they are written.**
   `LocalYamlLogSink(transform=...)` takes a synchronous function that
   returns the record to write, typically built with `dataclasses.replace`,
