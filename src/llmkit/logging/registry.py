@@ -365,9 +365,14 @@ def write_installed(
             # The built-in sink warns through its own latches and returns
             # what happened instead of raising; only the counting happens here.
             outcome = sink.write_with_outcome(record)
-            if outcome.path is None:
+            # A skip is checked first: it also carries no path, and must not
+            # be counted as a failed write. Failures keep the original
+            # record's feature and label, the identifiers the caller passed.
+            if outcome.skipped:
+                health.record_skipped()
+            elif outcome.path is None:
                 error = outcome.write_error or OSError("built-in sink wrote no file")
-                health.record_failed("write", error, record.feature, record.label)
+                health.record_failed(outcome.failure_stage, error, record.feature, record.label)
             else:
                 health.record_written(record.feature, record.label, outcome.post_write_failures)
             if attempt is not None:

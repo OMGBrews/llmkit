@@ -35,7 +35,9 @@ network service. The most security-relevant surfaces are:
   which can quote what the provider sent. An inline image is stored at least
   twice per attempt, so images multiply file size. Treat the files as
   sensitive. Call `configure_llm_logging(None)`, or set `LLMKIT_LOG=off` in the
-  environment, to disable the default sink, or use a
+  environment, to disable the default sink, give it a
+  [`transform`](README.md#redacting-records-transform) that redacts or skips
+  records before they are written, or use a
   [custom sink](README.md#write-your-own-logsink) to control what is stored.
   An unrecognised `LLMKIT_LOG` value also disables it. See
   [where the logs go](README.md#where-the-logs-go) for directory selection.

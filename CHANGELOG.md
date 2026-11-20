@@ -245,6 +245,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redact or skip records before they are written.**
+  `LocalYamlLogSink(transform=...)` takes a synchronous function that
+  returns the record to write, typically built with `dataclasses.replace`,
+  or `None` to skip it. It runs on every write through the sink, and the
+  file, header and index line use the record it returns, while
+  `capture_llm_records()` keeps returning the original. Unlike a wrapping
+  sink, a transforming sink keeps the built-in health counts and path
+  capture. `LoggingHealth` gains `skipped`, which counts records the hook
+  skipped. A hook that raises, or returns anything else, writes nothing and
+  counts as `failed` at the new `transform` stage. Its warning names the
+  exception type and where it was raised, never the message or traceback,
+  and `last_failure.error` holds the type name alone. A non-callable or
+  `async` transform is rejected with `TypeError`.
+
 - **Logging can be switched off, and its retention changed, from the
   environment.** `LLMKIT_LOG=off` (or `0`, `false`, `no`; trimmed, any case)
   turns the import-time default sink off as `configure_llm_logging(None)`

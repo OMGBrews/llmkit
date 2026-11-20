@@ -33,6 +33,7 @@ LiteLLM is the implementation of the HTTP providers; llmkit owns the ergonomic c
   - [Environment switches](#environment-switches)
   - [Retention: bounded by default](#retention-bounded-by-default)
   - [Capturing call records](#capturing-call-records)
+  - [Redacting records: `transform`](#redacting-records-transform)
   - [Write your own `LogSink`](#write-your-own-logsink)
 - [Response cache](#response-cache)
   - [What counts as the same request](#what-counts-as-the-same-request)
@@ -1054,8 +1055,9 @@ without automatic redaction:
 Because the prompt and `requests` each carry it, an inline image is stored at
 least twice per attempt (three times when a repair re-sends it), so a 1 MB
 image makes a record of about 2.7 MB. Treat the files as sensitive: turn
-logging off or supply a filtering sink before sending data you do not want
-stored. See [Security: scope](SECURITY.md#scope).
+logging off or give the sink a [`transform`](#redacting-records-transform)
+that redacts or skips records before sending data you do not want stored.
+See [Security: scope](SECURITY.md#scope).
 
 `LocalYamlLogSink` (the default) writes **two** things to the log directory:
 
@@ -1249,6 +1251,39 @@ with capture_llm_log_paths() as paths:
 # paths contains only paths observed before this call returned; it may be empty.
 ```
 
+### Redacting records: `transform`
+
+`LocalYamlLogSink(transform=...)` takes a function that receives each record before it is written and returns the record to write, or `None` to skip it. Return a new record with `dataclasses.replace`; do not change the one you receive, which is the same object `capture_llm_records()` hands back. The prompt is not the only copy of the conversation: `requests` repeats the messages each dispatch sent, and `response`, `partial_text`, `tool_calls` and `error` can quote it too.
+
+```python
+import dataclasses
+from llmkit import LLMCallRecord, LocalYamlLogSink, configure_llm_logging
+
+def redact(record: LLMCallRecord) -> LLMCallRecord | None:
+    if record.feature == "medical-intake":
+        return None  # write nothing for this feature
+    return dataclasses.replace(
+        record,
+        prompt="[redacted]",
+        requests=[],
+        response="[redacted]",
+        partial_text=None,
+        tool_calls=None,
+    )
+
+configure_llm_logging(LocalYamlLogSink(transform=redact))
+```
+
+The transform is part of the sink, so it applies to every write through it: managed calls, `write_llm_log()` and `capture.record_call()`, and the sink's own write methods. The file name, summary header, YAML body and `index.jsonl` line all come from the record it returns. Because it is a sink you configure in code, `LLMKIT_LOG` no longer turns it off. Logging health keeps counting it as `builtin`, and `capture_llm_log_paths()` keeps returning the written paths.
+
+- **What callers see.** `capture_llm_records()` returns the original, unredacted record.
+- **A skip.** Returning `None` writes no file and no index line, returns no path, and counts in `get_logging_health().skipped`, nowhere else. Nothing is logged.
+- **A failure.** A transform that raises an `Exception`, or returns something that is neither a record nor `None`, writes nothing: the untransformed record never reaches disk. The record counts as `failed` at the `transform` stage. The warning names the exception type and where it was raised, but never its message or traceback, which may quote the data being redacted. The first failure of each exception type warns; repeats are logged at DEBUG until a transform succeeds. `last_failure.error` holds the type name alone.
+- **Identifiers.** `feature` and `label` appear in file names, warnings and `last_failure` as the caller passed them, even when the transform changes them. Keep sensitive data out of them.
+- **Constraints.** The transform must be synchronous; a non-callable or an `async` function is rejected with `TypeError` at construction. It runs on the thread doing the write, the delivery worker for a managed call, so a slow transform can push a write past the [delivery wait](#capturing-call-records) and leave `capture_llm_log_paths()` without that path.
+
+A sink that wraps `LocalYamlLogSink` to filter records still works, but it is a custom sink: health counts its records as handoffs and captures no paths.
+
 ### Write your own `LogSink`
 
 `LogSink` is a `Protocol` with a single, file-agnostic method:
@@ -1428,11 +1463,12 @@ A flush that returns `False` has not lost anything yet: records still `queued` o
 - `sink` is `"disabled"` (logging set to `None`), `"builtin"` (`LocalYamlLogSink`), or `"custom"`.
 - `written` counts records the built-in sink wrote to disk. `degraded` counts those whose index line or retention housekeeping failed afterwards: the YAML file exists, but `index.jsonl` may lack its line.
 - `handed_off` counts records a custom sink accepted by returning normally. llmkit cannot see past that return, so a handoff is not evidence the record was stored.
-- `failed` counts records lost to a detected failure: preparation failed, the built-in write failed, a sink raised, or a sink broke its return contract.
+- `failed` counts records lost to a detected failure: preparation failed, the built-in write failed, its `transform` failed, a sink raised, or a sink broke its return contract.
+- `skipped` counts records the built-in sink's [`transform`](#redacting-records-transform) chose not to write by returning `None`. A skip is not a failure, a drop or a write.
 - `queued` includes waiting records and snapshot preparation reservations; `in_flight` counts active managed writes for the installation.
 - `dropped` counts rejected or discarded delivery, including a full queue; `unavailable` identifies admission failures when the service cannot accept work. `preparation_failed` counts snapshot or worker-startup failures, also included in `failed`.
 - `wait_timeouts` counts expired caller waits. A timeout is not proof of loss: a later successful write still counts in `written` or `handed_off`.
-- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, or `contract`), the `"Type: message"` error text, the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
+- `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, `contract`, or `transform`), the `"Type: message"` error text (the type name alone for `transform`, whose message may quote the record), the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
 
 Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
 
