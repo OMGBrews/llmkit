@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A refused tool call no longer shifts a retried call's attempt numbers.**
+  Inside `with_retries`, a `tool_llm_call` or `tool_llm_call_stream` refused
+  before any request (an unsupported `tool_choice`, an unsupported
+  `output_schema`, a provider or model that cannot compose, or a registered
+  config that would not build) still claimed its `feature` and `label`. A
+  later call with the same `feature` and `label` then recorded its attempts
+  under two call ids, the second starting at attempt 2. These refusals now
+  raise before the claim, as the service-tier refusal and the other lanes'
+  refusals already did. The errors and their messages are unchanged.
+
 - **A failed structured answer records what it cost.** A structured answer
   that fails validation now writes the provider-reported `usage` (on the
   structured lane, instructor's total across its in-call repairs) and

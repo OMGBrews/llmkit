@@ -40,8 +40,8 @@ from llmkit._types import ChatMessage, ReasoningEffort, ServiceTier, ServiceTier
 from llmkit.calls._shared import (
     error_text,
     parse_tool_calls,
-    prepare_call,
     rejected_arguments_text,
+    resolve_call,
     resolve_model_and_provider,
     tool_repair_messages,
     tool_validation_budget,
@@ -60,7 +60,7 @@ from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider, build_provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
-from llmkit.retry import RetryPolicy, with_retries_stream
+from llmkit.retry import RetryPolicy, claim_logical_call, with_retries_stream
 from llmkit.run_scope import get_run_id
 from llmkit.sync import iterate_sync
 from llmkit.tools import (
@@ -172,7 +172,7 @@ async def tool_llm_call_stream(
     # First execution owns the baseline; transport and records get separate copies.
     prompt = snapshot_prompt(prompt)
     tools = snapshot_tools(tools)
-    args, provider, call_id, attempt_offset = prepare_call(
+    args, provider = resolve_call(
         options,
         temperature=temperature,
         model=model,
@@ -182,14 +182,14 @@ async def tool_llm_call_stream(
         service_tier=service_tier,
         retry=retry,
         provider=provider,
-        feature=feature,
-        label=label,
     )
-    # Before the retry loop, so a route that cannot honour the choice refuses
-    # it once, unlogged. With no provider (the registered config would not
-    # build) the transport raises that build error inside the attempt instead.
+    # Before the claim and the retry loop, so a route that cannot honour the
+    # choice refuses it once, unlogged, and counts no attempt in an outer
+    # with_retries. With no provider (the registered config would not build)
+    # the transport raises that build error inside the attempt instead.
     if provider is not None:
         guard_tool_choice(provider, tool_choice)
+    call_id, attempt_offset = claim_logical_call(feature, label)
     tag = label or feature
     # ``call_id`` and ``attempt_offset`` reach ``_stream_tools_once`` as plain
     # parameters — NEVER a ContextVar, for the reasons ``calls/stream.py``

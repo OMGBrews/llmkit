@@ -294,6 +294,85 @@ class PreparedCall(NamedTuple):
     attempt_offset: int
 
 
+def resolve_call(
+    options: LLMCallOptions | None,
+    *,
+    temperature: float | None | Unset,
+    model: str | None | Unset,
+    max_tokens: int | None | Unset,
+    reasoning_effort: ReasoningEffort | None | Unset,
+    retry: RetryPolicy | Unset,
+    provider: LLMProviderInterface | Provider | None | Unset,
+    cache: bool | Unset = UNSET,
+    timeout: float | None | Unset = UNSET,
+    schema_repairs: int | Unset = UNSET,
+    service_tier: ServiceTier | None | Unset = UNSET,
+) -> tuple[ResolvedCallArgs, LLMProviderInterface | None]:
+    """Resolve a call's arguments and build its provider, before the claim.
+
+    The first half of :func:`prepare_call`, and all of it the tool families
+    call directly: they run their own guards on the result and then claim the
+    call themselves with :func:`~llmkit.retry.claim_logical_call`. Everything
+    here runs before the claim, because inside an outer
+    :func:`~llmkit.retry.with_retries` a claim counts an attempt, so an error
+    raised after it would count a phantom one.
+
+    Each keyword arrives exactly as the call function received it —
+    :data:`~llmkit.UNSET` when the caller did not pass it — and is merged by
+    :func:`~llmkit.options.resolve_call_args`.
+
+    Building the provider here rather than per attempt is what lets the
+    transport and the log record name the same instance; it is config plus
+    cached SDK checks with no I/O, so once per call is both correct and cheap.
+
+    A per-call ``provider`` is coerced here by :func:`coerce_call_provider`,
+    before the not-configured check and before the call is claimed from an
+    enclosing retry loop, so a refused string or a member that cannot be built
+    raises before any attempt is made, logged or counted.
+
+    *cache* is passed by the families that read the response cache — the two
+    buffered ones and the streamed text family; the tool families leave it
+    unset. *schema_repairs* is passed by the structured family only; the
+    others leave it unset, so only an ``options`` value reaches the merge,
+    where an invalid one is still rejected.
+
+    The service tier is resolved and checked here too, once the provider is
+    built (see :func:`resolve_tier_request`), so a tier the route cannot
+    honour raises before any attempt, log record, cache lookup or request. The
+    result rides on ``args.tier_request``.
+
+    Returns the merged arguments and the provider the call runs on, or
+    ``None`` when the registered provider would not build (see
+    :func:`build_call_provider`).
+    """
+    args = resolve_call_args(
+        options,
+        temperature=temperature,
+        model=model,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        reasoning_effort=reasoning_effort,
+        retry=retry,
+        provider=provider,
+        cache=cache,
+        schema_repairs=schema_repairs,
+        service_tier=service_tier,
+    )
+    call_provider = coerce_call_provider(args.provider)
+    if call_provider is None and not client_configured():
+        # The one piece of setup a call needs, missing: fail before any attempt
+        # is made or logged, naming it. Other provider build failures keep the
+        # best-effort path below.
+        _ = active_config()
+    # Built before the claim so the tier check below can refuse before an
+    # attempt is counted. Building is best-effort and never raises: with no
+    # provider the check is skipped and the transport raises the build error.
+    built = build_call_provider(call_provider)
+    if built is not None:
+        args = dataclasses.replace(args, tier_request=resolve_tier_request(args, built))
+    return args, built
+
+
 def prepare_call(
     options: LLMCallOptions | None,
     *,
@@ -312,13 +391,11 @@ def prepare_call(
 ) -> PreparedCall:
     """Resolve everything a call decides once, before any attempt runs.
 
-    The preamble every family shares. Each keyword arrives exactly as the
-    call function received it — :data:`~llmkit.UNSET` when the caller did not
-    pass it — and is merged by :func:`~llmkit.options.resolve_call_args`.
-
-    Building the provider here rather than per attempt is what lets the
-    transport and the log record name the same instance; it is config plus
-    cached SDK checks with no I/O, so once per call is both correct and cheap.
+    The preamble the text, streamed text and structured families share:
+    :func:`resolve_call`, which resolves the arguments and builds the provider
+    and raises every pre-attempt refusal, then the claim. The tool families
+    call :func:`resolve_call` and claim themselves, so their own guards run
+    between the two.
 
     *feature* and *label* identify the call to an enclosing
     :func:`~llmkit.retry.with_retries` loop owned by this task (see
@@ -326,24 +403,8 @@ def prepare_call(
     every pass keeps one ``call_id``. For a stream this runs on the generator's
     first ``__anext__``, in the consumer's task — a read of the loop's scope,
     never a write.
-
-    A per-call ``provider`` is coerced here by :func:`coerce_call_provider`,
-    before the not-configured check and before the call is claimed from an
-    enclosing retry loop, so a refused string or a member that cannot be built
-    raises before any attempt is made, logged or counted.
-
-    *cache* is passed by the families that read the response cache — the two
-    buffered ones and the streamed text family; the tool families leave it
-    unset. *schema_repairs* is passed by the structured family only; the
-    others leave it unset, so only an ``options`` value reaches the merge,
-    where an invalid one is still rejected.
-
-    The service tier is resolved and checked here too, once the provider is
-    built and before the claim (see :func:`resolve_tier_request`), so a tier
-    the route cannot honour raises before any attempt, log record, cache
-    lookup or request. The result rides on ``args.tier_request``.
     """
-    args = resolve_call_args(
+    args, built = resolve_call(
         options,
         temperature=temperature,
         model=model,
@@ -356,20 +417,6 @@ def prepare_call(
         schema_repairs=schema_repairs,
         service_tier=service_tier,
     )
-    # Before the claim: inside an outer with_retries a claim counts an attempt,
-    # so an error raised after it would count a phantom one.
-    call_provider = coerce_call_provider(args.provider)
-    if call_provider is None and not client_configured():
-        # The one piece of setup a call needs, missing: fail before any attempt
-        # is made or logged, naming it. Other provider build failures keep the
-        # best-effort path below.
-        _ = active_config()
-    # Built before the claim so the tier check below can refuse before an
-    # attempt is counted. Building is best-effort and never raises: with no
-    # provider the check is skipped and the transport raises the build error.
-    built = build_call_provider(call_provider)
-    if built is not None:
-        args = dataclasses.replace(args, tier_request=resolve_tier_request(args, built))
     call_id, attempt_offset = claim_logical_call(feature, label)
     return PreparedCall(args, built, call_id, attempt_offset)
 

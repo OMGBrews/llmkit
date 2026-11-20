@@ -31,8 +31,8 @@ from llmkit.calls._shared import (
     guard_output_schema,
     logger,
     parse_tool_calls,
-    prepare_call,
     rejected_arguments_text,
+    resolve_call,
     resolve_model_and_provider,
     run_with_policy,
     tool_repair_messages,
@@ -55,7 +55,7 @@ from llmkit.logging.record import RequestSnapshot
 from llmkit.options import UNSET, LLMCallOptions, Unset
 from llmkit.providers import LLMProviderInterface, Provider
 from llmkit.rate_limiting import begin_queue_wait, current_queue_wait_ms
-from llmkit.retry import RetryPolicy
+from llmkit.retry import RetryPolicy, claim_logical_call
 from llmkit.run_scope import get_run_id
 from llmkit.sync import run_sync
 from llmkit.tools import (
@@ -170,7 +170,10 @@ async def tool_llm_call[T: BaseModel](
     # First execution owns the baseline; transport and records get separate copies.
     prompt = snapshot_prompt(prompt)
     tools = snapshot_tools(tools)
-    args, provider, call_id, attempt_offset = prepare_call(
+    # The guards below run between resolving the call and claiming it: inside
+    # an outer with_retries a claim counts an attempt, so a refusal raised
+    # after it would count a phantom one.
+    args, provider = resolve_call(
         options,
         temperature=temperature,
         model=model,
@@ -180,13 +183,11 @@ async def tool_llm_call[T: BaseModel](
         service_tier=service_tier,
         retry=retry,
         provider=provider,
-        feature=feature,
-        label=label,
     )
     if output_schema is not None:
         guard_output_schema(output_schema)
         if provider is None:
-            # ``prepare_call`` raised already if nothing is registered, so ``None``
+            # ``resolve_call`` raised already if nothing is registered, so ``None``
             # here is a registered config that would not build. Build it again so
             # its own error (a missing key, a rejected field, a missing extra)
             # surfaces before any attempt, instead of a compose refusal that
@@ -206,6 +207,7 @@ async def tool_llm_call[T: BaseModel](
     # build error inside the attempt instead.
     if provider is not None:
         guard_tool_choice(provider, tool_choice)
+    call_id, attempt_offset = claim_logical_call(feature, label)
     definitions = {definition.name: definition for definition in tools}
     attempt_count = 0
     repair: list[ChatMessage] = []
