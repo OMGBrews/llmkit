@@ -154,9 +154,7 @@ def _loop_main(loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
                 # scheduled; the next turn of the loop delivers it. A
                 # ``loop.stop`` queued by ``shutdown`` still ends the restarted
                 # run normally.
-                logger.debug(
-                    "contained an interrupt raised on the sync loop thread", exc_info=True
-                )
+                logger.debug("contained an interrupt raised on the sync loop thread", exc_info=True)
                 continue
             break
     finally:

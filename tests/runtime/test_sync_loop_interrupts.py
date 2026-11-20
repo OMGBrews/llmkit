@@ -36,6 +36,7 @@ from llmkit import sync as sync_module
 from llmkit.sync import iterate_sync, run_sync
 
 _INTERRUPTS = [KeyboardInterrupt, SystemExit]
+_IDS = [exc.__name__ for exc in _INTERRUPTS]
 
 # Bounds the follow-up call, which without containment raises at once or waits
 # on a loop that never runs again.
@@ -51,11 +52,11 @@ def _fresh_sync_loop() -> Iterator[None]:
     """
     sync_module.shutdown()
     yield
-    loop = sync_module._loop  # pyright: ignore[reportPrivateUsage]
+    loop = sync_module._loop
     if loop is not None and loop.is_closed():
-        with sync_module._lock:  # pyright: ignore[reportPrivateUsage]
-            sync_module._loop = None  # pyright: ignore[reportPrivateUsage]
-            sync_module._thread = None  # pyright: ignore[reportPrivateUsage]
+        with sync_module._lock:
+            sync_module._loop = None
+            sync_module._thread = None
     else:
         with contextlib.suppress(RuntimeError):
             sync_module.shutdown()
@@ -69,17 +70,17 @@ async def _answer() -> int:
 def _assert_loop_survived(thread: object) -> None:
     """The follow-up call returns, on the same thread, which is still alive."""
     assert run_sync(_answer(), timeout=_FOLLOW_UP_TIMEOUT) == 42
-    assert sync_module._thread is thread  # pyright: ignore[reportPrivateUsage]
-    assert sync_module._thread is not None  # pyright: ignore[reportPrivateUsage]
-    assert sync_module._thread.is_alive()  # pyright: ignore[reportPrivateUsage]
+    assert sync_module._thread is thread
+    assert sync_module._thread is not None
+    assert sync_module._thread.is_alive()
 
 
-@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=lambda exc: exc.__name__)
+@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=_IDS)
 def test_an_interrupt_in_run_sync_reaches_the_caller_and_the_loop_survives(
     interrupt: type[BaseException],
 ) -> None:
     assert run_sync(_answer()) == 42  # start the loop
-    thread = sync_module._thread  # pyright: ignore[reportPrivateUsage]
+    thread = sync_module._thread
     assert thread is not None
 
     async def _raise() -> None:
@@ -92,12 +93,12 @@ def test_an_interrupt_in_run_sync_reaches_the_caller_and_the_loop_survives(
     _assert_loop_survived(thread)
 
 
-@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=lambda exc: exc.__name__)
+@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=_IDS)
 def test_an_interrupt_in_a_stream_step_reaches_the_caller_and_the_loop_survives(
     interrupt: type[BaseException],
 ) -> None:
     assert run_sync(_answer()) == 42  # start the loop
-    thread = sync_module._thread  # pyright: ignore[reportPrivateUsage]
+    thread = sync_module._thread
     assert thread is not None
 
     async def _items() -> AsyncGenerator[int]:
@@ -147,7 +148,7 @@ print(run_sync(_answer(), timeout=5))
 """
 
 
-@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=lambda exc: exc.__name__)
+@pytest.mark.parametrize("interrupt", _INTERRUPTS, ids=_IDS)
 def test_process_exit_after_an_interrupt_on_the_loop_is_clean(
     interrupt: type[BaseException],
 ) -> None:
