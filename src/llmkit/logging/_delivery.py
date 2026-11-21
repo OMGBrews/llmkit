@@ -1,8 +1,15 @@
 """Bounded managed log delivery, independent of event loops and executors.
 
-One daemon worker owns sink I/O. Callers reserve queue space before preparing
-private payloads, then publish into FIFO order. Neither caller cancellation nor
-flush timeouts cancel delivery or create replacement workers.
+One daemon worker per process owns sink I/O. Callers reserve queue space before
+preparing private payloads, then publish into FIFO order. Neither caller
+cancellation nor flush timeouts cancel delivery or create replacement workers.
+
+A forked child inherits the parent's delivery state but not its worker, and any
+lock a parent thread held at the fork stays held. At-fork hooks therefore hold
+the registry's short critical sections across the fork, then give the child a
+fresh delivery service, re-install the current sink with fresh counters, and
+replace the other locks on the child's submit and write path. The parent's
+queued records are left to the parent's worker.
 
 The first record an installation drops (queue full, delivery closed or
 unavailable, the exit drain timing out) emits one WARNING naming
@@ -15,6 +22,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import os
+import sys
 import threading
 import time
 from asyncio import sleep
@@ -23,6 +32,8 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import cast
 
+import llmkit._diagnostics as _diagnostics
+import llmkit.logging._policy as _policy
 import llmkit.logging.registry as registry
 from llmkit._diagnostics import report
 from llmkit._durations import duration
@@ -306,6 +317,32 @@ class _Delivery:
 
 
 _delivery = _Delivery()
+
+
+def _reset_after_fork() -> None:
+    """Give a forked child its own delivery service and unheld locks.
+
+    Runs in the child between ``fork`` and its first line of code, so it takes
+    no lock, logs nothing and cannot raise. The inherited queue is dropped
+    without settling or counting: those records are the parent's, and its
+    worker still delivers them. Every consumer reads the module-level
+    ``_delivery`` at call time, so rebinding it reaches them all.
+    """
+    global _delivery
+    _delivery = _Delivery()
+    _policy.reset_after_fork()
+    _diagnostics.reset_after_fork()
+    registry.reset_after_fork()
+
+
+# Registered once, at import, never per ``_Delivery``: tests build their own
+# instances, and an at-fork hook cannot be unregistered.
+if sys.platform != "win32":
+    os.register_at_fork(
+        before=registry.before_fork,
+        after_in_parent=registry.after_fork_in_parent,
+        after_in_child=_reset_after_fork,
+    )
 
 
 def submit(record: LLMCallRecord, context: contextvars.Context) -> Receipt | None:

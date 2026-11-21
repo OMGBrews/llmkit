@@ -60,7 +60,8 @@ class DiagnosticsHealth:
 
     Attributes:
         lost: Diagnostics whose logging call raised and was contained, since
-            the process started. Never reset.
+            the process started. Never reset; a forked child starts with its
+            parent's count.
         last_loss: The most recent loss, or ``None`` when nothing was lost.
     """
 
@@ -96,6 +97,17 @@ def _record_loss(logger: logging.Logger, level: int, exc: Exception) -> None:
     with _lock:
         _lost += 1
         _last_loss = loss
+
+
+def reset_after_fork() -> None:
+    """Give a forked child an unheld lock, keeping the parent's counts.
+
+    Runs in the child between ``fork`` and its first line of code, where a
+    parent thread recording a loss would otherwise leave the lock held
+    forever. Takes no lock and cannot raise.
+    """
+    global _lock
+    _lock = threading.Lock()
 
 
 def report(
@@ -139,7 +151,8 @@ def get_diagnostics_health() -> DiagnosticsHealth:
     answer or raises the provider's error, and counts the lost record here.
 
     * ``lost`` counts lost diagnostics since the process started; it is never
-      reset, because it is not tied to a sink installation.
+      reset, because it is not tied to a sink installation. A forked child
+      starts with its parent's count.
     * ``last_loss`` names the most recent loss's logger, level, error text
       and time.
 

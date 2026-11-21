@@ -44,6 +44,17 @@ def freeze_delivery_policy() -> None:
         _frozen = True
 
 
+def reset_after_fork() -> None:
+    """Give a forked child an unheld lock; the policy and its freeze carry over.
+
+    Runs in the child between ``fork`` and its first line of code, where a
+    parent thread inside :func:`freeze_delivery_policy` would otherwise leave
+    the lock held forever. Takes no lock and cannot raise.
+    """
+    global _lock
+    _lock = threading.Lock()
+
+
 def configure_delivery(policy: LogDeliveryPolicy) -> None:
     if not isinstance(policy, LogDeliveryPolicy):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime public boundary
         raise TypeError("delivery_policy must be a LogDeliveryPolicy")  # pyright: ignore[reportUnreachable]  # untyped callers

@@ -13,7 +13,7 @@ the historical log shape so existing analysis tooling keeps working.
 ``LLMKIT_LOG_RETENTION_DAYS`` sets its retention, both without a code change;
 an explicit :func:`configure_llm_logging` or ``retention_days=`` wins.
 
-Managed logging uses one daemon worker and a bounded queue (256 waiting
+Managed logging uses one daemon worker per process and a bounded queue (256 waiting
 records by default). Calls wait at most 100 ms after snapshot preparation;
 abandoned streams submit without waiting. Accepted writes may finish later,
 but caller capture lists never receive late path appends. Explicit low-level

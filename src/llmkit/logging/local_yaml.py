@@ -1209,3 +1209,23 @@ def implicit_default_sink(log_dir: Path | None = None) -> LocalYamlLogSink:
     sink = LocalYamlLogSink(log_dir)
     sink._env_switch_applies = True  # pyright: ignore[reportPrivateUsage]  # the module that owns the class
     return sink
+
+
+def retention_lock(sink: LocalYamlLogSink) -> threading.Lock:
+    """The lock guarding *sink*'s retention settings, for the logging fork hooks.
+
+    Internal: it is held only for a few assignments and never while host code
+    runs, so the hooks can hold it across ``fork``.
+    """
+    return sink._retention_lock  # pyright: ignore[reportPrivateUsage]  # the module that owns the class
+
+
+def reset_after_fork(sink: LocalYamlLogSink) -> None:
+    """Give a forked child's copy of *sink* an unheld retention lock.
+
+    Internal: the logging fork hook calls this for the installed built-in
+    sink, between ``fork`` and the child's first line of code, where a parent
+    thread resolving retention would otherwise leave the lock held forever.
+    Takes no lock and cannot raise.
+    """
+    sink._retention_lock = threading.Lock()  # pyright: ignore[reportPrivateUsage]  # the module that owns the class
