@@ -155,9 +155,10 @@ print("done")
 # Every lock the fork hooks replace, as an expression evaluated in the parent
 # before fork. The default sink is still implicit (``LLMKIT_LOG`` unread), so the
 # child's first submit takes ``_switch_lock``, and the sink has not resolved its
-# retention, so the child's first write takes ``_retention_lock``. Those two are
-# held by the forking thread itself across the fork, which then waits for the
-# holder's timed release; the others are still held by the parent thread.
+# retention or its folder, so the child's first write takes ``_retention_lock``
+# and ``_location_lock``. Those three are held by the forking thread itself
+# across the fork, which then waits for the holder's timed release; the others
+# are still held by the parent thread.
 _LOCKS = {
     "delivery-condition": "_delivery._delivery.condition",
     "switch-lock": "registry._switch_lock",
@@ -165,6 +166,7 @@ _LOCKS = {
     "health-lock": "registry._installed.health._lock",
     "diagnostics-lock": "_diagnostics._lock",
     "retention-lock": "registry._installed.sink._retention_lock",
+    "location-lock": "registry._installed.sink._location_lock",
 }
 
 

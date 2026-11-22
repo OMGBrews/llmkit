@@ -31,8 +31,8 @@ from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOu
 from llmkit.logging._paths import LOG_ENV_VAR, blank_is_unset
 from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
 from llmkit.logging.local_yaml import LocalYamlLogSink, implicit_default_sink
+from llmkit.logging.local_yaml import fork_locks as _sink_fork_locks
 from llmkit.logging.local_yaml import reset_after_fork as _reset_sink_after_fork
-from llmkit.logging.local_yaml import retention_lock as _retention_lock
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
 
@@ -193,11 +193,11 @@ def configure_llm_logging(
 
 
 def before_fork() -> None:
-    """Hold the switch and built-in retention locks across ``fork``.
+    """Hold the switch lock and the built-in sink's settings locks across ``fork``.
 
     Each guards a few assignments that must be seen together, such as
     ``_installed`` and ``_implicit`` in :func:`configure_llm_logging`, and
-    neither is held while host code runs, so waiting for them is brief. A
+    none is held while host code runs, so waiting for them is brief. A
     child forked in the middle of one would otherwise inherit half-applied
     state: an explicitly configured sink with ``_implicit`` still set, which
     ``LLMKIT_LOG=off`` would then replace.
@@ -206,9 +206,9 @@ def before_fork() -> None:
     _fork_held.append(_switch_lock)
     sink = _installed.sink
     if isinstance(sink, LocalYamlLogSink):
-        lock = _retention_lock(sink)
-        _ = lock.acquire()
-        _fork_held.append(lock)
+        for lock in _sink_fork_locks(sink):
+            _ = lock.acquire()
+            _fork_held.append(lock)
 
 
 def after_fork_in_parent() -> None:
