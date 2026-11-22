@@ -71,8 +71,8 @@ class LoggingHealth:
     """A point-in-time snapshot of the installed sink's outcomes.
 
     Counts cover the current installation only: every
-    :func:`~llmkit.logging.configure_llm_logging` call starts a fresh set, and
-    a write still in flight when the sink is replaced is counted against the
+    :func:`~llmkit.logging.configure_llm_logging` call starts a fresh set, as
+    does a forked child for the sink it inherited, and a write still in flight when the sink is replaced is counted against the
     installation it started under.
 
     Attributes:
@@ -248,7 +248,8 @@ class HealthState:
         """``True`` exactly once per installation: the first drop's caller warns.
 
         A latch rather than a counter check, so concurrent first drops cannot
-        both warn; a reconfigure installs fresh state and so re-arms it.
+        both warn; a reconfigure installs fresh state and so re-arms it, as
+        does a fork in the child.
         """
         with self._lock:
             if self._drop_warned:

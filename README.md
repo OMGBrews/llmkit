@@ -1350,7 +1350,7 @@ A custom sink that returns normally counts as a handoff: llmkit cannot see
 whether it actually wrote anything through `write(record) -> None`. Record
 capture proves a record was built, not that a sink persisted it.
 
-**Bounded managed delivery.** One daemon worker handles sink writes, with room for
+**Bounded managed delivery.** One daemon worker per process handles sink writes, with room for
 256 waiting records plus at most one active write. A full queue drops the incoming
 delivery immediately and counts it in logging health; record capture still works.
 A normal call waits at most 100 ms, including time queued and writing. A timeout
@@ -1439,6 +1439,21 @@ signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
 A host that already handles SIGTERM can call `flush_llm_logs()` in its handler
 before it exits. Nothing helps against SIGKILL or `os._exit()`.
 
+**Forked processes.** A child created with `os.fork()`, or a `multiprocessing`
+worker using the fork start method, gets its own delivery worker, an empty queue
+and fresh logging-health counts for the sink it inherited. Records the parent had
+already queued stay with the parent, whose worker still writes them. A
+`multiprocessing` worker ends with `os._exit()`, so llmkit's exit drain does not
+run there: call `flush_llm_logs()` before the worker function returns. Records still queued when such a worker exits without flushing are lost
+without being counted.
+
+This covers logging delivery only. A custom sink's own locks, threads and open
+handles are the host's to reset in the child, for example with
+`os.register_at_fork`. llmkit's synchronous API (`run_sync` and the `*_sync`
+helpers) can hang in a child forked after the parent used it; use the async API
+in such a child. A fork made from inside a sink write, or while the parent's
+interpreter is exiting, is not supported.
+
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 
 **Installing a sink temporarily: `get_log_sink()`.** `configure_llm_logging` sets; `get_log_sink()` reads back what is installed (`LogSink | None`). Save and restore around a scope rather than guessing what to put back:
@@ -1481,7 +1496,7 @@ A flush that returns `False` has not lost anything yet: records still `queued` o
 - `wait_timeouts` counts expired caller waits. A timeout is not proof of loss: a later successful write still counts in `written` or `handed_off`.
 - `last_failure` is a `LoggingFailure` naming the stage (`write`, `index`, `housekeeping`, `sink_raised`, `contract`, `transform`, or `location`, the fallback to the per-user directory, whose error is the one the project folder raised, or the one reading a deleted current directory raised), the `"Type: message"` error text (the type name alone for `transform`, whose message may quote the record), the record's feature and label, and the time. It never holds the prompt or response. Admission, preparation and worker-termination counters retain no exception text and do not replace this last sink failure. `last_success_at` is the time of the last write or handoff.
 
-Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
+Counts belong to the installation bound at submission and reset on every `configure_llm_logging` call, so a temporary swap clears visible counts even when it restores the same sink. A forked child starts from zero; the parent's counts stay with the parent (see **Forked processes** above). Older queued records still use their original sink and counters. Counts are lock-guarded; a write in progress has no completion outcome yet. A user `atexit` handler registered after `import llmkit` runs before llmkit’s final drain: explicitly flush and inspect health there if needed, checking the flush result rather than assuming delivery completed.
 
 **Checking for lost diagnostics: `get_diagnostics_health()`.** Logging health answers whether records were lost; diagnostics health answers whether llmkit's own warnings were lost, so a sink failure whose warning is also lost increments both, for different reasons. When a host `logging.Handler` raises while handling a record on an `llmkit.*` logger, llmkit discards that record, keeps the call's outcome, and counts the loss in a frozen `DiagnosticsHealth` snapshot:
 
@@ -1493,7 +1508,7 @@ if diagnostics.lost:
     print(f"lost diagnostics={diagnostics.lost}, last={diagnostics.last_loss}")
 ```
 
-- `lost` counts diagnostics whose logging call raised, since the process started. It is process-wide and never reset, because it is not tied to a sink installation.
+- `lost` counts diagnostics whose logging call raised, since the process started. It is process-wide and never reset, because it is not tied to a sink installation. A forked child starts with its parent's count.
 - `last_loss` is a `DiagnosticLoss` naming the logger, the level of the lost record, the handler's `"Type: message"` error text and the time, or `None` when nothing was lost.
 
 A lost diagnostic is not reported through logging again, since the broken handler would only raise again. A handler that blocks rather than raises is not detected here.

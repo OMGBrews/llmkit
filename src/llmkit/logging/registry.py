@@ -30,7 +30,9 @@ from llmkit._latch import OnceLatch
 from llmkit.logging._health import HealthState, LoggingHealth, SinkKind, WriteOutcome
 from llmkit.logging._paths import LOG_ENV_VAR, blank_is_unset
 from llmkit.logging._policy import LogDeliveryPolicy, configure_delivery
-from llmkit.logging.local_yaml import implicit_default_sink
+from llmkit.logging.local_yaml import LocalYamlLogSink, implicit_default_sink
+from llmkit.logging.local_yaml import fork_locks as _sink_fork_locks
+from llmkit.logging.local_yaml import reset_after_fork as _reset_sink_after_fork
 from llmkit.logging.record import LLMCallRecord
 from llmkit.logging.sink import LogSink
 
@@ -114,6 +116,10 @@ _switch_lock = threading.Lock()
 # permanently broken third-party sink can't flood stderr either.
 _sink_latch = OnceLatch()
 
+# Locks :func:`before_fork` acquired, released again by
+# :func:`after_fork_in_parent`.
+_fork_held: list[threading.Lock] = []
+
 
 class _SinkContractError(TypeError):
     """A sink matched a capability protocol structurally but broke its contract.
@@ -143,7 +149,8 @@ def configure_llm_logging(
     Re-arms the warn-once latch on sink failures, so a newly configured sink
     gets a fresh loud first warning if it too turns out to be broken, and
     starts fresh :func:`get_logging_health` counts — including when the call
-    restores a previously installed sink.
+    restores a previously installed sink. A forked child also starts fresh
+    counts for the sink it inherited.
 
     Raises:
         TypeError: if *sink* is neither ``None`` nor a :class:`LogSink`
@@ -183,6 +190,51 @@ def configure_llm_logging(
         _installed = _install(sink)
         _implicit = False
     _sink_latch.succeeded()
+
+
+def before_fork() -> None:
+    """Hold the switch lock and the built-in sink's settings locks across ``fork``.
+
+    Each guards a few assignments that must be seen together, such as
+    ``_installed`` and ``_implicit`` in :func:`configure_llm_logging`, and
+    none is held while host code runs, so waiting for them is brief. A
+    child forked in the middle of one would otherwise inherit half-applied
+    state: an explicitly configured sink with ``_implicit`` still set, which
+    ``LLMKIT_LOG=off`` would then replace.
+    """
+    _ = _switch_lock.acquire()
+    _fork_held.append(_switch_lock)
+    sink = _installed.sink
+    if isinstance(sink, LocalYamlLogSink):
+        for lock in _sink_fork_locks(sink):
+            _ = lock.acquire()
+            _fork_held.append(lock)
+
+
+def after_fork_in_parent() -> None:
+    """Release what :func:`before_fork` acquired."""
+    while _fork_held:
+        _fork_held.pop().release()
+
+
+def reset_after_fork() -> None:
+    """Re-install the current sink in a forked child, with fresh locks and counts.
+
+    Runs in the child between ``fork`` and its first line of code. The
+    child's copies of the locks :func:`before_fork` held, and of the health
+    lock a parent thread may have held, would otherwise stay held forever,
+    and the inherited counters would describe the parent's records.
+    ``_implicit`` is kept, so an unread ``LLMKIT_LOG`` still applies at the
+    child's first use. A custom sink's own locks are the host's to reset.
+    Takes no lock and cannot raise.
+    """
+    global _installed, _switch_lock
+    _fork_held.clear()
+    _switch_lock = threading.Lock()
+    sink = _installed.sink
+    if isinstance(sink, LocalYamlLogSink):
+        _reset_sink_after_fork(sink)
+    _installed = _install(sink)
 
 
 def _apply_log_switch() -> None:
@@ -301,7 +353,8 @@ def get_logging_health() -> LoggingHealth:
 
     Counts belong to the current installation and reset on every
     :func:`configure_llm_logging` call, so a temporary sink swap — even one
-    restored with :func:`get_log_sink` — clears them. Writes run on worker
+    restored with :func:`get_log_sink` — clears them. A forked child starts
+    from zero too; the parent's counts stay with the parent. Writes run on worker
     threads; counts are lock-guarded and exact. A write still running when
     this is read is visible in ``in_flight``, but has no outcome yet.
     ``queued`` includes preparation reservations; ``dropped`` counts records

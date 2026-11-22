@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A forked child writes its own logs.** A process forked after llmkit had
+  logged a call, with `os.fork()` or a `multiprocessing` fork-context worker,
+  inherited the parent's delivery state without its worker thread: its records
+  never reached the sink and `flush_llm_logs()` returned `False`. A child
+  forked while another parent thread was submitting a record could also hang
+  on a lock that thread held. A forked child now gets its own delivery worker,
+  unheld logging locks and fresh `get_logging_health()` counts; the parent's
+  queued records stay with the parent. A `multiprocessing` worker should call
+  `flush_llm_logs()` before it returns, because llmkit's exit drain does not
+  run there. llmkit's `*_sync` API in a child forked after the parent used it
+  is not covered yet.
+
 - **A refused tool call no longer shifts a retried call's attempt numbers.**
   Inside `with_retries`, a `tool_llm_call` or `tool_llm_call_stream` refused
   before any request (an unsupported `tool_choice`, an unsupported
