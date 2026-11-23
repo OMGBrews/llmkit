@@ -72,10 +72,11 @@ siblings), and `ci-ok` succeeds only when every CI job does.
   - Evidence state: available
   - CI status: `check (…)` matrix cells, `ci-ok`
 - **Dependency floors**
-  - Command: `uv sync --resolution lowest-direct && uv run --no-sync pytest`
-  - Pass condition: exit 0, testing against the lowest declared versions of the direct
-    dependencies. Keep `--no-sync`: without it `uv run` re-resolves at the highest
-    versions and reinstalls them before the tests run.
+  - Command: `uv run --no-sync pytest`
+  - Pass condition: exit 0 in an environment installed immediately beforehand with
+    `uv sync --resolution lowest-direct`, so the tests run against the lowest declared
+    versions of the direct dependencies. Keep `--no-sync`: without it `uv run` re-resolves
+    at the highest versions and reinstalls them before the tests run.
   - Applies to: any change to `pyproject.toml` or to code that may rely on a newer
     `litellm`, `instructor`, `pydantic`, `jsonschema` or `referencing` API than the declared floor.
   - Evidence type: automated
@@ -110,9 +111,10 @@ siblings), and `ci-ok` succeeds only when every CI job does.
     provider adapter.
   - Evidence type: automated
   - Enforcement: procedural
-  - Evidence state: available to maintainers; contributors without credentials ask a
-    maintainer to run it against the pull request.
+  - Evidence state: available
   - CI status: none
+  - The evidence needs every provider's credentials. A contributor without them cannot
+    produce it and asks a maintainer to run the suite against the pull request.
 
 ### Docs-only surface
 
@@ -157,24 +159,33 @@ work environment, not in this repository.
     cannot be run blocks the release until it can.
   - Evidence type: automated
   - Enforcement: procedural
-  - Evidence state: available to maintainers
+  - Evidence state: available
+  - Strengthened for immutable PyPI releases: landing asks for this suite only when a
+    provider-facing surface changes; a release asks for it every time.
+  - The evidence needs every provider's credentials, which only maintainers hold.
 - **CI at the exact released ref**
-  - Command: none — `.github/workflows/publish.yml` calls `ci.yml` on the release ref.
-  - Pass condition: every CI job passes at the tagged ref before anything is built for
-    upload; `publish.yml`'s `build` job needs it.
+  - Command: `.github/workflows/publish.yml`
+  - Pass condition: the workflow's `ci` job, which calls `.github/workflows/ci.yml` on the
+    release ref, passes every CI job at the tagged ref before anything is built for
+    upload; the `build` job needs it.
   - Applies to: every release.
   - Evidence type: automated
   - Enforcement: procedural
   - Evidence state: available
+  - Strengthened for immutable PyPI releases: CI already ran when the commit landed, and
+    runs again at the exact tag because a published version cannot be replaced.
+  - Nobody runs this by hand: publishing a GitHub Release, or a manual dispatch, starts
+    the workflow.
 - **Immutable version identity**
-  - Command: none — performed by `publish.yml`.
-  - Pass condition: the version built from git tags equals the `vX.Y.Z` release tag (or the
-    `confirm_version` input of a manual dispatch), and the wheel is published to PyPI as
-    `omg-llmkit` through Trusted Publishing.
+  - Command: `.github/workflows/publish.yml`
+  - Pass condition: the version the workflow builds from git tags equals the `vX.Y.Z`
+    release tag (or the `confirm_version` input of a manual dispatch), and the wheel is
+    published to PyPI as `omg-llmkit` through Trusted Publishing.
   - Applies to: every release.
   - Evidence type: automated
   - Enforcement: procedural
   - Evidence state: available
+  - Nobody runs this by hand: the same workflow run performs it.
 
 ## Deployment requirements
 
