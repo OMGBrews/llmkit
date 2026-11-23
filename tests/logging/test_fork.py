@@ -4,9 +4,9 @@ A child process inherits a copy of the parent's memory but only the thread that
 called ``fork``. Each scenario forks from a fresh interpreter, gives the child a
 bounded time to submit, flush and report, and kills it if it does not finish,
 so a child that inherited a dead worker or a held lock fails its case instead
-of hanging the suite. Children never call a ``*_sync`` helper: the inherited
-sync loop is a separate defect. Each child ends with an explicit flush and
-``os._exit``, so no result depends on an exit drain.
+of hanging the suite. Children never call a ``*_sync`` helper, whose fork
+behaviour ``tests/runtime/test_fork.py`` covers. Each child ends with an
+explicit flush and ``os._exit``, so no result depends on an exit drain.
 """
 
 from __future__ import annotations

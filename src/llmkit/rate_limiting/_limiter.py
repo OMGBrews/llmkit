@@ -14,6 +14,8 @@ deadlock, and contention-dependently at that.
 import asyncio
 import contextlib
 import logging
+import os
+import sys
 import threading
 from collections.abc import AsyncGenerator, Generator, Mapping
 
@@ -242,6 +244,29 @@ class GlobalRateLimiter:
             adaptive=True,
             breaker=False,
         )
+
+    @classmethod
+    def _reset_after_fork(cls) -> None:
+        """Give a forked child fresh per-provider state under the same settings.
+
+        A child inherits the parent's registries mid-use: in-flight counts its
+        own calls never release, waiter tickets only a dead parent thread would
+        clear, a breaker probe that never returns, and possibly a held
+        ``cls._lock``. Replacing every registry, as :meth:`configure` does, and
+        the lock gives the child state of its own; the policy, overrides and
+        the enabled, adaptive and breaker settings are kept. A slot the forking
+        thread itself held releases into a discarded object, so no count in the
+        child goes negative. Runs in the child between ``fork`` and its first
+        line of code, so unlike :meth:`configure` it takes no lock, logs
+        nothing and cannot raise.
+        """
+        cls._lock = threading.Lock()
+        cls._async_gates = {}
+        cls._adaptive_states = {}
+        cls._breaker_states = {}
+        cls._sync_gates = {}
+        cls._rpm_buckets = {}
+        cls._tpm_buckets = {}
 
     @staticmethod
     def normalize_key(provider_name: str) -> str:
@@ -607,3 +632,11 @@ class GlobalRateLimiter:
                 )
         finally:
             gate.release()
+
+
+# Registered once, at import. Each llmkit subsystem registers its own child-side
+# hook; none reads state another writes, so their order does not matter.
+if sys.platform != "win32":
+    os.register_at_fork(
+        after_in_child=GlobalRateLimiter._reset_after_fork  # pyright: ignore[reportPrivateUsage]  # the module that owns the class
+    )

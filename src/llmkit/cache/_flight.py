@@ -20,6 +20,18 @@ _lock = threading.Lock()
 _in_flight: dict[tuple[asyncio.AbstractEventLoop, str], _Flight] = {}
 
 
+def reset_after_fork() -> None:
+    """Give a forked child an unheld lock and an empty flight table.
+
+    Internal: the cache's fork hook calls this. The inherited flights belong
+    to the parent's loop, which nothing runs in the child, so none of them can
+    land there. Takes no lock and cannot raise.
+    """
+    global _lock, _in_flight
+    _lock = threading.Lock()
+    _in_flight = {}
+
+
 def lead_or_follow(key: str) -> tuple[bool, _Flight]:
     """Join the flight for *key* on the running loop: ``(True, fut)`` makes the
     caller its leader, ``(False, fut)`` a follower of an existing one."""

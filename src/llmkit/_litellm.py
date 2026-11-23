@@ -55,6 +55,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
+import sys
 import threading
 import time
 from collections.abc import (
@@ -66,7 +68,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Literal, cast
@@ -243,6 +245,75 @@ def _refuses_temperature(exc: Exception, kwargs: dict[str, object]) -> bool:
 # check-and-add atomic across the sync bridge's loop and host loops alike.
 _temperature_warned_models: set[str] = set()
 _temperature_warned_lock = threading.Lock()
+
+# LiteLLM's logging worker, and the attributes on it that are bound to one event
+# loop or hold that loop's work: what its ``_ensure_queue`` rebinds when it sees
+# a new loop, plus the two tables of queued callbacks. Not every name exists on
+# every supported LiteLLM; a test pins the ones that must.
+_LOGGING_WORKER_MODULE = "litellm.litellm_core_utils.logging_worker"
+_LOGGING_WORKER_LOOP_STATE = (
+    "_queue",
+    "_worker_task",
+    "_sem",
+    "_bound_loop",
+    "_running_tasks",
+    "_overflow_tasks",
+    "_timeout_summary_task",
+    "_dequeued_tasks",
+    "_pending_enqueues",
+)
+
+# What a forked child detached from LiteLLM's worker: the parent's queue, tasks
+# and queued callbacks. Kept referenced for the child's lifetime, so dropping
+# them is never what finalizes the parent's work in the child. Measured on
+# Python 3.12 to 3.14, nothing reaches stderr either way.
+_fork_orphans: list[dict[str, object]] = []
+
+
+def _detach_logging_worker() -> None:
+    """Unbind LiteLLM's logging worker from the parent's loop in a forked child.
+
+    The child inherits the worker still bound to a loop nothing runs there.
+    Left alone, the child's first call would carry the parent's queued
+    callbacks onto the child's loop and run them a second time, and drop the
+    old worker task with a stderr warning. Clearing the loop-bound state lets
+    the worker start clean on the child's first use; the parent's callbacks
+    stay the parent's, and run only there. Best-effort, as the exit drain is:
+    any failure is swallowed.
+    """
+    with suppress(BaseException):
+        module = sys.modules.get(_LOGGING_WORKER_MODULE)
+        worker: object = getattr(module, "GLOBAL_LOGGING_WORKER", None)
+        if worker is None:
+            return
+        detached: dict[str, object] = {}
+        for name in _LOGGING_WORKER_LOOP_STATE:
+            if not hasattr(worker, name):
+                continue
+            value = cast("object", getattr(worker, name))
+            detached[name] = value
+            fresh: object = type(value)() if type(value) in (set, dict) else None
+            setattr(worker, name, fresh)
+        _fork_orphans.append(detached)
+
+
+def _reset_after_fork() -> None:
+    """Give a forked child an unheld warning lock and a detached LiteLLM worker.
+
+    Runs in the child between ``fork`` and its first line of code, so it takes
+    no lock, logs nothing and cannot raise. Registered here, in a module that
+    is only imported once LiteLLM is, so the hook imports nothing; it reaches
+    the worker through :data:`sys.modules`.
+    """
+    global _temperature_warned_lock
+    _temperature_warned_lock = threading.Lock()
+    _detach_logging_worker()
+
+
+# Registered once, at import. Each llmkit subsystem registers its own child-side
+# hook; none reads state another writes, so their order does not matter.
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def _report_dropped_temperature(model: object, value: object) -> None:

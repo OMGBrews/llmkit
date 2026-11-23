@@ -17,8 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unheld logging locks and fresh `get_logging_health()` counts; the parent's
   queued records stay with the parent. A `multiprocessing` worker should call
   `flush_llm_logs()` before it returns, because llmkit's exit drain does not
-  run there. llmkit's `*_sync` API in a child forked after the parent used it
-  is not covered yet.
+  run there.
+
+- **The sync API works in a forked child.** A process forked after the parent
+  had made a `*_sync` call inherited the parent's sync loop without the thread
+  that runs it: the child's `*_sync` calls never returned, and its normal exit
+  waited ten seconds on that loop. A child forked while a parent thread held
+  one of llmkit's rate-limiter, cache or transport locks could also hang on
+  it. A forked child now starts its own sync loop on its first sync call, with
+  fresh rate-limiter state under the parent's settings, unheld llmkit locks
+  (including the configured `InMemoryLLMCache`'s) and LiteLLM's logging worker
+  detached from the parent's loop, so the callbacks the parent had queued run
+  only in the parent. A sync stream opened before the fork raises
+  `RuntimeError` in the child instead of hanging.
 
 - **A refused tool call no longer shifts a retried call's attempt numbers.**
   Inside `with_retries`, a `tool_llm_call` or `tool_llm_call_stream` refused

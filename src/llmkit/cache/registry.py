@@ -9,10 +9,15 @@ unit, for the reason :mod:`llmkit.logging.registry` gives for its sink: a
 from __future__ import annotations
 
 import logging
+import os
+import sys
 
 from llmkit._diagnostics import report
 from llmkit._durations import duration
 from llmkit._latch import OnceLatch
+from llmkit.cache._flight import reset_after_fork as _reset_flights_after_fork
+from llmkit.cache.memory import InMemoryLLMCache
+from llmkit.cache.memory import reset_after_fork as _reset_store_after_fork
 from llmkit.cache.store import LLMCache
 from llmkit.options import UNSET, Unset
 
@@ -152,3 +157,24 @@ def report_cache_failure(what: str, exc: BaseException) -> None:
         )
     else:
         _ = report(logger, logging.DEBUG, "LLM response cache %s failed", what, exc_info=exc)
+
+
+def _reset_after_fork() -> None:
+    """Give a forked child unheld cache locks; the configured store stays.
+
+    Runs in the child between ``fork`` and its first line of code, so it takes
+    no lock, logs nothing and cannot raise. Clears the single-flight table and
+    its lock, and renews the configured store's lock when it is the shipped
+    :class:`~llmkit.cache.InMemoryLLMCache`; a host's own store is the host's
+    to reset.
+    """
+    _reset_flights_after_fork()
+    cache = _cache
+    if isinstance(cache, InMemoryLLMCache):
+        _reset_store_after_fork(cache)
+
+
+# Registered once, at import. Each llmkit subsystem registers its own child-side
+# hook; none reads state another writes, so their order does not matter.
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_reset_after_fork)

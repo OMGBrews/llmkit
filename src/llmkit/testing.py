@@ -381,6 +381,8 @@ class _Double:
 
     def __init__(self, fake: Fake) -> None:
         self._fake: Fake = fake
+        # Not reset in a forked child: a fake is test-only, and this lock is
+        # held only to record or copy one request.
         self._lock: threading.Lock = threading.Lock()
         self._requests: list[TransportRequest] = []
 
