@@ -32,6 +32,9 @@ class InMemoryLLMCache:
             raise ValueError(f"max_entries must be an integer >= 1, got {max_entries!r}")
         self.max_entries: int = max_entries
         self._entries: OrderedDict[str, LLMCacheEntry] = OrderedDict()
+        # A forked child gets a fresh copy of this lock only for the configured
+        # store (see ``reset_after_fork``); a store the host holds elsewhere is
+        # the host's to reset, as with a custom log sink.
         self._lock: threading.Lock = threading.Lock()
 
     async def get(self, key: str) -> LLMCacheEntry | None:
@@ -54,3 +57,14 @@ class InMemoryLLMCache:
         """The number of entries currently held."""
         with self._lock:
             return len(self._entries)
+
+
+def reset_after_fork(cache: InMemoryLLMCache) -> None:
+    """Give a forked child's copy of *cache* an unheld lock; its entries stay.
+
+    Internal: the cache's fork hook calls this for the configured store,
+    between ``fork`` and the child's first line of code, where the child's
+    copy would otherwise stay held forever if a parent thread held it. Takes
+    no lock and cannot raise.
+    """
+    cache._lock = threading.Lock()  # pyright: ignore[reportPrivateUsage]  # the module that owns the class

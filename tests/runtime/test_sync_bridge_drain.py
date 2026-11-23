@@ -455,7 +455,7 @@ def test_shutdown_closes_a_sync_stream_left_between_items() -> None:
             assert next(chunks) == "a"
             sync.shutdown()
             assert [record.error for record in written] == [STREAM_ABANDONED_ERROR]
-            with pytest.raises(RuntimeError, match="shut down while this stream was open"):
+            with pytest.raises(RuntimeError, match="shut down while the stream was open"):
                 _ = next(chunks)
             chunks.close()
     assert sync._loop is None, "a pull after shutdown restarted the loop"

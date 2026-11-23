@@ -55,6 +55,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
+import sys
 import threading
 import time
 from collections.abc import (
@@ -243,6 +245,24 @@ def _refuses_temperature(exc: Exception, kwargs: dict[str, object]) -> bool:
 # check-and-add atomic across the sync bridge's loop and host loops alike.
 _temperature_warned_models: set[str] = set()
 _temperature_warned_lock = threading.Lock()
+
+
+def _reset_after_fork() -> None:
+    """Give a forked child an unheld temperature-warning lock.
+
+    Runs in the child between ``fork`` and its first line of code, so it takes
+    no lock, logs nothing and cannot raise. LiteLLM's logging worker is
+    detached by :mod:`llmkit.sync`'s hook, which is registered whether or not
+    this module was ever imported.
+    """
+    global _temperature_warned_lock
+    _temperature_warned_lock = threading.Lock()
+
+
+# Registered once, at import. Each llmkit subsystem registers its own child-side
+# hook; none reads state another writes, so their order does not matter.
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def _report_dropped_temperature(model: object, value: object) -> None:

@@ -16,6 +16,8 @@ installs a :class:`TransportDouble`.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
@@ -202,6 +204,22 @@ class TransportDouble(Protocol):
 # under test. The lock guards the list against installs from several threads.
 _doubles: list[TransportDouble] = []
 _doubles_lock = threading.Lock()
+
+
+def _reset_after_fork() -> None:
+    """Give a forked child an unheld doubles lock; installed doubles stay.
+
+    Runs in the child between ``fork`` and its first line of code, so it takes
+    no lock, logs nothing and cannot raise.
+    """
+    global _doubles_lock
+    _doubles_lock = threading.Lock()
+
+
+# Registered once, at import. Each llmkit subsystem registers its own child-side
+# hook; none reads state another writes, so their order does not matter.
+if sys.platform != "win32":
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def push_double(double: TransportDouble) -> None:
