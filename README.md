@@ -1451,19 +1451,21 @@ The synchronous API works in such a child too. The child's first `*_sync` call
 starts the child's own sync loop, and the child's normal exit does not wait on
 the parent's. The rate limiter starts fresh with the parent's settings: the
 parent's in-flight calls, waiting callers, adapted limits and circuit-breaker
-state stay with the parent. llmkit's own locks are unheld in the child,
-including the lock of an `InMemoryLLMCache` installed with
-`configure_llm_cache`, whose entries stay. LiteLLM's logging worker starts
-clean on the child's first call, and the callbacks the parent had queued run
-only in the parent.
+state stay with the parent. llmkit's shared locks (sync loop, rate limiter,
+cache, transport and logging) are unheld in the child, including the lock of an
+`InMemoryLLMCache` installed with `configure_llm_cache`, whose entries stay.
+LiteLLM's logging worker starts clean on the child's first call, and the
+callbacks the parent had queued run only in the parent.
 
 The rest is the host's or unsupported. A sync stream opened before the fork
-belongs to the parent: its next `next()` in the child raises `RuntimeError`.
-The locks, threads and open handles of a custom sink or a custom cache store,
-and of an `InMemoryLLMCache` that is not the configured one, are the host's to
-reset in the child, for example with `os.register_at_fork`. LiteLLM's own
-locks are not reset. A fork made from inside a sink write, or while the
-parent's interpreter is exiting, is not supported.
+belongs to the parent: its next `next()` in the child raises `RuntimeError`, or
+`ValueError` if a parent thread was in the middle of a step at the fork. A test
+fake from `llmkit.testing` keeps its own lock as it was at the fork. The locks,
+threads and open handles of a custom sink or a custom cache store, and of an
+`InMemoryLLMCache` that is not the configured one, are the host's to reset in
+the child, for example with `os.register_at_fork`. LiteLLM's own locks are not
+reset. A fork made from inside a sink write, or while the parent's interpreter
+is exiting, is not supported.
 
 `configure_llm_logging` checks the object you hand it: anything that is neither `None` nor a `LogSink` — including the sink *class* where you meant an instance — raises `TypeError` there and then, rather than being installed and silently swallowing every subsequent call's log. The check is structural, so it tests that `write` exists, not that its signature is right (a type checker catches the rest at the call site). One consequence in your own tests: a bare `MagicMock()` doesn't register as a sink, because structural checks use static attribute lookup and see through no `__getattr__` — stub with `Mock(spec=LogSink)`, a small fake class, or `configure_llm_logging(None)`.
 

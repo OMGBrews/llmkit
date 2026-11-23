@@ -790,7 +790,8 @@ def iterate_sync[T](agen: AsyncGenerator[T]) -> Generator[T]:
     items is closed by the shutdown, and its next ``next()`` raises
     :class:`RuntimeError`. A stream opened before the process forked is bound
     to the parent's loop, so in the child its next ``next()`` raises the same
-    :class:`RuntimeError` and closing it does nothing.
+    :class:`RuntimeError`, or :class:`ValueError` when a parent thread was in
+    the middle of a step at the fork, and closing it does nothing.
 
     Raises :class:`RuntimeError` when called, or iterated, on the persistent
     loop's own thread, where it would deadlock.
@@ -915,6 +916,60 @@ _ = atexit.register(_shutdown_at_exit)
 _fork_orphans: list[asyncio.AbstractEventLoop] = []
 
 
+# LiteLLM's logging worker, and the attributes on it that are bound to one event
+# loop or hold that loop's work: what its ``_ensure_queue`` rebinds when it sees
+# a new loop, plus the two tables of queued callbacks. Not every name exists on
+# every supported LiteLLM; a test pins the ones that must. The detach lives
+# here, not in :mod:`llmkit._litellm`, because this loop is what binds the
+# worker, and a host can bind it through :func:`run_sync` without ever
+# loading that module.
+_LOGGING_WORKER_MODULE = "litellm.litellm_core_utils.logging_worker"
+_LOGGING_WORKER_LOOP_STATE = (
+    "_queue",
+    "_worker_task",
+    "_sem",
+    "_bound_loop",
+    "_running_tasks",
+    "_overflow_tasks",
+    "_timeout_summary_task",
+    "_dequeued_tasks",
+    "_pending_enqueues",
+)
+
+# What a forked child detached from LiteLLM's worker: the parent's queue, tasks
+# and queued callbacks. Kept referenced for the child's lifetime, so dropping
+# them is never what finalizes the parent's work in the child. Measured on
+# Python 3.12 to 3.14, nothing reaches stderr either way.
+_detached_workers: list[dict[str, object]] = []
+
+
+def _detach_logging_worker() -> None:
+    """Unbind LiteLLM's logging worker from the parent's loop in a forked child.
+
+    The child inherits the worker still bound to a loop nothing runs there.
+    Left alone, the child's first call would carry the parent's queued
+    callbacks onto the child's loop and run them a second time, and drop the
+    old worker task with a stderr warning. Clearing the loop-bound state lets
+    the worker start clean on the child's first use; the parent's callbacks
+    stay the parent's, and run only there. Best-effort, as the exit drain is:
+    any failure is swallowed.
+    """
+    with contextlib.suppress(BaseException):
+        module = sys.modules.get(_LOGGING_WORKER_MODULE)
+        worker: object = getattr(module, "GLOBAL_LOGGING_WORKER", None)
+        if worker is None:
+            return
+        detached: dict[str, object] = {}
+        for name in _LOGGING_WORKER_LOOP_STATE:
+            if not hasattr(worker, name):
+                continue
+            value = cast("object", getattr(worker, name))
+            detached[name] = value
+            fresh: object = type(value)() if type(value) in (set, dict) else None
+            setattr(worker, name, fresh)
+        _detached_workers.append(detached)
+
+
 def _reset_after_fork() -> None:
     """Give a forked child its own sync loop, started on its first sync call.
 
@@ -922,9 +977,10 @@ def _reset_after_fork() -> None:
     a call submitted to it would wait forever, and the exit drain would wait
     out its whole bound. Runs in the child between ``fork`` and its first line
     of code, so it takes no lock, logs nothing and cannot raise. The inherited
-    loop is kept but never run or closed (see ``_fork_orphans``). A sync
-    stream opened before the fork is pinned to that loop, so its next step
-    raises :class:`RuntimeError` instead of hanging, and its close is a no-op.
+    loop is kept but never run or closed (see ``_fork_orphans``), and
+    LiteLLM's logging worker is detached from it. A sync stream opened before
+    the fork is pinned to that loop, so its next step raises instead of
+    hanging (see :func:`iterate_sync`), and its close is a no-op.
     """
     global _lock, _loop, _thread, _stop_requested, _fallback_lock
     if _loop is not None:
@@ -934,6 +990,7 @@ def _reset_after_fork() -> None:
     _loop = None
     _thread = None
     _stop_requested = None
+    _detach_logging_worker()
 
 
 # Registered once, at import. Each llmkit subsystem registers its own child-side

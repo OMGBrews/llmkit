@@ -21,7 +21,7 @@ from typing import cast
 import pytest
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
-from llmkit import _litellm
+from llmkit import sync
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="fork is POSIX-only")
 
@@ -47,16 +47,19 @@ import threading
 import time
 from pathlib import Path
 
-from llmkit import text_llm_call_sync
-from llmkit.testing import Reply, install
-from tests._support import ollama_call_defaults
-
 WORK_DIR = Path(sys.argv[1])
 
-_defaults = ollama_call_defaults()
-_defaults.__enter__()
-_fake = install(lambda request: Reply(content="ok"))
-_fake.__enter__()
+# A scenario about a host that only uses ``run_sync`` skips this setup, which
+# would import ``llmkit._litellm``.
+if sys.argv[2] == "fake":
+    from llmkit import text_llm_call_sync
+    from llmkit.testing import Reply, install
+    from tests._support import ollama_call_defaults
+
+    _defaults = ollama_call_defaults()
+    _defaults.__enter__()
+    _fake = install(lambda request: Reply(content="ok"))
+    _fake.__enter__()
 
 
 def call(prompt="hi"):
@@ -133,8 +136,11 @@ def hold(lock):
 """
 
 
-def _run(source: str, work_dir: Path) -> None:
+def _run(source: str, work_dir: Path, *, fake: bool = True) -> None:
     """Run *source* after the common helpers; it must print ``done`` and exit 0.
+
+    With *fake*, the helpers first configure a keyless provider and install an
+    :mod:`llmkit.testing` fake that answers ``"ok"``.
 
     The combined output of the parent and its children must also show no sign
     of the parent's async work leaking into a child.
@@ -143,7 +149,14 @@ def _run(source: str, work_dir: Path) -> None:
     env["LLMKIT_LOG_DIR"] = str(work_dir / "logs")
     try:
         result = subprocess.run(
-            [sys.executable, "-u", "-c", _COMMON + source, str(work_dir)],
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                _COMMON + source,
+                str(work_dir),
+                "fake" if fake else "bare",
+            ],
             cwd=_ROOT,
             env=env,
             stdout=subprocess.PIPE,
@@ -213,14 +226,16 @@ print("done")
     )
 
 
-def test_litellm_logging_worker_is_detached_in_the_child(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fake", [True, False], ids=["after-a-sync-call", "run-sync-only"])
+def test_litellm_logging_worker_is_detached_in_the_child(tmp_path: Path, fake: bool) -> None:
     """The parent's queued LiteLLM callbacks stay the parent's.
 
     The parent makes a real LiteLLM call, whose success path binds LiteLLM's
     logging worker to llmkit's loop, then forks while three more callbacks wait
     in the worker's queue. The child makes its own real call and exits
     normally: none of the parent's callbacks runs there, and nothing reports a
-    destroyed task or an unawaited coroutine.
+    destroyed task or an unawaited coroutine. A host that only drives LiteLLM
+    through ``run_sync`` never loads ``llmkit._litellm``, and is covered too.
     """
     _run(
         r"""
@@ -246,6 +261,7 @@ async def mark():
 
 response = run_sync(litellm.acompletion(**REQUEST))
 assert response.choices[0].message.content == "ok"
+assert ("llmkit._litellm" in sys.modules) == (sys.argv[2] == "fake")
 loop = sync._loop
 assert worker._bound_loop is loop
 
@@ -282,6 +298,7 @@ assert marks == [str(os.getpid())] * 3, marks
 print("done")
 """,
         tmp_path,
+        fake=fake,
     )
 
 
@@ -475,6 +492,6 @@ def test_litellm_logging_worker_has_the_state_the_fork_reset_clears() -> None:
         "_timeout_summary_task",
         "_dequeued_tasks",
     }
-    assert required <= set(_litellm._LOGGING_WORKER_LOOP_STATE)
+    assert required <= set(sync._LOGGING_WORKER_LOOP_STATE)
     missing = sorted(name for name in required if not hasattr(GLOBAL_LOGGING_WORKER, name))
     assert not missing, missing

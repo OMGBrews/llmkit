@@ -25,11 +25,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   waited ten seconds on that loop. A child forked while a parent thread held
   one of llmkit's rate-limiter, cache or transport locks could also hang on
   it. A forked child now starts its own sync loop on its first sync call, with
-  fresh rate-limiter state under the parent's settings, unheld llmkit locks
-  (including the configured `InMemoryLLMCache`'s) and LiteLLM's logging worker
+  fresh rate-limiter state under the parent's settings, unheld shared llmkit
+  locks (including the configured `InMemoryLLMCache`'s) and LiteLLM's logging worker
   detached from the parent's loop, so the callbacks the parent had queued run
-  only in the parent. A sync stream opened before the fork raises
-  `RuntimeError` in the child instead of hanging.
+  only in the parent, including after a bare `run_sync` LiteLLM call. A sync
+  stream opened before the fork raises in the child instead of hanging.
 
 - **A refused tool call no longer shifts a retried call's attempt numbers.**
   Inside `with_retries`, a `tool_llm_call` or `tool_llm_call_stream` refused
